@@ -1,0 +1,905 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>UAV 禁飞区地图 — 上海建筑高度</title>
+
+  <!-- Bootstrap 5 -->
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/css/bootstrap.min.css">
+  <!-- Leaflet -->
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
+  <!-- Leaflet.draw -->
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/leaflet.draw/1.0.4/leaflet.draw.css">
+
+  <style>
+    /* ── 整体布局 ── */
+    html, body { height: 100%; margin: 0; padding: 0; font-family: "Microsoft YaHei", sans-serif; background: #f4f6f9; }
+    #app { display: flex; height: 100vh; flex-direction: column; }
+
+    /* ── 顶部导航栏 ── */
+    #topbar {
+      background: linear-gradient(90deg, #1565c0 0%, #1976d2 100%);
+      color: #fff; padding: 8px 20px;
+      display: flex; align-items: center; gap: 16px;
+      flex-shrink: 0; border-bottom: 2px solid #e94560;
+    }
+    #topbar .title { font-size: 1.15rem; font-weight: 700; letter-spacing: 1px; }
+    #topbar .subtitle { font-size: 0.78rem; color: #bbdefb; }
+    #status-dot { width: 10px; height: 10px; border-radius: 50%; background: #ff4444; flex-shrink: 0; }
+    #status-dot.ok { background: #44cc44; }
+    #status-dot.spin { animation: pulse 1s infinite; }
+    @keyframes pulse { 0%,100%{opacity:1}50%{opacity:.3} }
+    #status-text { font-size: 0.8rem; color: #e3f2fd; }
+
+    /* ── 主体区域 ── */
+    #main { display: flex; flex: 1; overflow: hidden; }
+
+    /* ── 侧边栏 ── */
+    #sidebar {
+      width: 320px; min-width: 280px; background: #f0f4f8;
+      color: #222; overflow-y: auto; flex-shrink: 0;
+      padding: 14px 14px 20px; border-right: 1px solid #c8d8ea;
+      display: flex; flex-direction: column; gap: 12px;
+    }
+    .card-dark {
+      background: #fff; border-radius: 8px;
+      padding: 12px 14px; border: 1px solid #c8d8ea;
+      box-shadow: 0 1px 4px rgba(0,0,0,.06);
+    }
+    .card-dark h6 {
+      color: #1565c0; font-size: 0.78rem; text-transform: uppercase;
+      letter-spacing: 1px; margin-bottom: 10px; font-weight: 600;
+    }
+    .label-sm { font-size: 0.75rem; color: #555; margin-bottom: 3px; display: block; }
+    .val-lg { font-size: 1.3rem; font-weight: 700; color: #111; }
+    .val-red { color: #c0392b; }
+    .val-grn { color: #1a7a3c; }
+
+    /* ── 表单控件 ── */
+    .form-control-dark, .form-select-dark {
+      background: #f8fafc; border: 1px solid #b0c4de;
+      color: #222; border-radius: 6px; font-size: 0.85rem; padding: 5px 10px;
+    }
+    .form-control-dark:focus, .form-select-dark:focus {
+      background: #fff; border-color: #1565c0; color: #111;
+      box-shadow: 0 0 0 2px rgba(21,101,192,.2); outline: none;
+    }
+    input[type=range] { accent-color: #e94560; width: 100%; }
+    .range-labels { display: flex; justify-content: space-between; font-size: 0.7rem; color: #777; }
+
+    /* ── 按钮 ── */
+    .btn-accent {
+      background: #e94560; border: none; color: #fff;
+      border-radius: 6px; padding: 7px 14px; font-size: 0.85rem;
+      font-weight: 600; width: 100%; cursor: pointer; transition: background .2s;
+    }
+    .btn-accent:hover { background: #c73652; }
+    .btn-accent:disabled { background: #555; cursor: not-allowed; }
+    .btn-outline-light-sm {
+      background: transparent; border: 1px solid #aaa; color: #ccc;
+      border-radius: 6px; padding: 5px 10px; font-size: 0.78rem;
+      cursor: pointer; transition: all .2s; flex: 1;
+    }
+    .btn-outline-light-sm:hover { background: #e3edf8; border-color: #1565c0; color: #1565c0; }
+    .btn-outline-light-sm.active { background: #e94560; border-color: #e94560; color: #fff; }
+
+    /* ── 坐标表格 ── */
+    .coord-table { width: 100%; border-collapse: collapse; font-size: .72rem; margin-top:6px; }
+    .coord-table td { padding: 3px 6px; border: 1px solid #c8d8ea; }
+    .coord-table td:first-child { color: #666; white-space: nowrap; }
+    .coord-table td:last-child { color: #1565c0; font-family: monospace; font-size:.73rem; }
+    .copy-btn {
+      display: inline-block; margin-top: 6px; padding: 3px 10px;
+      font-size: .7rem; color: #555; background: #f0f4f8;
+      border: 1px solid #b0c4de; border-radius: 4px; cursor: pointer;
+    }
+    .copy-btn:hover { background: #dce8f5; color: #1565c0; }
+
+    /* ── 统计卡片 ── */
+    .stat-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+    .stat-item { background: #eef3f9; border-radius: 6px; padding: 8px 10px; text-align: center; border: 1px solid #c8d8ea; }
+    .stat-item .n { font-size: 1.25rem; font-weight: 700; color: #111; }
+    .stat-item .l { font-size: 0.68rem; color: #777; }
+
+    /* ── 进度条 ── */
+    .progress-dark { background: #dce8f5; border-radius: 4px; height: 6px; }
+    .progress-bar-accent { background: #e94560; height: 100%; border-radius: 4px; transition: width .4s; }
+
+    /* ── 地图 ── */
+    #map-wrap { flex: 1; position: relative; }
+    #map { width: 100%; height: 100%; }
+
+    /* ── 地图浮层提示 ── */
+    #map-overlay {
+      position: absolute; top: 12px; left: 50%; transform: translateX(-50%);
+      background: rgba(255,255,255,.92); color: #1565c0;
+      border: 1px solid #90caf9; border-radius: 8px;
+      padding: 6px 16px; font-size: 0.8rem; pointer-events: none;
+      z-index: 800; white-space: nowrap; box-shadow: 0 2px 8px rgba(0,0,0,.1);
+    }
+
+    /* ── 图例 ── */
+    #legend {
+      position: absolute; bottom: 28px; right: 10px;
+      background: rgba(255,255,255,.95); border: 1px solid #b0c4de;
+      border-radius: 8px; padding: 10px 14px; z-index: 800; font-size: 0.78rem; color: #333;
+      box-shadow: 0 2px 8px rgba(0,0,0,.1);
+    }
+    .legend-item { display: flex; align-items: center; gap: 8px; margin-bottom: 4px; }
+    .legend-box { width: 16px; height: 16px; border-radius: 3px; border: 1px solid #ccc; }
+
+    /* ── 加载遮罩 ── */
+    #loading-mask {
+      position: fixed; inset: 0; background: rgba(240,244,248,.96);
+      display: flex; flex-direction: column; align-items: center; justify-content: center;
+      z-index: 9999; gap: 20px;
+    }
+    #loading-mask.hidden { display: none; }
+    .spinner {
+      width: 50px; height: 50px; border: 4px solid #b0c4de;
+      border-top-color: #e94560; border-radius: 50%; animation: spin 1s linear infinite;
+    }
+    @keyframes spin { to { transform: rotate(360deg); } }
+    .loading-text { color: #222; font-size: 1rem; }
+    .loading-sub  { color: #666; font-size: 0.78rem; }
+
+    /* ── Leaflet popup 覆盖 ── */
+    .leaflet-popup-content-wrapper {
+      background: #fff !important; color: #222 !important; border-radius: 8px !important;
+      box-shadow: 0 3px 12px rgba(0,0,0,.15) !important;
+    }
+    .leaflet-popup-tip { background: #fff !important; }
+    .popup-h { font-size: 1.1rem; font-weight: 700; color: #111; }
+    .popup-tag { display: inline-block; padding: 2px 8px; border-radius: 4px; font-size: 0.75rem; font-weight: 600; }
+    .popup-tag.nf { background: #ae2012; color: #fff; }
+    .popup-tag.ok { background: #2d6a4f; color: #fff; }
+
+    /* ── 响应式 ── */
+    @media (max-width: 720px) {
+      #sidebar { width: 100%; min-width: unset; max-height: 50vh; }
+      #main { flex-direction: column; }
+    }
+  </style>
+</head>
+
+<body>
+<!-- ══════════════════════ 加载遮罩 ══════════════════════ -->
+<div id="loading-mask">
+  <div class="spinner"></div>
+  <div class="loading-text">正在加载上海建筑高度数据…</div>
+  <div style="width:260px;">
+    <div class="progress-dark"><div id="load-bar" class="progress-bar-accent" style="width:0%"></div></div>
+  </div>
+  <div class="loading-sub" id="load-sub">请稍候，文件较大（~240 MB）约需 30–60 秒</div>
+</div>
+
+<!-- ══════════════════════ 顶部栏 ══════════════════════ -->
+<div id="app">
+<div id="topbar">
+  <div>
+    <div class="title">✈ UAV 禁飞区地图</div>
+    <div class="subtitle">上海建筑高度数据 2020 · WGS1984 · shp</div>
+  </div>
+  <div style="margin-left:auto;display:flex;align-items:center;gap:8px;">
+    <div id="status-dot"></div>
+    <div id="status-text">连接中…</div>
+  </div>
+</div>
+
+<!-- ══════════════════════ 主体 ══════════════════════ -->
+<div id="main">
+
+  <!-- ─── 侧边栏 ─── -->
+  <div id="sidebar">
+
+    <!-- 数据集信息 -->
+    <div class="card-dark" id="info-card">
+      <h6>📊 数据集信息</h6>
+      <div class="stat-grid">
+        <div class="stat-item">
+          <div class="n" id="info-total">—</div>
+          <div class="l">总建筑数</div>
+        </div>
+        <div class="stat-item">
+          <div class="n" id="info-hcol" style="font-size:.9rem">—</div>
+          <div class="l">高度字段</div>
+        </div>
+        <div class="stat-item">
+          <div class="n val-red" id="info-hmax">—</div>
+          <div class="l">最高 (m)</div>
+        </div>
+        <div class="stat-item">
+          <div class="n val-grn" id="info-hmean">—</div>
+          <div class="l">均值 (m)</div>
+        </div>
+      </div>
+    </div>
+
+    <!-- 选区工具 -->
+    <div class="card-dark">
+      <h6>🗺 选取研究范围</h6>
+      <div class="d-flex gap-2 mb-2">
+        <button class="btn-outline-light-sm" id="btn-draw">✏ 手动框选</button>
+        <button class="btn-outline-light-sm" id="btn-quick">📍 中心点选区</button>
+      </div>
+      <!-- 快速选区参数（中心点模式） -->
+      <div id="quick-panel" style="display:none; margin-top:8px;">
+        <span class="label-sm">点击地图设置中心，范围（米）：</span>
+        <div class="d-flex gap-2">
+          <div style="flex:1">
+            <span class="label-sm">宽 (E-W)</span>
+            <input type="number" id="qw" value="4000" min="100" max="20000" step="100" class="form-control-dark" style="width:100%">
+          </div>
+          <div style="flex:1">
+            <span class="label-sm">高 (N-S)</span>
+            <input type="number" id="qh" value="4000" min="100" max="20000" step="100" class="form-control-dark" style="width:100%">
+          </div>
+        </div>
+      </div>
+      <!-- 当前选区信息 -->
+      <div id="sel-info" style="margin-top:8px; display:none;">
+        <div style="font-size:.75rem; color:#aaa; margin-bottom:4px;">
+          已选区域：<span id="sel-size" style="color:#7ec8e3;font-weight:600"></span>
+        </div>
+        <table class="coord-table">
+          <tr><td>↙ 西南角 (SW)</td><td id="coord-sw">—</td></tr>
+          <tr><td>↗ 东北角 (NE)</td><td id="coord-ne">—</td></tr>
+          <tr><td>↙ 西北角 (NW)</td><td id="coord-nw">—</td></tr>
+          <tr><td>↗ 东南角 (SE)</td><td id="coord-se">—</td></tr>
+          <tr><td>⊙ 中心点</td><td id="coord-ctr">—</td></tr>
+        </table>
+        <span class="copy-btn" id="btn-copy-coords">📋 复制四角坐标</span>
+      </div>
+      <button class="btn-accent mt-2" id="btn-clear-sel" style="display:none; opacity:.7; font-weight:400; font-size:.78rem; padding:5px;">✕ 清除选区</button>
+    </div>
+
+    <!-- 高度设置 -->
+    <div class="card-dark">
+      <h6>⚡ 高度阈值设置</h6>
+      <span class="label-sm">无人机飞行高度AGL (m) — 超过此值为禁飞区</span>
+      <div class="d-flex align-items-center gap-2" style="margin-top:6px;">
+        <input type="range" id="height-slider" min="10" max="500" step="5" value="120" style="flex:1">
+        <input type="number" id="height-input" value="120" min="0" max="9999"
+               class="form-control-dark" style="width:70px; text-align:center;">
+        <span style="font-size:.8rem; color:#aaa;">m</span>
+      </div>
+      <div class="range-labels"><span>10m</span><span>500m</span></div>
+      <div style="margin-top:8px; font-size:.75rem; color:#aaa; line-height:1.5">
+        常见场景：城区低空 <b style="color:#f8961e">50m</b> ·
+        一般巡航 <b style="color:#f8961e">120m</b> ·
+        高空飞行 <b style="color:#f8961e">300m</b>
+      </div>
+
+      <hr style="border-color:#1a4480; margin:10px 0">
+      <span class="label-sm">高度字段（自动检测，可手动切换）</span>
+      <select id="height-col-sel" class="form-select-dark mt-1" style="width:100%">
+        <option value="">— 加载中 —</option>
+      </select>
+    </div>
+
+    <!-- 查询 -->
+    <button class="btn-accent" id="btn-query" disabled>🔍 分析选区建筑</button>
+
+    <!-- 统计结果 -->
+    <div class="card-dark" id="stat-card" style="display:none;">
+      <h6>📈 查询结果</h6>
+      <div class="stat-grid">
+        <div class="stat-item">
+          <div class="n" id="stat-total">—</div>
+          <div class="l">选区建筑</div>
+        </div>
+        <div class="stat-item">
+          <div class="n" id="stat-shown">—</div>
+          <div class="l">已显示</div>
+        </div>
+        <div class="stat-item">
+          <div class="n val-red" id="stat-nf">—</div>
+          <div class="l">🔴 禁飞区</div>
+        </div>
+        <div class="stat-item">
+          <div class="n val-grn" id="stat-fly">—</div>
+          <div class="l">🟢 可飞区</div>
+        </div>
+      </div>
+      <div id="stat-trunc" style="display:none; margin-top:6px; font-size:.72rem; color:#f8961e;">
+        ⚠ 建筑数量超限，仅显示部分结果。导出时将包含所有数据。
+      </div>
+    </div>
+
+    <!-- 导出 -->
+    <div class="card-dark" id="export-card" style="display:none;">
+      <h6>💾 导出数据</h6>
+      <span class="label-sm">选择格式</span>
+      <div class="d-flex gap-1 mt-1 mb-2 flex-wrap">
+        <button class="btn-outline-light-sm" data-fmt="sumo_zip_osm" id="fmt-sumo-osm">SUMO 真实路网 (.zip) 🌟</button>
+        <button class="btn-outline-light-sm" data-fmt="sumo_zip" id="fmt-sumo-zip">SUMO 网格路网 (.zip)</button>
+        <button class="btn-outline-light-sm" data-fmt="sumo_poly" id="fmt-sumo">仅 .add.xml</button>
+        <button class="btn-outline-light-sm" data-fmt="geojson" id="fmt-geo">GeoJSON</button>
+        <button class="btn-outline-light-sm" data-fmt="csv" id="fmt-csv">CSV</button>
+      </div>
+      <!-- SUMO ZIP 网格设置（仅网格模式显示） -->
+      <div id="grid-panel" style="display:none; margin-bottom:8px;">
+        <span class="label-sm">路网网格间距（米）</span>
+        <div class="d-flex align-items-center gap-2">
+          <input type="number" id="grid-spacing" value="200" min="50" max="1000" step="50"
+                 class="form-control-dark" style="width:90px; text-align:center;">
+          <span style="font-size:.75rem; color:#888;">m 选择范围 50–1000</span>
+        </div>
+      </div>
+      <div id="fmt-desc" style="font-size:.72rem; color:#888; margin-bottom:10px; line-height:1.5">
+        下载选区内真实 OSM 道路，包含 <b style="color:#7ec8e3">roads.net.xml</b>（真实道路）+<b style="color:#7ec8e3">no_fly_zones.add.xml</b>，解压后直接运行。
+      </div>
+      <button class="btn-accent" id="btn-export">⬇ 下载导出文件</button>
+    </div>
+
+    <!-- 使用说明 -->
+    <div class="card-dark" style="font-size:.72rem; color:#888; line-height:1.6">
+      <h6>📖 使用步骤</h6>
+      1. 等待数据加载完成<br>
+      2. 用"手动框选"或"中心点选区"圈定研究范围<br>
+      3. 调整飞行高度阈值<br>
+      4. 点击"分析选区建筑"<br>
+      5. 查看红色禁飞区 / 绿色可飞区<br>
+      6. 选择格式并下载导出文件<br><br>
+      <span style="color:#7ec8e3">SUMO 加载示例：</span><br>
+      <code style="color:#f8961e; font-size:.7rem">
+        sumo-gui -n grid.net.xml<br>
+        &nbsp;&nbsp;--additional-files no_fly_zones.add.xml
+      </code>
+    </div>
+
+  </div><!-- /sidebar -->
+
+  <!-- ─── 地图 ─── -->
+  <div id="map-wrap">
+    <div id="map"></div>
+    <div id="map-overlay">请先选取研究范围</div>
+    <div id="legend">
+      <div style="font-size:.72rem; color:#1565c0; font-weight:600; margin-bottom:6px;">图例</div>
+      <div class="legend-item"><div class="legend-box" style="background:rgba(255,0,0,.65)"></div>禁飞区（高于阈值）</div>
+      <div class="legend-item"><div class="legend-box" style="background:rgba(0,180,0,.45)"></div>可飞区（低于阈值）</div>
+      <div class="legend-item"><div class="legend-box" style="background:#e6a817; height:6px; border-radius:3px; border:none; margin-top:5px;"></div>OSM 道路</div>
+      <div class="legend-item"><div class="legend-box" style="background:rgba(255,165,0,.4)"></div>选区边界</div>
+    </div>
+  </div>
+
+</div><!-- /main -->
+</div><!-- /app -->
+
+<!-- ══════════════════════ Scripts ══════════════════════ -->
+<script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/js/bootstrap.bundle.min.js"></script>
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet.draw/1.0.4/leaflet.draw.js"></script>
+
+<script>
+/* ══════════════════════════════════════════════════════════════════
+   UAV 禁飞区地图 — 前端主逻辑
+   ══════════════════════════════════════════════════════════════════ */
+
+// ── 常量 ──────────────────────────────────────────────────────────
+const LAT_M = 1 / 111000;          // 1m 对应纬度度数
+const colorNoFly = '#ff4444';
+const colorFly   = '#33bb55';
+const opNoFly = 0.70;
+const opFly   = 0.35;
+
+// ── 状态变量 ────────────────────────────────────────────────────
+let appReady     = false;
+let serverState  = {};
+let map, drawControl, drawnItems, buildingLayer, roadLayer;
+let selRect      = null;   // 当前矩形 Leaflet layer
+let selBounds    = null;   // {minx,miny,maxx,maxy}
+let currentFmt   = 'sumo_zip_osm';
+let quickMode    = false;  // 点击设中心 模式
+let statusInterval;
+
+// ── DOM refs ────────────────────────────────────────────────────
+const elMask      = document.getElementById('loading-mask');
+const elLoadBar   = document.getElementById('load-bar');
+const elLoadSub   = document.getElementById('load-sub');
+const elDot       = document.getElementById('status-dot');
+const elStatusTxt = document.getElementById('status-text');
+const elBtnQuery  = document.getElementById('btn-query');
+const elStatCard  = document.getElementById('stat-card');
+const elExportCard= document.getElementById('export-card');
+const elOverlay   = document.getElementById('map-overlay');
+const elSelInfo   = document.getElementById('sel-info');
+const elBtnClear  = document.getElementById('btn-clear-sel');
+const elStatTrunc = document.getElementById('stat-trunc');
+
+// ══════════════════════════════════════════════════════════════════
+// 初始化地图
+// ══════════════════════════════════════════════════════════════════
+function initMap(centerLon, centerLat) {
+  map = L.map('map', {
+    center: [centerLat || 31.23, centerLon || 121.47],
+    zoom: 13,
+    zoomControl: true,
+  });
+
+  // 底图
+  const positron = L.tileLayer(
+    'https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}{r}.png',
+    { attribution: '© CARTO © OpenStreetMap contributors', maxZoom: 19 }
+  );
+  const osm = L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+    attribution: '© OpenStreetMap contributors', maxZoom: 19
+  });
+  positron.addTo(map);
+  L.control.layers({ '白色 CartoDB': positron, 'OpenStreetMap': osm }, {}).addTo(map);
+
+  // 绘制图层
+  drawnItems = new L.FeatureGroup();
+  map.addLayer(drawnItems);
+
+  drawControl = new L.Control.Draw({
+    draw: {
+      rectangle: {
+        shapeOptions: { color: '#f8961e', weight: 2, fillOpacity: 0.08 }
+      },
+      polygon: false, polyline: false, circle: false,
+      circlemarker: false, marker: false,
+    },
+    edit: { featureGroup: drawnItems, remove: false },
+  });
+  map.addControl(drawControl);
+
+  // 事件：绘制完成
+  map.on(L.Draw.Event.CREATED, (e) => {
+    setSelection(e.layer.getBounds());
+  });
+
+  // 事件：中心点选区
+  map.on('click', (e) => {
+    if (!quickMode) return;
+    const lat  = e.latlng.lat;
+    const lon  = e.latlng.lng;
+    const halfW = parseInt(document.getElementById('qw').value) / 2;
+    const halfH = parseInt(document.getElementById('qh').value) / 2;
+    const dLat  = halfH * LAT_M;
+    const dLon  = halfW * LAT_M / Math.cos(lat * Math.PI / 180);
+    const bounds = L.latLngBounds(
+      [lat - dLat, lon - dLon],
+      [lat + dLat, lon + dLon]
+    );
+    setSelection(bounds);
+  });
+
+  // 鼠标悬停提示坐标
+  map.on('mousemove', (e) => {
+    if (!quickMode) return;
+    elOverlay.textContent =
+      `点击设置中心 | ${e.latlng.lat.toFixed(5)}, ${e.latlng.lng.toFixed(5)}`;
+  });
+}
+
+// ══════════════════════════════════════════════════════════════════
+// 设置选区
+// ══════════════════════════════════════════════════════════════════
+function setSelection(lBounds) {
+  // 清除旧的
+  if (selRect) { map.removeLayer(selRect); }
+
+  selRect = L.rectangle(lBounds, {
+    color: '#f8961e', weight: 2, fillColor: '#f8961e', fillOpacity: 0.06,
+  }).addTo(map);
+
+  const sw  = lBounds.getSouthWest();   // (minLat, minLng)
+  const ne  = lBounds.getNorthEast();   // (maxLat, maxLng)
+  const nw  = L.latLng(ne.lat, sw.lng);
+  const se  = L.latLng(sw.lat, ne.lng);
+  const ctr = lBounds.getCenter();
+
+  selBounds = { minx: sw.lng, miny: sw.lat, maxx: ne.lng, maxy: ne.lat };
+
+  // 格式化坐标：纬度°N, 经度°E
+  const fmt = (lat, lng) =>
+    `${lat.toFixed(6)}°N,  ${lng.toFixed(6)}°E`;
+
+  document.getElementById('coord-sw').textContent  = fmt(sw.lat,  sw.lng);
+  document.getElementById('coord-ne').textContent  = fmt(ne.lat,  ne.lng);
+  document.getElementById('coord-nw').textContent  = fmt(nw.lat,  nw.lng);
+  document.getElementById('coord-se').textContent  = fmt(se.lat,  se.lng);
+  document.getElementById('coord-ctr').textContent = fmt(ctr.lat, ctr.lng);
+
+  // 计算范围（米）
+  const dLat   = ne.lat - sw.lat;
+  const dLon   = ne.lng - sw.lng;
+  const latMid = ctr.lat;
+  const wM     = Math.round(dLon * 111000 * Math.cos(latMid * Math.PI / 180));
+  const hM     = Math.round(dLat * 111000);
+
+  document.getElementById('sel-size').textContent =
+    `${(wM/1000).toFixed(2)} km × ${(hM/1000).toFixed(2)} km`;
+
+  elSelInfo.style.display  = 'block';
+  elBtnClear.style.display = 'block';
+  elBtnQuery.disabled      = false;
+  elOverlay.textContent    =
+    `已选区 ${(wM/1000).toFixed(1)} km × ${(hM/1000).toFixed(1)} km  |  中心 ${fmt(ctr.lat, ctr.lng)}`;
+
+  // 退出快速模式
+  if (quickMode) toggleQuickMode(false);
+}
+
+// 复制四角坐标到剪贴板
+document.getElementById('btn-copy-coords').addEventListener('click', () => {
+  if (!selBounds) return;
+  const b = selBounds;
+  const cLat = (b.miny + b.maxy) / 2;
+  const cLon = (b.minx + b.maxx) / 2;
+  const text =
+    `西南角 (SW): ${b.miny.toFixed(6)}°N, ${b.minx.toFixed(6)}°E\n` +
+    `东北角 (NE): ${b.maxy.toFixed(6)}°N, ${b.maxx.toFixed(6)}°E\n` +
+    `西北角 (NW): ${b.maxy.toFixed(6)}°N, ${b.minx.toFixed(6)}°E\n` +
+    `东南角 (SE): ${b.miny.toFixed(6)}°N, ${b.maxx.toFixed(6)}°E\n` +
+    `中心点 (CTR): ${cLat.toFixed(6)}°N, ${cLon.toFixed(6)}°E\n` +
+    `---\n` +
+    `minLon=${b.minx.toFixed(6)}  maxLon=${b.maxx.toFixed(6)}\n` +
+    `minLat=${b.miny.toFixed(6)}  maxLat=${b.maxy.toFixed(6)}`;
+  navigator.clipboard.writeText(text).then(() => {
+    const btn = document.getElementById('btn-copy-coords');
+    btn.textContent = '✓ 已复制';
+    setTimeout(() => { btn.textContent = '📋 复制四角坐标'; }, 2000);
+  });
+});
+
+// ══════════════════════════════════════════════════════════════════
+// UI 控件事件绑定
+// ══════════════════════════════════════════════════════════════════
+// 滑块 ↔ 数字输入联动
+const slider = document.getElementById('height-slider');
+const numIn  = document.getElementById('height-input');
+slider.addEventListener('input', () => { numIn.value = slider.value; });
+numIn.addEventListener('input', () => {
+  const v = Math.max(0, parseInt(numIn.value) || 0);
+  slider.value = Math.min(500, v);
+});
+
+// 手动框选
+document.getElementById('btn-draw').addEventListener('click', () => {
+  toggleQuickMode(false);
+  new L.Draw.Rectangle(map, drawControl.options.draw.rectangle).enable();
+  elOverlay.textContent = '在地图上拖拽绘制矩形选区';
+});
+
+// 中心点选区
+document.getElementById('btn-quick').addEventListener('click', () => {
+  toggleQuickMode(!quickMode);
+});
+
+function toggleQuickMode(on) {
+  quickMode = on;
+  const btn = document.getElementById('btn-quick');
+  btn.classList.toggle('active', on);
+  document.getElementById('quick-panel').style.display = on ? 'block' : 'none';
+  if (on) {
+    map.getContainer().style.cursor = 'crosshair';
+    elOverlay.textContent = '点击地图设置中心点';
+  } else {
+    map.getContainer().style.cursor = '';
+    if (!selBounds) elOverlay.textContent = '请先选取研究范围';
+  }
+}
+
+// 清除选区
+document.getElementById('btn-clear-sel').addEventListener('click', () => {
+  if (selRect) { map.removeLayer(selRect); selRect = null; }
+  if (buildingLayer) { map.removeLayer(buildingLayer); buildingLayer = null; }
+  if (roadLayer) { map.removeLayer(roadLayer); roadLayer = null; }
+  selBounds = null;
+  elSelInfo.style.display = 'none';
+  elBtnClear.style.display = 'none';
+  elBtnQuery.disabled = true;
+  elStatCard.style.display = 'none';
+  elExportCard.style.display = 'none';
+  elOverlay.textContent = '请先选取研究范围';
+});
+
+// 查询
+document.getElementById('btn-query').addEventListener('click', queryBuildings);
+
+// 格式切换
+const fmtDescs = {
+  sumo_zip_osm: '下载选区内真实 OSM 道路，包含 <b style="color:#7ec8e3">roads.net.xml</b>（真实道路）+<b style="color:#7ec8e3">no_fly_zones.add.xml</b>，解压后直接运行。需联网（Overpass API）。',
+  sumo_zip:     '纯 Python 自动生成简化<b style="color:#7ec8e3">网格路网</b>+禁飞区叠加层，无需联网。',
+  sumo_poly:    'SUMO polygon additional file，需配合已有 net.xml 使用。',
+  geojson:      'GeoJSON 格式，包含建筑高度与禁飞标记，适用于 QGIS / 网页地图。',
+  csv:          'CSV 表格，含每栋建筑质心坐标、高度、是否禁飞，便于数据分析。',
+};
+document.querySelectorAll('[data-fmt]').forEach(btn => {
+  btn.addEventListener('click', () => {
+    document.querySelectorAll('[data-fmt]').forEach(b => b.classList.remove('active'));
+    btn.classList.add('active');
+    currentFmt = btn.dataset.fmt;
+    document.getElementById('fmt-desc').innerHTML = fmtDescs[currentFmt] || '';
+    document.getElementById('grid-panel').style.display =
+      currentFmt === 'sumo_zip' ? 'block' : 'none';
+  });
+});
+// 默认选中真实路网
+(function() {
+  document.querySelectorAll('[data-fmt]').forEach(b => b.classList.remove('active'));
+  document.getElementById('fmt-sumo-osm').classList.add('active');
+  currentFmt = 'sumo_zip_osm';
+  document.getElementById('grid-panel').style.display = 'none';
+  document.getElementById('fmt-desc').innerHTML = fmtDescs['sumo_zip_osm'];
+})();
+
+// 导出
+document.getElementById('btn-export').addEventListener('click', exportData);
+
+// ══════════════════════════════════════════════════════════════════
+// 轮询后端状态
+// ══════════════════════════════════════════════════════════════════
+async function pollStatus() {
+  try {
+    const res = await fetch('/api/status');
+    const s   = await res.json();
+    serverState = s;
+
+    // 更新进度条
+    elLoadBar.style.width = s.progress + '%';
+
+    if (s.error) {
+      elLoadSub.textContent = '❌ 加载失败：' + s.error;
+      elDot.className = '';
+      elStatusTxt.textContent = '加载失败';
+      clearInterval(statusInterval);
+      return;
+    }
+
+    if (s.loaded) {
+      elMask.classList.add('hidden');
+      elDot.className = 'ok';
+      elStatusTxt.textContent = `就绪 · ${s.total.toLocaleString()} 栋建筑`;
+      clearInterval(statusInterval);
+      onDataReady(s);
+    } else if (s.loading) {
+      elDot.className = 'spin';
+      elStatusTxt.textContent = `加载中 ${s.progress}%…`;
+      elLoadSub.textContent = `已处理 ${s.progress}%，请稍候`;
+    }
+  } catch (e) {
+    elDot.className = '';
+    elStatusTxt.textContent = '连接失败';
+  }
+}
+
+function onDataReady(s) {
+  appReady = true;
+
+  // 填充信息卡
+  document.getElementById('info-total').textContent = s.total.toLocaleString();
+  document.getElementById('info-hcol').textContent  = s.height_column || 'N/A';
+  if (s.height_stats) {
+    document.getElementById('info-hmax').textContent  = s.height_stats.max;
+    document.getElementById('info-hmean').textContent = s.height_stats.mean;
+  }
+
+  // 填充字段选择器
+  const sel = document.getElementById('height-col-sel');
+  sel.innerHTML = '';
+  (s.numeric_columns || []).forEach(c => {
+    const opt = document.createElement('option');
+    opt.value = c;
+    opt.textContent = c;
+    if (c === s.height_column) opt.selected = true;
+    sel.appendChild(opt);
+  });
+
+  // 初始化地图（居中于数据范围）
+  const b = s.bounds;
+  const dataLatLngBounds = L.latLngBounds(
+    [b.miny, b.minx],
+    [b.maxy, b.maxx]
+  );
+  if (!map) {
+    initMap(b.center_lon, b.center_lat);
+    map.fitBounds(dataLatLngBounds, { padding: [30, 30] });
+  } else {
+    map.fitBounds(dataLatLngBounds, { padding: [30, 30] });
+  }
+
+  // 在地图上叠加数据集范围虚线框
+  L.rectangle(dataLatLngBounds, {
+    color: '#7ec8e3', weight: 1, dashArray: '4,6',
+    fill: false, interactive: false,
+  }).addTo(map).bindTooltip(
+    `数据集范围<br>SW: ${b.miny.toFixed(4)}°N, ${b.minx.toFixed(4)}°E<br>`+
+    `NE: ${b.maxy.toFixed(4)}°N, ${b.maxx.toFixed(4)}°E`,
+    { sticky: true, className: 'leaflet-tooltip' }
+  );
+}
+
+// ══════════════════════════════════════════════════════════════════
+// 查询建筑
+// ══════════════════════════════════════════════════════════════════
+async function queryBuildings() {
+  if (!selBounds) return;
+
+  elBtnQuery.disabled = true;
+  elBtnQuery.textContent = '⏳ 查询中…';
+  elOverlay.textContent = '正在分析建筑数据…';
+
+  const threshold = parseInt(document.getElementById('height-input').value) || 120;
+  const hCol = document.getElementById('height-col-sel').value || null;
+
+  try {
+    const res  = await fetch('/api/query', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        ...selBounds,
+        threshold,
+        height_column: hCol,
+        max: 30000,
+      }),
+    });
+    const geojson = await res.json();
+
+    if (geojson.error) throw new Error(geojson.error);
+
+    renderBuildings(geojson);
+    updateStats(geojson.stats);
+    fetchRoads();   // 同时加载黄色道路层
+
+  } catch (e) {
+    elOverlay.textContent = '❌ 查询失败：' + e.message;
+    console.error(e);
+  } finally {
+    elBtnQuery.disabled = false;
+    elBtnQuery.textContent = '🔍 分析选区建筑';
+  }
+}
+
+// ══════════════════════════════════════════════════════════════════
+// 渲染建筑层
+// ══════════════════════════════════════════════════════════════════
+// 黄色道路层（OSM）
+// ══════════════════════════════════════════════════════════════════
+async function fetchRoads() {
+  if (!selBounds) return;
+  if (roadLayer) { map.removeLayer(roadLayer); roadLayer = null; }
+  try {
+    const res = await fetch('/api/roads', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(selBounds),
+    });
+    const gj = await res.json();
+    if (gj.error) { console.warn('[roads]', gj.error); return; }
+    const _w = { motorway:5, trunk:4, primary:3.5, secondary:3,
+                 tertiary:2.5, residential:2, service:1.5, unclassified:2,
+                 motorway_link:2.5, trunk_link:2, primary_link:2,
+                 secondary_link:1.5, tertiary_link:1.5, living_street:1.5, road:2 };
+    roadLayer = L.geoJSON(gj, {
+      style: f => ({ color: '#e6a817', weight: _w[f.properties.highway] || 2, opacity: 0.9 }),
+      onEachFeature: (f, layer) => {
+        const n = f.properties.name;
+        if (n) layer.bindTooltip(`${n} <span style="color:#888">(${f.properties.highway})</span>`,
+          { sticky: true, opacity: 0.92 });
+      },
+    }).addTo(map);
+    roadLayer.bringToBack();
+  } catch (e) {
+    console.warn('[roads] 下载失败:', e);
+  }
+}
+
+// ══════════════════════════════════════════════════════════════════
+// 渲染建筑层
+// ══════════════════════════════════════════════════════════════════
+function renderBuildings(geojson) {
+  if (buildingLayer) map.removeLayer(buildingLayer);
+
+  buildingLayer = L.geoJSON(geojson, {
+    style: (feature) => {
+      const nf = feature.properties.nf;
+      return {
+        color:       nf ? '#cc0000' : '#008800',
+        weight:      0.6,
+        fillColor:   nf ? colorNoFly : colorFly,
+        fillOpacity: nf ? opNoFly : opFly,
+      };
+    },
+    onEachFeature: (feature, layer) => {
+      const p  = feature.properties;
+      const nf = p.nf;
+      layer.bindPopup(
+        `<div class="popup-h">${p.h} m</div>
+         <span class="popup-tag ${nf ? 'nf' : 'ok'}">
+           ${nf ? '🔴 禁飞区' : '🟢 可飞区'}
+         </span>`,
+        { maxWidth: 180 }
+      );
+      layer.on('mouseover', () => layer.openPopup());
+    },
+  }).addTo(map);
+
+  // 自适应缩放到选区
+  if (selRect) map.fitBounds(selRect.getBounds(), { padding: [20, 20] });
+}
+
+// ══════════════════════════════════════════════════════════════════
+// 更新统计面板
+// ══════════════════════════════════════════════════════════════════
+function updateStats(stats) {
+  document.getElementById('stat-total').textContent = stats.total.toLocaleString();
+  document.getElementById('stat-shown').textContent = stats.shown.toLocaleString();
+  document.getElementById('stat-nf').textContent    = stats.no_fly.toLocaleString();
+  document.getElementById('stat-fly').textContent   = stats.fly.toLocaleString();
+  elStatTrunc.style.display = stats.truncated ? 'block' : 'none';
+
+  elStatCard.style.display   = 'block';
+  elExportCard.style.display = 'block';
+
+  const pct = stats.total > 0
+    ? ((stats.no_fly / stats.total) * 100).toFixed(1)
+    : 0;
+  elOverlay.textContent =
+    `共 ${stats.total.toLocaleString()} 栋建筑 ｜ 禁飞区 ${stats.no_fly.toLocaleString()} (${pct}%) · 可飞区 ${stats.fly.toLocaleString()}`;
+}
+
+// ══════════════════════════════════════════════════════════════════
+// 导出
+// ══════════════════════════════════════════════════════════════════
+async function exportData() {
+  if (!selBounds) return;
+
+  const btn = document.getElementById('btn-export');
+  btn.disabled = true;
+  btn.textContent = '⏳ 生成中…';
+
+  const threshold = parseInt(document.getElementById('height-input').value) || 120;
+  const hCol = document.getElementById('height-col-sel').value || null;
+
+  try {
+    const res = await fetch('/api/export', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        ...selBounds,
+        threshold,
+        height_column: hCol,
+        format: currentFmt,
+        grid_spacing: parseFloat(document.getElementById('grid-spacing')?.value || 200),
+      }),
+    });
+
+    if (!res.ok) {
+      const err = await res.json();
+      throw new Error(err.error || res.statusText);
+    }
+
+    // 触发文件下载
+    const blob = await res.blob();
+    const cd   = res.headers.get('Content-Disposition') || '';
+    const match = cd.match(/filename="?([^"]+)"?/);
+    const fname = match ? match[1] : 'export_file';
+    const url   = URL.createObjectURL(blob);
+    const a     = document.createElement('a');
+    a.href = url; a.download = fname; a.click();
+    URL.revokeObjectURL(url);
+
+  } catch (e) {
+    alert('导出失败：' + e.message);
+    console.error(e);
+  } finally {
+    btn.disabled = false;
+    btn.textContent = '⬇ 下载导出文件';
+  }
+}
+
+// ══════════════════════════════════════════════════════════════════
+// 初始化地图（数据加载前先画空地图）
+// ══════════════════════════════════════════════════════════════════
+initMap(121.47, 31.23);
+
+// 启动轮询
+statusInterval = setInterval(pollStatus, 1500);
+pollStatus();
+</script>
+</body>
+</html>
