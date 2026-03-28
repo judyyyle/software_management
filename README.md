@@ -1,193 +1,145 @@
-# UAV 禁飞区地图生成工具
+# HiveLogix — 卡车-无人机-充换电站 多模态协同调度系统
 
-基于上海建筑高度矢量数据，自动识别无人机禁飞区并支持导出 SUMO 仿真文件。
-
----
-
-## 项目背景
-
-### 数据来源
-
-| 项目 | 说明 |
-|---|---|
-| 数据名称 | 上海市建筑轮廓与建筑高度矢量数据 |
-| 数据时间 | 2020 年 |
-| 发布时间 | 2024 年 5 月 30 日 |
-| 坐标系 | WGS1984（EPSG:4326） |
-| 格式 | Shapefile（.shp） |
-| 数据量 | ~236 MB（.shp 主文件） |
-
-### 数据说明
-
-该数据包含建筑轮廓矢量与建筑高度信息，字段如下：
-
-| 字段名 | 类型 | 说明 |
-|---|---|---|
-| `id` | 数值 | 建筑唯一编号 |
-| `Height` | 浮点 | 建筑高度（米） |
-| `geometry` | Polygon | 建筑轮廓（WGS84 经纬度） |
-
-建筑高度由研究者通过集成多源遥感特征（SAR、光学、地形、社会经济图像）和 XGBoost 机器学习回归方法估算得到，训练数据来自 ONEGEO Map、微软建筑物足迹、百度地图等。
-
-建筑轮廓基础数据来自 Qian Shi 等学者发布的东亚五国建筑矢量数据，通过 Google Earth 2020–2022 年 0.5m 分辨率影像提取。
-
-**数据覆盖范围（经纬度）：**
-```
-西南角：31.0733°N, 120.8953°E
-东北角：31.0862°N, 120.9035°E
-```
+基于离散事件仿真的城市物流"最后一公里"协同配送平台，支持卡车直递、卡-空协同、仓-空直递、动态补货、多跳中继五种履约模式，实现 100% 动态订单履约。
 
 ---
 
-## 项目功能
+## 项目架构
 
-### 核心逻辑
-
-设定一个**飞行高度阈值**（地面高度 + 无人机常规飞行高度 AGL），将建筑物分为两类：
-
-- 🔴 **禁飞区**：建筑高度 ≥ 阈值（超高建筑，无人机需绕行或抬升）
-- 🟢 **可飞区**：建筑高度 < 阈值（可在该高度安全飞越）
-
-### 可视化界面
-
-基于 Flask + Leaflet.js 的 Web 地图工具，在浏览器中交互操作：
-
-| 功能 | 说明 |
-|---|---|
-| 数据加载 | 后台线程异步加载，前端实时显示进度条 |
-| 手动框选 | 在地图上拖拽绘制矩形选区 |
-| 中心点选区 | 输入尺寸（默认 4×4 km），点击地图自动生成选框 |
-| 高度阈值调节 | 滑块 + 数字输入，范围 10–500m，实时联动 |
-| 四角坐标显示 | 框选后显示西南/东北/西北/东南/中心点的精确经纬度（6位小数） |
-| 一键复制坐标 | 复制选区四角坐标及 minLon/maxLon/minLat/maxLat |
-| 建筑渲染 | 红色=禁飞，绿色=可飞，鼠标悬停显示具体高度 |
-| 统计面板 | 选区总建筑数、禁飞区数量、可飞区数量及占比 |
-
-### 导出格式
-
-| 格式 | 文件 | 说明 |
-|---|---|---|
-| **SUMO 真实路网包**（推荐） | `uav_no_fly_sumo_osm.zip` | 下载选区内真实 OSM 道路生成路网，解压即用 |
-| SUMO 网格路网包 | `uav_no_fly_sumo.zip` | 自动生成简化网格路网，无需联网 |
-| SUMO 仅叠加层 | `no_fly_zones.add.xml` | 配合已有路网使用 |
-| GeoJSON | `buildings.geojson` | 适用于 QGIS、网页地图 |
-| CSV | `buildings.csv` | 含质心坐标、高度、禁飞标记，便于数据分析 |
-
----
-
-## 文件结构
+> 图例：✅ 已实现 · 🔲 待实现 · 📁 目录占位
 
 ```
-D:\Judy_Tongji\UAV\map\
+HiveLogix/
+├── backend/                              # 后端：算法引擎与仿真系统
+│   │
+│   ├── api/                              # 🔲 HTTP / WebSocket 接口层
+│   │   ├── routes/                       #     订单注入 / 状态查询 REST 接口
+│   │   └── websockets/                   #     仿真实时推送
+│   │
+│   ├── core/                             # 🔲 核心领域模型
+│   │   ├── entities/                     #     仓库 / 卡车 / 充换电站 / 无人机 实体类
+│   │   └── models/                       #     订单模型（静态+动态，软时间窗）
+│   │
+│   ├── environment/
+│   │   ├── simulation/                   # 🔲 离散事件仿真主循环 + 事件队列
+│   │   ├── network/                      # 🔲 路网图结构 + 最短路径服务
+│   │   ├── energy_model/                 # 🔲 能耗 / 充电 / 换电模型
+│   │   ├── constraints/                  # 🔲 约束校验（库存/电量/时空同步）
+│   │   ├── state/                        # 🔲 全局状态管理 + 时间轴控制
+│   │   └── geo/                          # ✅ 地理数据服务（禁飞区识别/建筑高度）
+│   │       ├── app.py                    #     Flask 入口：路由注册与请求分发
+│   │       ├── data_loader.py            #     Shapefile 异步加载 + 状态管理
+│   │       ├── building_service.py       #     空间裁剪 + 禁飞区阈值分类
+│   │       ├── osm_service.py            #     Overpass API + OSM→GeoJSON 转换
+│   │       ├── requirements.txt          #     Python 依赖（flask, geopandas 等）
+│   │       ├── exporters/
+│   │       │   ├── sumo_poly.py          #     SUMO .add.xml 禁飞区叠加层
+│   │       │   ├── sumo_net_osm.py       #     OSM XML → SUMO net.xml
+│   │       │   ├── sumo_net_grid.py      #     纯 Python 生成网格路网
+│   │       │   └── geofile.py            #     GeoJSON / CSV 导出
+│   │       ├── static/                   #     Flask 静态资源（旧版保留）
+│   │       │   ├── css/geo_map.css
+│   │       │   └── js/geo_map.js
+│   │       ├── templates/
+│   │       │   └── index.html            #     Flask Jinja2 模板（旧版保留）
+│   │       └── shanghai_map/             #     ⚠ 数据文件（已 gitignore，需自行放置）
+│   │           └── shanghai.shp / .dbf / .shx / .prj / .cpg
+│   │
+│   ├── solver/                           # 🔲 调度求解层
+│   │   ├── fulfillment_modes/            #     五种派送模式 A~E
+│   │   ├── decision_engine/              #     编排层：查货→查距/电→选模式→派单
+│   │   └── algorithms/                   #     ALNS / GA / DRL
+│   │
+│   ├── storage/                          # 🔲 数据持久化（调度日志/仿真快照/回放）
+│   ├── config/                           # 🔲 物理参数 + 算法超参 YAML
+│   └── utils/                            # 🔲 通用工具（几何计算等）
 │
-├── app.py                      # Flask 后端主程序
-├── requirements.txt            # Python 依赖列表
-├── README.md                   # 本文档
+├── frontend/                             # 前端：调度监控大屏（Vue 3 + TypeScript + Vite）
+│   ├── index.html                        #   HTML 入口（CDN 载入 Bootstrap 5 / Leaflet 1.9）
+│   ├── vite.config.ts                    #   开发代理：/api/* → Flask :5000
+│   ├── tsconfig.json
+│   ├── package.json
+│   └── src/
+│       ├── main.ts                       #   Vue 应用挂载
+│       ├── App.vue                       #   根组件（<router-view />）
+│       ├── router/
+│       │   └── index.ts                  #   路由：/geo · /monitor · /analytics
+│       ├── stores/                       #   Pinia 全局状态
+│       │   ├── system.ts                 #     仿真运行状态（时刻/加速比/开关）
+│       │   ├── entity.ts                 #     实体快照（仓库/卡车/站点/无人机）
+│       │   └── order.ts                  #     订单生命周期（待派/在途/完成）
+│       ├── services/
+│       │   ├── http.ts                   #     统一 fetch 封装（baseURL + 错误处理）
+│       │   └── websocket.ts              #     WebSocket 长连接 + 自动重连
+│       ├── types/
+│       │   └── index.ts                  #     全系统 TS 类型（与后端模型对齐）
+│       ├── components/                   # 🔲 共享组件占位
+│       │   ├── map/
+│       │   ├── dashboard/
+│       │   └── controls/
+│       └── views/
+│           ├── GeoTool/                  # ✅ UAV 禁飞区地图工具
+│           │   ├── index.vue             #     主视图：状态编排 + API 调用
+│           │   ├── geo_map.css           #     页面样式
+│           │   └── components/
+│           │       ├── LoadingMask.vue   #     数据加载进度遮罩
+│           │       ├── TopBar.vue        #     顶部状态栏
+│           │       ├── SideBar.vue       #     控制面板（选区/阈值/统计/导出）
+│           │       └── MapView.vue       #     Leaflet 地图（建筑/道路/选区图层）
+│           ├── MainMonitor/              # 🔲 实时调度大屏
+│           │   └── index.vue
+│           └── Analytics/               # 🔲 历史分析与回放
+│               └── index.vue
 │
-├── templates\
-│   └── index.html              # 前端地图界面
-│
-├── output\                     # 导出文件存放目录（自动创建）
-│   ├── uav_no_fly_sumo.zip     # SUMO 完整包（导出后生成）
-│   ├── no_fly_zones.add.xml    # SUMO 禁飞区叠加层
-│   ├── grid.net.xml            # SUMO 网格路网
-│   ├── buildings.geojson       # GeoJSON 导出
-│   └── buildings.csv           # CSV 导出
-│
-└── shanghai_map\               # 原始数据（只读，勿修改）
-    ├── shanghai.shp            # 建筑轮廓与高度主文件（236 MB）
-    ├── shanghai.dbf            # 属性数据库（73 MB）
-    ├── shanghai.shx            # 空间索引（12 MB）
-    ├── shanghai.prj            # 坐标系定义
-    └── shanghai.cpg            # 字符编码
+└── docs/
+    └── geo-tool.md                       # 禁飞区地图工具说明
 ```
 
 ---
 
-## 环境配置与运行
+## 快速启动
 
-### 依赖安装
-
+### 后端（geo 禁飞区工具）
 ```bash
-pip install flask geopandas pandas numpy shapely pyproj
+conda activate hivelogix
+cd backend/environment/geo
+python app.py          # 启动于 http://localhost:5000
 ```
 
-> 推荐使用 conda 安装 geopandas，避免依赖冲突：
-> ```bash
-> conda install geopandas flask pandas numpy
-> ```
+> 首次运行需将上海建筑高度 Shapefile 放入 `backend/environment/geo/shanghai_map/`
+> 包含：`shanghai.shp` · `.dbf` · `.shx` · `.prj` · `.cpg`
 
-### 启动服务
-
+### 前端
 ```bash
-cd D:\Judy_Tongji\UAV\map
-python app.py
+cd frontend
+npm install            # 首次安装依赖
+npm run dev            # 启动于 http://localhost:5173
 ```
+> 前端开发服务器自动将 `/api/*` 代理到 Flask `:5000`，需后端同时运行。
 
-启动后在浏览器打开：**http://localhost:5000**
+## 核心实体
 
-> 首次加载约需 30–60 秒（读取 236MB shapefile），页面进度条实时显示，加载完成后自动跳转地图。
-
----
-
-## SUMO 仿真使用方法
-
-### 导出流程
-
-1. 在地图中框选目标区域（建议 ≤ 5×5 km，避免文件过大）
-2. 设置飞行高度阈值（例如城区低空 50m，常规巡航 120m）
-3. 点击「分析选区建筑」，确认红/绿渲染结果
-4. 选择格式「**SUMO 真实路网 (.zip)**」（默认，需联网）
-5. 点击「下载导出文件」，得到 `uav_no_fly_sumo_osm.zip`
-
-> 真实路网导出需向 Overpass API 联网下载 OSM 数据；
-> 如无网络，可选「**SUMO 网格路网**」离线导出。
-
-### SUMO 加载
-
-解压 zip 后，在 SUMO 安装目录执行：
-
-```bash
-# 真实路网包解压后
-sumo-gui -n roads.net.xml --additional-files no_fly_zones.add.xml
-
-# 网格路网包解压后
-sumo-gui -n grid.net.xml --additional-files no_fly_zones.add.xml
-```
-
-在 sumo-gui 中：
-- **红色多边形**（`type="no_fly_zone"`）= 建筑高度 ≥ 阈值，无人机禁飞区
-- **绿色多边形**（`type="fly_zone"`）= 建筑高度 < 阈值，可飞区
-
-### 导出文件坐标系说明
-
-| 文件 | 坐标系 | 原点 |
-|---|---|---|
-| `roads.net.xml` | EPSG:32651 (UTM Zone 51N)，单位：米 | 选区左下角 |
-| `grid.net.xml` | EPSG:32651 (UTM Zone 51N)，单位：米 | 选区左下角 |
-| `no_fly_zones.add.xml` | EPSG:32651 (UTM Zone 51N)，单位：米 | 选区左下角（与路网一致） |
-
-两个文件坐标系完全对齐，可直接叠加使用。
-
----
-
-## 技术栈
-
-| 层次 | 技术 |
+| 实体 | 说明 |
 |---|---|
-| 后端 | Python 3, Flask |
-| 地理空间处理 | GeoPandas, Shapely, PyProj |
-| 前端地图 | Leaflet.js 1.9, Leaflet.draw |
-| UI 框架 | Bootstrap 5 |
-| 底图 | CartoDB Dark Matter / OpenStreetMap |
-| SUMO 路网生成 | 纯 Python 实现（无需安装 SUMO 即可生成路网文件） |
+| **仓库 (Depot)** | 固定位置，库存无限，无人机起降与维护中心 |
+| **卡车 (Truck)** | 路网移动，移动基站+微仓，搭载 K 架无人机，容量 $C_{truck}$ |
+| **充换电站 (Station)** | 离散分布固定节点，换电模式 $\tau_{swap}$，拓展无人机作业半径 |
+| **无人机 (Drone)** | 最大载重 $C_{drone}$，电池容量 $E_{max}$，能耗随距离/载重动态变化 |
 
----
+## 五种履约模式
 
-## 已知限制
+| 模式 | 名称 | 路径 |
+|---|---|---|
+| A | 卡车直递 | 卡车 → 客户 |
+| B | 卡-空短途协同 | 卡车 → 无人机起飞 → 客户 → 无人机回收至卡车下一节点 |
+| C | 仓-空直递 | 仓库 → 无人机 → 客户 → 仓库 |
+| D | 空-地动态补货 | 仓库无人机 → 携货飞向卡车 → 卡车后续派送 |
+| E | 多跳中继 | 卡车/仓库 → 客户 → 充换电站补能 → 追赶卡车/返回仓库 |
 
-- 数据覆盖范围为上海局部区域（约 1km × 1.5km），非全市数据
-- 建筑高度为模型估算值，非测量值，存在一定误差
-- 框选区域过大（> 10万栋建筑）时，前端仅渲染部分结果；导出文件包含全量数据
-- 真实路网导出需联网，离线环境请使用「网格路网」选项
-- 生成的 `roads.net.xml` 仅包含 OSM 长途道路类型，小巷、人行沙滑等可能被过滤
+## 核心约束
+
+- **库存不透支**：卡车/无人机容量实时追踪
+- **时空同步**：无人机与卡车汇合必须满足位置+时间一致
+- **能量守恒**：任意飞行段终点 $E_{arrive} \ge 0$，节点补能状态严格更新
+- **时间惩罚**：充换电站滞留时间计入全局时间轴，影响后续汇合可行性
+- **100% 履约**：所有动态订单不可拒绝，软时间窗超时产生惩罚成本

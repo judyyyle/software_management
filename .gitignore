@@ -37,3 +37,22 @@ desktop.ini
 # ── 环境变量 ──────────────────────────────────────────────
 .env
 .env.*
+!.env.example
+
+# ── Node.js / 前端 ───────────────────────────────────────
+node_modules/
+frontend/dist/
+frontend/.env
+frontend/.env.*
+frontend/.env.local
+*.tsbuildinfo
+
+# ── 日志 ─────────────────────────────────────────────────
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+*.log
+
+# ── misc ─────────────────────────────────────────────────
+*.bak
+*.tmp
