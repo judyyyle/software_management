@@ -30,20 +30,15 @@
 
       <!-- 中央地图区 -->
       <div class="dispatch-map">
-        <div class="map-placeholder">
+        <UnifiedMapView v-if="sceneStore.context" ref="mapRef" />
+        <div v-else class="map-placeholder">
           <div class="map-placeholder__icon">🌐</div>
-          <p class="map-placeholder__title">Mars3D / Leaflet 调度地图</p>
+          <p class="map-placeholder__title">尚未加载仿真场景</p>
           <p class="map-placeholder__desc">
-            将展示：静态设施层 · 地面动态层（卡车）·<br />
-            空中动态层（无人机）· 任务热力层 · 能量拓扑层
+            请前往「仿真与配置」→「地图选取」，完成建筑分析后<br />
+            点击「<strong>导出到指挥中心地图</strong>」以建立仿真底图。
           </p>
-          <div class="layer-tags">
-            <span class="layer-tag" style="--c:#2563eb">🏭 设施层</span>
-            <span class="layer-tag" style="--c:#16a34a">🚚 地面层</span>
-            <span class="layer-tag" style="--c:#7c3aed">🛸 空中层</span>
-            <span class="layer-tag" style="--c:#d97706">📦 热力层</span>
-            <span class="layer-tag" style="--c:#0891b2">⚡ 能量层</span>
-          </div>
+          <router-link to="/simulation" class="go-btn">前往仿真与配置 →</router-link>
         </div>
       </div>
 
@@ -66,8 +61,14 @@
 </template>
 
 <script setup lang="ts">
-import PageShell  from '@/components/PageShell/index.vue'
+import { ref } from 'vue'
+import PageShell   from '@/components/PageShell/index.vue'
 import SectionCard from './components/SectionCard.vue'
+import UnifiedMapView from './components/UnifiedMapView.vue'
+import { useSceneStore } from '@/stores/scene'
+
+const sceneStore = useSceneStore()
+const mapRef = ref<InstanceType<typeof UnifiedMapView> | null>(null)
 </script>
 
 <style scoped>
@@ -122,22 +123,20 @@ import SectionCard from './components/SectionCard.vue'
   line-height: 1.7;
 }
 
-.layer-tags {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 8px;
-  justify-content: center;
-  margin-top: 4px;
+.go-btn {
+  display: inline-block;
+  margin-top: 6px;
+  padding: 8px 20px;
+  background: var(--hl-primary, #1565c0);
+  color: #fff;
+  border-radius: 8px;
+  font-size: 13px;
+  font-weight: 600;
+  text-decoration: none;
+  transition: opacity 0.2s;
 }
 
-.layer-tag {
-  font-size: 11px;
-  padding: 3px 10px;
-  border-radius: 999px;
-  border: 1px solid var(--c, var(--hl-primary));
-  color: var(--c, var(--hl-primary));
-  background: color-mix(in srgb, var(--c, var(--hl-primary)) 8%, white);
-}
+.go-btn:hover { opacity: 0.85; }
 
 /* 右侧详情 */
 .dispatch-detail {

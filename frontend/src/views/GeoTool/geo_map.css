@@ -151,3 +151,90 @@ input[type=range] { accent-color: #e94560; width: 100%; }
   #sidebar { width: 100%; min-width: unset; max-height: 50vh; }
   #main { flex-direction: column; }
 }
+
+/* ── 导出到指挥中心卡片 ── */
+.card-dispatch {
+  background: linear-gradient(135deg, #e8f4fd 0%, #f0f7ff 100%);
+  border: 1px solid #90caf9;
+  border-radius: 10px;
+  padding: 14px 14px 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  box-shadow: 0 2px 8px rgba(21, 101, 192, 0.08);
+}
+
+.card-dispatch__header {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+}
+
+.card-dispatch__icon {
+  font-size: 1.5rem;
+  line-height: 1;
+  margin-top: 2px;
+}
+
+.card-dispatch__title {
+  font-size: 0.88rem;
+  font-weight: 700;
+  color: #1565c0;
+}
+
+.card-dispatch__sub {
+  font-size: 0.75rem;
+  color: #5577aa;
+  margin-top: 2px;
+  line-height: 1.4;
+}
+
+.card-dispatch__error {
+  font-size: 0.75rem;
+  color: #c62828;
+  background: #ffebee;
+  border: 1px solid #ef9a9a;
+  border-radius: 6px;
+  padding: 6px 10px;
+}
+
+.btn-dispatch {
+  width: 100%;
+  height: 36px;
+  background: linear-gradient(135deg, #1565c0 0%, #1976d2 100%);
+  color: #fff;
+  border: none;
+  border-radius: 8px;
+  font-size: 0.83rem;
+  font-weight: 600;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  transition: opacity 0.2s, transform 0.12s;
+}
+
+.btn-dispatch:hover:not(:disabled) {
+  opacity: 0.88;
+  transform: translateY(-1px);
+}
+
+.btn-dispatch:active:not(:disabled) {
+  transform: translateY(0);
+}
+
+.btn-dispatch:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+
+.btn-dispatch__spinner {
+  display: inline-block;
+  width: 14px;
+  height: 14px;
+  border: 2px solid rgba(255, 255, 255, 0.4);
+  border-top-color: #fff;
+  border-radius: 50%;
+  animation: spin 0.8s linear infinite;
+}

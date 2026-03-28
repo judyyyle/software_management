@@ -28,6 +28,9 @@
         @fmt-change="currentFmt = $event"
         @hcol-change="currentHCol = $event"
         @grid-spacing-change="gridSpacing = $event"
+        @export-to-dispatch="handleExportToDispatch"
+        :dispatch-loading="sceneStore.loading"
+        :dispatch-error="sceneStore.error"
       />
 
       <!-- 地图区域 -->
@@ -42,11 +45,16 @@
 
 <script setup lang="ts">
 import { ref, onMounted, onUnmounted } from 'vue'
+import { useRouter } from 'vue-router'
 import LoadingMask from './components/LoadingMask.vue'
 import TopBar      from './components/TopBar.vue'
 import SideBar     from './components/SideBar.vue'
 import MapView     from './components/MapView.vue'
+import { useSceneStore } from '@/stores/scene'
 import './geo_map.css'
+
+const sceneStore = useSceneStore()
+const router     = useRouter()
 
 // ── 类型 ──────────────────────────────────────────────────────────
 
@@ -203,6 +211,18 @@ async function handleExport() {
     URL.revokeObjectURL(url)
   } catch (e: unknown) {
     alert('导出失败：' + (e instanceof Error ? e.message : String(e)))
+  }
+}
+
+async function handleExportToDispatch() {
+  if (!selBounds.value) return
+  await sceneStore.prepareScene({
+    sel_bounds:    selBounds.value,
+    threshold:     currentThreshold.value,
+    height_column: currentHCol.value ?? null,
+  })
+  if (!sceneStore.error) {
+    router.push('/dispatch')
   }
 }
 
