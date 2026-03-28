@@ -152,6 +152,29 @@
       <button class="btn-accent" @click="$emit('export')">⬇ 下载导出文件</button>
     </div>
 
+    <!-- ── 导出到指挥中心地图 ── -->
+    <div class="card-dispatch" v-if="queryResult">
+      <div class="card-dispatch__header">
+        <span class="card-dispatch__icon">🚀</span>
+        <div>
+          <div class="card-dispatch__title">导出到指挥中心地图</div>
+          <div class="card-dispatch__sub">对齐路网与禁飞区，建立仿真底图</div>
+        </div>
+      </div>
+      <!-- 错误提示 -->
+      <div v-if="dispatchError" class="card-dispatch__error">
+        ❌ {{ dispatchError }}
+      </div>
+      <button
+        class="btn-dispatch"
+        :disabled="dispatchLoading"
+        @click="$emit('export-to-dispatch')"
+      >
+        <span v-if="dispatchLoading" class="btn-dispatch__spinner"></span>
+        <span v-else>🗺️ 前往实时指挥中心</span>
+      </button>
+    </div>
+
     <!-- ── 使用说明 ── -->
     <div class="card-dark" style="font-size:.72rem; color:#888; line-height:1.6">
       <h6>📖 使用步骤</h6>
@@ -186,10 +209,12 @@ interface SelBounds { minx: number; miny: number; maxx: number; maxy: number }
 interface QueryStats { total: number; shown: number; no_fly: number; fly: number; truncated: boolean }
 
 const props = defineProps<{
-  serverState:  ServerState | null
-  selBounds:    SelBounds | null
-  queryResult:  QueryStats | null
-  appReady:     boolean
+  serverState:    ServerState | null
+  selBounds:      SelBounds | null
+  queryResult:    QueryStats | null
+  appReady:       boolean
+  dispatchLoading?: boolean
+  dispatchError?:   string | null
 }>()
 
 const emit = defineEmits<{
@@ -198,6 +223,7 @@ const emit = defineEmits<{
   (e: 'clear'): void
   (e: 'draw'): void
   (e: 'quick-mode', on: boolean, qw: number, qh: number): void
+  (e: 'export-to-dispatch'): void
   (e: 'height-change', v: number): void
   (e: 'fmt-change', v: string): void
   (e: 'hcol-change', v: string | null): void

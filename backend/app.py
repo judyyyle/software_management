@@ -24,13 +24,16 @@ from flask import Flask, jsonify
 from flask_cors import CORS
 
 # ── 模块路径注入（保持子模块内部的平坦式 import 不变）─────────────────────────
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-GEO_DIR  = os.path.join(BASE_DIR, "environment", "geo")
+BASE_DIR   = os.path.dirname(os.path.abspath(__file__))
+GEO_DIR    = os.path.join(BASE_DIR, "environment", "geo")
+SCENE_DIR  = os.path.join(BASE_DIR, "environment", "scene")
 sys.path.insert(0, GEO_DIR)
+sys.path.insert(0, SCENE_DIR)
 
 # ── Blueprint 导入（在 sys.path 注入之后）─────────────────────────────────────
-from geo_blueprint import geo_bp           # noqa: E402
-from data_loader   import load_shapefile_async  # noqa: E402
+from geo_blueprint     import geo_bp                # noqa: E402
+from data_loader       import load_shapefile_async  # noqa: E402
+from scene_blueprint   import scene_bp              # noqa: E402
 
 # ── 应用初始化 ─────────────────────────────────────────────────────────────────
 app = Flask(__name__)
@@ -40,11 +43,8 @@ CORS(app, resources={r"/api/*": {
 }})
 
 # ── Blueprint 注册 ─────────────────────────────────────────────────────────────
-app.register_blueprint(geo_bp, url_prefix="/api/geo")
-
-# 扩展示例（待实现）：
-# from api.routes.dispatch import dispatch_bp
-# app.register_blueprint(dispatch_bp, url_prefix="/api/dispatch")
+app.register_blueprint(geo_bp,   url_prefix="/api/geo")
+app.register_blueprint(scene_bp, url_prefix="/api/scene")
 
 
 # ── 通用端点 ───────────────────────────────────────────────────────────────────
