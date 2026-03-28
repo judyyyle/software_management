@@ -92,7 +92,7 @@ let pollTimer: ReturnType<typeof setInterval> | null = null
 
 async function pollStatus() {
   try {
-    const res  = await fetch('/api/status')
+    const res  = await fetch('/api/geo/status')
     const s: ServerState = await res.json()
     serverState.value  = s
     loadProgress.value = s.progress
@@ -128,7 +128,7 @@ async function handleQuery() {
   if (!selBounds.value) return
   overlayText.value = '正在分析建筑数据…'
   try {
-    const res = await fetch('/api/query', {
+    const res = await fetch('/api/geo/query', {
       method:  'POST',
       headers: { 'Content-Type': 'application/json' },
       body:    JSON.stringify({
@@ -178,7 +178,7 @@ function handleQuickMode(on: boolean, qw: number, qh: number) {
 async function handleExport() {
   if (!selBounds.value) return
   try {
-    const res = await fetch('/api/export', {
+    const res = await fetch('/api/geo/export', {
       method:  'POST',
       headers: { 'Content-Type': 'application/json' },
       body:    JSON.stringify({

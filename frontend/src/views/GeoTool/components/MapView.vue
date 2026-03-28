@@ -189,7 +189,7 @@ async function fetchRoads(bounds: SelBounds) {
   if (!map) return
   if (roadLayer) { map.removeLayer(roadLayer); roadLayer = null }
   try {
-    const res = await fetch('/api/roads', {
+    const res = await fetch('/api/geo/roads', {
       method:  'POST',
       headers: { 'Content-Type': 'application/json' },
       body:    JSON.stringify(bounds),
