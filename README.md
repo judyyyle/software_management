@@ -18,9 +18,18 @@ HiveLogix/
 │   │   └── routes/                             # 🔲 新功能 Blueprint 路由文件存放处
 │   │       └── __init__.py
 │   │
-│   ├── core/                                   # 🔲 核心领域模型
-│   │   ├── entities/                           #     仓库 / 卡车 / 充换电站 / 无人机 实体类
-│   │   └── models/                             #     订单模型（静态+动态，软时间窗）
+│   ├── core/                                   # ✅ 核心领域模型
+│   │   ├── __init__.py
+│   │   ├── entities/                           # ✅ 全部实体类（已实现）
+│   │   │   ├── __init__.py                     #     统一公共 API 出口（from core.entities import *）
+│   │   │   ├── primitives.py                   # ✅ Position3D / 全状态机枚举 / RouteWaypoint（零依赖）
+│   │   │   ├── charging_host.py                # ✅ ChargingHost 抽象基类（M/D/K 换电队列模型）
+│   │   │   ├── order.py                        # ✅ Order（状态机校验 / 软时间窗惩罚 / RL 向量接口）
+│   │   │   ├── drone.py                        # ✅ Drone / LightDrone / HeavyDrone（多旋翼功耗模型）
+│   │   │   ├── swap_station.py                 # ✅ SwapStation（固定换电站，复用基类队列逻辑）
+│   │   │   ├── truck.py                        # ✅ Truck（路网插值 / 起降平台占位 / 轨迹预测）
+│   │   │   └── depot.py                        # ✅ Depot（换电回调钩子 / 订单池 / 装车管理）
+│   │   └── models/                             # 🔲 订单模型扩展（静态批量订单，待实现）
 │   │
 │   ├── environment/
 │   │   ├── simulation/                         # 🔲 离散事件仿真主循环 + 事件队列
@@ -54,8 +63,13 @@ HiveLogix/
 │   │   └── algorithms/                         #     ALNS / GA / DRL
 │   │
 │   ├── storage/                                # 🔲 数据持久化（调度日志/仿真快照/回放）
-│   ├── config/                                 # 🔲 物理参数 + 算法超参 YAML
-│   └── utils/                                  # 🔲 通用工具（几何计算等）
+│   ├── config/                                 # ✅ 物理参数 + 算法超参 YAML
+│   │   ├── __init__.py
+│   │   ├── drone_params.yaml                   # ✅ LightDrone / HeavyDrone 气动参数（k1/k2/电池容量等）
+│   │   └── loader.py                           # ✅ YAML 加载器（frozen dataclass + lru_cache）
+│   └── utils/                                  # ✅ 通用工具
+│       ├── __init__.py
+│       └── coord_utils.py                      # ✅ UTM ↔ WGS84 坐标转换包装层（隔离 pyproj 依赖）
 │
 ├── frontend/                                   # 前端：调度监控大屏（Vue 3 + TypeScript + Vite）
 │   ├── index.html
