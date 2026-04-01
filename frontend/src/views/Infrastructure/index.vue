@@ -5,10 +5,10 @@
     desc="仓库网点 · 充换电站网络 · 站点部署与参数配置"
   >
     <div class="infra-grid">
-      <!-- 未定位提示横幅 -->
-      <div v-if="entityStore.hasUnlocated" class="infra-unlocated-banner">
-        📍 仓库 / 充换电站坐标待分配 &nbsp;·&nbsp;
-        请前往「仿真与配置」 →「地图选取」第一次框选地图范围，系统将自动分配坐标
+      <!-- 坐标自动分配提示横幅 -->
+      <div class="infra-unlocated-banner infra-unlocated-banner--info">
+        📐 坐标由系统自动分配 &nbsp;·&nbsp;
+        在「实时指挥中心」点击「初始化并发送到后端」时，仓库将自动分配到地图中心区，充换电站均匀铺满全图，无需手动填写经纬度
       </div>
       <!-- 仓库面板 -->
       <div class="infra-panel">
@@ -23,7 +23,7 @@
         <div class="infra-table-head">
           <span class="col-name">名称</span>
           <span class="col-id">ID</span>
-          <span class="col-coord">坐标 (lng, lat)</span>
+          <span class="col-coord">坐标</span>
           <span class="col-num">容量</span>
           <span class="col-num">泊位</span>
           <span class="col-num">τ_swap (s)</span>
@@ -35,7 +35,7 @@
             <span class="col-name infra-row__primary">{{ d.name }}</span>
             <span class="col-id infra-row__id">{{ d.depot_id }}</span>
             <span class="col-coord infra-row__muted">
-              <span v-if="d.lng === 0 && d.lat === 0" class="badge-unlocated">⚠️ 待定位</span>
+              <span v-if="d.lng === 0 && d.lat === 0" class="badge-auto">📐 初始化时自动分配</span>
               <template v-else>{{ d.lng.toFixed(4) }}, {{ d.lat.toFixed(4) }}</template>
             </span>
             <span class="col-num">{{ d.capacity }}</span>
@@ -63,7 +63,7 @@
         <div class="infra-table-head">
           <span class="col-name">名称</span>
           <span class="col-id">ID</span>
-          <span class="col-coord">坐标 (lng, lat)</span>
+          <span class="col-coord">坐标</span>
           <span class="col-num">泊位</span>
           <span class="col-num">τ_swap (s)</span>
           <span class="col-ops">操作</span>
@@ -74,7 +74,7 @@
             <span class="col-name infra-row__primary">{{ s.name }}</span>
             <span class="col-id infra-row__id">{{ s.station_id }}</span>
             <span class="col-coord infra-row__muted">
-              <span v-if="s.lng === 0 && s.lat === 0" class="badge-unlocated">⚠️ 待定位</span>
+              <span v-if="s.lng === 0 && s.lat === 0" class="badge-auto">📐 初始化时自动分配</span>
               <template v-else>{{ s.lng.toFixed(4) }}, {{ s.lat.toFixed(4) }}</template>
             </span>
             <span class="col-num">{{ s.parking_slots }}</span>
@@ -94,10 +94,8 @@
       <strong>补能模式参数说明：</strong>
       充换电站（Station）与仓库（Depot）均支持换电服务，<code>swap_time</code> 为单次换电耗时（秒），
       <code>parking_slots</code> 为同时容纳无人机数量。仓库 <code>capacity</code> 表示最大库存包裹件数。
-      <br /><strong>仿真假设：</strong>货物供应和换电资源永远充足， <code>capacity</code> 与 <code>parking_slots</code> 仅为调度算法提供约束参考，前端不做消耗计算。
-      <span v-if="entityStore.hasUnlocated">
-        <br /><strong>提示：</strong>標注 ⚠️ 的实体坐标尚未分配，选取地图地图后将自动更新。
-      </span>
+      <br /><strong>仿真假设：</strong>货物供应和换电资源永远充足，<code>capacity</code> 与 <code>parking_slots</code> 仅为调度算法提供约束参考，前端不做消耗计算。
+      <br /><strong>坐标分配：</strong>无需手动填写经纬度。每次在「实时指挥中心」点击「初始化并发送到后端」时，系统自动根据仿真场景 bbox 均匀分配坐标——仓库分布在地图中心区域，充换电站均匀铺满全图。
     </div>
 
     <!-- 仓库弹窗 -->
@@ -109,22 +107,11 @@
             <button class="modal-close" @click="closeDepotModal">✕</button>
           </div>
           <div class="modal-body">
+            <div class="form-hint-auto">📐 经纬度由系统自动分配（初始化时均匀布局到地图中心区域）</div>
             <div class="form-group">
               <label>名称 *</label>
               <input v-model="depotModal.form.name" placeholder="如：浦东枢纽仓" maxlength="32" />
               <span v-if="depotErrors.name" class="form-error">{{ depotErrors.name }}</span>
-            </div>
-            <div class="form-row">
-              <div class="form-group">
-                <label>经度 (lng) *</label>
-                <input v-model.number="depotModal.form.lng" type="number" step="0.0001" placeholder="121.5" />
-                <span v-if="depotErrors.lng" class="form-error">{{ depotErrors.lng }}</span>
-              </div>
-              <div class="form-group">
-                <label>纬度 (lat) *</label>
-                <input v-model.number="depotModal.form.lat" type="number" step="0.0001" placeholder="31.2" />
-                <span v-if="depotErrors.lat" class="form-error">{{ depotErrors.lat }}</span>
-              </div>
             </div>
             <div class="form-row">
               <div class="form-group">
@@ -168,22 +155,11 @@
             <button class="modal-close" @click="closeStationModal">✕</button>
           </div>
           <div class="modal-body">
+            <div class="form-hint-auto">📐 经纬度由系统自动分配（初始化时均匀铺满全图）</div>
             <div class="form-group">
               <label>名称 *</label>
               <input v-model="stationModal.form.name" placeholder="如：虹桥补能站-1" maxlength="32" />
               <span v-if="stationErrors.name" class="form-error">{{ stationErrors.name }}</span>
-            </div>
-            <div class="form-row">
-              <div class="form-group">
-                <label>经度 (lng) *</label>
-                <input v-model.number="stationModal.form.lng" type="number" step="0.0001" placeholder="121.5" />
-                <span v-if="stationErrors.lng" class="form-error">{{ stationErrors.lng }}</span>
-              </div>
-              <div class="form-group">
-                <label>纬度 (lat) *</label>
-                <input v-model.number="stationModal.form.lat" type="number" step="0.0001" placeholder="31.2" />
-                <span v-if="stationErrors.lat" class="form-error">{{ stationErrors.lat }}</span>
-              </div>
             </div>
             <div class="form-row">
               <div class="form-group">
@@ -223,7 +199,7 @@ const entityStore = useEntityStore()
 
 // ── Depot Modal ─────────────────────────────────────────────────────
 const mkDepot = (): DepotConfig => ({
-  depot_id: '', name: '', lng: 121.5, lat: 31.2, altitude: 0,
+  depot_id: '', name: '', lng: 0, lat: 0, altitude: 0,
   capacity: 200, parking_slots: 4, swap_time: 90,
 })
 
@@ -237,6 +213,7 @@ function validateDepot(): boolean {
   if (f.capacity      < 1)  e.capacity      = '容量至少 1 件'
   if (f.parking_slots < 1)  e.parking_slots = '至少 1 个泊位'
   if (f.swap_time     <= 0) e.swap_time     = '必须 > 0 秒'
+  // lng/lat 由系统自动分配，不做校验
   depotErrors.value = e
   return Object.keys(e).length === 0
 }
@@ -263,7 +240,7 @@ function deleteDepot(id: string) {
 
 // ── Station Modal ───────────────────────────────────────────────────
 const mkStation = (): StationConfig => ({
-  station_id: '', name: '', lng: 121.5, lat: 31.2, altitude: 0,
+  station_id: '', name: '', lng: 0, lat: 0, altitude: 0,
   parking_slots: 2, swap_time: 60,
 })
 
@@ -276,6 +253,7 @@ function validateStation(): boolean {
   if (!f.name.trim())       e.name          = '请输入名称'
   if (f.parking_slots < 1)  e.parking_slots = '至少 1 个泊位'
   if (f.swap_time     <= 0) e.swap_time     = '必须 > 0 秒'
+  // lng/lat 由系统自动分配，不做校验
   stationErrors.value = e
   return Object.keys(e).length === 0
 }
@@ -399,14 +377,20 @@ function deleteStation(id: string) {
 
 .infra-unlocated-banner {
   grid-column: 1 / -1;
-  background: #fef3c7;
-  border: 1px solid #fde68a;
-  color: #92400e;
   border-radius: var(--hl-card-radius);
   padding: 10px 14px;
   font-size: 12.5px;
   margin-bottom: 0;
   line-height: 1.6;
+  background: #eff6ff;
+  border: 1px solid #bfdbfe;
+  color: #1e40af;
+}
+
+.infra-unlocated-banner--info {
+  background: #eff6ff;
+  border-color: #bfdbfe;
+  color: #1e40af;
 }
 
 .badge-unlocated {
@@ -419,6 +403,29 @@ function deleteStation(id: string) {
   font-size: 11px;
   font-weight: 600;
   white-space: nowrap;
+}
+
+.badge-auto {
+  display: inline-block;
+  background: #eff6ff;
+  color: #1e40af;
+  border: 1px solid #bfdbfe;
+  border-radius: 4px;
+  padding: 0 5px;
+  font-size: 11px;
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+/* 表单顶部自动分配提示 */
+.form-hint-auto {
+  padding: 7px 11px;
+  background: #eff6ff;
+  border: 1px solid #bfdbfe;
+  border-radius: 6px;
+  color: #1e40af;
+  font-size: 12px;
+  margin-bottom: 12px;
 }
 
 .btn-add {
