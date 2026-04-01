@@ -380,6 +380,30 @@ class Drone:
             "remaining_range_m":    round(self.get_remaining_range(), 2),
         }
 
+    def to_dynamic_state(self) -> dict:
+        """
+        轻量序列化，仅含 TICK 帧所需字段。
+        包含所有 DroneConfig 非 Optional 字段，防止 setRuntimeAll 全量替换后字段丢失。
+        drone_type / home_id / home_type 已内嵌，无需 _metadata 合并。
+        """
+        lon, lat = self.current_loc.to_wgs84()
+        return {
+            "drone_id":              self.drone_id,
+            # ── 静态 DroneConfig 必填字段（防止 TICK 替换后丢失渲染信息）────────
+            "drone_type":            self.__class__.__name__,
+            "home_id":               self.home_id,
+            "home_type":             self.home_type.value,
+            # ── 动态字段 ─────────────────────────────────────────────────────
+            "lng":                   lon,
+            "lat":                   lat,
+            "altitude":              self.current_loc.z,
+            "status":                self.status.value,
+            "battery_ratio":         round(self.battery_ratio, 4),
+            "carrying_order_id":     self.carrying_order_id,
+            "cumulative_distance_m": round(self.cumulative_distance, 2),
+            "remaining_range_m":     round(self.get_remaining_range(), 2),
+        }
+
     def __repr__(self) -> str:
         return (
             f"{self.__class__.__name__}(id={self.drone_id!r}, "

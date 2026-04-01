@@ -65,8 +65,8 @@ class Order:
         create_time: float,
         deadline: float,
         delivery_loc: Position3D,
-        pickup_source_id: str,
-        source_type: SourceType,
+        pickup_source_id: Optional[str] = None,
+        source_type: Optional[SourceType] = None,
         payload_weight: float,
         penalty_rate: float = 1.0,
         assigned_vehicle_id: Optional[str] = None,
@@ -88,8 +88,8 @@ class Order:
         self.create_time: float = create_time
         self.deadline: float = deadline
         self.delivery_loc: Position3D = delivery_loc
-        self.pickup_source_id: str = pickup_source_id
-        self.source_type: SourceType = source_type
+        self.pickup_source_id: Optional[str] = pickup_source_id
+        self.source_type: Optional[SourceType] = source_type
         self.payload_weight: float = payload_weight
         self._status: TaskStatus = TaskStatus.PENDING
         self.assigned_vehicle_id: Optional[str] = assigned_vehicle_id
@@ -244,7 +244,7 @@ class Order:
             "entity_type":         "order",
             "order_id":            self.order_id,
             "status":              self._status.value,
-            "source_type":         self.source_type.value,
+            "source_type":         self.source_type.value if self.source_type else None,
             "pickup_source_id":    self.pickup_source_id,
             "payload_weight":      self.payload_weight,
             "create_time":         self.create_time,

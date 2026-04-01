@@ -506,7 +506,30 @@ class Truck(ChargingHost):
             "waiting_drones":   waiting,
             "parking_slots":    self.parking_slots,
             "available_slots":  self.available_slots,
-            "swap_time_s":      self.swap_time,
+            "swap_time":        self.swap_time,
+        }
+
+    def to_dynamic_state(self) -> dict:
+        """
+        轻量序列化，仅含 TICK 帧所需字段。
+        包含所有 TruckConfig 非 Optional 字段，防止 setRuntimeAll 全量替换后字段丢失。
+        name / home_depot_id 由 EntityManager.get_telemetry() 从 _metadata 合并。
+        """
+        lon, lat = self.current_loc.to_wgs84()
+        return {
+            "truck_id":        self.truck_id,
+            # ── 静态 TruckConfig 必填字段 ─────────────────────────────────────
+            "speed":           self.speed,
+            "max_inventory":   self.max_inventory,
+            "swap_time":       self.swap_time,
+            "parking_slots":   self.parking_slots,
+            # ── 动态字段 ─────────────────────────────────────────────────────
+            "lng":             lon,
+            "lat":             lat,
+            "status":          self.status.value,
+            "inventory_count": len(self.inventory),
+            "available_slots": self.available_slots,
+            "docked_drones":   list(self.docked_drones),
         }
 
     def __repr__(self) -> str:

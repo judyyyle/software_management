@@ -180,7 +180,7 @@ class TaskStatus(str, Enum):
     def valid_transitions(cls) -> dict["TaskStatus", set["TaskStatus"]]:
         """返回合法的状态转移图（每个状态 → 允许流转到的下一状态集合）。"""
         return {
-            cls.PENDING:    {cls.ASSIGNED, cls.REJECTED},
+            cls.PENDING:    {cls.ASSIGNED, cls.REJECTED, cls.TIMEOUT},
             cls.ASSIGNED:   {cls.PICKED_UP},
             cls.PICKED_UP:  {cls.DELIVERING},
             cls.DELIVERING: {cls.COMPLETED, cls.TIMEOUT},

@@ -4,13 +4,14 @@ import AppLayout from '@/layouts/AppLayout.vue'
 const router = createRouter({
   history: createWebHistory(),
   routes: [
-    // 根路径重定向到调度大屏
-    { path: '/', redirect: '/dashboard' },
+    // 根路径重定向到实时指挥中心
+    { path: '/', redirect: '/dispatch' },
 
     // 旧路径向后兼容重定向
-    { path: '/geo',      redirect: '/simulation' },
-    { path: '/monitor',  redirect: '/dispatch'   },
-    { path: '/analytics',redirect: '/dashboard'  },
+    { path: '/geo',       redirect: '/simulation' },
+    { path: '/monitor',   redirect: '/dispatch'   },
+    { path: '/analytics', redirect: '/dispatch'   },
+    { path: '/dashboard', redirect: '/dispatch'   },
 
     // ── 主布局（含侧边导航栏）────────────────────────────────────────
     {
@@ -44,14 +45,14 @@ const router = createRouter({
         },
         {
           path: 'simulation',
-          component: () => import('@/views/SimulationBox/index.vue'),
-          meta: { title: '仿真与配置 · HiveLogix' },
+          component: () => import('@/views/GeoTool/index.vue'),
+          meta: { title: '环境构建 · HiveLogix' },
         },
       ],
     },
 
     // 404 兜底（保留旧占位页供复用）
-    { path: '/:pathMatch(.*)*', redirect: '/dashboard' },
+    { path: '/:pathMatch(.*)*', redirect: '/dispatch' },
   ],
 })
 
