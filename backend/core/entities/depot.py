@@ -324,8 +324,31 @@ class Depot(ChargingHost):
             "parking_slots":     self.parking_slots,
             "available_slots":   self.available_slots,
             "queue_length":      self.queue_length,
-            "swap_time_s":       self.swap_time,
+            "swap_time":         self.swap_time,
             "charging_drone_ids": serving_ids,
+        }
+
+    def to_dynamic_state(self) -> dict:
+        """
+        轻量序列化，仅含 TICK 帧所需字段。
+        包含所有 DepotConfig 非 Optional 字段，防止 setRuntimeAll 全量替换后字段丢失。
+        name 由 EntityManager.get_telemetry() 从 _metadata 合并。
+        """
+        lon, lat = self.location.to_wgs84()
+        return {
+            "depot_id":         self.depot_id,
+            # ── 静态 DepotConfig 必填字段 ─────────────────────────────────────
+            "lng":              lon,
+            "lat":              lat,
+            "altitude":         self.location.z,
+            "capacity":         self.capacity,
+            "swap_time":        self.swap_time,
+            "parking_slots":    self.parking_slots,
+            # ── 动态字段 ─────────────────────────────────────────────────────
+            "pending_count":    self.pending_count,
+            "idle_drone_count": self.idle_drone_count,
+            "available_slots":  self.available_slots,
+            "queue_length":     self.queue_length,
         }
 
     def __repr__(self) -> str:

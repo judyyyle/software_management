@@ -19,6 +19,17 @@ HiveLogix — 主 Flask 应用入口
 
 import os
 import sys
+import re
+import logging
+
+# ── 控制台日志（显示所有模块的 INFO/DEBUG 输出，方便调试）───────────────────────
+logging.basicConfig(
+    level=logging.DEBUG,
+    format="%(asctime)s [%(levelname)-8s] %(name)s: %(message)s",
+    datefmt="%H:%M:%S",
+)
+# 降低 Werkzeug 路由日志噪声（只保留 WARNING 以上）
+logging.getLogger("werkzeug").setLevel(logging.WARNING)
 
 from flask import Flask, jsonify
 from flask_cors import CORS
@@ -27,24 +38,32 @@ from flask_cors import CORS
 BASE_DIR   = os.path.dirname(os.path.abspath(__file__))
 GEO_DIR    = os.path.join(BASE_DIR, "environment", "geo")
 SCENE_DIR  = os.path.join(BASE_DIR, "environment", "scene")
+STATE_DIR  = os.path.join(BASE_DIR, "environment", "state")
+ROUTES_DIR = os.path.join(BASE_DIR, "api", "routes")
+sys.path.insert(0, BASE_DIR)      # 使 utils.coord_utils 等顶层包可导入
 sys.path.insert(0, GEO_DIR)
 sys.path.insert(0, SCENE_DIR)
+sys.path.insert(0, STATE_DIR)
+sys.path.insert(0, ROUTES_DIR)
 
 # ── Blueprint 导入（在 sys.path 注入之后）─────────────────────────────────────
 from geo_blueprint     import geo_bp                # noqa: E402
 from data_loader       import load_shapefile_async  # noqa: E402
 from scene_blueprint   import scene_bp              # noqa: E402
+from simulation_bp     import sim_bp, sock          # noqa: E402
 
 # ── 应用初始化 ─────────────────────────────────────────────────────────────────
 app = Flask(__name__)
+sock.init_app(app)   # flask-sock 初始化（WebSocket 支持）
 
 CORS(app, resources={r"/api/*": {
-    "origins": ["http://localhost:5173", "http://127.0.0.1:5173"],
+    "origins": re.compile(r"^http://(localhost|127\.0\.0\.1):517\d$"),
 }})
 
 # ── Blueprint 注册 ─────────────────────────────────────────────────────────────
 app.register_blueprint(geo_bp,   url_prefix="/api/geo")
 app.register_blueprint(scene_bp, url_prefix="/api/scene")
+app.register_blueprint(sim_bp,   url_prefix="/api/sim")
 
 
 # ── 通用端点 ───────────────────────────────────────────────────────────────────

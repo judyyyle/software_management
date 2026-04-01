@@ -93,9 +93,32 @@ class SwapStation(ChargingHost):
             "parking_slots":     self.parking_slots,
             "available_slots":   self.available_slots,
             "queue_length":      self.queue_length,
-            "swap_time_s":       self.swap_time,
+            "swap_time":         self.swap_time,
             "serving_drone_ids": serving_ids,
             "waiting_drone_ids": queue_ids,
+        }
+
+    def to_dynamic_state(self) -> dict:
+        """
+        轻量序列化，仅含 TICK 帧所需字段。
+        包含所有 StationConfig 非 Optional 字段，防止 setRuntimeAll 全量替换后字段丢失。
+        name 由 EntityManager.get_telemetry() 从 _metadata 合并。
+        """
+        lon, lat = self.location.to_wgs84()
+        with self._lock:
+            serving_ids = list(self.serving_drones.keys())
+        return {
+            "station_id":        self.station_id,
+            # ── 静态 StationConfig 必填字段 ───────────────────────────────────
+            "lng":               lon,
+            "lat":               lat,
+            "altitude":          self.location.z,
+            "swap_time":         self.swap_time,
+            "parking_slots":     self.parking_slots,
+            # ── 动态字段 ─────────────────────────────────────────────────────
+            "available_slots":   self.available_slots,
+            "queue_length":      self.queue_length,
+            "serving_drone_ids": serving_ids,
         }
 
     def __repr__(self) -> str:
