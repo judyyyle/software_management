@@ -294,6 +294,19 @@ async function doInit() {
   _log('info', '正在发送初始化请求到后端...')
   try {
     const bounds = sceneStore.context?.road_network.bounds
+
+    // 每次初始化前，根据当前场景 bbox 自动重新均匀分配坐标
+    // 仓库偏中心（收缩 28% 内区），充换电站均匀铺满整图
+    if (bounds) {
+      entityStore.redistributeByBounds(bounds)
+      _log('info',
+        `📐 坐标已自动分配 — 仓库 ${entityStore.depots.length} 个（居中区）` +
+        `· 充换电站 ${entityStore.stations.length} 个（均布全图）`
+      )
+    } else {
+      _log('warn', '⚠️ 未加载场景，使用实体当前坐标（可能为 0,0）')
+    }
+
     const result = await systemStore.initSim({
       bbox:    bounds,
       sceneId: sceneStore.context?.scene_id,

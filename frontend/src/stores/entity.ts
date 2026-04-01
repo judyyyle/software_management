@@ -97,8 +97,19 @@ export const useEntityStore = defineStore('entity', () => {
    * @param bounds 当前仿真地图边界（来自 sceneStore.context.road_network.bounds）
    */
   function redistributeByBounds(bounds: SceneBounds) {
-    const depotCoords   = gridLayout(depots.value.length,   bounds)
+    // 充换电站：均匀分布在完整 bbox 内
     const stationCoords = gridLayout(stations.value.length, bounds)
+
+    // 仓库：分布在 bbox 中心区域（各方向向内收缩 28%），使仓库偏向地图中央
+    const mx  = (bounds.max_lng - bounds.min_lng) * 0.28
+    const my  = (bounds.max_lat - bounds.min_lat) * 0.28
+    const centerBounds: SceneBounds = {
+      min_lng: bounds.min_lng + mx,
+      max_lng: bounds.max_lng - mx,
+      min_lat: bounds.min_lat + my,
+      max_lat: bounds.max_lat - my,
+    }
+    const depotCoords = gridLayout(depots.value.length, centerBounds)
 
     depots.value = depots.value.map((d, i) => ({
       ...d,
