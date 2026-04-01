@@ -39,12 +39,11 @@ interface NavItemDef {
 }
 
 const navItems: NavItemDef[] = [
-  { path: '/dashboard',  icon: '📊', label: '调度性能大屏' },
   { path: '/dispatch',   icon: '🗺️', label: '实时指挥中心' },
   { path: '/orders',     icon: '📦', label: '订单与任务管理' },
   { path: '/fleet',      icon: '🛸', label: '载具管理调度' },
   { path: '/infra',      icon: '🏗️', label: '基础设施配置' },
-  { path: '/simulation', icon: '⚙️', label: '仿真与配置', badge: 'LIVE' },
+  { path: '/simulation', icon: '🌍', label: '环境构建' },
 ]
 </script>
 

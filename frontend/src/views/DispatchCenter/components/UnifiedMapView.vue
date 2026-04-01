@@ -12,6 +12,12 @@
     <!-- 图例 -->
     <div class="umap-legend">
       <div class="umap-legend__item">
+        <span class="umap-legend__pin" style="background:#1e40af">🏭</span>仓库
+      </div>
+      <div class="umap-legend__item">
+        <span class="umap-legend__pin" style="background:#d97706">⚡</span>充换电站
+      </div>
+      <div class="umap-legend__item">
         <span class="umap-legend__box" style="background:#ff4444;opacity:.65"></span>禁飞区建筑
       </div>
       <div class="umap-legend__item">
@@ -27,6 +33,7 @@
 <script setup lang="ts">
 import { ref, watch, onMounted, onBeforeUnmount } from 'vue'
 import { useSceneStore, type SceneContext } from '@/stores/scene'
+import { useEntityStore } from '@/stores/entity'
 
 declare const L: typeof import('leaflet')
 
@@ -36,15 +43,18 @@ interface SelBounds { minx: number; miny: number; maxx: number; maxy: number }
 
 // ── Store & refs ──────────────────────────────────────────────────
 
-const sceneStore = useSceneStore()
+const sceneStore  = useSceneStore()
+const entityStore = useEntityStore()
 
 const mapEl         = ref<HTMLDivElement | null>(null)
 const layerLoading  = ref(false)
 const layerLoadingText = ref('正在加载地图数据…')
 
 let map: ReturnType<typeof L.map> | null = null
-let buildingLayer: L.GeoJSON | null      = null
-let roadLayer: L.GeoJSON | null          = null
+let buildingLayer:  L.GeoJSON      | null = null
+let roadLayer:      L.GeoJSON      | null = null
+let depotGroup:     L.LayerGroup   | null = null
+let stationGroup:   L.LayerGroup   | null = null
 
 // ── 道路权重（与 GeoTool 保持一致）────────────────────────────────
 
@@ -173,7 +183,76 @@ async function loadLayers(scene: SceneContext) {
     ], { padding: [20, 20] })
   }
 
+  // 场景加载完成后立即绘制设施标注（确保显示在建筑/道路图层之上）
+  drawFacilities()
+
   layerLoading.value = false
+}
+
+// ── 设施标注（仓库 + 充换电站）────────────────────────────────────
+
+function _depotIcon(name: string) {
+  return L.divIcon({
+    className: '',
+    html: `<div class="fac-pin fac-pin--depot" title="${name}">🏭</div>`,
+    iconSize:   [34, 34],
+    iconAnchor: [17, 17],
+    popupAnchor: [0, -18],
+  })
+}
+
+function _stationIcon(name: string) {
+  return L.divIcon({
+    className: '',
+    html: `<div class="fac-pin fac-pin--station" title="${name}">⚡</div>`,
+    iconSize:   [28, 28],
+    iconAnchor: [14, 14],
+    popupAnchor: [0, -15],
+  })
+}
+
+function drawFacilities() {
+  if (!map) return
+
+  // 确保 LayerGroup 存在（创建一次后复用）
+  if (!depotGroup)   { depotGroup   = L.layerGroup().addTo(map) }
+  if (!stationGroup) { stationGroup = L.layerGroup().addTo(map) }
+
+  depotGroup.clearLayers()
+  stationGroup.clearLayers()
+
+  for (const depot of entityStore.depots) {
+    // 跳过坐标未就绪（未选地图时默认 0,0）
+    if (depot.lng === 0 && depot.lat === 0) continue
+    L.marker([depot.lat, depot.lng], { icon: _depotIcon(depot.name) })
+      .bindPopup(
+        `<div class="fac-popup">
+          <div class="fac-popup__title">🏭 ${depot.name}</div>
+          <div class="fac-popup__row"><span>ID</span><span>${depot.depot_id}</span></div>
+          <div class="fac-popup__row"><span>容量</span><span>${depot.capacity} 件</span></div>
+          <div class="fac-popup__row"><span>充换电位</span><span>${depot.parking_slots} 个</span></div>
+          <div class="fac-popup__row"><span>坐标</span><span>${depot.lng.toFixed(5)}, ${depot.lat.toFixed(5)}</span></div>
+        </div>`,
+        { maxWidth: 220, className: 'fac-popup-wrap' }
+      )
+      .addTo(depotGroup)
+  }
+
+  for (const sta of entityStore.stations) {
+    if (sta.lng === 0 && sta.lat === 0) continue
+    L.marker([sta.lat, sta.lng], { icon: _stationIcon(sta.name) })
+      .bindPopup(
+        `<div class="fac-popup">
+          <div class="fac-popup__title">⚡ ${sta.name}</div>
+          <div class="fac-popup__row"><span>ID</span><span>${sta.station_id}</span></div>
+          <div class="fac-popup__row"><span>并发槽位</span><span>${sta.parking_slots} 个</span></div>
+          <div class="fac-popup__row"><span>换电耗时</span><span>${sta.swap_time} s</span></div>
+          <div class="fac-popup__row"><span>坐标</span><span>${sta.lng.toFixed(5)}, ${sta.lat.toFixed(5)}</span></div>
+        </div>`,
+        { maxWidth: 220, className: 'fac-popup-wrap' }
+      )
+      .addTo(stationGroup)
+  }
 }
 
 // ── 生命周期 ──────────────────────────────────────────────────────
@@ -182,27 +261,43 @@ onMounted(() => {
   initMap()
   if (sceneStore.context) {
     loadLayers(sceneStore.context)
+  } else {
+    // 无场景时也尝试绘制设施（坐标为 0 的会被跳过）
+    drawFacilities()
   }
 })
 
 onBeforeUnmount(() => {
+  depotGroup?.remove()
+  stationGroup?.remove()
   map?.remove()
   map = null
 })
 
-// ── 监听 sceneStore 变更（跨路由导航时自动刷新）────────────────────
+// ── 监听 sceneStore 变更（跨路由导航时自动刷新地图层）───────────────
 
 watch(() => sceneStore.context, (ctx) => {
   if (ctx && map) loadLayers(ctx)
 })
 
-// ── P2 接口预留（供 DispatchCenter 父组件调用，仿真实体覆盖层）──────
+// ── 监听实体变更（redistributeByBounds 或初始化后重绘设施标注）───────
 
-function setFacilities(_geojson: unknown) { /* P2: 设施层 */ }
+watch(
+  () => [entityStore.depots, entityStore.stations],
+  () => { if (map) drawFacilities() },
+  { deep: true }
+)
+
+// ── P2 接口（供 DispatchCenter 父组件调用）────────────────────────────
+
+function setFacilities(_geojson: unknown) { drawFacilities() }
 function updateTruck(_id: string, _lng: number, _lat: number) { /* P2: 卡车位置更新 */ }
 function updateDrone(_id: string, _lng: number, _lat: number, _alt: number) { /* P2: 无人机位置更新 */ }
 function addOrder(_id: string, _lng: number, _lat: number) { /* P2: 订单标记 */ }
-function clearDynamic() { /* P2: 清除所有动态实体覆盖层 */ }
+function clearDynamic() {
+  depotGroup?.clearLayers()
+  stationGroup?.clearLayers()
+}
 
 defineExpose({ setFacilities, updateTruck, updateDrone, addOrder, clearDynamic })
 </script>
@@ -281,6 +376,19 @@ defineExpose({ setFacilities, updateTruck, updateDrone, addOrder, clearDynamic }
   flex-shrink: 0;
 }
 
+.umap-legend__pin {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 20px;
+  height: 20px;
+  border-radius: 50%;
+  font-size: 0.7rem;
+  flex-shrink: 0;
+  border: 1.5px solid rgba(255, 255, 255, 0.9);
+  box-shadow: 0 1px 4px rgba(0, 0, 0, 0.2);
+}
+
 .umap-legend__line {
   display: inline-block;
   width: 20px;
@@ -288,4 +396,71 @@ defineExpose({ setFacilities, updateTruck, updateDrone, addOrder, clearDynamic }
   border-radius: 2px;
   flex-shrink: 0;
 }
+
+/* ── 设施标注 Pin（DivIcon，使用 :deep 穿透 Leaflet DOM）── */
+:deep(.fac-pin) {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 50%;
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.35);
+  border: 2.5px solid rgba(255, 255, 255, 0.95);
+  cursor: pointer;
+  transition: transform 0.15s;
+  user-select: none;
+}
+
+:deep(.fac-pin:hover) { transform: scale(1.18); }
+
+:deep(.fac-pin--depot) {
+  width: 34px;
+  height: 34px;
+  font-size: 1.15rem;
+  background: #1e40af;
+}
+
+:deep(.fac-pin--station) {
+  width: 28px;
+  height: 28px;
+  font-size: 0.95rem;
+  background: #d97706;
+}
+
+/* ── 设施弹窗内容 ── */
+:deep(.fac-popup-wrap .leaflet-popup-content-wrapper) {
+  border-radius: 10px;
+  padding: 0;
+  overflow: hidden;
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.18);
+}
+
+:deep(.fac-popup-wrap .leaflet-popup-content) {
+  margin: 0;
+}
+
+:deep(.fac-popup) {
+  min-width: 180px;
+  font-size: 0.82rem;
+  color: #1a1a2e;
+}
+
+:deep(.fac-popup__title) {
+  padding: 8px 12px;
+  font-weight: 700;
+  font-size: 0.9rem;
+  background: #f0f4ff;
+  border-bottom: 1px solid #dde6f5;
+}
+
+:deep(.fac-popup__row) {
+  display: flex;
+  justify-content: space-between;
+  padding: 4px 12px;
+  border-bottom: 1px solid #f0f0f0;
+  gap: 12px;
+}
+
+:deep(.fac-popup__row:last-child) { border-bottom: none; }
+:deep(.fac-popup__row span:first-child) { color: #666; }
+:deep(.fac-popup__row span:last-child) { font-weight: 600; color: #1a1a2e; }
 </style>

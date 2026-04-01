@@ -51,10 +51,12 @@ import TopBar      from './components/TopBar.vue'
 import SideBar     from './components/SideBar.vue'
 import MapView     from './components/MapView.vue'
 import { useSceneStore } from '@/stores/scene'
+import { useEntityStore } from '@/stores/entity'
 import './geo_map.css'
 
-const sceneStore = useSceneStore()
-const router     = useRouter()
+const sceneStore  = useSceneStore()
+const entityStore = useEntityStore()
+const router      = useRouter()
 
 // ── 类型 ──────────────────────────────────────────────────────────
 
@@ -221,7 +223,9 @@ async function handleExportToDispatch() {
     threshold:     currentThreshold.value,
     height_column: currentHCol.value ?? null,
   })
-  if (!sceneStore.error) {
+  if (!sceneStore.error && sceneStore.context) {
+    // 根据新地图 bbox 重新分配仓库和充换电站坐标
+    entityStore.redistributeByBounds(sceneStore.context.road_network.bounds)
     router.push('/dispatch')
   }
 }

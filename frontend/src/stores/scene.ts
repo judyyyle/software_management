@@ -13,6 +13,7 @@
 
 import { defineStore } from 'pinia'
 import { ref } from 'vue'
+import { http } from '@/services/http'
 
 // ── 类型定义（与后端 SceneContext 协议对齐）─────────────────────────────────
 
@@ -96,22 +97,14 @@ export const useSceneStore = defineStore('scene', () => {
     error.value   = null
 
     try {
-      const res = await fetch('/api/scene/prepare', {
-        method:  'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          ...payload.sel_bounds,
-          threshold:     payload.threshold,
-          height_column: payload.height_column,
-        }),
+      const data = await http.post<SceneContext>('/api/scene/prepare', {
+        ...payload.sel_bounds,
+        threshold:     payload.threshold,
+        height_column: payload.height_column,
       })
-
-      if (!res.ok) {
-        const body = await res.json().catch(() => ({}))
-        throw new Error((body as { error?: string }).error ?? `HTTP ${res.status}`)
-      }
-
-      context.value = (await res.json()) as SceneContext
+      context.value = data
+      // 持久化 scene_id，供页面刷新后 restoreScene() 使用
+      localStorage.setItem('hl-scene-id', data.scene_id)
     } catch (e: unknown) {
       error.value = e instanceof Error ? e.message : String(e)
     } finally {
@@ -123,7 +116,22 @@ export const useSceneStore = defineStore('scene', () => {
   function clear(): void {
     context.value = null
     error.value   = null
+    localStorage.removeItem('hl-scene-id')
   }
 
-  return { context, loading, error, prepareScene, clear }
+  /**
+   * 从后端按 scene_id 恢复已有场景（页面刷新后调用）。
+   * 若 scene_id 不存在或已失效（服务重启）则静默忽略。
+   */
+  async function restoreScene(sceneId: string): Promise<void> {
+    if (!sceneId || context.value?.scene_id === sceneId) return
+    try {
+      const data = await http.get<SceneContext>(`/api/scene/${encodeURIComponent(sceneId)}`)
+      context.value = data
+    } catch {
+      // 404 或网络错误：保持当前状态
+    }
+  }
+
+  return { context, loading, error, prepareScene, restoreScene, clear }
 })
