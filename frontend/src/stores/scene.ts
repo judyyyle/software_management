@@ -14,6 +14,7 @@
 import { defineStore } from 'pinia'
 import { ref } from 'vue'
 import { http } from '@/services/http'
+import type { FeatureCollection } from 'geojson'
 
 // ── 类型定义（与后端 SceneContext 协议对齐）─────────────────────────────────
 
@@ -56,7 +57,7 @@ export interface SceneBounds {
   max_lat: number
 }
 
-/** 完整场景上下文（不含 buildings GeoJSON，建筑数据由 UnifiedMapView 独立加载） */
+/** 完整场景上下文（buildings GeoJSON 独立缓存于 sceneStore.buildingsGeoJSON） */
 export interface SceneContext {
   scene_id:     string
   sel_bounds:   { minx: number; miny: number; maxx: number; maxy: number }
@@ -75,6 +76,13 @@ export interface SceneContext {
 export const useSceneStore = defineStore('scene', () => {
   /** 当前已加载的场景上下文，null 表示尚未导出 */
   const context = ref<SceneContext | null>(null)
+
+  /**
+   * 对应 context 的建筑 GeoJSON 缓存。
+   * 由 GeoTool 查询后写入，UnifiedMapView 优先读取以跳过重复 API 调用。
+   * scene 切换时（prepareScene / clear）自动清空，防止展示陈旧数据。
+   */
+  const buildingsGeoJSON = ref<FeatureCollection | null>(null)
 
   /** /api/scene/prepare 请求进行中 */
   const loading = ref(false)
@@ -95,6 +103,8 @@ export const useSceneStore = defineStore('scene', () => {
     if (loading.value) return
     loading.value = true
     error.value   = null
+    // 清空上一场景的建筑缓存，防止新场景渲染陈旧数据
+    buildingsGeoJSON.value = null
 
     try {
       const data = await http.post<SceneContext>('/api/scene/prepare', {
@@ -114,9 +124,19 @@ export const useSceneStore = defineStore('scene', () => {
 
   /** 清除场景（用于重新选区或退出仿真） */
   function clear(): void {
-    context.value = null
-    error.value   = null
+    context.value        = null
+    buildingsGeoJSON.value = null
+    error.value          = null
     localStorage.removeItem('hl-scene-id')
+  }
+
+  /**
+   * 写入建筑 GeoJSON 缓存。
+   * 由 GeoTool 在用户点击「导出到指挥中心地图」前调用，
+   * 保证 UnifiedMapView 挂载时直接使用而无需重新请求后端。
+   */
+  function setBuildingsGeoJSON(geojson: FeatureCollection | null): void {
+    buildingsGeoJSON.value = geojson
   }
 
   /**
@@ -133,5 +153,5 @@ export const useSceneStore = defineStore('scene', () => {
     }
   }
 
-  return { context, loading, error, prepareScene, restoreScene, clear }
+  return { context, loading, error, buildingsGeoJSON, setBuildingsGeoJSON, prepareScene, restoreScene, clear }
 })

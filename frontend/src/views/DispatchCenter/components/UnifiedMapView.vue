@@ -37,10 +37,6 @@ import { useEntityStore } from '@/stores/entity'
 
 declare const L: typeof import('leaflet')
 
-// ── 类型 ─────────────────────────────────────────────────────────
-
-interface SelBounds { minx: number; miny: number; maxx: number; maxy: number }
-
 // ── Store & refs ──────────────────────────────────────────────────
 
 const sceneStore  = useSceneStore()
@@ -56,14 +52,6 @@ let roadLayer:      L.GeoJSON      | null = null
 let depotGroup:     L.LayerGroup   | null = null
 let stationGroup:   L.LayerGroup   | null = null
 
-// ── 道路权重（与 GeoTool 保持一致）────────────────────────────────
-
-const ROAD_WIDTHS: Record<string, number> = {
-  motorway: 5, trunk: 4, primary: 3.5, secondary: 3,
-  tertiary: 2.5, residential: 2, service: 1.5, unclassified: 2,
-  motorway_link: 2.5, trunk_link: 2, primary_link: 2,
-  secondary_link: 1.5, tertiary_link: 1.5, living_street: 1.5, road: 2,
-}
 
 // ── 地图初始化 ────────────────────────────────────────────────────
 
@@ -92,42 +80,44 @@ async function loadLayers(scene: SceneContext) {
   if (!map) return
 
   layerLoading.value     = true
-  layerLoadingText.value = '正在加载建筑与路网数据…'
+  layerLoadingText.value = '正在渲染场景数据…'
 
-  const bounds: SelBounds = {
-    minx: scene.sel_bounds.minx,
-    miny: scene.sel_bounds.miny,
-    maxx: scene.sel_bounds.maxx,
-    maxy: scene.sel_bounds.maxy,
+  // ── 建筑图层：优先读取 sceneStore 缓存，避免重复 API 调用 ──────────────────
+  if (buildingLayer) { map.removeLayer(buildingLayer); buildingLayer = null }
+
+  let buildData: GeoJSON.FeatureCollection | null =
+    sceneStore.buildingsGeoJSON as GeoJSON.FeatureCollection | null
+
+  if (!buildData) {
+    // 未命中缓存（页面刷新后 / 首次直接访问）：从后端加载并写入缓存
+    layerLoadingText.value = '正在加载建筑数据（首次加载）…'
+    try {
+      const r = await fetch('/api/geo/query', {
+        method:  'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body:    JSON.stringify({
+          minx:          scene.sel_bounds.minx,
+          miny:          scene.sel_bounds.miny,
+          maxx:          scene.sel_bounds.maxx,
+          maxy:          scene.sel_bounds.maxy,
+          threshold:     scene.threshold,
+          height_column: scene.height_column ?? null,
+          max:           30000,
+        }),
+      })
+      const d = await r.json()
+      if (!d.error) {
+        buildData = d as GeoJSON.FeatureCollection
+        // 写入缓存供下次路由切换复用
+        sceneStore.setBuildingsGeoJSON(buildData)
+      }
+    } catch {
+      // 静默处理：geo 后端未启动时地图无建筑层，但不崩溃
+    }
   }
 
-  // 并行获取建筑和路网数据（各自独立 catch，互不影响）
-  let buildGeoJSON: unknown = null
-  let roadGeoJSON:  unknown = null
-
-  await Promise.all([
-    fetch('/api/geo/query', {
-      method:  'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body:    JSON.stringify({
-        ...bounds,
-        threshold:     scene.threshold,
-        height_column: scene.height_column ?? null,
-        max:           30000,
-      }),
-    }).then(r => r.json()).then(d => { if (!d.error) buildGeoJSON = d }).catch(() => {}),
-
-    fetch('/api/geo/roads', {
-      method:  'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body:    JSON.stringify(bounds),
-    }).then(r => r.json()).then(d => { if (!d.error) roadGeoJSON = d }).catch(() => {}),
-  ])
-
-  // 建筑图层
-  if (buildingLayer) { map.removeLayer(buildingLayer); buildingLayer = null }
-  if (buildGeoJSON) {
-    buildingLayer = L.geoJSON(buildGeoJSON as GeoJSON.FeatureCollection, {
+  if (buildData) {
+    buildingLayer = L.geoJSON(buildData, {
       style: (feature: GeoJSON.Feature | undefined) => {
         const nf = feature?.properties?.nf
         return {
@@ -137,49 +127,53 @@ async function loadLayers(scene: SceneContext) {
           fillOpacity: nf ? 0.65 : 0.35,
         }
       },
-      onEachFeature: (feature: GeoJSON.Feature, layer: L.Layer) => {
-        const p = feature.properties
-        if (!p) return
-        layer.bindPopup(
-          `<div style="font-size:1rem;font-weight:700">${p.h} m</div>
-           <span style="display:inline-block;padding:2px 8px;border-radius:4px;font-size:.75rem;font-weight:600;
-                        background:${p.nf ? '#ae2012' : '#2d6a4f'};color:#fff">
-             ${p.nf ? '🔴 禁飞区' : '🟢 可飞区'}
-           </span>`,
-          { maxWidth: 180 }
-        )
-      },
+      // onEachFeature 已移除：Canvas 渲染器下 N 万个独立 popup 绑定严重消耗内存
     }).addTo(map)
+
+    // 事件委托：图层级单次 click，动态创建 Popup，替代逐个 Feature 绑定
+    buildingLayer.on('click', (e) => {
+      const evt = e as unknown as L.LeafletMouseEvent & {
+        layer?: L.Layer & { feature?: GeoJSON.Feature }
+      }
+      const p = evt.layer?.feature?.properties
+      if (!p || !map) return
+      L.popup({ maxWidth: 180 })
+        .setLatLng(evt.latlng)
+        .setContent(
+          `<div style="font-size:1rem;font-weight:700">${p.h} m</div>` +
+          `<span style="display:inline-block;padding:2px 8px;border-radius:4px;font-size:.75rem;font-weight:600;` +
+          `background:${p.nf ? '#ae2012' : '#2d6a4f'};color:#fff">` +
+          `${p.nf ? '🔴 禁飞区' : '🟢 可飞区'}</span>`
+        )
+        .openOn(map)
+    })
   }
 
-  // 道路图层
+  // ── 道路图层：直接从 scene.road_network.edges 构造，无需 Overpass API ─────
+  // edges.shape 已是 [lng, lat][] 序列，与 GeoJSON LineString 坐标格式完全一致
   if (roadLayer) { map.removeLayer(roadLayer); roadLayer = null }
-  if (roadGeoJSON) {
-    roadLayer = L.geoJSON(roadGeoJSON as GeoJSON.FeatureCollection, {
-      style: (f: GeoJSON.Feature | undefined) => ({
-        color:   '#e6a817',
-        weight:  ROAD_WIDTHS[f?.properties?.highway] ?? 2,
-        opacity: 0.9,
-      }),
-      onEachFeature: (f: GeoJSON.Feature, layer: L.Layer) => {
-        const n = f.properties?.name
-        if (n) layer.bindTooltip(
-          `${n} <span style="color:#888">(${f.properties?.highway})</span>`,
-          { sticky: true, opacity: 0.92 }
-        )
-      },
-    }).addTo(map)
+
+  if (scene.road_network.edges.length > 0) {
+    const roadFeatures: GeoJSON.Feature[] = scene.road_network.edges.map(e => ({
+      type:       'Feature'    as const,
+      geometry:   { type: 'LineString' as const, coordinates: e.shape },
+      properties: {},
+    }))
+    roadLayer = L.geoJSON(
+      { type: 'FeatureCollection', features: roadFeatures } as GeoJSON.FeatureCollection,
+      { style: () => ({ color: '#e6a817', weight: 2, opacity: 0.85 }) }
+    ).addTo(map)
     roadLayer.bringToBack()
   }
 
-  // 缩放到路网范围
+  // ── 缩放到路网范围 ─────────────────────────────────────────────────────────
   const rb = scene.road_network?.bounds
   if (rb) {
     map.fitBounds([[rb.min_lat, rb.min_lng], [rb.max_lat, rb.max_lng]], { padding: [20, 20] })
   } else {
     map.fitBounds([
-      [bounds.miny, bounds.minx],
-      [bounds.maxy, bounds.maxx],
+      [scene.sel_bounds.miny, scene.sel_bounds.minx],
+      [scene.sel_bounds.maxy, scene.sel_bounds.maxx],
     ], { padding: [20, 20] })
   }
 

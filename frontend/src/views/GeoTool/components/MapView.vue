@@ -61,7 +61,7 @@ let qh            = 4000
 
 function initMap(centerLon = 121.47, centerLat = 31.23) {
   if (!mapEl.value || map) return
-  map = L.map(mapEl.value, { center: [centerLat, centerLon], zoom: 13, zoomControl: true })
+  map = L.map(mapEl.value, { center: [centerLat, centerLon], zoom: 13, zoomControl: true, preferCanvas: true })
 
   // ── Leaflet.draw 汉化 ──────────────────────────────────────────
   L.drawLocal.draw.toolbar.buttons.rectangle        = '框选矩形区域'
@@ -167,18 +167,25 @@ function renderBuildings(geojson: GeoJSON.FeatureCollection) {
         fillOpacity: nf ? 0.70 : 0.35,
       }
     },
-    onEachFeature: (feature, layer) => {
-      const p = feature.properties
-      layer.bindPopup(
-        `<div class="popup-h">${p.h} m</div>
-         <span class="popup-tag ${p.nf ? 'nf' : 'ok'}">
-           ${p.nf ? '🔴 禁飞区' : '🟢 可飞区'}
-         </span>`,
-        { maxWidth: 180 }
-      );
-      (layer as L.Path).on('mouseover', () => (layer as L.Popup).openPopup?.())
-    },
+    // onEachFeature 已移除：Canvas 模式下 3 万个独立监听器会占用大量内存并連带 mouseover 卡顿
   }).addTo(map)
+
+  // 事件委托：图层级单次 click，动态生成 Popup，替代逐个 Feature 绑定
+  buildingLayer.on('click', (e) => {
+    const evt = e as unknown as L.LeafletMouseEvent & {
+      layer?: L.Layer & { feature?: GeoJSON.Feature }
+    }
+    const p = evt.layer?.feature?.properties
+    if (!p || !map) return
+    L.popup({ maxWidth: 180 })
+      .setLatLng(evt.latlng)
+      .setContent(
+        `<div class="popup-h">${p.h} m</div>` +
+        `<span class="popup-tag ${p.nf ? 'nf' : 'ok'}">` +
+        `${p.nf ? '🔴 禁飞区' : '🟢 可飞区'}</span>`
+      )
+      .openOn(map)
+  })
 
   if (selRect) map.fitBounds(selRect.getBounds(), { padding: [20, 20] })
 }
