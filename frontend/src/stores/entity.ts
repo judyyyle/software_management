@@ -6,7 +6,7 @@ import type {
 } from '@/types'
 import type { SceneBounds } from '@/stores/scene'
 import { DEFAULT_DEPOTS, DEFAULT_STATIONS, DEFAULT_TRUCKS, DEFAULT_DRONES } from '@/data/defaultEntities'
-import { gridLayout } from '@/utils/geoLayout'
+import { gridLayoutSplit } from '@/utils/geoLayout'
 
 // ── localStorage 持久化 ───────────────────────────────────────────
 const LS_KEY = 'hl-entity-config-v1'
@@ -97,19 +97,10 @@ export const useEntityStore = defineStore('entity', () => {
    * @param bounds 当前仿真地图边界（来自 sceneStore.context.road_network.bounds）
    */
   function redistributeByBounds(bounds: SceneBounds) {
-    // 充换电站：均匀分布在完整 bbox 内
-    const stationCoords = gridLayout(stations.value.length, bounds)
-
-    // 仓库：分布在 bbox 中心区域（各方向向内收缩 28%），使仓库偏向地图中央
-    const mx  = (bounds.max_lng - bounds.min_lng) * 0.28
-    const my  = (bounds.max_lat - bounds.min_lat) * 0.28
-    const centerBounds: SceneBounds = {
-      min_lng: bounds.min_lng + mx,
-      max_lng: bounds.max_lng - mx,
-      min_lat: bounds.min_lat + my,
-      max_lat: bounds.max_lat - my,
-    }
-    const depotCoords = gridLayout(depots.value.length, centerBounds)
+    // 整体均匀分布：仓库与充换电站共用同一均匀网格
+    // 仓库占据 2D 子网格映射位置（自身也均匀），充换电站填充剩余格点
+    const { depots: depotCoords, stations: stationCoords } =
+      gridLayoutSplit(depots.value.length, stations.value.length, bounds)
 
     depots.value = depots.value.map((d, i) => ({
       ...d,

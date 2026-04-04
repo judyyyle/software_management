@@ -132,6 +132,20 @@ def prepare_scene(
             for nid, (lon, lat) in osm_nodes.items()
         ]
 
+    else:
+        # ── OSM 不可用时降级为合成网格路网，确保前端始终有路网可渲染 ─────────────
+        # 生成 6×6 纵横路网：6 条纵向线 + 6 条横向线，覆盖整个选区
+        n_lines = 6
+        lng_step = (maxx - minx) / (n_lines + 1)
+        lat_step = (maxy - miny) / (n_lines + 1)
+        for i in range(1, n_lines + 1):
+            lng = minx + lng_step * i
+            road_edges.append({"shape": [[lng, miny], [lng, maxy]]})
+        for j in range(1, n_lines + 1):
+            lat = miny + lat_step * j
+            road_edges.append({"shape": [[minx, lat], [maxx, lat]]})
+        print(f"[scene] Overpass 不可达，已生成合成网格路网 {len(road_edges)} 条")
+
     # ── 3. 计算 netOffset（与 sumo_net_osm.py 保持一致，以选区左下角为 UTM 原点）
     _tr = Transformer.from_crs("EPSG:4326", "EPSG:32651", always_xy=True)
     ox, oy = _tr.transform(minx, miny)

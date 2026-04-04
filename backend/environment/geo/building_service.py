@@ -5,9 +5,10 @@
 负责：空间裁剪、高度阈值分类、GeoJSON FeatureCollection 生成
 """
 
+import json
+
 import pandas as pd
 import geopandas as gpd
-from shapely.geometry import mapping
 
 
 def query_buildings(
@@ -52,31 +53,29 @@ def query_buildings(
         heights = heights.loc[keep]
         nf_mask = nf_mask.loc[keep]
 
-    features = []
-    for idx, row in sub.iterrows():
-        g = row.geometry
-        if g is None or g.is_empty:
-            continue
-        features.append({
-            "type": "Feature",
-            "geometry": mapping(g),
-            "properties": {
-                "h":  round(float(heights[idx]), 1),
-                "nf": bool(nf_mask[idx]),
-            },
-        })
-
-    return {
-        "type": "FeatureCollection",
-        "features": features,
-        "stats": {
-            "total":     total,
-            "shown":     len(features),
-            "no_fly":    no_fly_count,
-            "fly":       total - no_fly_count,
-            "truncated": truncated,
+    # 构建精简 GeoDataFrame（仅保留必要字段）并简化几何
+    # 使用 geometry= 参数确保正确设置几何列，按 index 对齐
+    slim = gpd.GeoDataFrame(
+        {
+            "h":  heights.round(1),
+            "nf": nf_mask.astype(bool),
         },
+        geometry=sub.geometry.simplify(0.00001, preserve_topology=True),
+        crs=sub.crs,
+    )
+    # 极少数建筑在简化后退化为空几何（如细长条），过滤掉
+    slim = slim[slim.geometry.notna() & ~slim.geometry.is_empty]
+
+    # 向量化序列化：利用 geopandas C 扩展，远快于 iterrows + mapping
+    result: dict = json.loads(slim.to_json())
+    result["stats"] = {
+        "total":     total,
+        "shown":     len(slim),
+        "no_fly":    no_fly_count,
+        "fly":       total - no_fly_count,
+        "truncated": truncated,
     }
+    return result
 
 
 def prepare_sub(gdf: gpd.GeoDataFrame, minx, miny, maxx, maxy, threshold, h_col):

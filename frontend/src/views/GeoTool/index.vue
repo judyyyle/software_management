@@ -91,6 +91,10 @@ const currentThreshold = ref(120)
 const currentFmt      = ref('sumo_zip_osm')
 const currentHCol     = ref<string | null>(null)
 const gridSpacing     = ref(200)
+// 保存最近一次 /api/geo/query 的建筑 GeoJSON，供「导出到指挥中心」时递传给 sceneStore
+// 避免 UnifiedMapView 挂载时重复请求。类型宽松为 any，因为 fetch 返回本就是 untyped JSON
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+const lastBuildingsGeoJSON = ref<any>(null)
 
 const statusInfo = ref({ dot: '', text: '连接中…' })
 
@@ -152,6 +156,8 @@ async function handleQuery() {
     if (geojson.error) throw new Error(geojson.error)
 
     queryResult.value = geojson.stats
+    // 缓存建筑 GeoJSON，供后续「导出到指挥中心」直接使用
+    lastBuildingsGeoJSON.value = geojson
     mapRef.value?.renderBuildings(geojson)
     mapRef.value?.fetchRoads(selBounds.value)
 
@@ -218,13 +224,17 @@ async function handleExport() {
 
 async function handleExportToDispatch() {
   if (!selBounds.value) return
+  // 1. 请求后端构建场景（会内部清空旧缓存）
   await sceneStore.prepareScene({
     sel_bounds:    selBounds.value,
     threshold:     currentThreshold.value,
     height_column: currentHCol.value ?? null,
   })
   if (!sceneStore.error && sceneStore.context) {
-    // 根据新地图 bbox 重新分配仓库和充换电站坐标
+    // 2. 将本次查询的建筑 GeoJSON 写入缓存——
+    //    必须在 prepareScene 成功后设置，因为 prepareScene 会先清空旧缓存
+    sceneStore.setBuildingsGeoJSON(lastBuildingsGeoJSON.value)
+    // 3. 根据新地图 bbox 重新均匀分配仓库和充换电站坐标
     entityStore.redistributeByBounds(sceneStore.context.road_network.bounds)
     router.push('/dispatch')
   }
