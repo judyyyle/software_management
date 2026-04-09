@@ -9,7 +9,7 @@ import { DEFAULT_DEPOTS, DEFAULT_STATIONS, DEFAULT_TRUCKS, DEFAULT_DRONES } from
 import { gridLayoutSplit } from '@/utils/geoLayout'
 
 // ── localStorage 持久化 ───────────────────────────────────────────
-const LS_KEY = 'hl-entity-config-v1'
+const LS_KEY = 'hl-entity-config-v2'
 
 function loadFromStorage(): {
   depots: DepotConfig[]

@@ -5,27 +5,17 @@
  *   - 纯静态数据，不含任何逻辑、响应式状态或函数
  *   - lng / lat 均为 0：坐标由地图选取后 redistributeByBounds() 自动填充
  *   - 命名使用通用编号，不绑定任何真实地名或城市
- *   - 规模：2 仓库 + 10 充换电站 + 3 卡车 + 12 无人机（满足 Phase 2 约束）
+ *   - 规模：1 仓库 + 10 充换电站 + 1 卡车 + 12 无人机
  */
 
 import type { DepotConfig, StationConfig, TruckConfig, DroneConfig } from '@/types'
 
-// ── 默认仓库（2 个） ─────────────────────────────────────────────
+// ── 默认仓库（1 个） ─────────────────────────────────────────────
 
 export const DEFAULT_DEPOTS: DepotConfig[] = [
   {
     depot_id:      'DEP-DEFAULT-01',
     name:          '仓库-01',
-    lng:           0,
-    lat:           0,
-    altitude:      0,
-    capacity:      500,
-    swap_time:     90,
-    parking_slots: 4,
-  },
-  {
-    depot_id:      'DEP-DEFAULT-02',
-    name:          '仓库-02',
     lng:           0,
     lat:           0,
     altitude:      0,
@@ -47,7 +37,7 @@ export const DEFAULT_STATIONS: StationConfig[] = Array.from({ length: 10 }, (_, 
   parking_slots: 2,
 }))
 
-// ── 默认卡车（3 辆） ─────────────────────────────────────────────
+// ── 默认卡车（1 辆） ─────────────────────────────────────────────
 
 export const DEFAULT_TRUCKS: TruckConfig[] = [
   {
@@ -59,48 +49,27 @@ export const DEFAULT_TRUCKS: TruckConfig[] = [
     parking_slots: 3,
     home_depot_id: 'DEP-DEFAULT-01',
   },
-  {
-    truck_id:      'TRK-DEFAULT-02',
-    name:          '卡车-02',
-    speed:         15,
-    max_inventory: 30,
-    swap_time:     90,
-    parking_slots: 3,
-    home_depot_id: 'DEP-DEFAULT-01',
-  },
-  {
-    truck_id:      'TRK-DEFAULT-03',
-    name:          '卡车-03',
-    speed:         12,
-    max_inventory: 40,
-    swap_time:     90,
-    parking_slots: 3,
-    home_depot_id: 'DEP-DEFAULT-02',
-  },
 ]
 
 // ── 默认无人机（12 架：LightDrone × 9 + HeavyDrone × 3） ────────
 //
-//   卡车搭载：每辆卡车 1 架 LightDrone（共 3 架）
+//   卡车搭载：1 架 LightDrone
 //   仓库-01：  LightDrone × 3 + HeavyDrone × 2
-//   仓库-02：  LightDrone × 3 + HeavyDrone × 1
 
 export const DEFAULT_DRONES: DroneConfig[] = [
   // 卡车搭载
   { drone_id: 'UAV-DEFAULT-01', drone_type: 'LightDrone', home_id: 'TRK-DEFAULT-01', home_type: 'TRUCK' },
-  { drone_id: 'UAV-DEFAULT-02', drone_type: 'LightDrone', home_id: 'TRK-DEFAULT-02', home_type: 'TRUCK' },
-  { drone_id: 'UAV-DEFAULT-03', drone_type: 'LightDrone', home_id: 'TRK-DEFAULT-03', home_type: 'TRUCK' },
   // 仓库-01 LightDrone
+  { drone_id: 'UAV-DEFAULT-02', drone_type: 'LightDrone', home_id: 'DEP-DEFAULT-01', home_type: 'DEPOT' },
+  { drone_id: 'UAV-DEFAULT-03', drone_type: 'LightDrone', home_id: 'DEP-DEFAULT-01', home_type: 'DEPOT' },
   { drone_id: 'UAV-DEFAULT-04', drone_type: 'LightDrone', home_id: 'DEP-DEFAULT-01', home_type: 'DEPOT' },
   { drone_id: 'UAV-DEFAULT-05', drone_type: 'LightDrone', home_id: 'DEP-DEFAULT-01', home_type: 'DEPOT' },
   { drone_id: 'UAV-DEFAULT-06', drone_type: 'LightDrone', home_id: 'DEP-DEFAULT-01', home_type: 'DEPOT' },
-  // 仓库-02 LightDrone
-  { drone_id: 'UAV-DEFAULT-07', drone_type: 'LightDrone', home_id: 'DEP-DEFAULT-02', home_type: 'DEPOT' },
-  { drone_id: 'UAV-DEFAULT-08', drone_type: 'LightDrone', home_id: 'DEP-DEFAULT-02', home_type: 'DEPOT' },
-  { drone_id: 'UAV-DEFAULT-09', drone_type: 'LightDrone', home_id: 'DEP-DEFAULT-02', home_type: 'DEPOT' },
+  { drone_id: 'UAV-DEFAULT-07', drone_type: 'LightDrone', home_id: 'DEP-DEFAULT-01', home_type: 'DEPOT' },
+  { drone_id: 'UAV-DEFAULT-08', drone_type: 'LightDrone', home_id: 'DEP-DEFAULT-01', home_type: 'DEPOT' },
+  { drone_id: 'UAV-DEFAULT-09', drone_type: 'LightDrone', home_id: 'DEP-DEFAULT-01', home_type: 'DEPOT' },
   // 仓库-01 HeavyDrone
   { drone_id: 'UAV-DEFAULT-10', drone_type: 'HeavyDrone', home_id: 'DEP-DEFAULT-01', home_type: 'DEPOT' },
   { drone_id: 'UAV-DEFAULT-11', drone_type: 'HeavyDrone', home_id: 'DEP-DEFAULT-01', home_type: 'DEPOT' },
-  // 仓库-02 HeavyDrone
-  { drone_id: 'UAV-DEFAULT-12', drone_type: 'HeavyDrone', home_id: 'DEP-DEFAULT-02', home_type: 'DEPOT' },
+  { drone_id: 'UAV-DEFAULT-12', drone_type: 'HeavyDrone', home_id: 'DEP-DEFAULT-01', home_type: 'DEPOT' },
 ]

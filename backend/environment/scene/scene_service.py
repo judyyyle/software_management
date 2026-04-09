@@ -200,3 +200,94 @@ def get_scene_by_id(scene_id: str) -> Optional[dict]:
         if ctx["scene_id"] == scene_id:
             return ctx
     return None
+
+
+def load_preset_scene(preset_id: str) -> Optional[dict]:
+    """
+    加载预设场景（从磁盘缓存）。
+    
+    Args:
+        preset_id: 预设场景 ID，如 'default_test_4x4km'
+    
+    Returns:
+        SceneContext dict，格式与 prepare_scene() 返回值相同
+        或 None 如果预设场景不存在
+    """
+    try:
+        from preset_scenes import get_preset_scene
+        preset = get_preset_scene(preset_id)
+        if not preset:
+            return None
+        
+        # 将预设场景转换为 SceneContext 格式
+        bounds = preset.get("bounds", {})
+        config = preset.get("config", {})
+        osm_data = preset.get("osm_network", {})
+        
+        sel_bounds = {
+            "minx": bounds.get("min_lng", 0),
+            "miny": bounds.get("min_lat", 0),
+            "maxx": bounds.get("max_lng", 0),
+            "maxy": bounds.get("max_lat", 0),
+        }
+        
+        # 使用配置中的阈值，或默认 80
+        threshold = config.get("threshold", 80)
+        
+        # 从 OSM GeoJSON 提取特征（道路）
+        geojson_features = osm_data.get("features", []) if isinstance(osm_data, dict) else []
+        
+        # 过滤出 LineString 类型作为道路
+        road_edges = [
+            {"shape": f["geometry"]["coordinates"]} 
+            for f in geojson_features 
+            if f.get("geometry", {}).get("type") == "LineString"
+        ]
+        
+        # 计算 netOffset
+        _tr = Transformer.from_crs("EPSG:4326", "EPSG:32651", always_xy=True)
+        ox, oy = _tr.transform(sel_bounds["minx"], sel_bounds["miny"])
+        
+        # 组装 SceneContext
+        scene_id = str(uuid.uuid4())
+        ctx: dict = {
+            "scene_id": scene_id,
+            "sel_bounds": sel_bounds,
+            "threshold": threshold,
+            "height_column": "height",
+            "meta": {
+                "road_source": "osm_preset",
+                "road_nodes": 0,
+                "road_edges": len(road_edges),
+                "created_at": datetime.datetime.utcnow().isoformat() + "Z",
+                "utm_zone": 51,
+                "utm_band": "N",
+                "net_offset": {
+                    "ox": round(float(ox), 2),
+                    "oy": round(float(oy), 2),
+                },
+            },
+            "road_network": {
+                "nodes": [],
+                "edges": road_edges,
+                "bounds": {
+                    "min_lng": sel_bounds["minx"],
+                    "min_lat": sel_bounds["miny"],
+                    "max_lng": sel_bounds["maxx"],
+                    "max_lat": sel_bounds["maxy"],
+                },
+            },
+        }
+        
+        # 写入缓存
+        h = _params_hash(sel_bounds, threshold)
+        _cache[h] = ctx
+        print(f"[scene] 预设场景已加载 preset_id={preset_id} scene_id={scene_id}")
+        return ctx
+        
+    except Exception as e:
+        print(f"[ERROR] 加载预设场景失败: {e}", file=sys.stderr)
+        import traceback
+        traceback.print_exc()
+        return None
+

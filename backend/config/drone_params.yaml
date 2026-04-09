@@ -18,7 +18,7 @@ light_drone:
   k2: 0.0059        # W / (m/s)^3  (巡航速度阻力项)
 
   # 飞行性能
-  cruise_speed: 15.0           # m/s，巡航速度
+  cruise_speed: 20.0           # m/s，巡航速度
   payload_capacity: 2.0        # kg，最大有效载荷
   empty_weight: 1.5            # kg，机体自重
 
@@ -33,7 +33,7 @@ heavy_drone:
   k2: 0.10          # W / (m/s)^3  (较大机体，阻力系数更高)
 
   # 飞行性能
-  cruise_speed: 10.0           # m/s，巡航速度较慢
+  cruise_speed: 15.0           # m/s，巡航速度较慢
   payload_capacity: 10.0       # kg，最大有效载荷
   empty_weight: 5.0            # kg，机体自重
 

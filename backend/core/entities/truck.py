@@ -103,14 +103,16 @@ class Truck(ChargingHost):
         route_nodes: list[str],
         route_positions: list[Position3D],
         departure_time: float,
+        geometry: list[Position3D] | None = None,
     ) -> None:
         """
         绑定新的行驶路由。
 
         Args:
-            route_nodes:     SUMO 节点 ID 列表（与 route_positions 等长）
-            route_positions: 每个节点对应的 UTM 三维坐标列表
+            route_nodes:     SUMO 节点 ID 列表（关键节点）
+            route_positions: 每个关键节点对应的 UTM 三维坐标列表
             departure_time:  开始行驶的仿真时间（秒）
+            geometry:        完整的路径几何（包含所有中间OSM节点），若提供则用其替代 route_positions
 
         Raises:
             ValueError: 节点 ID 列表与坐标列表长度不一致
@@ -128,19 +130,27 @@ class Truck(ChargingHost):
         self._current_node_idx = 1  # 从第一段开始前进
 
         # ── 预计算各节点的累计路径长度（便于后续 O(log n) 位置插值）──────────
+        # 优先使用完整几何路径；若几何点不足（<2）则回退关键节点，避免“零长度路线”
+        positions_to_use = geometry if geometry and len(geometry) >= 2 else route_positions
+        
         self._route_data = []
         cumulative = 0.0
         prev_pos: Optional[Position3D] = None
-        for nid, pos in zip(route_nodes, route_positions):
+        for pos in positions_to_use:
             if prev_pos is not None:
                 cumulative += prev_pos.distance_2d(pos)  # 地面路由取2D距离
-            self._route_data.append(_RouteNode(nid, pos, cumulative))
+            self._route_data.append(_RouteNode("", pos, cumulative))
             prev_pos = pos
+
+        # ── 立即更新为路由起始点 ─────────────────────────────────────────────
+        if self._route_data:
+            self.current_loc = self._route_data[0].position
 
         self.status = TruckStatus.DRIVING
         logger.debug(
-            "[Truck %s] 设置路由：%d 个节点，总路径长 %.0f m",
-            self.truck_id, len(route_nodes), self._route_data[-1].cumulative_dist,
+            "[Truck %s] 设置路由：%d 个关键节点，几何路径 %d 点，总路径长 %.0f m，起始位置 (%.2f, %.2f)",
+            self.truck_id, len(route_nodes), len(positions_to_use), self._route_data[-1].cumulative_dist,
+            self.current_loc.x, self.current_loc.y,
         )
 
     # ══════════════════════════════════════════════════════════════════════════
@@ -486,7 +496,12 @@ class Truck(ChargingHost):
         Returns:
             JSON 可序列化的卡车状态字典
         """
-        lon, lat = self.current_loc.to_wgs84()
+        try:
+            lon, lat = self.current_loc.to_wgs84()
+        except Exception as e:
+            logger.error(f"[Truck.to_telemetry_dict] 坐标转换失败: {e}, current_loc={self.current_loc}")
+            lon, lat = 0.0, 0.0
+        
         with self._lock:
             docked = list(self.docked_drones)
             waiting = list(self.wait_queue)
@@ -515,7 +530,13 @@ class Truck(ChargingHost):
         包含所有 TruckConfig 非 Optional 字段，防止 setRuntimeAll 全量替换后字段丢失。
         name / home_depot_id 由 EntityManager.get_telemetry() 从 _metadata 合并。
         """
-        lon, lat = self.current_loc.to_wgs84()
+        try:
+            lon, lat = self.current_loc.to_wgs84()
+        except Exception as e:
+            logger.error(f"[Truck.to_dynamic_state] 坐标转换失败: {e}, current_loc={self.current_loc}")
+            # 返回临时坐标避免序列化失败
+            lon, lat = 0.0, 0.0
+        
         return {
             "truck_id":        self.truck_id,
             # ── 静态 TruckConfig 必填字段 ─────────────────────────────────────
