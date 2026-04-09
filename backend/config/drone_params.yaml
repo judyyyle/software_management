@@ -67,3 +67,13 @@ solver_energy:
   # 业务约束：是否允许无人机在运动中的卡车上直接起飞（模式B）
   # false: 仅允许 B_WAIT（随车到站后起飞）
   allow_moving_truck_launch: false
+
+  # 业务时长参数（所有算法共享）
+  # 卡车配送订单（到达客户点后的服务停留）
+  truck_service_time_order_s: 60
+  # 无人机配送订单（到达客户点后的服务停留）
+  drone_service_time_order_s: 30
+  # 卡车放飞无人机操作时长
+  truck_drone_launch_time_s: 10
+  # 卡车接回无人机操作时长
+  truck_drone_recover_time_s: 10

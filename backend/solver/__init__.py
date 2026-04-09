@@ -8,6 +8,16 @@ HiveLogix — 求解层
   from solver.decision_engine import DispatchDecisionEngine
 """
 
+from solver.decision_engine import DispatchDecisionEngine
+from solver.factory import create_solver, list_solvers, register_solver
 from solver.greedy_baseline import GreedyBaseline
+from solver.interfaces import DispatchSolver
 
-__all__ = ["GreedyBaseline"]
+__all__ = [
+    "GreedyBaseline",
+    "DispatchDecisionEngine",
+    "DispatchSolver",
+    "create_solver",
+    "register_solver",
+    "list_solvers",
+]

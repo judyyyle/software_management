@@ -652,9 +652,9 @@ def sim_orders():
 @sim_bp.route("/dispatch", methods=["POST"])
 def sim_dispatch():
     """
-    触发调度决策（贪心算法 baseline）。
+    触发调度决策（支持可切换求解器）。
 
-    将所有待分配订单（pending_orders）传递给贪心求解器，
+    将所有待分配订单（pending_orders）传递给当前求解器，
     返回分配方案并将订单状态更新为 assigned。
 
     请求体：
@@ -685,9 +685,12 @@ def sim_dispatch():
 
     logger.debug(f"[sim_dispatch] 收到请求体: {body}")
 
-    if solver != "greedy":
+    try:
+        _dispatch_engine.set_solver(str(solver))
+    except ValueError as exc:
         return jsonify({
-            "error": f"暂不支持求解器 '{solver}'，请使用 'greedy' baseline",
+            "error": str(exc),
+            "available_solvers": _dispatch_engine.get_available_solvers(),
         }), 400
 
     if not bbox or not all(k in bbox for k in ["minx", "miny", "maxx", "maxy"]):

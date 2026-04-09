@@ -19,7 +19,10 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING
 
-from solver.greedy_baseline import GreedyBaseline, AllocationResult, DispatchPlan
+from config.loader import load_solver_energy_params
+from solver.factory import create_solver, list_solvers
+from solver.greedy_baseline import AllocationResult, DispatchPlan
+from solver.interfaces import DispatchSolver
 from core.entities.primitives import RouteWaypoint, WaypointAction, SourceType, DroneStatus
 
 if TYPE_CHECKING:
@@ -34,7 +37,7 @@ class DispatchDecisionEngine:
     调度决策编排器。
 
     职责：
-      1. 调用 GreedyBaseline（或后续的其他求解器）进行分配
+        1. 调用已配置求解器（Greedy/ALNS/DRL 等）进行分配
       2. 应用分配结果到实体和订单的状态机
       3. 发出后续行为触发（如驾驶、飞行、充电）
     """
@@ -43,15 +46,44 @@ class DispatchDecisionEngine:
         self,
         entity_mgr: "EntityManager",
         order_mgr: "OrderManager",
+        solver: DispatchSolver | None = None,
+        solver_name: str = "greedy",
     ) -> None:
         """
         Args:
             entity_mgr: EntityManager 实例
             order_mgr:  OrderManager 实例
+            solver:     可选，外部注入求解器实例
+            solver_name:未注入 solver 时，按名称从工厂创建（默认 greedy）
         """
         self.entity_mgr = entity_mgr
         self.order_mgr = order_mgr
-        self.solver = GreedyBaseline(entity_mgr)
+        if solver is not None:
+            self.solver = solver
+            self.solver_name = solver.__class__.__name__.lower()
+        else:
+            self.solver_name = solver_name.strip().lower()
+            self.solver = create_solver(self.solver_name, self.entity_mgr)
+
+        runtime_cfg = load_solver_energy_params()
+        self.TRUCK_DRONE_LAUNCH_TIME = runtime_cfg.truck_drone_launch_time_s
+        self.TRUCK_DRONE_RECOVER_TIME = runtime_cfg.truck_drone_recover_time_s
+
+    def set_solver(self, solver_name: str) -> None:
+        """按名称切换求解器实例。"""
+        target = solver_name.strip().lower()
+        if not target:
+            raise ValueError("solver_name 不能为空")
+        if target == self.solver_name:
+            return
+        self.solver = create_solver(target, self.entity_mgr)
+        self.solver_name = target
+        logger.info("[DispatchDecisionEngine] 已切换求解器为 %s", target)
+
+    @staticmethod
+    def get_available_solvers() -> list[str]:
+        """返回当前可用求解器列表。"""
+        return list_solvers()
 
     def execute(self, current_time: float, bbox: dict, scene_id: str | None = None) -> DispatchPlan:
         """
@@ -216,7 +248,7 @@ class DispatchDecisionEngine:
                 None,
             )
             if launch_node is not None:
-                alloc.launch_time = launch_node.arrival_time
+                alloc.launch_time = launch_node.arrival_time + self.TRUCK_DRONE_LAUNCH_TIME
 
         # ── 第三步：应用无人机路由 ────────────────────────────────────────────
         self._setup_drone_routes(plan, current_time)
@@ -249,8 +281,11 @@ class DispatchDecisionEngine:
             return
 
         allocs_by_recovery: dict[str, list["AllocationResult"]] = {}
+        allocs_by_launch: dict[str, list["AllocationResult"]] = {}
         for alloc in related_allocs:
             allocs_by_recovery.setdefault(alloc.recovery_station_id, []).append(alloc)
+            if alloc.launch_station_id:
+                allocs_by_launch.setdefault(alloc.launch_station_id, []).append(alloc)
 
         original_arrivals = [node.arrival_time for node in route.nodes]
         original_departures = [node.departure_time for node in route.nodes]
@@ -279,6 +314,16 @@ class DispatchDecisionEngine:
                     expected_recovery_time = launch_arrival + alloc.wait_duration
                     needed_departure = max(needed_departure, expected_recovery_time)
                 service_time = max(0.0, needed_departure - arrival)
+                launch_ops = allocs_by_launch.get(node.node_id, [])
+                recovery_ops = allocs_by_recovery.get(node.node_id, [])
+                op_hold = 0.0
+                if launch_ops:
+                    op_hold = max(op_hold, self.TRUCK_DRONE_LAUNCH_TIME)
+                if recovery_ops:
+                    op_hold = max(op_hold, self.TRUCK_DRONE_RECOVER_TIME)
+                if op_hold > 0.0:
+                    # 若同站同时有放飞和回收，按可并行处理取 max，而非累加。
+                    service_time = max(service_time, op_hold)
             else:
                 service_time = base_services[i]
 
@@ -318,15 +363,25 @@ class DispatchDecisionEngine:
         elif node.node_type == "customer":
             return f"配送订单 {node.order_id}"
         elif node.node_type == "recovery":
-            # 找到关联的订单
-            related_orders = [
+            launch_orders = [
                 alloc.order_id for alloc in allocations
-                if alloc.recovery_station_id == node.node_id and alloc.mode == "B"
+                if alloc.feasible and alloc.mode == "B_WAIT" and alloc.launch_station_id == node.node_id
             ]
-            if related_orders:
-                return f"回收无人机（订单: {', '.join(related_orders)}）"
-            else:
-                return "回收无人机"
+            recovery_orders = [
+                alloc.order_id for alloc in allocations
+                if alloc.feasible and alloc.mode in ("B", "B_WAIT") and alloc.recovery_station_id == node.node_id
+            ]
+
+            if launch_orders and recovery_orders:
+                return (
+                    f"放飞+回收无人机（放飞订单: {', '.join(launch_orders)}；"
+                    f"回收订单: {', '.join(recovery_orders)}）"
+                )
+            if launch_orders:
+                return f"放飞无人机（订单: {', '.join(launch_orders)}）"
+            if recovery_orders:
+                return f"回收无人机（订单: {', '.join(recovery_orders)}）"
+            return "站点停靠"
         elif node.node_type == "station":
             return "经停充电站（广播给无人机）"
         else:
