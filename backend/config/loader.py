@@ -67,7 +67,7 @@ class DroneParamsConfig:
 
 @dataclass(frozen=True)
 class SolverEnergyParams:
-    """求解器统一评分参数（距离/能耗/时间惩罚）。"""
+    """求解器统一参数（评分 + 业务时长）。"""
 
     c_dist_et: float
     c_dist_uav: float
@@ -80,6 +80,12 @@ class SolverEnergyParams:
     uav_energy_model: str
     uav_alpha_wh_per_kg_km: float
     allow_moving_truck_launch: bool
+
+    # 业务时长参数 [s]
+    truck_service_time_order_s: float
+    drone_service_time_order_s: float
+    truck_drone_launch_time_s: float
+    truck_drone_recover_time_s: float
 
     @property
     def truck_energy_wh_per_meter(self) -> float:
@@ -168,6 +174,10 @@ def _parse_solver_energy(raw: dict[str, Any]) -> SolverEnergyParams:
         uav_energy_model=str(raw.get("uav_energy_model", "physics")).strip().lower(),
         uav_alpha_wh_per_kg_km=float(raw.get("uav_alpha_wh_per_kg_km", 0.24)),
         allow_moving_truck_launch=bool(raw.get("allow_moving_truck_launch", False)),
+        truck_service_time_order_s=float(raw.get("truck_service_time_order_s", 60.0)),
+        drone_service_time_order_s=float(raw.get("drone_service_time_order_s", 30.0)),
+        truck_drone_launch_time_s=float(raw.get("truck_drone_launch_time_s", 10.0)),
+        truck_drone_recover_time_s=float(raw.get("truck_drone_recover_time_s", 10.0)),
     )
 
     if params.truck_energy_kwh_per_km <= 0:
@@ -178,6 +188,14 @@ def _parse_solver_energy(raw: dict[str, Any]) -> SolverEnergyParams:
         raise ValueError("[solver_energy] uav_alpha_wh_per_kg_km 必须为正数")
     if params.lambda_time < 0:
         raise ValueError("[solver_energy] lambda_time 不能为负数")
+    if params.truck_service_time_order_s < 0:
+        raise ValueError("[solver_energy] truck_service_time_order_s 不能为负数")
+    if params.drone_service_time_order_s < 0:
+        raise ValueError("[solver_energy] drone_service_time_order_s 不能为负数")
+    if params.truck_drone_launch_time_s < 0:
+        raise ValueError("[solver_energy] truck_drone_launch_time_s 不能为负数")
+    if params.truck_drone_recover_time_s < 0:
+        raise ValueError("[solver_energy] truck_drone_recover_time_s 不能为负数")
 
     return params
 
