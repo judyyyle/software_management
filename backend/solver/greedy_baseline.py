@@ -23,6 +23,7 @@ import networkx as nx
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Optional
 
+from config.loader import load_solver_energy_params
 from core.entities.primitives import DroneStatus, Position3D
 from pyproj import Transformer
 import osm_service as _osm_svc
@@ -65,6 +66,11 @@ class AllocationResult:
     launch_station_id: str = ""         # 模式 B_WAIT：无人机出发的充电站 ID
     launch_time: float = 0.0            # 无人机实际起飞时间
     wait_duration: float = 0.0          # 在出发充电站等待的时间（秒）
+    # 统一评分结果（用于模式间比较）
+    score_total: float = math.inf
+    cost_dist: float = 0.0
+    cost_energy: float = 0.0
+    cost_penalty: float = 0.0
 
 
 @dataclass
@@ -132,10 +138,35 @@ class GreedyBaseline:
     WAIT_PENALTY_FACTOR   = 0.5    # 每秒等待时间的成本系数（相对于距离）
     EARLY_ARRIVAL_PENALTY = 120.0  # 每分钟提早到达的惩罚（相对于距离）
 
+    # 统一目标函数系数：f = f_dist + f_energy + f_penalty
+    C_DIST_ET = 1.0
+    C_DIST_UAV = 1.0
+    C_ENERGY_ET = 1.0
+    C_ENERGY_UAV = 1.0
+    LAMBDA_TIME = 1.0
+
+    # 能耗模型参数（用于评分）
+    TRUCK_ENERGY_KWH_PER_KM = 0.75  # ET: 每公里耗电 [kWh/km]
+    TRUCK_ENERGY_WH_PER_METER = TRUCK_ENERGY_KWH_PER_KM  # = 0.75 Wh/m
+    UAV_ALPHA_WH_PER_KG_KM = 0.24   # UAV: alpha_k [Wh/(kg·km)]
+
     def __init__(self, entity_mgr: "EntityManager") -> None:
         self.entity_mgr = entity_mgr
         self.min_reserve_energy = 200.0   # 无人机绝对电量底线 [J]
         self.delivery_service_time = 30.0  # 配送点停留时间 [s]
+
+        # 评分与能耗参数统一从配置读取，便于所有算法共享。
+        energy_cfg = load_solver_energy_params()
+        self.C_DIST_ET = energy_cfg.c_dist_et
+        self.C_DIST_UAV = energy_cfg.c_dist_uav
+        self.C_ENERGY_ET = energy_cfg.c_energy_et
+        self.C_ENERGY_UAV = energy_cfg.c_energy_uav
+        self.LAMBDA_TIME = energy_cfg.lambda_time
+        self.TRUCK_ENERGY_KWH_PER_KM = energy_cfg.truck_energy_kwh_per_km
+        self.TRUCK_ENERGY_WH_PER_METER = energy_cfg.truck_energy_wh_per_meter
+        self.UAV_ENERGY_MODEL = energy_cfg.uav_energy_model
+        self.UAV_ALPHA_WH_PER_KG_KM = energy_cfg.uav_alpha_wh_per_kg_km
+        self.ALLOW_MOVING_TRUCK_LAUNCH = energy_cfg.allow_moving_truck_launch
 
     # ══════════════════════════════════════════════════════════════════════════
     # 公共接口
@@ -242,9 +273,13 @@ class GreedyBaseline:
             )
 
         cost_total = sum(
-            r.distance for r in allocations
-            if r.feasible and math.isfinite(r.distance)
+            r.score_total for r in allocations
+            if r.feasible and math.isfinite(r.score_total)
         )
+
+        cost_dist_total = sum(r.cost_dist for r in allocations if r.feasible)
+        cost_energy_total = sum(r.cost_energy for r in allocations if r.feasible)
+        cost_penalty_total = sum(r.cost_penalty for r in allocations if r.feasible)
 
         plan = DispatchPlan(
             allocations=allocations,
@@ -253,6 +288,11 @@ class GreedyBaseline:
                 "total_orders": len(allocations),
                 "feasible": sum(1 for r in allocations if r.feasible),
                 "modes": mode_counter,
+                "cost_breakdown": {
+                    "dist": cost_dist_total,
+                    "energy": cost_energy_total,
+                    "penalty": cost_penalty_total,
+                },
             },
             truck_routes=truck_routes,
         )
@@ -306,11 +346,20 @@ class GreedyBaseline:
             predicted_stations = self._predict_truck_charging_stations(truck, current_time)
 
             for station_id, station_loc in predicted_stations:
+                truck_loc = truck.get_location(current_time)
+                truck_distance_to_launch = self._dist(truck_loc, station_loc)
+                launch_delay = (
+                    truck_distance_to_launch / truck.speed
+                    if truck.speed > 0 else float("inf")
+                )
+
                 # 评估从该充电站出发的方案
                 scenario = self._evaluate_charging_station_departure(
                     drone=drone,
                     launch_loc=station_loc,
                     launch_station_id=station_id,
+                    truck_distance_to_launch=truck_distance_to_launch,
+                    launch_delay=launch_delay,
                     delivery_loc=order.delivery_loc,
                     payload=order.payload_weight,
                     recovery_pool=recovery_pool,
@@ -337,6 +386,10 @@ class GreedyBaseline:
                 launch_station_id=best_scenario["launch_station_id"],
                 launch_time=best_scenario["launch_time"],
                 wait_duration=best_scenario["wait_duration"],
+                score_total=best_scenario["score"],
+                cost_dist=best_scenario["cost_dist"],
+                cost_energy=best_scenario["cost_energy"],
+                cost_penalty=best_scenario["cost_penalty"],
             )
 
         # 找不到可行方案
@@ -349,23 +402,56 @@ class GreedyBaseline:
     # ══════════════════════════════════════════════════════════════════════════
 
     def _allocate_order(self, order: "Order", current_time: float, allocated_drones: set[str]) -> AllocationResult:
-        """优先级：模式 B_WAIT > 模式 B > 模式 C > 模式 A。
+        """在可行候选中选择统一评分最小的方案。
         
         Args:
             order: 待分配订单
             current_time: 当前仿真时刻
             allocated_drones: 本次调度中已分配的无人机ID集合（用于防止重复分配）
         """
-        # 首先尝试改进的模式 B（在充电站等待）
-        result = self._try_mode_b_with_waiting(order, current_time, allocated_drones)
-        if result.feasible:
-            return result
+        candidates: list[AllocationResult] = []
 
-        # 然后尝试原始模式 B（从卡车当前位置）
-        for try_fn in (self._try_mode_b, self._try_mode_c, self._try_mode_a):
+        try_fns = [self._try_mode_b_with_waiting, self._try_mode_c, self._try_mode_a]
+        if self.ALLOW_MOVING_TRUCK_LAUNCH:
+            try_fns.insert(1, self._try_mode_b)
+
+        for try_fn in try_fns:
             result = try_fn(order, current_time, allocated_drones)
-            if result.feasible:
-                return result
+            if not result.feasible:
+                continue
+
+            score_total, cost_dist, cost_energy, cost_penalty = self._score_allocation(
+                result, order, current_time
+            )
+            result.score_total = score_total
+            result.cost_dist = cost_dist
+            result.cost_energy = cost_energy
+            result.cost_penalty = cost_penalty
+            candidates.append(result)
+
+        if candidates:
+            best = min(candidates, key=lambda r: r.score_total)
+            logger.info(
+                "[GreedyBaseline] 订单 %s 候选评分: %s | 选中=%s score=%.2f (dist=%.2f, energy=%.2f, penalty=%.2f)",
+                order.order_id,
+                [
+                    {
+                        "mode": c.mode,
+                        "score": round(c.score_total, 2),
+                        "dist": round(c.cost_dist, 2),
+                        "energy": round(c.cost_energy, 2),
+                        "penalty": round(c.cost_penalty, 2),
+                    }
+                    for c in candidates
+                ],
+                best.mode,
+                best.score_total,
+                best.cost_dist,
+                best.cost_energy,
+                best.cost_penalty,
+            )
+            return best
+
         return AllocationResult(
             order_id=order.order_id,
             vehicle_id="",
@@ -852,6 +938,120 @@ class GreedyBaseline:
         dz = pos_a.z - pos_b.z
         return math.sqrt(dx * dx + dy * dy + dz * dz)
 
+    def _truck_energy_wh(self, distance_m: float) -> float:
+        """卡车电耗模型：0.75 kWh/km -> 0.75 Wh/m。"""
+        return max(0.0, distance_m) * self.TRUCK_ENERGY_WH_PER_METER
+
+    def _uav_energy_wh(
+        self,
+        drone: "Drone",
+        from_pos: Position3D,
+        to_pos: Position3D,
+        payload: float,
+    ) -> float:
+        """
+        UAV 能耗模型（评分用）：
+        - physics: 复用 drone.py 既有功率模型，先算焦耳再转 Wh
+        - alpha:   线性经验模型 B_ij = alpha_k * (W_k + payload) * d_ij(km)
+        """
+        if self.UAV_ENERGY_MODEL == "physics":
+            # _flight_energy 内部已调用 drone.calculate_power(...)，与实体耗能口径一致。
+            return self._flight_energy(drone, from_pos, to_pos, payload) / 3600.0
+
+        distance_km = self._dist(from_pos, to_pos) / 1000.0
+        total_mass = max(0.0, drone.empty_weight + max(0.0, payload))
+        return self.UAV_ALPHA_WH_PER_KG_KM * total_mass * distance_km
+
+    def _score_allocation(
+        self,
+        alloc: AllocationResult,
+        order: "Order",
+        current_time: float,
+    ) -> tuple[float, float, float, float]:
+        """
+        统一评分：f = f_dist + f_energy + f_penalty。
+
+        Returns:
+            (score_total, cost_dist, cost_energy, cost_penalty)
+        """
+        if not alloc.feasible:
+            return float("inf"), 0.0, 0.0, 0.0
+
+        truck_distance = 0.0
+        uav_distance = 0.0
+        truck_energy = 0.0
+        uav_energy = 0.0
+        delivery_time_est = current_time
+
+        if alloc.mode == "A":
+            truck = self.entity_mgr.trucks.get(alloc.vehicle_id)
+            if truck is None or truck.speed <= 0:
+                return float("inf"), 0.0, 0.0, 0.0
+            truck_distance = self._dist(truck.get_location(current_time), order.delivery_loc)
+            truck_energy = self._truck_energy_wh(truck_distance)
+            delivery_time_est = current_time + truck_distance / truck.speed + self.SERVICE_TIME_CUSTOMER
+
+        elif alloc.mode in ("B", "B_WAIT"):
+            drone = self.entity_mgr.drones.get(alloc.drone_id)
+            if drone is None or drone.cruise_speed <= 0:
+                return float("inf"), 0.0, 0.0, 0.0
+
+            if alloc.mode == "B_WAIT":
+                truck = self.entity_mgr.trucks.get(alloc.vehicle_id)
+                launch_station = self.entity_mgr.stations.get(alloc.launch_station_id)
+                if truck is None or launch_station is None or truck.speed <= 0:
+                    return float("inf"), 0.0, 0.0, 0.0
+                launch_loc = launch_station.location
+                truck_distance = self._dist(truck.get_location(current_time), launch_loc)
+                truck_energy = self._truck_energy_wh(truck_distance)
+                launch_time_est = (
+                    alloc.launch_time
+                    if alloc.launch_time > current_time
+                    else current_time + truck_distance / truck.speed
+                )
+            else:
+                truck = self.entity_mgr.trucks.get(alloc.vehicle_id)
+                if truck is None:
+                    return float("inf"), 0.0, 0.0, 0.0
+                launch_loc = truck.get_location(current_time)
+                launch_time_est = current_time
+
+            recovery = (
+                self.entity_mgr.stations.get(alloc.recovery_station_id)
+                or self.entity_mgr.depots.get(alloc.recovery_station_id)
+            )
+            if recovery is None:
+                return float("inf"), 0.0, 0.0, 0.0
+
+            dist_out = self._dist(launch_loc, order.delivery_loc)
+            dist_back = self._dist(order.delivery_loc, recovery.location)
+            uav_distance = dist_out + dist_back
+            uav_energy = self._uav_energy_wh(drone, launch_loc, order.delivery_loc, order.payload_weight)
+            uav_energy += self._uav_energy_wh(drone, order.delivery_loc, recovery.location, 0.0)
+            delivery_time_est = launch_time_est + dist_out / drone.cruise_speed + self.delivery_service_time
+
+        elif alloc.mode == "C":
+            drone = self.entity_mgr.drones.get(alloc.drone_id)
+            depot = self.entity_mgr.depots.get(alloc.vehicle_id)
+            if drone is None or depot is None or drone.cruise_speed <= 0:
+                return float("inf"), 0.0, 0.0, 0.0
+            dist_out = self._dist(depot.location, order.delivery_loc)
+            dist_back = self._dist(order.delivery_loc, depot.location)
+            uav_distance = dist_out + dist_back
+            uav_energy = self._uav_energy_wh(drone, depot.location, order.delivery_loc, order.payload_weight)
+            uav_energy += self._uav_energy_wh(drone, order.delivery_loc, depot.location, 0.0)
+            delivery_time_est = current_time + dist_out / drone.cruise_speed + self.delivery_service_time
+
+        else:
+            return float("inf"), 0.0, 0.0, 0.0
+
+        cost_dist = self.C_DIST_ET * truck_distance + self.C_DIST_UAV * uav_distance
+        cost_energy = self.C_ENERGY_ET * truck_energy + self.C_ENERGY_UAV * uav_energy
+        lateness = max(0.0, delivery_time_est - order.deadline)
+        cost_penalty = self.LAMBDA_TIME * order.penalty_rate * lateness
+        score_total = cost_dist + cost_energy + cost_penalty
+        return score_total, cost_dist, cost_energy, cost_penalty
+
     # ══════════════════════════════════════════════════════════════════════════
     # 改进的模式 B：支持无人机在充电站等待
     # ══════════════════════════════════════════════════════════════════════════
@@ -861,6 +1061,8 @@ class GreedyBaseline:
         drone: "Drone",
         launch_loc: Position3D,
         launch_station_id: str,
+        truck_distance_to_launch: float,
+        launch_delay: float,
         delivery_loc: Position3D,
         payload: float,
         recovery_pool: list,
@@ -901,11 +1103,11 @@ class GreedyBaseline:
         best_score = float("inf")
 
         for recovery_id, recovery_loc in recovery_pool:
-            # 能量校验
-            energy_to_recovery = self._flight_energy(drone, delivery_loc, recovery_loc, 0.0)
-            total_energy = (energy_to_deliver + energy_to_recovery) * self.ENERGY_SAFETY_FACTOR
+            # 能量校验（可行性约束继续使用物理模型[J]）
+            energy_to_recovery_j = self._flight_energy(drone, delivery_loc, recovery_loc, 0.0)
+            total_energy_j = (energy_to_deliver + energy_to_recovery_j) * self.ENERGY_SAFETY_FACTOR
 
-            if total_energy > drone.battery_current:
+            if total_energy_j > drone.battery_current:
                 continue
 
             # 时间计算（这里的 wait_duration 暂设为 0，实际由卡车路径决定）
@@ -918,22 +1120,39 @@ class GreedyBaseline:
             flight_time_back = dist_back / drone.cruise_speed if drone.cruise_speed > 0 else 1000
             flight_time_total = flight_time_out + self.delivery_service_time + flight_time_back
 
-            # 成本评分：距离 + 等待时间惩罚
-            # wait_duration 代表无人机完成任务所需的时间（飞行往返 + 配送）
-            score = total_distance
+            # 统一评分：f = f_dist + f_energy + f_penalty
+            delivery_time_est = current_time + launch_delay + flight_time_out + self.delivery_service_time
+            lateness = max(0.0, delivery_time_est - order.deadline)
+
+            cost_dist = (
+                self.C_DIST_UAV * total_distance
+                + self.C_DIST_ET * truck_distance_to_launch
+            )
+            cost_energy = (
+                self.C_ENERGY_UAV * (
+                    self._uav_energy_wh(drone, launch_loc, delivery_loc, payload)
+                    + self._uav_energy_wh(drone, delivery_loc, recovery_loc, 0.0)
+                )
+                + self.C_ENERGY_ET * self._truck_energy_wh(truck_distance_to_launch)
+            )
+            cost_penalty = self.LAMBDA_TIME * order.penalty_rate * lateness
+            score = cost_dist + cost_energy + cost_penalty
 
             if score < best_score:
                 best_score = score
                 best_scenario = {
                     'feasible': True,
                     'launch_station_id': launch_station_id,
-                    'launch_time': current_time,  # 暂设为当前时间，后续调整
+                    'launch_time': current_time + launch_delay,
                     'recovery_station_id': recovery_id,
                     'wait_duration': flight_time_total,
                     'score': best_score,
                     'distance': total_distance,
-                    'energy_needed': total_energy,
+                    'energy_needed': total_energy_j,
                     'flight_time': flight_time_total,
+                    'cost_dist': cost_dist,
+                    'cost_energy': cost_energy,
+                    'cost_penalty': cost_penalty,
                 }
 
         return best_scenario

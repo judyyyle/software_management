@@ -9,9 +9,10 @@ HiveLogix — 配置文件加载器
   - 首次加载后缓存结果，重复调用无 I/O 开销
 
 使用方式：
-  from config.loader import load_drone_params
-  params = load_drone_params()
-  print(params.light.k1)
+    from config.loader import load_drone_params, load_solver_energy_params
+    params = load_drone_params()
+    print(params.light.k1)
+    print(load_solver_energy_params().truck_energy_kwh_per_km)
 """
 
 from __future__ import annotations
@@ -61,6 +62,29 @@ class DroneParamsConfig:
 
     light: DroneTypeParams
     heavy: DroneTypeParams
+    solver_energy: "SolverEnergyParams"
+
+
+@dataclass(frozen=True)
+class SolverEnergyParams:
+    """求解器统一评分参数（距离/能耗/时间惩罚）。"""
+
+    c_dist_et: float
+    c_dist_uav: float
+    c_energy_et: float
+    c_energy_uav: float
+    lambda_time: float
+
+    # 能耗模型参数
+    truck_energy_kwh_per_km: float
+    uav_energy_model: str
+    uav_alpha_wh_per_kg_km: float
+    allow_moving_truck_launch: bool
+
+    @property
+    def truck_energy_wh_per_meter(self) -> float:
+        """kWh/km -> Wh/m。数值相同（例如 0.75 kWh/km = 0.75 Wh/m）。"""
+        return self.truck_energy_kwh_per_km
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -125,6 +149,39 @@ def _parse_drone_type(raw: dict[str, Any], label: str) -> DroneTypeParams:
     return params
 
 
+def _parse_solver_energy(raw: dict[str, Any]) -> SolverEnergyParams:
+    """
+    解析求解器评分参数。
+
+    为兼容历史配置，允许缺省并使用默认值。
+    """
+    if not isinstance(raw, dict):
+        raw = {}
+
+    params = SolverEnergyParams(
+        c_dist_et=float(raw.get("c_dist_et", 1.0)),
+        c_dist_uav=float(raw.get("c_dist_uav", 1.0)),
+        c_energy_et=float(raw.get("c_energy_et", 1.0)),
+        c_energy_uav=float(raw.get("c_energy_uav", 1.0)),
+        lambda_time=float(raw.get("lambda_time", 1.0)),
+        truck_energy_kwh_per_km=float(raw.get("truck_energy_kwh_per_km", 0.75)),
+        uav_energy_model=str(raw.get("uav_energy_model", "physics")).strip().lower(),
+        uav_alpha_wh_per_kg_km=float(raw.get("uav_alpha_wh_per_kg_km", 0.24)),
+        allow_moving_truck_launch=bool(raw.get("allow_moving_truck_launch", False)),
+    )
+
+    if params.truck_energy_kwh_per_km <= 0:
+        raise ValueError("[solver_energy] truck_energy_kwh_per_km 必须为正数")
+    if params.uav_energy_model not in {"physics", "alpha"}:
+        raise ValueError("[solver_energy] uav_energy_model 仅支持 physics 或 alpha")
+    if params.uav_alpha_wh_per_kg_km <= 0:
+        raise ValueError("[solver_energy] uav_alpha_wh_per_kg_km 必须为正数")
+    if params.lambda_time < 0:
+        raise ValueError("[solver_energy] lambda_time 不能为负数")
+
+    return params
+
+
 @lru_cache(maxsize=1)
 def load_drone_params() -> DroneParamsConfig:
     """
@@ -154,4 +211,11 @@ def load_drone_params() -> DroneParamsConfig:
     return DroneParamsConfig(
         light=_parse_drone_type(raw.get("light_drone", {}), "light_drone"),
         heavy=_parse_drone_type(raw.get("heavy_drone", {}), "heavy_drone"),
+        solver_energy=_parse_solver_energy(raw.get("solver_energy", {})),
     )
+
+
+@lru_cache(maxsize=1)
+def load_solver_energy_params() -> SolverEnergyParams:
+    """加载并缓存求解器评分参数。"""
+    return load_drone_params().solver_energy

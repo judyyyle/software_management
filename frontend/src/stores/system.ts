@@ -81,20 +81,35 @@ export const useSystemStore = defineStore('system', () => {
       }
       
       for (const backendOrder of payload.orders) {
-        const localOrder = orderStore.generatedOrders.find(o => o.order_id === backendOrder.order_id)
-        if (localOrder && backendOrder.status) {
-          // 更新订单状态（PENDING, ASSIGNED, COMPLETED 等）
-          if (DEBUG_WEBSOCKET && backendOrder.status === 'COMPLETED') {
-            console.log(`[SystemStore.handleTick] 订单 ${backendOrder.order_id} 状态变为 COMPLETED，更新前端`)
+        const normalizedOrder = {
+          order_id: backendOrder.order_id,
+          status: backendOrder.status,
+          source_type: backendOrder.source_type ?? null,
+          pickup_source_id: backendOrder.pickup_source_id ?? null,
+          payload_weight: Number(backendOrder.payload_weight ?? 0),
+          create_time: Number(backendOrder.create_time ?? 0),
+          deadline: Number(backendOrder.deadline ?? 0),
+          actual_deliver_time: backendOrder.actual_deliver_time ?? undefined,
+          assigned_vehicle_id: backendOrder.assigned_vehicle_id ?? undefined,
+          assigned_mode: backendOrder.assigned_mode ?? undefined,
+          delivery_lng: Number(backendOrder.delivery_lng ?? 0),
+          delivery_lat: Number(backendOrder.delivery_lat ?? 0),
+          delivery_z: Number(backendOrder.delivery_z ?? 0),
+          time_domain: backendOrder.time_domain ?? 'sim_s',
+        }
+
+        const idx = orderStore.generatedOrders.findIndex(o => o.order_id === normalizedOrder.order_id)
+        if (idx >= 0) {
+          const oldStatus = orderStore.generatedOrders[idx].status
+          Object.assign(orderStore.generatedOrders[idx], normalizedOrder)
+          if (DEBUG_WEBSOCKET && normalizedOrder.status !== oldStatus) {
+            console.log(`  订单状态: ${oldStatus} → ${normalizedOrder.status}`)
           }
-          const oldStatus = localOrder.status
-          localOrder.status = backendOrder.status
-          if (DEBUG_WEBSOCKET && backendOrder.status !== oldStatus) {
-            console.log(`  订单状态: ${oldStatus} → ${backendOrder.status}`)
+        } else {
+          orderStore.generatedOrders.push(normalizedOrder as any)
+          if (DEBUG_WEBSOCKET && completedCount > 0) {
+            console.warn(`[SystemStore.handleTick] 新增后端订单 ${normalizedOrder.order_id} 到前端列表`)
           }
-        } else if (!localOrder && DEBUG_WEBSOCKET && completedCount > 0) {
-          // 只在有COMPLETED订单时，或者每100条订单显示一次"未找到"
-          console.warn(`[SystemStore.handleTick] 订单 ${backendOrder.order_id} 未在generatedOrders中找到 (status=${backendOrder.status})`)
         }
       }
     }

@@ -424,6 +424,50 @@ def _serialize_drone_route(
     return None
 
 
+def _serialize_runtime_drone_route(
+    alloc: "AllocationResult",
+    runtime_route,
+) -> dict | None:
+    """
+    优先使用调度执行层已下发的真实无人机航线进行序列化。
+
+    这能保证前端紫色虚线与动态实体运动逻辑一致，避免“可视化推断路线”
+    与执行层路线不一致。
+    """
+    if runtime_route is None:
+        return None
+
+    launch_loc = runtime_route.launch_loc
+    delivery_loc = runtime_route.delivery_loc
+    recovery_loc = runtime_route.recovery_loc
+
+    path = [
+        list(utm_to_wgs84(launch_loc.x, launch_loc.y)),
+        list(utm_to_wgs84(delivery_loc.x, delivery_loc.y)),
+        list(utm_to_wgs84(recovery_loc.x, recovery_loc.y)),
+    ]
+
+    if alloc.mode == "B_WAIT":
+        launch_node_id = alloc.launch_station_id or alloc.vehicle_id
+        launch_node_type = "station"
+    elif alloc.mode == "C":
+        launch_node_id = alloc.vehicle_id
+        launch_node_type = "depot"
+    else:
+        launch_node_id = alloc.vehicle_id
+        launch_node_type = "truck"
+
+    return {
+        "drone_id": alloc.drone_id,
+        "order_id": alloc.order_id,
+        "mode": alloc.mode,
+        "launch_node_id": launch_node_id,
+        "launch_node_type": launch_node_type,
+        "recovery_station_id": alloc.recovery_station_id,
+        "path": path,
+    }
+
+
 # ══════════════════════════════════════════════════════════════════════════
 # POST /init
 # ══════════════════════════════════════════════════════════════════════════
@@ -670,7 +714,12 @@ def sim_dispatch():
             if order is None:
                 logger.warning(f"[sim_dispatch] 找不到订单 {alloc.order_id}，跳过该分配")
                 continue
-            route = _serialize_drone_route(alloc, order, current_time, plan.truck_routes)
+
+            # 优先使用执行层真实航线，确保与动态仿真一致。
+            runtime_route = plan.drone_routes.get(alloc.drone_id) if alloc.drone_id else None
+            route = _serialize_runtime_drone_route(alloc, runtime_route)
+            if route is None:
+                route = _serialize_drone_route(alloc, order, current_time, plan.truck_routes)
             if route is not None:
                 drone_routes.append(route)
 
@@ -681,6 +730,7 @@ def sim_dispatch():
                 "feasible":      plan.summary.get("feasible", 0),
                 "modes":         plan.summary.get("modes", {}),
                 "cost_total":    round(plan.cost_total, 2),
+                "cost_breakdown": plan.summary.get("cost_breakdown", {}),
                 "allocations": [
                     {
                         "order_id": a.order_id,
