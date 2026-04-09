@@ -226,6 +226,11 @@ export interface DispatchPlan {
   feasible: number
   modes: Record<string, number>
   cost_total: number
+  cost_breakdown?: {
+    dist: number
+    energy: number
+    penalty: number
+  }
   allocations: unknown[]
   truck_routes?: Record<string, DispatchTruckRoute>
   drone_routes?: DispatchDroneRoute[]
