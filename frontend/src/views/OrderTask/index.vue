@@ -12,6 +12,7 @@
         <span class="oc-title">⚙️ 订单生成参数配置</span>
         <div class="oc-controls">
           <button class="btn-gen-once" @click="orderStore.generateOnce()">📋 预览一笔</button>
+          <button class="btn-gen-batch" @click="generateBatch(10)">📦 快速生成10笔</button>
           <button class="btn-clear" @click="clearOrders">🗑️ 清空预览</button>
         </div>
       </div>
@@ -447,6 +448,12 @@ function clearOrders() {
   if (window.confirm('确认清空所有已生成订单？')) orderStore.clearOrders()
 }
 
+function generateBatch(count: number) {
+  const generated = orderStore.generateBatch(count)
+  const msg = `已生成 ${generated} 笔订单`
+  alert(msg)
+}
+
 function onBurstEnabledChange(e: Event) {
   orderStore.updateConfig({ burst_enabled: (e.target as HTMLInputElement).checked })
 }
@@ -649,6 +656,14 @@ function exportCsv() {
   color: var(--hl-text-secondary);
 }
 .btn-gen-once:hover { background: var(--hl-content-bg); color: var(--hl-text); }
+.btn-gen-batch {
+  height: 28px; padding: 0 13px; border-radius: var(--hl-border-radius);
+  font-size: 12px; font-weight: 500; cursor: pointer;
+  border: 1px solid var(--hl-primary); background: var(--hl-primary);
+  color: #fff;
+  transition: background var(--hl-transition);
+}
+.btn-gen-batch:hover { background: #1d4ed8; }
 .btn-clear {
   border: 1px solid var(--hl-border); background: none;
   color: var(--hl-danger);

@@ -2,6 +2,9 @@ import type { WsMessage } from '@/types'
 
 type Handler<T = unknown> = (payload: T) => void
 
+// ── 调试开关 ────────────────────────────────────────────────────
+const DEBUG_WEBSOCKET = false
+
 /** WebSocket 长连接封装（仿真实时推送） */
 export class WsClient {
   private ws: WebSocket | null = null
@@ -12,6 +15,12 @@ export class WsClient {
 
   connect() {
     this.ws = new WebSocket(this.url)
+    
+    this.ws.onopen = () => {
+      if (DEBUG_WEBSOCKET) {
+        console.log(`[WsClient] ✅ WebSocket 已连接: ${this.url}`)
+      }
+    }
 
     this.ws.onmessage = (ev) => {
       try {
@@ -22,9 +31,21 @@ export class WsClient {
         console.warn('[WsClient] 无法解析消息:', ev.data)
       }
     }
+    
+    this.ws.onerror = (ev) => {
+      console.error('[WsClient] ❌ WebSocket 错误:', ev)
+    }
 
     this.ws.onclose = () => {
-      this.reconnectTimer = setTimeout(() => this.connect(), 3000)
+      if (DEBUG_WEBSOCKET) {
+        console.warn(`[WsClient] ⚠️ WebSocket 已断开: ${this.url}`)
+      }
+      this.reconnectTimer = setTimeout(() => {
+        if (DEBUG_WEBSOCKET) {
+          console.log('[WsClient] 尝试重新连接...')
+        }
+        this.connect()
+      }, 3000)
     }
   }
 

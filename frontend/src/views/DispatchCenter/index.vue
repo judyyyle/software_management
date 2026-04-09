@@ -63,6 +63,24 @@
               <button class="sc-btn sc-btn--reset" @click="doReset">🔄 重置</button>
             </div>
 
+            <!-- 调度控制行 -->
+            <div class="sc-action-row">
+              <button class="sc-btn sc-btn--dispatch"
+                :disabled="!initDone || dispatchLoading"
+                @click="doDispatch">
+                {{ dispatchLoading ? '⏳ 调度中...' : '🎯 批量贪心调度' }}
+              </button>
+              <span v-if="lastDispatchResult" class="dispatch-quick-stat">
+                ✓ {{ lastDispatchResult.plan.feasible }}/{{ lastDispatchResult.plan.total_orders }} 可行
+              </span>
+              <button class="sc-btn sc-btn--export"
+                :disabled="savingPreset"
+                @click="doSavePreset"
+                title="将当前调整的实体配置和任务点保存到预设文件">
+                {{ savingPreset ? '⏳ 保存中...' : '💾 保存预设' }}
+              </button>
+            </div>
+
             <div class="sc-speed-row">
               <span class="sc-speed-label">仿真倍率</span>
               <div class="sc-speed-btns">
@@ -161,78 +179,9 @@
           </div>
         </div>
 
-        <!-- 右侧详情面板 -->
+        <!-- 右侧动态流程面板 -->
         <aside class="dispatch-detail">
-          <SectionCard title="实体详情" icon="🔍">
-            <p class="detail-hint">点击地图上的实体查看详情</p>
-            <div class="detail-tabs">
-              <button class="detail-tab detail-tab--active">卡车</button>
-              <button class="detail-tab">无人机</button>
-              <button class="detail-tab">电站</button>
-            </div>
-            <div class="empty-list">
-              <span>未选中任何实体</span>
-            </div>
-          </SectionCard>
-
-          <!-- 履约模式构成（迁自 Dashboard） -->
-          <div class="chart-card">
-            <div class="chart-card__header">
-              <span class="chart-card__title">履约模式构成</span>
-              <span class="chart-card__sub">模式 A–E 触发频次</span>
-            </div>
-            <div class="chart-card__body">
-              <div class="mode-bars">
-                <div v-for="m in modes" :key="m.label" class="mode-bar">
-                  <span class="mode-bar__label">{{ m.label }}</span>
-                  <div class="mode-bar__track">
-                    <div class="mode-bar__fill" :style="{ width: m.pct + '%', background: m.color }" />
-                  </div>
-                  <span class="mode-bar__pct">{{ m.pct }}%</span>
-                </div>
-              </div>
-            </div>
-          </div>
-
-          <!-- 能量与中继效率（迁自 Dashboard） -->
-          <div class="chart-card">
-            <div class="chart-card__header">
-              <span class="chart-card__title">能量与中继效率</span>
-              <span class="chart-card__sub">充换电站拥堵热力图</span>
-            </div>
-            <div class="chart-card__body chart-card__body--placeholder">
-              <div class="placeholder-visual">
-                <div class="placeholder-visual__grid">
-                  <div v-for="i in 20" :key="i"
-                    class="placeholder-visual__cell"
-                    :style="{ opacity: Math.random() * 0.6 + 0.2, background: heatColor(i) }"
-                  />
-                </div>
-                <p class="placeholder-visual__hint">ECharts 热力图 · 待接入实时数据</p>
-              </div>
-            </div>
-          </div>
-
-          <!-- 时效与成本趋势（迁自 Dashboard） -->
-          <div class="chart-card">
-            <div class="chart-card__header">
-              <span class="chart-card__title">时效与成本趋势</span>
-              <span class="chart-card__sub">订单量 vs 超时惩罚成本</span>
-            </div>
-            <div class="chart-card__body chart-card__body--placeholder">
-              <div class="placeholder-visual">
-                <svg viewBox="0 0 400 80" class="mock-chart" preserveAspectRatio="none">
-                  <polyline
-                    points="0,60 40,50 80,55 120,30 160,35 200,20 240,25 280,15 320,22 360,10 400,18"
-                    fill="none" stroke="var(--hl-primary)" stroke-width="2" />
-                  <polyline
-                    points="0,70 40,65 80,70 120,60 160,62 200,55 240,58 280,50 320,52 360,45 400,42"
-                    fill="none" stroke="var(--hl-danger)" stroke-width="2" stroke-dasharray="4 2" />
-                </svg>
-                <p class="placeholder-visual__hint">ECharts 时序折线图 · 待接入仿真数据流</p>
-              </div>
-            </div>
-          </div>
+          <DynamicFlowPanel ref="flowPanelRef" />
         </aside>
       </div>
     </div>
@@ -240,14 +189,16 @@
 </template>
 
 <script setup lang="ts">
-import { computed, ref } from 'vue'
+import { computed, ref, onMounted, onBeforeUnmount, watch } from 'vue'
 import PageShell     from '@/components/PageShell/index.vue'
 import SectionCard   from './components/SectionCard.vue'
 import UnifiedMapView from './components/UnifiedMapView.vue'
+import DynamicFlowPanel from './components/DynamicFlowPanel.vue'
 import { useSceneStore }  from '@/stores/scene'
 import { useSystemStore } from '@/stores/system'
 import { useEntityStore } from '@/stores/entity'
 import { useOrderStore }  from '@/stores/order'
+import type { DispatchPlan, DispatchTruckRoute, DispatchDroneRoute, Order } from '@/types'
 
 const sceneStore  = useSceneStore()
 const systemStore = useSystemStore()
@@ -255,10 +206,19 @@ const entityStore = useEntityStore()
 const orderStore  = useOrderStore()
 
 const mapRef = ref<InstanceType<typeof UnifiedMapView> | null>(null)
+const flowPanelRef = ref<InstanceType<typeof DynamicFlowPanel> | null>(null)
 
-// initDone 从 store 派生，路由切换不丢失
-const initDone    = computed(() => systemStore.running || systemStore.simTime > 0)
+// initDone 从 store 派生，路由切换不丢失 (改用 initialized 标志)
+const initDone    = computed(() => systemStore.initialized)
 const initLoading = ref(false)
+
+// 调度相关状态
+const dispatchLoading = ref(false)
+const lastDispatchResult = ref<any>(null)
+const dispatchPlan = ref<DispatchPlan | null>(null)
+
+// 预设保存状态
+const savingPreset = ref(false)
 
 interface CtrlLog { type: 'info' | 'success' | 'error' | 'warn'; ts: string; msg: string }
 const ctrlLogs = ref<CtrlLog[]>([])
@@ -295,17 +255,38 @@ async function doInit() {
   try {
     const bounds = sceneStore.context?.road_network.bounds
 
-    // 每次初始化前，根据当前场景 bbox 自动重新均匀分配坐标
-    // 仓库偏中心（收缩 28% 内区），充换电站均匀铺满整图
-    if (bounds) {
-      entityStore.redistributeByBounds(bounds)
-      _log('info',
-        `📐 坐标已自动分配 — 仓库 ${entityStore.depots.length} 个（居中区）` +
-        `· 充换电站 ${entityStore.stations.length} 个（均布全图）`
-      )
-    } else {
-      _log('warn', '⚠️ 未加载场景，使用实体当前坐标（可能为 0,0）')
+    // ⚠️ 修复 v5.0：移除这里的 redistributeByBounds 调用
+    // 原因：GeoTool 在选择场景时已经调用过一次，这里再调用会导致每次初始化时
+    // 生成不同的随机坐标，造成充电站"瞬移"效果（用户看到坐标从一个位置跳到另一个位置）
+    // 
+    // 正确的流程应该是：
+    //   1. 使用 GeoTool 选择场景 → 自动调用 redistributeByBounds 生成初始坐标
+    //   2. 在 DispatchCenter 点击初始化 → 使用已有坐标，不重新生成
+    //   3. 若需要重新生成坐标，明确点击"重新分配坐标"按钮（待实现）
+    
+    if (!bounds) {
+      _log('warn', '⚠️ 未加载场景，请先在「地图工具」中选择场景')
+      initLoading.value = false
+      return
     }
+
+    // 📊 保存发送前的坐标快照（用于诊断和对比）
+    const stationSnapshotBefore = entityStore.stations.map(s => ({ 
+      id: s.station_id, 
+      lng: s.lng, 
+      lat: s.lat 
+    }))
+    const depotSnapshotBefore = entityStore.depots.map(d => ({
+      id: d.depot_id,
+      lng: d.lng,
+      lat: d.lat
+    }))
+    
+    _log('info',
+      `📐 使用现有坐标 — 仓库 ${entityStore.depots.length} 个` +
+      `· 充换电站 ${entityStore.stations.length} 个`
+    )
+    console.log('[doInit] 发送前坐标快照：', { depots: depotSnapshotBefore, stations: stationSnapshotBefore })
 
     const result = await systemStore.initSim({
       bbox:    bounds,
@@ -313,7 +294,49 @@ async function doInit() {
     })
     const s = result.summary
     _log('success', `✅ 初始化成功 — 仓库×${s.depots} · 站点×${s.stations} · 卡车×${s.trucks} · 无人机×${s.drones}`)
+    
+    // 初始化后等待一小段时间确保 WebSocket FULL_SNAPSHOT 被推送
+    await new Promise(resolve => setTimeout(resolve, 500))
+    
+    // 🔍 收到后端 WebSocket 后，检查坐标是否发生变化
+    const stationSnapshotAfter = entityStore.stations.map(s => ({ 
+      id: s.station_id, 
+      lng: s.lng, 
+      lat: s.lat 
+    }))
+    const depotSnapshotAfter = entityStore.depots.map(d => ({
+      id: d.depot_id,
+      lng: d.lng,
+      lat: d.lat
+    }))
+    console.log('[doInit] 收到 WebSocket 后坐标快照：', { depots: depotSnapshotAfter, stations: stationSnapshotAfter })
+    
+    // 检查坐标是否发生了变化
+    const stationChanged = stationSnapshotAfter.some((s, i) => {
+      const before = stationSnapshotBefore[i]
+      return !before || Math.abs(s.lng - before.lng) > 0.00001 || Math.abs(s.lat - before.lat) > 0.00001
+    })
+    const depotChanged = depotSnapshotAfter.some((d, i) => {
+      const before = depotSnapshotBefore[i]
+      return !before || Math.abs(d.lng - before.lng) > 0.00001 || Math.abs(d.lat - before.lat) > 0.00001
+    })
+    
+    if (stationChanged || depotChanged) {
+      _log('warn', '⚠️ 坐标发生变化（可能由WGS84↔UTM转换精度差异导致）')
+      console.warn('[doInit] 坐标变化详情：', { 
+        stations: { before: stationSnapshotBefore, after: stationSnapshotAfter },
+        depots: { before: depotSnapshotBefore, after: depotSnapshotAfter }
+      })
+    } else {
+      _log('info', '✓ 坐标验证通过，发送和接收的坐标一致')
+    }
+    
+    if (DEBUG_VEHICLE_UPDATES) {
+      console.log('[doInit] 初始化完成，当前卡车数:', entityStore.rtTrucks.length)
+      _log('info', `📍 前端已接收 ${entityStore.rtTrucks.length} 辆卡车`)
+    }
   } catch (e: any) {
+    systemStore.initialized = false  // 初始化失败时重置标志
     _log('error', `❌ 初始化失败：${e.message}`)
   } finally {
     initLoading.value = false
@@ -329,6 +352,246 @@ async function doSetSpeed(ratio: number) {
   await systemStore.setSpeed(ratio)
   _log('info', `⚡ 速率已设为 ×${ratio}`)
 }
+
+async function doDispatch() {
+  dispatchLoading.value = true
+  _log('info', '🎯 正在执行贪心调度算法...')
+  try {
+    // 检查是否有加载场景
+    if (!sceneStore.context) {
+      _log('error', '❌ 尚未加载场景，请先完成环境构建')
+      dispatchLoading.value = false
+      return
+    }
+
+    const bbox = mapRef.value?.getCurrentBounds?.()
+    if (DEBUG_VEHICLE_UPDATES) {
+      console.log('[doDispatch] bbox object:', bbox)
+      console.log('[doDispatch] bbox keys:', bbox ? Object.keys(bbox) : 'null')
+    }
+    _log('info', `📍 地图边界: ${bbox ? `(${bbox.minx.toFixed(3)}, ${bbox.miny.toFixed(3)}) - (${bbox.maxx.toFixed(3)}, ${bbox.maxy.toFixed(3)})` : 'null'}`)
+    
+    if (!bbox || typeof bbox.minx !== 'number') {
+      _log('error', '❌ 无法获取地图边界，请检查地图是否正常加载')
+      dispatchLoading.value = false
+      return
+    }
+    
+    if (DEBUG_VEHICLE_UPDATES) {
+      console.log('[doDispatch] 将调用 dispatch，bbox:', bbox)
+    }
+    const result = await systemStore.dispatch(bbox)
+    if (DEBUG_VEHICLE_UPDATES) {
+      console.log('[doDispatch] dispatch 返回:', result)
+    }
+    lastDispatchResult.value = result
+
+    if (result.status === 'ok' && result.plan) {
+      const plan = result.plan as DispatchPlan
+      const modeStr = Object.entries(plan.modes || {})
+        .map(([k, v]) => `${k}:${v}`)
+        .join(' ')
+
+      _log('success',
+        `✅ 调度完成 — ${plan.feasible}/${plan.total_orders} 可行 ` +
+        `(${modeStr ? '模式分布: ' + modeStr : '暂无分配'}) · ` +
+        `待派 ${result.pending_count} | 派送中 ${result.assigned_count}`
+      )
+
+      dispatchPlan.value = plan
+      mapRef.value?.clearDispatchRoutes?.()
+      
+      // 调试：打印无人机路线信息便于诊断显示问题
+      if (plan.drone_routes && plan.drone_routes.length > 0) {
+        console.group('🚁 无人机路线详情')
+        for (const route of plan.drone_routes) {
+          console.log(`📍 订单 ${route.order_id}:`, {
+            drone_id: route.drone_id,
+            mode: route.mode,
+            recovery_station_id: route.recovery_station_id,
+            path: route.path,
+          })
+        }
+        console.groupEnd()
+      }
+      
+      mapRef.value?.drawDispatchRoutes?.(plan)
+      
+      // 清除之前的动态实体标记，为仿真做准备
+      mapRef.value?.clearDynamicEntities?.()
+      
+      flowPanelRef.value?.addEvent?.('🎯', `调度完成 ${plan.feasible}/${plan.total_orders} 订单可行`)
+    } else {
+      _log('error', `❌ 调度失败：${result.error || '未知错误'}`)
+    }
+  } catch (e: any) {
+    _log('error', `❌ 调度出错：${e.message}`)
+  } finally {
+    dispatchLoading.value = false
+  }
+}
+
+/**
+ * 保存调整后的预设场景到后端磁盘文件
+ */
+async function doSavePreset() {
+  savingPreset.value = true
+  _log('info', '💾 正在保存预设场景...')
+  try {
+    // 构建要保存的数据
+    const payload = {
+      entities: {
+        depots: entityStore.depots,
+        stations: entityStore.stations,
+        trucks: entityStore.trucks,
+        drones: entityStore.drones,
+      },
+      orders: {
+        static_orders: orderStore.generatedOrders,
+      },
+    }
+
+    const response = await fetch('/api/sim/preset/entities/default_test_4x4km', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    })
+
+    if (response.ok) {
+      const result = await response.json()
+      _log('success', `✅ 预设场景已保存: ${result.message}`)
+      flowPanelRef.value?.addEvent?.('💾', '调整的实体配置和任务点已保存到预设文件')
+    } else {
+      const error = await response.json()
+      _log('error', `❌ 保存失败: ${error.error}`)
+    }
+  } catch (e: any) {
+    _log('error', `❌ 保存出错：${e.message}`)
+  } finally {
+    savingPreset.value = false
+  }
+}
+
+// ── WebSocket 实时位置更新 ────────────────────────────────────────────
+
+// ── 调试开关 ────────────────────────────────────────────────────────
+const DEBUG_VEHICLE_UPDATES = false
+
+function setupRealtimeUpdates() {
+  // 首先初始化 WebSocket 连接
+  systemStore.initWs()
+  
+  // 监听 TICK 事件，实时更新卡车、无人机和订单状态
+  let tickCount = 0
+  systemStore.onTick(() => {
+    tickCount++
+    if (DEBUG_VEHICLE_UPDATES && tickCount <= 3) {
+      console.log(`[setupRealtimeUpdates] TICK 回调被触发 (${tickCount})，当前卡车: ${entityStore.rtTrucks.length}`)
+      if (entityStore.rtTrucks.length > 0) {
+        const truck = entityStore.rtTrucks[0]
+        console.log(`  - 第一辆卡车: ${truck.truck_id}, 坐标: (${truck.lng}, ${truck.lat})`)
+      }
+    }
+    
+    // 更新卡车位置（使用运行时数据 rtTrucks）
+    for (const truck of entityStore.rtTrucks) {
+      if (truck.lng && truck.lat) {
+        if (DEBUG_VEHICLE_UPDATES) {
+          console.log(`[setupRealtimeUpdates] 更新卡车 ${truck.truck_id} 到 (${truck.lng.toFixed(5)}, ${truck.lat.toFixed(5)})`)
+        }
+        mapRef.value?.updateTruck?.(truck.truck_id, truck.lng, truck.lat, truck.status)
+      } else if (DEBUG_VEHICLE_UPDATES && tickCount <= 1) {
+        console.warn(`[setupRealtimeUpdates] 卡车 ${truck.truck_id} 坐标无效: lng=${truck.lng}, lat=${truck.lat}`)
+      }
+    }
+    
+    // 更新无人机位置（使用运行时数据 rtDrones）
+    for (const drone of entityStore.rtDrones) {
+      if (drone.lng && drone.lat) {
+        mapRef.value?.updateDrone?.(drone.drone_id, drone.lng, drone.lat, drone.status)
+      }
+    }
+    
+    // 重绘订单标记（使用最新的订单状态）
+    mapRef.value?.drawOrders?.()
+  })
+}
+
+onMounted(() => {
+  setupRealtimeUpdates()
+  
+  // 如果已加载预设场景，自动加载预设的实体配置
+  if (sceneStore.context?.scene_id) {
+    loadPresetEntitiesIfAvailable()
+  }
+})
+
+/**
+ * 尝试从后端加载预设场景的实体配置（仓库、充电站、无人机）
+ */
+async function loadPresetEntitiesIfAvailable() {
+  try {
+    // 判断是否是预设场景
+    const presetId = sceneStore.context?.meta?.road_source === 'osm_preset' 
+      ? 'default_test_4x4km' 
+      : null
+    
+    if (!presetId) return
+    
+    const response = await fetch(`/api/sim/preset/entities/${presetId}`)
+    if (!response.ok) return
+    
+    const data = await response.json()
+    if (!data || !data.depots) return
+    
+    // 使用预设的实体配置替换前端配置
+    if (data.depots) entityStore.depots = data.depots
+    if (data.stations) entityStore.stations = data.stations
+    if (data.trucks) entityStore.trucks = data.trucks
+    if (data.drones) entityStore.drones = data.drones
+    
+    // 加载预设的任务点（补全所有必需字段）
+    if (data.orders && Array.isArray(data.orders)) {
+      const now = Date.now()
+      orderStore.generatedOrders = data.orders.map((o: any) => {
+        const priority = o.priority || 'NORMAL'
+        const priorityLabels: Record<string, string> = {
+          'URGENT': '紧急',
+          'NORMAL': '普通',
+          'LOW': '低优先'
+        }
+        
+        return {
+          order_id: o.order_id,
+          create_time: o.create_time ?? 0,
+          deadline: o.deadline ?? now + 600000,
+          delivery_lng: o.delivery_lng,
+          delivery_lat: o.delivery_lat,
+          delivery_z: o.delivery_z ?? 0,
+          payload_weight: o.payload_weight,
+          priority: priority,
+          status: 'PENDING',
+          source_type: 'DEPOT',
+          pickup_source_id: null,
+          fulfillment_mode: o.payload_weight > 3.5 ? 'DRONE_TRUCK_DEPOT' : 'DRONE_DIRECT',
+          warehouse_name: data.depots[0]?.name || '仓库-中心',
+          deadline_iso: new Date(o.deadline ?? now + 600000).toLocaleTimeString('zh-CN', {
+            hour: '2-digit',
+            minute: '2-digit',
+          }),
+          priority_label: priorityLabels[priority] || '普通',
+          time_domain: 'wall_ms',
+        } as Order
+      })
+    }
+  } catch (e) {
+    console.warn('[DispatchCenter] 加载预设实体失败:', e)
+  }
+}
+
+onBeforeUnmount(() => {
+  mapRef.value?.clearDynamicEntities?.()
+})
 </script>
 
 <style scoped>
@@ -418,6 +681,20 @@ async function doSetSpeed(ratio: number) {
 .sc-btn--pause:hover:not(:disabled) { background: #b45309; }
 .sc-btn--reset { background: none; border: 1px solid var(--hl-border); color: var(--hl-text-secondary); }
 .sc-btn--reset:hover { background: var(--hl-content-bg); color: var(--hl-danger); border-color: var(--hl-danger); }
+.sc-btn--dispatch { background: var(--hl-info); color: #fff; flex: 1; min-width: 140px; }
+.sc-btn--dispatch:hover:not(:disabled) { background: #0284c7; }
+.sc-btn--export { background: #7c3aed; color: #fff; }
+.sc-btn--export:hover:not(:disabled) { background: #6d28d9; }
+
+/* 调度统计快览 */
+.dispatch-quick-stat {
+  display: inline-flex;
+  align-items: center;
+  padding: 0 8px;
+  font-size: 12px;
+  color: var(--hl-success);
+  font-weight: 500;
+}
 
 /* 速率选择 */
 .sc-speed-row { display: flex; align-items: center; gap: 12px; }

@@ -9,6 +9,8 @@ OSM 数据获取与道路 GeoJSON 转换服务
 import urllib.request as _ureq
 import urllib.parse  as _uparse
 import xml.etree.ElementTree as _ET
+import networkx as nx
+from pyproj import Transformer
 
 # ── 道路类型参数表 ─────────────────────────────────────────────────────────────
 HW_SPEED = {
@@ -79,3 +81,75 @@ def osm_to_geojson(osm_xml: str) -> dict:
         })
 
     return {"type": "FeatureCollection", "features": features}
+
+
+def build_road_graph(osm_xml: str) -> tuple[nx.DiGraph, dict]:
+    """
+    从 OSM XML 构建道路图，用于路径计算。
+    
+    Returns:
+        G: networkx.DiGraph，节点为 OSM node id，边权重为距离（米）
+        nodes: dict[node_id: (lon, lat)]
+    """
+    root = _ET.fromstring(osm_xml)
+    nodes = {}
+    for nd in root.iter("node"):
+        nodes[nd.get("id")] = (float(nd.get("lon", 0)), float(nd.get("lat", 0)))
+
+    G = nx.DiGraph()
+    transformer = Transformer.from_crs("EPSG:4326", "EPSG:32651")  # WGS84 to UTM Zone 51N
+
+    for way in root.iter("way"):
+        tags = {t.get("k"): t.get("v") for t in way.iter("tag")}
+        hw = tags.get("highway", "")
+        if hw not in HW_SPEED:
+            continue
+        nd_refs = [r.get("ref") for r in way.iter("nd") if r.get("ref") in nodes]
+        for i in range(len(nd_refs) - 1):
+            u = nd_refs[i]
+            v = nd_refs[i + 1]
+            lon1, lat1 = nodes[u]
+            lon2, lat2 = nodes[v]
+            x1, y1 = transformer.transform(lat1, lon1)
+            x2, y2 = transformer.transform(lat2, lon2)
+            dist = ((x2 - x1)**2 + (y2 - y1)**2)**0.5
+            G.add_edge(u, v, weight=dist)
+            if hw not in ONEWAY_HW:
+                G.add_edge(v, u, weight=dist)
+
+    return G, nodes
+
+
+def find_nearest_node(G: nx.DiGraph, nodes: dict, pos_x: float, pos_y: float) -> str:
+    """
+    找到最近的 OSM 节点（必须在图中）。
+    
+    Args:
+        pos_x, pos_y: UTM 坐标
+    """
+    if not G or not G.nodes():
+        return ""
+    
+    transformer = Transformer.from_crs("EPSG:4326", "EPSG:32651")
+    min_dist = float('inf')
+    nearest = ""
+    # 只在图中已有的节点里查找，避免孤立节点
+    for nid in G.nodes():
+        if nid not in nodes:
+            continue
+        lon, lat = nodes[nid]
+        x, y = transformer.transform(lat, lon)
+        dist = ((x - pos_x)**2 + (y - pos_y)**2)**0.5
+        if dist < min_dist:
+            min_dist = dist
+            nearest = nid
+    return nearest
+
+
+def shortest_path(G: nx.DiGraph, start_node: str, end_node: str) -> list[str]:
+    """计算最短路径，返回节点列表。"""
+    try:
+        path = nx.shortest_path(G, start_node, end_node, weight='weight')
+        return path
+    except (nx.NetworkXNoPath, nx.NodeNotFound):
+        return []

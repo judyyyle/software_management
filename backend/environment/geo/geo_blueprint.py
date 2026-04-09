@@ -18,6 +18,7 @@ from flask import Blueprint, request, jsonify, send_file
 from data_loader      import load_shapefile_async, get_state, get_gdf  # noqa: E402
 from building_service import query_buildings, prepare_sub               # noqa: E402
 from osm_service      import download_osm, osm_to_geojson               # noqa: E402
+from preset_scenes    import get_buildings_from_cache                   # noqa: E402
 
 from exporters.sumo_poly     import export_sumo_poly      # noqa: E402
 from exporters.sumo_net_grid import export_grid_net       # noqa: E402
@@ -55,11 +56,21 @@ def api_roads():
 
 @geo_bp.route("/query", methods=["POST"])
 def api_query():
+    body      = request.get_json(force=True)
+    scene_id  = body.get("scene_id")
+    
+    # 优先检查预设场景缓存
+    if scene_id:
+        cached = get_buildings_from_cache(scene_id)
+        if cached:
+            print(f"[GEO] 从缓存加载预设场景 {scene_id}")
+            return jsonify(cached)
+    
+    # 正常流程：从 Shapefile 加载
     state = get_state()
     if not state["loaded"]:
         return jsonify({"error": "数据尚未加载完毕，请稍候"}), 503
 
-    body      = request.get_json(force=True)
     threshold = float(body.get("threshold", 50))
     h_col     = body.get("height_column") or state["height_column"]
     max_feat  = min(int(body.get("max", 30000)), 60000)
