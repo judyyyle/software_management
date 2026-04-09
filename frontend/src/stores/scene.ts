@@ -153,5 +153,27 @@ export const useSceneStore = defineStore('scene', () => {
     }
   }
 
-  return { context, loading, error, buildingsGeoJSON, setBuildingsGeoJSON, prepareScene, restoreScene, clear }
+  /**
+   * 加载预设场景（从后端的磁盘缓存）。
+   * 用于快速加载预生成的测试场景，无需重新下载 OSM 或查询建筑。
+   */
+  async function loadPresetScene(presetId: string): Promise<void> {
+    if (loading.value) return
+    loading.value = true
+    error.value   = null
+    buildingsGeoJSON.value = null
+
+    try {
+      const data = await http.get<SceneContext>(`/api/scene/preset/${encodeURIComponent(presetId)}`)
+      context.value = data
+      localStorage.setItem('hl-scene-id', data.scene_id)
+    } catch (e: unknown) {
+      error.value = e instanceof Error ? e.message : String(e)
+    } finally {
+      loading.value = false
+    }
+  }
+
+  return { context, loading, error, buildingsGeoJSON, setBuildingsGeoJSON, prepareScene, restoreScene, loadPresetScene, clear }
+
 })

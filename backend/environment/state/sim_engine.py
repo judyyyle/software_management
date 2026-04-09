@@ -74,6 +74,8 @@ class SimulationEngine:
         """
         self._entity_mgr = entity_mgr
         self._order_mgr  = order_mgr
+        # 为 entity_mgr 设置 order_mgr 引用，支持无人机完成任务时的订单状态更新
+        entity_mgr.order_mgr = order_mgr
         logger.info("[SimEngine] 已挂载 EntityManager 和 OrderManager")
 
     # ══════════════════════════════════════════════════════════════════════════
@@ -199,20 +201,24 @@ class SimulationEngine:
         构造 TICK 帧的 payload 字典。
 
         Returns:
-            包含 sim_time / entities / stats 的字典
+            包含 sim_time / entities / orders / stats 的字典
         """
         entities = {}
+        orders   = []
         stats    = {}
 
         if self._entity_mgr is not None:
             entities = self._entity_mgr.get_telemetry()
 
         if self._order_mgr is not None:
+            # 推送所有订单的状态（pending + assigned + completed）
+            orders = self._order_mgr.get_recent_orders(limit=500)
             stats = self._order_mgr.get_status_summary()
 
         return {
             "sim_time": round(self.current_time, 3),
             "entities": entities,
+            "orders": orders,
             "stats":    stats,
         }
 

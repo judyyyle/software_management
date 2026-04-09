@@ -35,7 +35,7 @@ const DEFAULT_CONFIG: OrderGeneratorConfig = {
   priority_normal:   60,
   priority_low:      20,
   // Phase 2 扩展字段默认值
-  max_orders:        null,
+  max_orders:        80,
   geo_mode:          'uniform',
   cluster_radius_km: 1.5,
   burst_enabled:     false,
@@ -127,6 +127,32 @@ export const useOrderStore = defineStore('order', () => {
     }
     const order = buildOrder(generatorConfig.value, warehousePool.value, sceneBbox.value)
     addGeneratedOrder(order)
+  }
+
+  /**
+   * 一次性批量生成 N 个订单（不启动定时器，静态生成）。
+   * 用于快速测试或生成初始订单集合。
+   * 生成完后自动设置 max_orders 为当前订单数，防止动态生成新的。
+   */
+  function generateBatch(count: number) {
+    const maxOrders = generatorConfig.value.max_orders ?? null
+    let generated = 0
+    for (let i = 0; i < count; i++) {
+      if (maxOrders !== null && generatedOrders.value.length >= maxOrders) {
+        break  // 达到上限，停止
+      }
+      const order = buildOrder(generatorConfig.value, warehousePool.value, sceneBbox.value)
+      addGeneratedOrder(order)
+      generated++
+    }
+    
+    // 生成完后，自动设置 max_orders 为当前订单数（防止继续生成新的）
+    if (generated > 0) {
+      generatorConfig.value.max_orders = generatedOrders.value.length
+      _persistConfig()
+    }
+    
+    return generated
   }
 
   /**
@@ -233,6 +259,7 @@ export const useOrderStore = defineStore('order', () => {
     // 操作
     updateConfig,
     generateOnce,
+    generateBatch,
     startGenerator,
     stopGenerator,
     restartIfRunning,

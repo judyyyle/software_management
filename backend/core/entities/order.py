@@ -240,11 +240,15 @@ class Order:
             JSON 可序列化的订单状态字典
         """
         lon, lat = self.delivery_loc.to_wgs84()
+        # Handle source_type: could be SourceType enum or str
+        source_type_value = None
+        if self.source_type:
+            source_type_value = self.source_type.value if hasattr(self.source_type, 'value') else str(self.source_type)
         return {
             "entity_type":         "order",
             "order_id":            self.order_id,
             "status":              self._status.value,
-            "source_type":         self.source_type.value if self.source_type else None,
+            "source_type":         source_type_value,
             "pickup_source_id":    self.pickup_source_id,
             "payload_weight":      self.payload_weight,
             "create_time":         self.create_time,

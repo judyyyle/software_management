@@ -12,7 +12,7 @@ import traceback
 
 from flask import Blueprint, jsonify, request
 
-from scene_service import get_scene_by_id, prepare_scene
+from scene_service import get_scene_by_id, prepare_scene, load_preset_scene
 
 scene_bp = Blueprint("scene", __name__)
 
@@ -75,4 +75,22 @@ def api_get_scene(scene_id: str):
     ctx = get_scene_by_id(scene_id)
     if ctx is None:
         return jsonify({"error": "scene_id 不存在或服务重启后已失效"}), 404
+    return jsonify(ctx)
+
+
+@scene_bp.route("/preset/<preset_id>", methods=["GET"])
+def api_get_preset(preset_id: str):
+    """
+    加载预设场景（从磁盘缓存预生成的场景）。
+    
+    路径参数:
+      preset_id : 预设场景 ID，如 'default_test_4x4km'
+    
+    响应:
+      200 — SceneContext
+      404 — 预设场景不存在或加载失败
+    """
+    ctx = load_preset_scene(preset_id)
+    if ctx is None:
+        return jsonify({"error": f"预设场景 '{preset_id}' 不存在或加载失败"}), 404
     return jsonify(ctx)

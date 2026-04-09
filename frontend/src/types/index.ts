@@ -193,6 +193,44 @@ export interface WarehouseEntry {
 // WebSocket 推送消息
 // ══════════════════════════════════════════════════════════════════
 
+export interface DispatchRouteNode {
+  node_id: string
+  node_type: string
+  lng: number
+  lat: number
+  arrival_time: number
+  departure_time: number
+  order_id: string
+}
+
+export interface DispatchTruckRoute {
+  truck_id: string
+  nodes: DispatchRouteNode[]
+  total_distance: number
+  charging_stop_ids: string[]
+  geometry?: { lng: number; lat: number }[]
+}
+
+export interface DispatchDroneRoute {
+  drone_id: string
+  order_id: string
+  mode: FulfillmentMode
+  launch_node_id?: string
+  launch_node_type?: string
+  recovery_station_id?: string  // 新增：回收点 ID（充电站或仓库）
+  path: [number, number][]
+}
+
+export interface DispatchPlan {
+  total_orders: number
+  feasible: number
+  modes: Record<string, number>
+  cost_total: number
+  allocations: unknown[]
+  truck_routes?: Record<string, DispatchTruckRoute>
+  drone_routes?: DispatchDroneRoute[]
+}
+
 export interface WsMessage<T = unknown> {
   type: string
   payload: T
