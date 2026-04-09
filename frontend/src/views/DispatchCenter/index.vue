@@ -216,6 +216,7 @@ const initLoading = ref(false)
 const dispatchLoading = ref(false)
 const lastDispatchResult = ref<any>(null)
 const dispatchPlan = ref<DispatchPlan | null>(null)
+const totalEnergyCostWh = ref(0)
 
 // 预设保存状态
 const savingPreset = ref(false)
@@ -224,12 +225,70 @@ interface CtrlLog { type: 'info' | 'success' | 'error' | 'warn'; ts: string; msg
 const ctrlLogs = ref<CtrlLog[]>([])
 
 // ── 迁自 Dashboard ──────────────────────────────────────────────────
-const kpiList = [
-  { icon: '✅', label: '综合任务完成率', value: '—',     change: '—', up: true  },
-  { icon: '⏱️', label: '准时送达率',     value: '—',     change: '—', up: true  },
-  { icon: '📉', label: '平均订单延迟',   value: '— min', change: '—', up: false },
-  { icon: '⚡', label: '总体能耗成本',   value: '— Wh',  change: '—', up: false },
-]
+function toSimSeconds(value: number | undefined, timeDomain?: 'wall_ms' | 'sim_s') {
+  if (typeof value !== 'number' || !Number.isFinite(value)) return null
+  return timeDomain === 'wall_ms' ? value / 1000 : value
+}
+
+const kpiList = computed(() => {
+  const orders = orderStore.generatedOrders
+  const totalOrders = orders.length
+  const completedOrders = orders.filter(o => o.status === 'COMPLETED')
+  const completionRate = totalOrders > 0 ? (completedOrders.length / totalOrders) * 100 : 0
+
+  const completedWithTiming = completedOrders.filter(o =>
+    typeof o.deadline === 'number' && typeof o.actual_deliver_time === 'number'
+  )
+
+  let onTimeCount = 0
+  const delaysInMinutes: number[] = []
+  for (const order of completedWithTiming) {
+    const deadlineSec = toSimSeconds(order.deadline, order.time_domain)
+    const deliverSec = toSimSeconds(order.actual_deliver_time, order.time_domain)
+    if (deadlineSec === null || deliverSec === null) continue
+    if (deliverSec <= deadlineSec) onTimeCount += 1
+    delaysInMinutes.push(Math.max(0, deliverSec - deadlineSec) / 60)
+  }
+
+  const onTimeRate = completedWithTiming.length > 0
+    ? (onTimeCount / completedWithTiming.length) * 100
+    : 0
+
+  const avgDelayMin = delaysInMinutes.length > 0
+    ? delaysInMinutes.reduce((a, b) => a + b, 0) / delaysInMinutes.length
+    : 0
+
+  return [
+    {
+      icon: '✅',
+      label: '综合任务完成率',
+      value: `${completionRate.toFixed(1)}%`,
+      change: `${completedOrders.length}/${totalOrders || 0}`,
+      up: true,
+    },
+    {
+      icon: '⏱️',
+      label: '准时送达率',
+      value: `${onTimeRate.toFixed(1)}%`,
+      change: `${onTimeCount}/${completedWithTiming.length || 0}`,
+      up: true,
+    },
+    {
+      icon: '📉',
+      label: '平均订单延迟',
+      value: `${avgDelayMin.toFixed(2)} min`,
+      change: `${completedWithTiming.length || 0} 单`,
+      up: false,
+    },
+    {
+      icon: '⚡',
+      label: '总体能耗成本',
+      value: `${totalEnergyCostWh.value.toFixed(2)} Wh`,
+      change: '累计',
+      up: false,
+    },
+  ]
+})
 
 const modes = [
   { label: '模式A · 卡车直送',   pct: 0, color: '#2563eb' },
@@ -251,6 +310,7 @@ function _log(type: CtrlLog['type'], msg: string) {
 
 async function doInit() {
   initLoading.value = true
+  totalEnergyCostWh.value = 0
   _log('info', '正在发送初始化请求到后端...')
   try {
     const bounds = sceneStore.context?.road_network.bounds
@@ -345,6 +405,7 @@ async function doInit() {
 
 async function doReset() {
   await systemStore.reset().catch(() => {})
+  totalEnergyCostWh.value = 0
   _log('warn', '🔄 仿真已重置，请重新初始化')
 }
 
@@ -399,6 +460,13 @@ async function doDispatch() {
       )
 
       dispatchPlan.value = plan
+
+      // 累计能耗成本（Wh）用于 KPI 展示。
+      const energyWh = Number(plan.cost_breakdown?.energy ?? 0)
+      if (Number.isFinite(energyWh) && energyWh >= 0) {
+        totalEnergyCostWh.value += energyWh
+      }
+
       mapRef.value?.clearDispatchRoutes?.()
       
       // 调试：打印无人机路线信息便于诊断显示问题
@@ -532,7 +600,8 @@ onMounted(() => {
 async function loadPresetEntitiesIfAvailable() {
   try {
     // 判断是否是预设场景
-    const presetId = sceneStore.context?.meta?.road_source === 'osm_preset' 
+    const roadSource = (sceneStore.context?.meta as any)?.road_source
+    const presetId = roadSource === 'osm_preset' 
       ? 'default_test_4x4km' 
       : null
     
