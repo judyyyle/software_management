@@ -22,6 +22,7 @@ from __future__ import annotations
 import logging
 from typing import Optional, TYPE_CHECKING
 
+from config.loader import load_solver_energy_params
 from core.entities.depot import Depot
 from core.entities.drone import Drone, HeavyDrone, LightDrone
 from core.entities.primitives import Position3D, SourceType
@@ -65,6 +66,9 @@ class EntityManager:
         self.drones:   dict[str, Drone]       = {}
         self._metadata: dict[str, dict]       = {}
         self.order_mgr: Optional["OrderManager"] = None  # 订单管理器引用（由 sim_engine 注入）
+
+        runtime_cfg = load_solver_energy_params()
+        self.DRONE_SERVICE_TIME_ORDER = runtime_cfg.drone_service_time_order_s
 
     # ══════════════════════════════════════════════════════════════════════════
     # 初始化
@@ -376,6 +380,25 @@ class EntityManager:
         
         for drone in self.drones.values():
             try:
+                # 无人机配送点服务停留：到达 DELIVER 后暂停一段时间再继续后续航路。
+                delivery_service_end = float(getattr(drone, "delivery_service_end_time", 0.0))
+                if delivery_service_end > 0.0:
+                    if current_time + 1e-6 < delivery_service_end:
+                        continue
+                    pending_order = getattr(drone, "pending_release_order_id", None)
+                    if pending_order:
+                        released = drone.release_order()
+                        if released:
+                            self._complete_assigned_order(
+                                released,
+                                current_time,
+                                source=f"drone {drone.drone_id}",
+                            )
+                    drone.delivery_service_end_time = 0.0
+                    drone.pending_release_order_id = None
+                    # 服务刚结束这一拍不推进位移，避免视觉上瞬移。
+                    continue
+
                 # B_WAIT：无人机由卡车运输到起飞站前，位置与卡车绑定且不耗电。
                 transport_truck_id = getattr(drone, "transport_truck_id", None)
                 if transport_truck_id:
@@ -451,13 +474,14 @@ class EntityManager:
                         drone.status = DroneStatus.IDLE
                     
                     elif action == WaypointAction.DELIVER:
-                        # 无人机完成配送，更新订单状态为 COMPLETED
-                        released = drone.release_order()
-                        if released:
-                            self._complete_assigned_order(
-                                released,
-                                current_time,
-                                source=f"drone {drone.drone_id}",
+                        # 无人机到达配送点后执行卸货停留，再完成订单。
+                        if drone.carrying_order_id:
+                            drone.pending_release_order_id = drone.carrying_order_id
+                            drone.delivery_service_end_time = current_time + self.DRONE_SERVICE_TIME_ORDER
+                            logger.info(
+                                "[EntityManager.tick_all] 无人机 %s 到达配送点，开始卸货停留 %.1fs",
+                                drone.drone_id,
+                                self.DRONE_SERVICE_TIME_ORDER,
                             )
                     
                     elif action == WaypointAction.PICKUP:

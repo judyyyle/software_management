@@ -150,6 +150,10 @@ class GreedyBaseline:
     TRUCK_ENERGY_WH_PER_METER = TRUCK_ENERGY_KWH_PER_KM  # = 0.75 Wh/m
     UAV_ALPHA_WH_PER_KG_KM = 0.24   # UAV: alpha_k [Wh/(kg·km)]
 
+    # 业务时长参数（默认值，可由配置覆盖）
+    TRUCK_DRONE_LAUNCH_TIME = 10.0
+    TRUCK_DRONE_RECOVER_TIME = 10.0
+
     def __init__(self, entity_mgr: "EntityManager") -> None:
         self.entity_mgr = entity_mgr
         self.min_reserve_energy = 200.0   # 无人机绝对电量底线 [J]
@@ -167,6 +171,10 @@ class GreedyBaseline:
         self.UAV_ENERGY_MODEL = energy_cfg.uav_energy_model
         self.UAV_ALPHA_WH_PER_KG_KM = energy_cfg.uav_alpha_wh_per_kg_km
         self.ALLOW_MOVING_TRUCK_LAUNCH = energy_cfg.allow_moving_truck_launch
+        self.SERVICE_TIME_CUSTOMER = energy_cfg.truck_service_time_order_s
+        self.delivery_service_time = energy_cfg.drone_service_time_order_s
+        self.TRUCK_DRONE_LAUNCH_TIME = energy_cfg.truck_drone_launch_time_s
+        self.TRUCK_DRONE_RECOVER_TIME = energy_cfg.truck_drone_recover_time_s
 
     # ══════════════════════════════════════════════════════════════════════════
     # 公共接口
@@ -257,9 +265,10 @@ class GreedyBaseline:
         for alloc in allocations:
             if alloc.feasible and alloc.mode in ("B", "B_WAIT") and alloc.recovery_station_id:
                 # 对于同一个站点被多个allocation使用的情况，取最大等待时间
+                wait_s = max(0.0, alloc.wait_duration) + self.TRUCK_DRONE_RECOVER_TIME
                 recovery_station_wait_times[alloc.recovery_station_id] = max(
                     recovery_station_wait_times.get(alloc.recovery_station_id, 0),
-                    alloc.wait_duration,
+                    wait_s,
                 )
 
         truck_routes: dict[str, TruckRoute] = {}
@@ -708,6 +717,9 @@ class GreedyBaseline:
             station = self._find_insertable_station(
                 cur_pos, next_pos, stations, route.charging_stop_ids, calc_dist
             )
+            # 若待访问节点本身就是该充电站，不再额外插入同站 station 节点，避免重复停靠。
+            if station is not None and station.station_id == next_node["id"]:
+                station = None
             if station:
                 s_pos    = station.location
                 d_to_s, g_to_s   = calc_dist_and_geometry(cur_pos, s_pos)
@@ -1007,14 +1019,14 @@ class GreedyBaseline:
                 launch_time_est = (
                     alloc.launch_time
                     if alloc.launch_time > current_time
-                    else current_time + truck_distance / truck.speed
+                    else current_time + truck_distance / truck.speed + self.TRUCK_DRONE_LAUNCH_TIME
                 )
             else:
                 truck = self.entity_mgr.trucks.get(alloc.vehicle_id)
                 if truck is None:
                     return float("inf"), 0.0, 0.0, 0.0
                 launch_loc = truck.get_location(current_time)
-                launch_time_est = current_time
+                launch_time_est = current_time + self.TRUCK_DRONE_LAUNCH_TIME
 
             recovery = (
                 self.entity_mgr.stations.get(alloc.recovery_station_id)
@@ -1119,9 +1131,16 @@ class GreedyBaseline:
             flight_time_out = dist_out / drone.cruise_speed if drone.cruise_speed > 0 else 1000
             flight_time_back = dist_back / drone.cruise_speed if drone.cruise_speed > 0 else 1000
             flight_time_total = flight_time_out + self.delivery_service_time + flight_time_back
+            launch_operation_time = self.TRUCK_DRONE_LAUNCH_TIME
 
             # 统一评分：f = f_dist + f_energy + f_penalty
-            delivery_time_est = current_time + launch_delay + flight_time_out + self.delivery_service_time
+            delivery_time_est = (
+                current_time
+                + launch_delay
+                + launch_operation_time
+                + flight_time_out
+                + self.delivery_service_time
+            )
             lateness = max(0.0, delivery_time_est - order.deadline)
 
             cost_dist = (
@@ -1143,9 +1162,9 @@ class GreedyBaseline:
                 best_scenario = {
                     'feasible': True,
                     'launch_station_id': launch_station_id,
-                    'launch_time': current_time + launch_delay,
+                    'launch_time': current_time + launch_delay + launch_operation_time,
                     'recovery_station_id': recovery_id,
-                    'wait_duration': flight_time_total,
+                    'wait_duration': launch_operation_time + flight_time_total,
                     'score': best_score,
                     'distance': total_distance,
                     'energy_needed': total_energy_j,
