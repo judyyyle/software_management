@@ -236,10 +236,13 @@ export const useSystemStore = defineStore('system', () => {
   }
 
   /**
-   * 触发贪心调度决策。
-   * 将待分配订单传送到后端，返回分配方案。
+   * 触发调度决策。
+   * 将待分配订单传送到后端，并可指定求解算法。
    */
-  async function dispatch(bbox: { minx: number; miny: number; maxx: number; maxy: number }) {
+  async function dispatch(
+    bbox: { minx: number; miny: number; maxx: number; maxy: number },
+    solver: 'greedy' | 'market' = 'greedy',
+  ) {
     if (DEBUG_WEBSOCKET) {
       console.log('[system.dispatch] 被调用，bbox:', bbox)
     }
@@ -248,7 +251,7 @@ export const useSystemStore = defineStore('system', () => {
     const sceneStore = useSceneStore()
     const sceneId = sceneStore.context?.scene_id
     
-    const payload: any = { solver: 'greedy', bbox }
+    const payload: any = { solver, bbox }
     if (sceneId) {
       payload.scene_id = sceneId
     }
