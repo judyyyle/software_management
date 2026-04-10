@@ -66,10 +66,25 @@
             <!-- 调度控制行 -->
             <div class="sc-action-row">
               <button class="sc-btn sc-btn--dispatch"
+                :class="{ 'sc-btn--dispatch-active': dispatchSolver === 'greedy' }"
+                :disabled="!initDone || dispatchLoading"
+                @click="dispatchSolver = 'greedy'">
+                🧠 贪心算法
+              </button>
+              <button class="sc-btn sc-btn--dispatch"
+                :class="{ 'sc-btn--dispatch-active': dispatchSolver === 'market' }"
+                :disabled="!initDone || dispatchLoading"
+                @click="dispatchSolver = 'market'">
+                🏷️ 市场拍卖算法
+              </button>
+              <button class="sc-btn sc-btn--dispatch sc-btn--dispatch-run"
                 :disabled="!initDone || dispatchLoading"
                 @click="doDispatch">
-                {{ dispatchLoading ? '⏳ 调度中...' : '🎯 批量贪心调度' }}
+                {{ dispatchLoading ? '⏳ 调度中...' : (dispatchSolver === 'market' ? '🎯 批量市场拍卖调度' : '🎯 批量贪心调度') }}
               </button>
+              <span class="dispatch-solver-tag">
+                当前算法：{{ dispatchSolver === 'market' ? '市场拍卖' : '贪心' }}
+              </span>
               <span v-if="lastDispatchResult" class="dispatch-quick-stat">
                 ✓ {{ lastDispatchResult.plan.feasible }}/{{ lastDispatchResult.plan.total_orders }} 可行
               </span>
@@ -217,6 +232,7 @@ const dispatchLoading = ref(false)
 const lastDispatchResult = ref<any>(null)
 const dispatchPlan = ref<DispatchPlan | null>(null)
 const totalEnergyCostWh = ref(0)
+const dispatchSolver = ref<'greedy' | 'market'>('greedy')
 
 // 预设保存状态
 const savingPreset = ref(false)
@@ -416,7 +432,7 @@ async function doSetSpeed(ratio: number) {
 
 async function doDispatch() {
   dispatchLoading.value = true
-  _log('info', '🎯 正在执行贪心调度算法...')
+  _log('info', `🎯 正在执行${dispatchSolver.value === 'market' ? '市场拍卖' : '贪心'}调度算法...`)
   try {
     // 检查是否有加载场景
     if (!sceneStore.context) {
@@ -441,7 +457,7 @@ async function doDispatch() {
     if (DEBUG_VEHICLE_UPDATES) {
       console.log('[doDispatch] 将调用 dispatch，bbox:', bbox)
     }
-    const result = await systemStore.dispatch(bbox)
+    const result = await systemStore.dispatch(bbox, dispatchSolver.value)
     if (DEBUG_VEHICLE_UPDATES) {
       console.log('[doDispatch] dispatch 返回:', result)
     }
@@ -750,10 +766,30 @@ onBeforeUnmount(() => {
 .sc-btn--pause:hover:not(:disabled) { background: #b45309; }
 .sc-btn--reset { background: none; border: 1px solid var(--hl-border); color: var(--hl-text-secondary); }
 .sc-btn--reset:hover { background: var(--hl-content-bg); color: var(--hl-danger); border-color: var(--hl-danger); }
-.sc-btn--dispatch { background: var(--hl-info); color: #fff; flex: 1; min-width: 140px; }
+.sc-btn--dispatch { background: var(--hl-info); color: #fff; min-width: 140px; }
 .sc-btn--dispatch:hover:not(:disabled) { background: #0284c7; }
+.sc-btn--dispatch-active {
+  background: #0369a1;
+  box-shadow: inset 0 0 0 2px rgba(255, 255, 255, 0.18);
+}
+.sc-btn--dispatch-run {
+  flex: 1;
+  min-width: 180px;
+}
 .sc-btn--export { background: #7c3aed; color: #fff; }
 .sc-btn--export:hover:not(:disabled) { background: #6d28d9; }
+
+.dispatch-solver-tag {
+  display: inline-flex;
+  align-items: center;
+  padding: 0 10px;
+  height: 34px;
+  border-radius: var(--hl-border-radius);
+  background: var(--hl-content-bg);
+  color: var(--hl-text-secondary);
+  font-size: 12px;
+  white-space: nowrap;
+}
 
 /* 调度统计快览 */
 .dispatch-quick-stat {

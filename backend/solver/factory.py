@@ -11,6 +11,7 @@ from __future__ import annotations
 from typing import Any, Callable
 
 from solver.greedy_baseline import GreedyBaseline
+from solver.market_based_solver import MarketBasedSolver
 from solver.interfaces import DispatchSolver
 
 
@@ -19,6 +20,7 @@ SolverBuilder = Callable[[Any], DispatchSolver]
 
 _SOLVER_BUILDERS: dict[str, SolverBuilder] = {
     "greedy": lambda entity_mgr: GreedyBaseline(entity_mgr),
+    "market": lambda entity_mgr: MarketBasedSolver(entity_mgr),
 }
 
 
