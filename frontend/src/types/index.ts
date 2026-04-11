@@ -158,6 +158,28 @@ export interface Order {
   time_domain?: 'wall_ms' | 'sim_s'
 }
 
+/**
+ * 后端在仿真时刻 spawn_sim_s 注入的预定义动态订单（与 orders.json 对齐，保证复现）
+ * 使用 deadline_offset_s 或绝对 deadline_sim_s 之一。
+ */
+export interface ScheduledDynamicOrder {
+  order_id: string
+  spawn_sim_s: number
+  /** 从 spawn 起算的截止偏移（秒） */
+  deadline_offset_s?: number
+  /** 仿真绝对截止时间（秒），若设置则忽略 deadline_offset_s */
+  deadline_sim_s?: number
+  delivery_lng: number
+  delivery_lat: number
+  delivery_z?: number
+  payload_weight: number
+  source_type?: string | null
+  pickup_source_id?: string | null
+  fulfillment_mode?: string
+  priority?: string
+  priority_label?: string
+}
+
 /** 订单生成器参数（用户可在仿真面板调整） */
 export interface OrderGeneratorConfig {
   arrival_rate:    number   // 单/分钟

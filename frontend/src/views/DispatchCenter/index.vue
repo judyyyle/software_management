@@ -532,6 +532,7 @@ async function doSavePreset() {
       },
       orders: {
         static_orders: orderStore.generatedOrders,
+        dynamic_orders: orderStore.scheduledDynamicOrders,
       },
     }
 
@@ -635,21 +636,27 @@ async function loadPresetEntitiesIfAvailable() {
     if (data.trucks) entityStore.trucks = data.trucks
     if (data.drones) entityStore.drones = data.drones
     
-    // 加载预设的任务点（补全所有必需字段）
+    // 加载预设的静态任务点（补全所有必需字段）
     if (data.orders && Array.isArray(data.orders)) {
       const now = Date.now()
       orderStore.generatedOrders = data.orders.map((o: any) => {
+        const rowSim = o.time_domain === 'sim_s'
         const priority = o.priority || 'NORMAL'
         const priorityLabels: Record<string, string> = {
           'URGENT': '紧急',
           'NORMAL': '普通',
           'LOW': '低优先'
         }
-        
+        const dl = o.deadline ?? (rowSim ? 600 : now + 600000)
+        const fmtSimDeadline = (sec: number) => {
+          const m = Math.floor(sec / 60)
+          const s = Math.floor(sec % 60)
+          return `仿真+${m}分${String(s).padStart(2, '0')}秒`
+        }
         return {
           order_id: o.order_id,
           create_time: o.create_time ?? 0,
-          deadline: o.deadline ?? now + 600000,
+          deadline: dl,
           delivery_lng: o.delivery_lng,
           delivery_lat: o.delivery_lat,
           delivery_z: o.delivery_z ?? 0,
@@ -658,17 +665,22 @@ async function loadPresetEntitiesIfAvailable() {
           status: 'PENDING',
           source_type: 'DEPOT',
           pickup_source_id: null,
-          fulfillment_mode: o.payload_weight > 3.5 ? 'DRONE_TRUCK_DEPOT' : 'DRONE_DIRECT',
-          warehouse_name: data.depots[0]?.name || '仓库-中心',
-          deadline_iso: new Date(o.deadline ?? now + 600000).toLocaleTimeString('zh-CN', {
-            hour: '2-digit',
-            minute: '2-digit',
-          }),
-          priority_label: priorityLabels[priority] || '普通',
-          time_domain: 'wall_ms',
+          fulfillment_mode: o.fulfillment_mode ?? (o.payload_weight > 3.5 ? 'DRONE_TRUCK_DEPOT' : 'DRONE_DIRECT'),
+          warehouse_name: o.warehouse_name || data.depots[0]?.name || '仓库-中心',
+          deadline_iso: rowSim
+            ? fmtSimDeadline(Number(dl))
+            : new Date(dl).toLocaleTimeString('zh-CN', {
+                hour: '2-digit',
+                minute: '2-digit',
+              }),
+          priority_label: o.priority_label || priorityLabels[priority] || '普通',
+          time_domain: rowSim ? 'sim_s' : 'wall_ms',
         } as Order
       })
     }
+    orderStore.scheduledDynamicOrders = Array.isArray(data.dynamic_orders)
+      ? data.dynamic_orders
+      : []
   } catch (e) {
     console.warn('[DispatchCenter] 加载预设实体失败:', e)
   }
