@@ -249,14 +249,12 @@ class GreedyBaseline:
                 mode_counter[result.mode] = mode_counter.get(result.mode, 0) + 1
                 if result.mode == "A" and result.vehicle_id in truck_node_map:
                     truck_node_map[result.vehicle_id]["orders"].append(order)
-                elif result.mode in ("B", "B_WAIT", "C") and result.drone_id:
-                    # 记录已分配的无人机
+                elif result.mode in ("B", "B_WAIT", "B_DYNAMIC", "C") and result.drone_id:
                     allocated_drones.add(result.drone_id)
-                    # B 和 B_WAIT 模式都需要添加回收点到卡车路由
-                    if result.mode in ("B", "B_WAIT") and result.vehicle_id in truck_node_map:
-                        truck_node_map[result.vehicle_id]["recovery_stations"].append(result.recovery_station_id)
-                        # B_WAIT 模式还需要添加出发站（无人机在此等待）
-                        if result.mode == "B_WAIT" and result.launch_station_id:
+                    if result.mode in ("B", "B_WAIT", "B_DYNAMIC") and result.vehicle_id in truck_node_map:
+                        if result.mode != "B_DYNAMIC":
+                            truck_node_map[result.vehicle_id]["recovery_stations"].append(result.recovery_station_id)
+                        if result.mode in ("B_WAIT", "B_DYNAMIC") and result.launch_station_id:
                             truck_node_map[result.vehicle_id]["recovery_stations"].append(result.launch_station_id)
 
         # ── Phase 3：构建卡车路径 ─────────────────────────────────────────
@@ -273,8 +271,9 @@ class GreedyBaseline:
 
         truck_routes: dict[str, TruckRoute] = {}
         for truck_id, node_data in truck_node_map.items():
+            if not node_data["orders"] and not node_data["recovery_stations"]:
+                continue
             truck = self.entity_mgr.trucks[truck_id]
-            # 去除 recovery_stations 中的重复
             unique_recovery_stations = list(set(node_data["recovery_stations"]))
             truck_routes[truck_id] = self._build_truck_route(
                 truck, node_data["orders"], unique_recovery_stations, current_time, road_graph, nodes,

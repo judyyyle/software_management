@@ -56,6 +56,12 @@ class SimulationEngine:
         self._thread:     Optional[threading.Thread] = None
         self._stop_event: threading.Event            = threading.Event()
 
+        # 动态订单自动调度支持
+        self._dispatch_engine = None
+        self._dispatch_bbox:     Optional[dict] = None
+        self._dispatch_scene_id: Optional[str]  = None
+        self._pending_snapshot: set[str] = set()
+
     # ══════════════════════════════════════════════════════════════════════════
     # 初始化注入
     # ══════════════════════════════════════════════════════════════════════════
@@ -74,9 +80,20 @@ class SimulationEngine:
         """
         self._entity_mgr = entity_mgr
         self._order_mgr  = order_mgr
-        # 为 entity_mgr 设置 order_mgr 引用，支持无人机完成任务时的订单状态更新
         entity_mgr.order_mgr = order_mgr
         logger.info("[SimEngine] 已挂载 EntityManager 和 OrderManager")
+
+    def attach_dispatch_engine(
+        self,
+        dispatch_engine,
+        bbox: dict,
+        scene_id: Optional[str] = None,
+    ) -> None:
+        """注入调度引擎，使仿真循环能在动态订单出现时自动触发增量调度。"""
+        self._dispatch_engine = dispatch_engine
+        self._dispatch_bbox = bbox
+        self._dispatch_scene_id = scene_id
+        logger.info("[SimEngine] 已挂载 DispatchEngine，自动调度已启用")
 
     # ══════════════════════════════════════════════════════════════════════════
     # 生命周期控制
@@ -130,6 +147,10 @@ class SimulationEngine:
         self.sim_start_wall_ms = 0
         self._entity_mgr       = None
         self._order_mgr        = None
+        self._dispatch_engine  = None
+        self._dispatch_bbox    = None
+        self._dispatch_scene_id = None
+        self._pending_snapshot = set()
         logger.info("[SimEngine] 仿真引擎已重置")
 
     def set_speed(self, speed_ratio: float) -> None:
@@ -181,6 +202,16 @@ class SimulationEngine:
                     self._order_mgr.tick(self.current_time, self._entity_mgr)
                     self._order_mgr.update_timeouts(self.current_time)
 
+                # ── 3.5 动态订单自动增量调度 ──────────────────────────────────
+                self._try_auto_dispatch()
+
+                # ── 3.6 契约兑现检查 ─────────────────────────────────────────
+                if self._dispatch_engine is not None:
+                    try:
+                        self._dispatch_engine.try_fulfill_contracts(self.current_time)
+                    except Exception:
+                        pass
+
                 # ── 4. 广播 TICK ─────────────────────────────────────────────
                 payload = self._build_tick_payload()
                 broadcast_tick(payload)
@@ -195,6 +226,51 @@ class SimulationEngine:
                 self._stop_event.wait(timeout=sleep_sec)
 
         logger.info("[SimEngine._run_loop] 主循环退出")
+
+    def _try_auto_dispatch(self) -> None:
+        """检测新出现的 pending 订单，自动触发增量调度。
+
+        通过对比 pending_orders 的 id 快照来识别本轮新增的订单。
+        仅在调度引擎已挂载且已完成过首次调度后生效。
+        """
+        if (
+            self._dispatch_engine is None
+            or self._order_mgr is None
+            or self._dispatch_bbox is None
+        ):
+            return
+
+        current_ids = set(self._order_mgr.pending_orders.keys())
+        new_ids = current_ids - self._pending_snapshot
+        self._pending_snapshot = current_ids
+
+        if not new_ids:
+            return
+
+        new_orders = {
+            oid: self._order_mgr.pending_orders[oid]
+            for oid in new_ids
+            if oid in self._order_mgr.pending_orders
+        }
+        if not new_orders:
+            return
+
+        try:
+            logger.info(
+                "[SimEngine] 检测到 %d 个新订单，触发增量调度: %s",
+                len(new_orders),
+                list(new_orders.keys()),
+            )
+            self._dispatch_engine.execute_incremental(
+                new_orders,
+                self.current_time,
+                self._dispatch_bbox,
+                scene_id=self._dispatch_scene_id,
+            )
+            # 调度完成后刷新快照（feasible 的单已移入 assigned）
+            self._pending_snapshot = set(self._order_mgr.pending_orders.keys())
+        except Exception:
+            logger.exception("[SimEngine] 动态订单增量调度失败")
 
     def _build_tick_payload(self) -> dict:
         """
