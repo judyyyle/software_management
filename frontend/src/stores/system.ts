@@ -208,6 +208,7 @@ export const useSystemStore = defineStore('system', () => {
       status: o.status,
       source_type: o.source_type ?? null,
       pickup_source_id: o.pickup_source_id ?? null,
+      time_domain: o.time_domain,
     }))
     
     // 👇 新增：记录要发送的充电站坐标，用于对比
@@ -229,6 +230,7 @@ export const useSystemStore = defineStore('system', () => {
       },
       order_gen_config: orderStore.generatorConfig,
       initial_orders: initialOrders,  // 发送前端已生成的静态订单
+      scheduled_dynamic_orders: orderStore.scheduledDynamicOrders,
     })
     // 初始化成功后，标记为已初始化
     initialized.value = true

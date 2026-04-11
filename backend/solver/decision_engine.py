@@ -135,18 +135,72 @@ class DispatchDecisionEngine:
 
         return plan
 
-    def _apply_plan(self, plan: DispatchPlan, current_time: float) -> None:
+    def execute_incremental(
+        self,
+        new_orders: dict,
+        current_time: float,
+        bbox: dict,
+        scene_id: str | None = None,
+    ) -> DispatchPlan:
+        """增量调度：仅对动态新单执行拍卖，尊重已有契约。
+
+        核心原则：
+          1. 状态冻结 — 不覆盖飞行中无人机的位置/路径
+          2. 路径拼接 — 新任务段追加到已有路径末尾
+          3. 卡车路由保护 — 不重写正在执行的卡车路由
+        """
+        if not new_orders:
+            logger.debug("[DispatchDecisionEngine] 无新增订单")
+            return DispatchPlan(
+                allocations=[],
+                cost_total=0.0,
+                summary={"total_orders": 0, "feasible": 0, "modes": {}},
+            )
+
+        if not hasattr(self.solver, "dispatch_incremental"):
+            logger.info("[DispatchDecisionEngine] 当前求解器不支持增量调度，回退到全量")
+            return self.execute(current_time, bbox, scene_id)
+
+        plan = self.solver.dispatch_incremental(new_orders, current_time, bbox, scene_id=scene_id)
+        self._apply_plan(plan, current_time, incremental=True)
+        self._build_drone_routes(plan, current_time)
+
+        for truck_id, route in plan.truck_routes.items():
+            logger.info(
+                "[DispatchDecisionEngine] 增量调度卡车 %s 路径 %d 节点，里程 %.0fm",
+                truck_id, len(route.nodes), route.total_distance,
+            )
+
+        return plan
+
+    def try_fulfill_contracts(self, current_time: float) -> None:
+        """尝试兑现已完成回收的契约。
+
+        遍历求解器的活跃契约，若无人机已不再飞行（IDLE/CHARGING）
+        且当前时刻已超过 uav_arrival_time，则标记契约为 fulfilled。
+        供仿真引擎在每个 tick 中调用。
+        """
+        if not hasattr(self.solver, "fulfill_contract"):
+            return
+        if not hasattr(self.solver, "_active_contracts"):
+            return
+
+        for contract in self.solver._active_contracts:
+            if contract.status != "active":
+                continue
+            drone = self.entity_mgr.drones.get(contract.drone_id)
+            if drone is None:
+                continue
+            if current_time >= contract.uav_arrival_time and not drone.status.is_flying():
+                self.solver.fulfill_contract(contract.contract_id)
+
+    def _apply_plan(self, plan: DispatchPlan, current_time: float, incremental: bool = False) -> None:
         """
         应用分配方案，更新订单和实体状态。
 
-        流程：
-          1. 更新订单状态（pending → assigned）
-          2. 应用卡车路由（触发卡车开始行驶）
-          3. 无人机状态转换（标记为已分配）
-
-        对每个分配结果：
-          - 可行方案：订单转入 assigned，绑定 vehicle_id + mode
-          - 不可行：订单保留 pending，等待下次调度机会
+        Args:
+            incremental: 增量模式。为 True 时保护正在执行中的卡车路由，
+                         仅将新停靠事件追加到已有的时刻表中，不覆盖卡车物理路线。
         """
         for alloc in plan.allocations:
             order = self.order_mgr.pending_orders.get(alloc.order_id)
@@ -166,12 +220,12 @@ class DispatchDecisionEngine:
                 from core.entities.primitives import TaskStatus
                 order.update_status(TaskStatus.ASSIGNED)
 
-                # 更新日志，为 B_WAIT 模式增加出发站信息
-                if alloc.mode == "B_WAIT":
+                if alloc.mode in ("B_WAIT", "B_DYNAMIC"):
                     logger.info(
-                        "[DispatchDecisionEngine] 分配 %s 至 %s（模式 B_WAIT, 出发站 %s, 距离 %.1fm, 回收点 %s），状态转为 ASSIGNED",
+                        "[DispatchDecisionEngine] 分配 %s 至 %s（模式 %s, 出发站 %s, 距离 %.1fm, 回收点 %s），状态转为 ASSIGNED",
                         alloc.order_id,
                         alloc.vehicle_id,
+                        alloc.mode,
                         alloc.launch_station_id or "-",
                         alloc.distance,
                         alloc.recovery_station_id or "-",
@@ -200,19 +254,18 @@ class DispatchDecisionEngine:
                 logger.warning("[DispatchDecisionEngine] 卡车 %s 不存在", truck_id)
                 continue
 
-            # 在应用路由前，按 B_WAIT 任务关系重算节点时间：
-            # recovery 节点仅在无人机尚未返航时才需要等待，避免无意义超长停留。
             self._recalculate_truck_route_timing_for_b_wait(route, plan.allocations, current_time)
 
-            # 从路由节点中提取路网节点 ID 和位置
+            if incremental:
+                # 增量模式：保护正在执行的卡车路由，只追加新的停靠事件
+                self._merge_incremental_truck_stops(truck, route, plan.allocations, current_time)
+                continue
+
             route_nodes = [node.node_id for node in route.nodes]
             route_positions = [node.position for node in route.nodes]
 
             try:
-                # 使用完整的几何路径（包含所有中间OSM节点）使卡车沿着真实道路行驶
                 truck.set_route(route_nodes, route_positions, current_time, geometry=route.geometry)
-                # 记录带时间戳的关键节点计划，供 EntityManager 在 tick 中驱动事件：
-                # customer 节点触发订单完成，recovery 节点触发无人机回收上车。
                 truck._planned_route_stops = [
                     {
                         "node_id": node.node_id,
@@ -235,9 +288,9 @@ class DispatchDecisionEngine:
                     truck_id, str(e),
                 )
 
-        # ── 补齐 B_WAIT 起飞时刻：使用卡车实际到达出发站时刻 ───────────────────
+        # ── 补齐 B_WAIT/B_DYNAMIC 起飞时刻：使用卡车实际到达出发站时刻 ─────────
         for alloc in plan.allocations:
-            if not alloc.feasible or alloc.mode != "B_WAIT" or not alloc.launch_station_id:
+            if not alloc.feasible or alloc.mode not in ("B_WAIT", "B_DYNAMIC") or not alloc.launch_station_id:
                 continue
             truck_route = plan.truck_routes.get(alloc.vehicle_id)
             if truck_route is None:
@@ -252,6 +305,81 @@ class DispatchDecisionEngine:
 
         # ── 第三步：应用无人机路由 ────────────────────────────────────────────
         self._setup_drone_routes(plan, current_time)
+
+    def _merge_incremental_truck_stops(
+        self,
+        truck,
+        new_route: "TruckRoute",
+        allocations: list,
+        current_time: float,
+    ) -> None:
+        """增量模式下将新的停靠事件追加到卡车已有时刻表中，不覆盖物理路线。
+
+        原则：
+          - 保留已执行和正在执行的停靠事件（cursor 之前）
+          - 将新的 recovery / customer 停靠按时间顺序插入未执行区间
+          - 不调用 truck.set_route()，卡车继续沿原有几何路径行驶
+        """
+        existing_stops: list[dict] = getattr(truck, "_planned_route_stops", None) or []
+        cursor = int(getattr(truck, "_planned_route_cursor", 0))
+
+        if not existing_stops:
+            # 卡车尚未有路线（首次被增量调度命中），按全量模式设置
+            route_nodes = [node.node_id for node in new_route.nodes]
+            route_positions = [node.position for node in new_route.nodes]
+            try:
+                truck.set_route(route_nodes, route_positions, current_time, geometry=new_route.geometry)
+                truck._planned_route_stops = [
+                    {
+                        "node_id": n.node_id, "node_type": n.node_type,
+                        "position": n.position, "arrival_time": n.arrival_time,
+                        "departure_time": n.departure_time, "order_id": n.order_id,
+                    }
+                    for n in new_route.nodes
+                ]
+                truck._planned_route_cursor = 0
+                logger.info(
+                    "[DispatchDecisionEngine] 增量模式首次为卡车 %s 设置路由 (%d 节点)",
+                    truck.truck_id, len(route_nodes),
+                )
+            except Exception as e:
+                logger.exception("[DispatchDecisionEngine] 增量首次路由设置失败 %s: %s", truck.truck_id, e)
+            return
+
+        # 提取新路由中需要追加的事件性节点（customer / recovery）
+        existing_ids = {s.get("node_id") for s in existing_stops}
+        new_stops = []
+        for node in new_route.nodes:
+            if node.node_type in ("customer", "recovery", "station"):
+                if node.node_id in existing_ids:
+                    continue
+                new_stops.append({
+                    "node_id": node.node_id,
+                    "node_type": node.node_type,
+                    "position": node.position,
+                    "arrival_time": node.arrival_time,
+                    "departure_time": node.departure_time,
+                    "order_id": node.order_id,
+                })
+
+        if not new_stops:
+            logger.debug(
+                "[DispatchDecisionEngine] 增量模式卡车 %s 无需追加新停靠",
+                truck.truck_id,
+            )
+            return
+
+        # 将新停靠按 arrival_time 插入到未执行区间
+        future_stops = existing_stops[cursor:]
+        merged = future_stops + new_stops
+        merged.sort(key=lambda s: float(s.get("arrival_time", float("inf"))))
+        truck._planned_route_stops = existing_stops[:cursor] + merged
+        # cursor 不变，继续从之前的位置处理
+        logger.info(
+            "[DispatchDecisionEngine] 增量模式追加 %d 个停靠到卡车 %s "
+            "(cursor=%d, 总计 %d 停靠)",
+            len(new_stops), truck.truck_id, cursor, len(truck._planned_route_stops),
+        )
 
     def _recalculate_truck_route_timing_for_b_wait(
         self,
@@ -365,7 +493,7 @@ class DispatchDecisionEngine:
         elif node.node_type == "recovery":
             launch_orders = [
                 alloc.order_id for alloc in allocations
-                if alloc.feasible and alloc.mode == "B_WAIT" and alloc.launch_station_id == node.node_id
+                if alloc.feasible and alloc.mode in ("B_WAIT", "B_DYNAMIC") and alloc.launch_station_id == node.node_id
             ]
             recovery_orders = [
                 alloc.order_id for alloc in allocations
@@ -391,25 +519,25 @@ class DispatchDecisionEngine:
         """
         为分配的无人机设置路由计划。
 
-        调度结果中的每个可行分配都包含：
-          - drone_id: 分配的无人机 ID（仅模式 B/C 有效）
-          - mode: 分配模式（'A'=卡车直递，'B'=卡-空协同，'C'=仓-空直递）
-          - vehicle_id: 母体 ID（卡车 或 仓库）
-          - delivery_loc: 配送目标点坐标
-          - recovery_station_id: 回收点 ID（模式 B/C）
-
-        路由规划：
-          模式 B：[launch_loc (卡车当前)] → [delivery_loc] → [recovery_station]
-          模式 C：[depot_loc] → [delivery_loc] → [depot_loc]
+        增量安全：跳过正在飞行中的无人机，避免覆盖其当前路径和位置。
         """
         for alloc in plan.allocations:
             if not alloc.feasible or alloc.mode == "A" or not alloc.drone_id:
-                # 模式 A 不涉及无人机；不可行分配忽略
                 continue
 
             drone = self.entity_mgr.drones.get(alloc.drone_id)
             if drone is None:
                 logger.warning("[DispatchDecisionEngine] 无人机 %s 不存在", alloc.drone_id)
+                continue
+
+            # 状态冻结：正在飞行的无人机使用路径拼接（串联任务）
+            is_relay = getattr(alloc, "_is_relay", False)
+            if drone.status.is_flying and not is_relay:
+                logger.warning(
+                    "[DispatchDecisionEngine] 无人机 %s 正在飞行(status=%s)，"
+                    "跳过路由设置以保护轨迹连续性",
+                    alloc.drone_id, drone.status.value,
+                )
                 continue
 
             order = self.order_mgr.assigned_orders.get(alloc.order_id)
@@ -418,17 +546,13 @@ class DispatchDecisionEngine:
                 continue
 
             try:
-                if alloc.mode == "B" or alloc.mode == "B_WAIT":
-                    # 模式 B：卡-空协同（从卡车当前位置）
-                    # 模式 B_WAIT：无人机在充电站等待后起飞
+                if alloc.mode in ("B", "B_WAIT", "B_DYNAMIC"):
                     truck = self.entity_mgr.trucks.get(alloc.vehicle_id)
                     if truck is None:
                         logger.warning("[DispatchDecisionEngine] 卡车 %s 不存在", alloc.vehicle_id)
                         continue
 
-                    # 确定起飞位置
-                    if alloc.mode == "B_WAIT":
-                        # 从指定的充电站起飞
+                    if alloc.mode in ("B_WAIT", "B_DYNAMIC"):
                         launch_station = self.entity_mgr.stations.get(alloc.launch_station_id)
                         if launch_station is None:
                             logger.warning(
@@ -439,19 +563,21 @@ class DispatchDecisionEngine:
                         launch_loc = launch_station.location
                         wait_duration = alloc.wait_duration
                     else:
-                        # 从卡车当前位置起飞
                         launch_loc = truck.get_location(current_time)
                         wait_duration = 0.0
 
                     delivery_loc = order.delivery_loc
                     recovery_id = alloc.recovery_station_id
 
-                    recovery_station = self.entity_mgr.stations.get(recovery_id)
-                    if recovery_station is None:
-                        logger.warning("[DispatchDecisionEngine] 充电站 %s 不存在", recovery_id)
+                    if alloc.mode == "B_DYNAMIC":
+                        recovery_entity = self.entity_mgr.depots.get(recovery_id)
+                    else:
+                        recovery_entity = self.entity_mgr.stations.get(recovery_id)
+                    if recovery_entity is None:
+                        logger.warning("[DispatchDecisionEngine] 回收点 %s 不存在", recovery_id)
                         continue
 
-                    recovery_loc = recovery_station.location
+                    recovery_loc = recovery_entity.location
 
                     waypoints = [
                         RouteWaypoint(launch_loc, WaypointAction.PICKUP, alloc.order_id),
@@ -459,21 +585,17 @@ class DispatchDecisionEngine:
                         RouteWaypoint(recovery_loc, WaypointAction.DOCK_DEPOT, recovery_id),
                     ]
                     drone.set_route(waypoints)
-                    # 为无人机分配订单（在航路的 PICKUP 点会绑定）
                     try:
                         drone.assign_order(alloc.order_id, order.payload_weight)
                     except ValueError as e:
                         logger.warning("[DispatchDecisionEngine] 为无人机 %s 分配订单失败: %s", alloc.drone_id, e)
                     
-                    # 订单状态转为 PICKED_UP → DELIVERING（准备飞行配送）
                     from core.entities.primitives import TaskStatus
                     if order.status == TaskStatus.ASSIGNED:
                         order.update_status(TaskStatus.PICKED_UP)
                         order.update_status(TaskStatus.DELIVERING)
                     
-                    # 设置初始状态
-                    if alloc.mode == "B_WAIT":
-                        # 无人机先由卡车运输，直到 launch_time 才起飞。
+                    if alloc.mode in ("B_WAIT", "B_DYNAMIC"):
                         drone.current_loc = truck.get_location(current_time)
                         drone.status = DroneStatus.IDLE
                         drone.transport_truck_id = truck.truck_id
@@ -483,10 +605,11 @@ class DispatchDecisionEngine:
                         if alloc.drone_id not in truck.docked_drones:
                             truck.docked_drones.append(alloc.drone_id)
                         logger.info(
-                            "[DispatchDecisionEngine] 为无人机 %s 设置路由（模式 B_WAIT）："
+                            "[DispatchDecisionEngine] 为无人机 %s 设置路由（模式 %s）："
                             "随卡车 %s 运输至充电站 %s（t=%.1fs）后起飞，"
                             "飞行 %.1fs → 回收点 %s，订单: %s",
-                            alloc.drone_id, alloc.vehicle_id, alloc.launch_station_id,
+                            alloc.drone_id, alloc.mode, alloc.vehicle_id,
+                            alloc.launch_station_id,
                             alloc.launch_time, wait_duration,
                             recovery_id, alloc.order_id,
                         )
@@ -503,8 +626,6 @@ class DispatchDecisionEngine:
                         )
 
                 elif alloc.mode == "C":
-                    # 模式 C：仓-空直递
-                    # 无人机从仓库出发 → 配送点 → 仓库回收
                     depot = self.entity_mgr.depots.get(alloc.vehicle_id)
                     if depot is None:
                         logger.warning("[DispatchDecisionEngine] 仓库 %s 不存在", alloc.vehicle_id)
@@ -513,33 +634,48 @@ class DispatchDecisionEngine:
                     depot_loc = depot.location
                     delivery_loc = order.delivery_loc
 
-                    waypoints = [
-                        RouteWaypoint(depot_loc, WaypointAction.PICKUP, alloc.order_id),
-                        RouteWaypoint(delivery_loc, WaypointAction.DELIVER, alloc.order_id),
-                        RouteWaypoint(depot_loc, WaypointAction.DOCK_DEPOT, alloc.vehicle_id),
-                    ]
-                    drone.set_route(waypoints)
-                    # 为无人机分配订单
+                    if is_relay and drone.status.is_flying:
+                        # 串联任务：拼接新路径到现有路径末尾
+                        relay_origin = getattr(alloc, "_relay_origin", None) or delivery_loc
+                        relay_waypoints = [
+                            RouteWaypoint(relay_origin, WaypointAction.PICKUP, alloc.order_id),
+                            RouteWaypoint(delivery_loc, WaypointAction.DELIVER, alloc.order_id),
+                            RouteWaypoint(depot_loc, WaypointAction.DOCK_DEPOT, alloc.vehicle_id),
+                        ]
+                        drone.append_route(relay_waypoints)
+                        logger.info(
+                            "[DispatchDecisionEngine] 无人机 %s 串联任务：当前任务完成后 → "
+                            "取货 → 配送点 → 仓库，新订单: %s",
+                            alloc.drone_id, alloc.order_id,
+                        )
+                    else:
+                        waypoints = [
+                            RouteWaypoint(depot_loc, WaypointAction.PICKUP, alloc.order_id),
+                            RouteWaypoint(delivery_loc, WaypointAction.DELIVER, alloc.order_id),
+                            RouteWaypoint(depot_loc, WaypointAction.DOCK_DEPOT, alloc.vehicle_id),
+                        ]
+                        drone.set_route(waypoints)
+                        drone.transport_truck_id = None
+                        drone.scheduled_launch_time = 0.0
+                        drone.launch_station_id = ""
+                        drone.waiting_recovery_station_id = ""
+                        drone.status = DroneStatus.FLYING_TO_PICKUP
+
                     try:
                         drone.assign_order(alloc.order_id, order.payload_weight)
                     except ValueError as e:
                         logger.warning("[DispatchDecisionEngine] 为无人机 %s 分配订单失败: %s", alloc.drone_id, e)
-                    
-                    # 订单状态转为 PICKED_UP → DELIVERING（准备飞行配送）
+
                     from core.entities.primitives import TaskStatus
                     if order.status == TaskStatus.ASSIGNED:
                         order.update_status(TaskStatus.PICKED_UP)
                         order.update_status(TaskStatus.DELIVERING)
-                    
-                    drone.transport_truck_id = None
-                    drone.scheduled_launch_time = 0.0
-                    drone.launch_station_id = ""
-                    drone.waiting_recovery_station_id = ""
-                    drone.status = DroneStatus.FLYING_TO_PICKUP  # 设置初始飞行状态
-                    logger.info(
-                        "[DispatchDecisionEngine] 为无人机 %s 设置路由（模式 C）：仓库 → 配送点 → 仓库，订单: %s",
-                        alloc.drone_id, alloc.order_id,
-                    )
+
+                    if not is_relay:
+                        logger.info(
+                            "[DispatchDecisionEngine] 为无人机 %s 设置路由（模式 C）：仓库 → 配送点 → 仓库，订单: %s",
+                            alloc.drone_id, alloc.order_id,
+                        )
 
             except Exception as e:
                 logger.exception(
@@ -598,8 +734,7 @@ class DispatchDecisionEngine:
                     # 添加转换后的path
                     plan.drone_routes[alloc.drone_id] = drone_route
 
-                elif alloc.mode == "B_WAIT":
-                    # 模式 B_WAIT：无人机在充电站等待后从该站点起飞
+                elif alloc.mode in ("B_WAIT", "B_DYNAMIC"):
                     launch_station = self.entity_mgr.stations.get(alloc.launch_station_id)
                     if launch_station is None:
                         continue
@@ -607,14 +742,16 @@ class DispatchDecisionEngine:
                     launch_loc = launch_station.location
                     delivery_loc = order.delivery_loc
                     recovery_id = alloc.recovery_station_id
-                    recovery_station = self.entity_mgr.stations.get(recovery_id)
-                    if recovery_station is None:
-                        continue
-                    recovery_loc = recovery_station.location
 
-                    # 构建飞行路径：充电站 → 配送点 → 回收充电站
+                    if alloc.mode == "B_DYNAMIC":
+                        recovery_entity = self.entity_mgr.depots.get(recovery_id)
+                    else:
+                        recovery_entity = self.entity_mgr.stations.get(recovery_id)
+                    if recovery_entity is None:
+                        continue
+                    recovery_loc = recovery_entity.location
+
                     path = [launch_loc, delivery_loc, recovery_loc]
-                    # 转换为WGS84坐标供前端使用
                     path_wgs84 = []
                     for pos in path:
                         lon, lat = pos.to_wgs84()
@@ -623,8 +760,8 @@ class DispatchDecisionEngine:
                     drone_route = DroneRoute(
                         drone_id=alloc.drone_id,
                         order_id=alloc.order_id,
-                        path=[],  # 前端使用path_wgs84列表
-                        mode="B_WAIT",
+                        path=[],
+                        mode=alloc.mode,
                         launch_loc=launch_loc,
                         delivery_loc=delivery_loc,
                         recovery_loc=recovery_loc,
