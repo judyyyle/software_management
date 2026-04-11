@@ -1,6 +1,6 @@
 import { defineStore } from 'pinia'
 import { computed, ref } from 'vue'
-import type { Order, OrderGeneratorConfig, TaskStatus, WarehouseEntry } from '@/types'
+import type { Order, OrderGeneratorConfig, ScheduledDynamicOrder, TaskStatus, WarehouseEntry } from '@/types'
 import { http } from '@/services/http'
 
 /** 后端仿真运行时订单统计（由 TICK 帧推送） */
@@ -15,7 +15,8 @@ import { useSceneStore } from './scene'
 import { buildOrder } from '@/utils/orderGen'
 
 // ── localStorage Keys ────────────────────────────────────────────
-const LS_CONFIG_KEY     = 'hl-order-gen-config-v1'
+/** v2：默认关闭泊松随机流，与预设静态+动态订单基准一致；扩展随机流时可把 arrival_rate 调回 >0 */
+const LS_CONFIG_KEY     = 'hl-order-gen-config-v2'
 const LS_ORDERS_KEY     = 'hl-orders-v1'
 const MAX_STORED_ORDERS = 500
 
@@ -26,7 +27,8 @@ const DEFAULT_WAREHOUSES: WarehouseEntry[] = [
 ]
 
 const DEFAULT_CONFIG: OrderGeneratorConfig = {
-  arrival_rate:      4,
+  /** 0 = 仅 orders.json 静态 + 动态注入，便于算法对比；后续压力测试改为 4 等 */
+  arrival_rate:      0,
   weight_min:        0.5,
   weight_max:        5.0,
   window_min:        20,
@@ -34,8 +36,8 @@ const DEFAULT_CONFIG: OrderGeneratorConfig = {
   priority_urgent:   20,
   priority_normal:   60,
   priority_low:      20,
-  // Phase 2 扩展字段默认值
-  max_orders:        80,
+  // 10 静态 + 10 动态 + 余量；开启随机流时可再调高
+  max_orders:        40,
   geo_mode:          'uniform',
   cluster_radius_km: 1.5,
   burst_enabled:     false,
@@ -67,6 +69,8 @@ export const useOrderStore = defineStore('order', () => {
   // ── 响应式状态 ────────────────────────────────────────────────
   const generatorConfig  = ref<OrderGeneratorConfig>(loadConfig())
   const generatedOrders  = ref<Order[]>(loadOrders())
+  /** 与 orders.json dynamic_orders 一致，随 initSim 发给后端 */
+  const scheduledDynamicOrders = ref<ScheduledDynamicOrder[]>([])
   const generatorRunning = ref(false)
 
   // ── 后端联调统计（由 TICK 帧 stats 字段更新）──────────────────────────
@@ -218,6 +222,7 @@ export const useOrderStore = defineStore('order', () => {
 
   function clearOrders() {
     generatedOrders.value = []
+    scheduledDynamicOrders.value = []
     localStorage.removeItem(LS_ORDERS_KEY)
   }
 
@@ -252,6 +257,7 @@ export const useOrderStore = defineStore('order', () => {
   return {
     generatorConfig,
     generatedOrders,
+    scheduledDynamicOrders,
     generatorRunning,
     stats,
     backendOrders,

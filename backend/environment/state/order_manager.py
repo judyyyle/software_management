@@ -11,6 +11,7 @@ OrderManager 按仿真时钟自驱生成订单，维护全局三池（pending / 
   - pickup_source_id / source_type 留 None，由调度算法后续填充
   - 配送目的地坐标通过 bbox 均匀随机采样生成，不依赖 scene_service 内存缓存
   - completed_orders 仅保留末尾 N 条，防止内存无限增长
+  - 可选：通过 set_scheduled_dynamic_orders 在指定仿真时刻注入预定义动态订单（与 JSON 对齐、可复现）
 
 导入规则（依赖 app.py 已将 BASE_DIR 注入 sys.path）：
   from utils.coord_utils import wgs84_to_utm
@@ -59,6 +60,9 @@ class OrderManager:
         self._next_order_time:  float = 0.0
         self._bbox:             dict  = {}
         self._order_seq:        int   = 0      # 全局序号，构造 order_id
+        # 预定义动态订单（spawn_sim_s 触发，参数固定，便于算法对比复现）
+        self._scheduled_dynamic: list[dict] = []
+        self._scheduled_dynamic_i: int = 0
 
     # ══════════════════════════════════════════════════════════════════════════
     # 配置
@@ -79,10 +83,33 @@ class OrderManager:
         self.pending_orders.clear()
         self.assigned_orders.clear()
         self.completed_orders.clear()
+        self._scheduled_dynamic.clear()
+        self._scheduled_dynamic_i = 0
         logger.info(
             "[OrderManager] 配置完成：arrival_rate=%.1f/min，bbox=%s",
             gen_config.get("arrival_rate", 4),
             bbox,
+        )
+
+    def set_scheduled_dynamic_orders(self, entries: Optional[list]) -> None:
+        """
+        设置「调度过程中按仿真时刻注入」的订单列表（全量替换）。
+
+        每条记录建议字段：
+          order_id, spawn_sim_s, delivery_lng, delivery_lat,
+          deadline_offset_s 或 deadline_sim_s, payload_weight,
+          delivery_z?, pickup_source_id?, source_type?
+
+        spawn_sim_s：相对仿真起点的秒；create_time 固定为该值；deadline 由偏移或绝对时刻给出。
+        """
+        self._scheduled_dynamic = sorted(
+            (dict(e) for e in (entries or [])),
+            key=lambda e: float(e["spawn_sim_s"]),
+        )
+        self._scheduled_dynamic_i = 0
+        logger.info(
+            "[OrderManager] 已加载 %d 条预定义动态订单",
+            len(self._scheduled_dynamic),
         )
 
     # ══════════════════════════════════════════════════════════════════════════
@@ -100,13 +127,23 @@ class OrderManager:
             current_time: 仿真累计时间（秒）
             entity_mgr:   EntityManager 实例，用于获取当前仓库列表（预留扩展）
         """
+        # {} 视为「无泊松配置」，但仍可配合预定义动态订单工作
+        if not self._scheduled_dynamic and not self._gen_config:
+            return
+        cfg = self._gen_config or {}
+
+        max_orders = cfg.get("max_orders")
+        if max_orders is not None:
+            max_orders = int(max_orders)
+        total = len(self.pending_orders) + len(self.assigned_orders) + len(self.completed_orders)
+        if max_orders is None or total < max_orders:
+            self._spawn_scheduled_dynamic_orders(current_time, max_orders)
+
+        # 泊松流订单依赖完整 gen_config（含 bbox 等），无配置则跳过
         if not self._gen_config:
             return
 
         cfg = self._gen_config
-
-        # 总量上限检查
-        max_orders = cfg.get("max_orders") or None
         total = len(self.pending_orders) + len(self.assigned_orders) + len(self.completed_orders)
         if max_orders is not None and total >= max_orders:
             return
@@ -123,6 +160,11 @@ class OrderManager:
             if cfg.get("burst_enabled"):
                 arrival_rate *= float(cfg.get("burst_multiplier", 3))
 
+            # arrival_rate<=0：关闭泊松流（仅依赖 initial_orders + scheduled_dynamic）
+            if arrival_rate <= 0:
+                self._next_order_time = float("inf")
+                break
+
             # 生成一个订单
             order = self._create_order(current_time, cfg)
             if order is not None:
@@ -130,12 +172,8 @@ class OrderManager:
                 logger.debug("[OrderManager] 新订单 %s t=%.1fs", order.order_id, current_time)
 
             # 推进 _next_order_time（指数分布间隔，泊松过程）
-            if arrival_rate > 0:
-                inter_arrival = random.expovariate(arrival_rate / 60.0)
-                self._next_order_time += inter_arrival
-            else:
-                self._next_order_time = float("inf")
-                break
+            inter_arrival = random.expovariate(arrival_rate / 60.0)
+            self._next_order_time += inter_arrival
 
             # 保护：防止 arrival_rate=∞ 导致无限循环
             if self._next_order_time <= current_time:
@@ -226,6 +264,75 @@ class OrderManager:
     # ══════════════════════════════════════════════════════════════════════════
     # 内部工具
     # ══════════════════════════════════════════════════════════════════════════
+
+    def _spawn_scheduled_dynamic_orders(
+        self,
+        current_time: float,
+        max_orders: Optional[int],
+    ) -> None:
+        """在 current_time 到达 spawn_sim_s 时注入预定义订单（确定性、可复现）。"""
+        while self._scheduled_dynamic_i < len(self._scheduled_dynamic):
+            entry = self._scheduled_dynamic[self._scheduled_dynamic_i]
+            spawn_t = float(entry["spawn_sim_s"])
+            if current_time < spawn_t:
+                break
+            tot = (
+                len(self.pending_orders)
+                + len(self.assigned_orders)
+                + len(self.completed_orders)
+            )
+            if max_orders is not None and tot >= max_orders:
+                break
+            self._scheduled_dynamic_i += 1
+            order = self._order_from_scheduled_entry(entry, spawn_t)
+            if order is not None:
+                self.pending_orders[order.order_id] = order
+                logger.debug(
+                    "[OrderManager] 预定义动态订单 %s t=%.1fs",
+                    order.order_id,
+                    spawn_t,
+                )
+
+    def _order_from_scheduled_entry(
+        self,
+        entry: dict,
+        spawn_t: float,
+    ) -> Optional[Order]:
+        try:
+            oid = str(entry["order_id"])
+            lon = float(entry["delivery_lng"])
+            lat = float(entry["delivery_lat"])
+            x, y = wgs84_to_utm(lon, lat)
+            z = float(entry.get("delivery_z", 0.0))
+            delivery_loc = Position3D(x=x, y=y, z=z)
+            if "deadline_sim_s" in entry:
+                deadline = float(entry["deadline_sim_s"])
+            else:
+                deadline = spawn_t + float(entry.get("deadline_offset_s", 900.0))
+            if deadline <= spawn_t:
+                logger.warning(
+                    "[OrderManager] 动态订单 %s deadline 必须晚于 spawn_sim_s，已跳过",
+                    oid,
+                )
+                return None
+            weight = float(entry.get("payload_weight", 1.0))
+            st = entry.get("source_type")
+            return Order(
+                order_id=oid,
+                create_time=spawn_t,
+                deadline=deadline,
+                delivery_loc=delivery_loc,
+                pickup_source_id=entry.get("pickup_source_id"),
+                source_type=st,
+                payload_weight=weight,
+            )
+        except Exception as exc:
+            logger.warning(
+                "[OrderManager] 解析预定义动态订单失败: %s entry=%s",
+                exc,
+                entry.get("order_id", "?"),
+            )
+            return None
 
     def _create_order(self, current_time: float, cfg: dict) -> Optional[Order]:
         """

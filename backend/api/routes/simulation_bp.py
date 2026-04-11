@@ -65,6 +65,36 @@ set_snapshot_builder(_sim_engine.build_full_snapshot)
 # 辅助函数
 # ══════════════════════════════════════════════════════════════════════════════
 
+def _normalize_initial_orders_time_domain(initial_orders: list[dict]) -> list[dict]:
+    """
+    将 wall_ms 批次的 create_time / deadline 归一化到仿真秒（与 sim t=0 对齐）。
+
+    规则：取本批最小 create_time 为 t0，每条订单
+      create_sim  = (create - t0) / 1000
+      deadline_sim = (deadline - t0) / 1000
+    若 time_domain=='sim_s' 或 create_time 量级明显为秒（< 1e11），则不改写。
+    """
+    if not initial_orders:
+        return initial_orders
+    first = initial_orders[0]
+    if first.get("time_domain") == "sim_s":
+        return initial_orders
+    ct0 = float(first["create_time"])
+    if ct0 < 1e11:
+        return initial_orders
+    t0_ms = min(float(o["create_time"]) for o in initial_orders)
+    out: list[dict] = []
+    for o in initial_orders:
+        d = dict(o)
+        ct = float(d["create_time"])
+        dl = float(d["deadline"])
+        d["create_time"] = (ct - t0_ms) / 1000.0
+        d["deadline"] = (dl - t0_ms) / 1000.0
+        d["time_domain"] = "sim_s"
+        out.append(d)
+    return out
+
+
 def _load_initial_orders(initial_orders: list[dict], order_mgr: OrderManager) -> None:
     """
     从前端发送的初始订单列表加载订单到 pending_orders。
@@ -76,6 +106,8 @@ def _load_initial_orders(initial_orders: list[dict], order_mgr: OrderManager) ->
     from core.entities.order import Order
     from core.entities.primitives import Position3D
     from utils.coord_utils import wgs84_to_utm
+
+    initial_orders = _normalize_initial_orders_time_domain(initial_orders)
 
     for order_data in initial_orders:
         try:
@@ -521,6 +553,9 @@ def sim_init():
         _order_mgr.configure(gen_config, bbox)
         _sim_engine.attach(_entity_mgr, _order_mgr)
 
+        # ── 预定义动态订单（spawn_sim_s 注入，与算法无关、可复现）──────────────
+        _order_mgr.set_scheduled_dynamic_orders(body.get("scheduled_dynamic_orders") or [])
+
         # ── 加载前端发送的初始订单 ───────────────────────────────────────────
         initial_orders = body.get("initial_orders", [])
         if initial_orders:
@@ -701,6 +736,12 @@ def sim_dispatch():
         current_time = _sim_engine.current_time
         plan = _dispatch_engine.execute(current_time, bbox, scene_id=scene_id)
 
+        # 首次调度后注册自动增量调度，使后续动态订单能被自动处理
+        if _sim_engine._dispatch_engine is None:
+            _sim_engine.attach_dispatch_engine(_dispatch_engine, bbox, scene_id=scene_id)
+            # 初始化快照为当前已分配的订单，避免下一帧重复调度
+            _sim_engine._pending_snapshot = set(_order_mgr.pending_orders.keys())
+
         truck_routes = {
             truck_id: _serialize_truck_route(route)
             for truck_id, route in plan.truck_routes.items()
@@ -781,12 +822,14 @@ def api_get_preset_entities(preset_id: str):
         if not preset:
             return jsonify({"error": f"预设场景 '{preset_id}' 不存在"}), 404
         
+        od = preset.get("orders") or {}
         result = {
             "depots": preset.get("entities", {}).get("depots", []),
             "stations": preset.get("entities", {}).get("stations", []),
             "trucks": preset.get("entities", {}).get("trucks", []),
             "drones": preset.get("entities", {}).get("drones", []),
-            "orders": preset.get("orders", {}).get("static_orders", []),
+            "orders": od.get("static_orders", []),
+            "dynamic_orders": od.get("dynamic_orders", []),
         }
         return jsonify(result)
     except Exception as exc:
