@@ -245,8 +245,32 @@ class Drone:
                 "[Drone %s] set_route() 在非空闲状态(%s)下被调用，路由已覆盖。",
                 self.drone_id, self.status.value,
             )
-        self.route_plan = list(waypoints)  # 防御性拷贝
+        self.route_plan = list(waypoints)
         self.current_waypoint_index = 0
+
+    def append_route(self, waypoints: list[RouteWaypoint]) -> None:
+        """将新航路点追加到当前路径末尾（路径拼接，不覆盖已执行部分）。
+
+        用于串联任务场景：无人机在完成当前配送后继续执行新任务，
+        而非返回仓库后重新起飞。最后一个航路点（原 DOCK）在拼接时被
+        新路径替代。
+        """
+        if not self.route_plan or self.current_waypoint_index >= len(self.route_plan):
+            self.route_plan = list(waypoints)
+            self.current_waypoint_index = 0
+            return
+
+        keep = self.route_plan[:len(self.route_plan)]
+        if keep and keep[-1].action == WaypointAction.DOCK_DEPOT:
+            keep = keep[:-1]
+        keep.extend(waypoints)
+        self.route_plan = keep
+        logger.info(
+            "[Drone %s] 路径拼接：保留 %d 已有航点 + %d 新航点",
+            self.drone_id,
+            len(self.route_plan) - len(waypoints),
+            len(waypoints),
+        )
 
     # ══════════════════════════════════════════════════════════════════════════
     # 订单绑定
