@@ -17,6 +17,7 @@ HiveLogix — 调度决策编排层
 from __future__ import annotations
 
 import logging
+import math
 from typing import TYPE_CHECKING
 
 from config.loader import load_solver_energy_params
@@ -68,6 +69,9 @@ class DispatchDecisionEngine:
         runtime_cfg = load_solver_energy_params()
         self.TRUCK_DRONE_LAUNCH_TIME = runtime_cfg.truck_drone_launch_time_s
         self.TRUCK_DRONE_RECOVER_TIME = runtime_cfg.truck_drone_recover_time_s
+        self._truck_energy_wh_per_meter = runtime_cfg.truck_energy_wh_per_meter
+        self._cum_cost_total = 0.0
+        self._dispatch_count = 0
 
     def set_solver(self, solver_name: str) -> None:
         """按名称切换求解器实例。"""
@@ -113,6 +117,15 @@ class DispatchDecisionEngine:
 
         # 调用求解器，传递 scene_id 以支持使用缓存的 OSM 数据
         plan = self.solver.dispatch(pending, current_time, bbox, scene_id=scene_id)
+        plan.summary["solver"] = self.solver_name
+
+        if self.solver_name != "market":
+            bad = [a.order_id for a in plan.allocations if a.mode == "B_DYNAMIC"]
+            if bad:
+                raise RuntimeError(
+                    f"当前求解器={self.solver_name}，但返回了 B_DYNAMIC 分配: {bad}"
+                )
+        self._accumulate_plan_metrics(plan)
 
         # 应用分配（更新订单状态）
         self._apply_plan(plan, current_time)
@@ -141,14 +154,9 @@ class DispatchDecisionEngine:
         current_time: float,
         bbox: dict,
         scene_id: str | None = None,
+        replan_unfinished: bool | None = None,
     ) -> DispatchPlan:
-        """增量调度：仅对动态新单执行拍卖，尊重已有契约。
-
-        核心原则：
-          1. 状态冻结 — 不覆盖飞行中无人机的位置/路径
-          2. 路径拼接 — 新任务段追加到已有路径末尾
-          3. 卡车路由保护 — 不重写正在执行的卡车路由
-        """
+        """增量调度：由 solver 策略决定走“纯增量”或“滚动重优化”。"""
         if not new_orders:
             logger.debug("[DispatchDecisionEngine] 无新增订单")
             return DispatchPlan(
@@ -157,11 +165,30 @@ class DispatchDecisionEngine:
                 summary={"total_orders": 0, "feasible": 0, "modes": {}},
             )
 
-        if not hasattr(self.solver, "dispatch_incremental"):
-            logger.info("[DispatchDecisionEngine] 当前求解器不支持增量调度，回退到全量")
-            return self.execute(current_time, bbox, scene_id)
+        if replan_unfinished is None:
+            replan_unfinished = self.solver.should_replan_unfinished()
+
+        if replan_unfinished:
+            return self._execute_replan_unfinished(
+                new_orders,
+                current_time,
+                bbox,
+                scene_id=scene_id,
+            )
 
         plan = self.solver.dispatch_incremental(new_orders, current_time, bbox, scene_id=scene_id)
+        plan.summary["solver"] = self.solver_name
+        plan.summary["dispatch_type"] = "incremental"
+        plan.summary["new_orders"] = len(new_orders)
+
+        if self.solver_name != "market":
+            bad = [a.order_id for a in plan.allocations if a.mode == "B_DYNAMIC"]
+            if bad:
+                raise RuntimeError(
+                    f"当前求解器={self.solver_name}，但返回了 B_DYNAMIC 分配: {bad}"
+                )
+
+        self._accumulate_plan_metrics(plan)
         self._apply_plan(plan, current_time, incremental=True)
         self._build_drone_routes(plan, current_time)
 
@@ -173,6 +200,104 @@ class DispatchDecisionEngine:
 
         return plan
 
+    def _execute_replan_unfinished(
+        self,
+        new_orders: dict,
+        current_time: float,
+        bbox: dict,
+        scene_id: str | None = None,
+    ) -> DispatchPlan:
+        """滚动重优化：新单 + 未开工旧单一起重分配。"""
+        from core.entities.primitives import TaskStatus
+
+        # 自愈：历史异常可能留下“pending池里状态=ASSIGNED”的脏数据。
+        for oid, order in list(self.order_mgr.pending_orders.items()):
+            if order.status == TaskStatus.ASSIGNED:
+                self.order_mgr.pending_orders.pop(oid, None)
+                self.order_mgr.assigned_orders[oid] = order
+
+        # 不在求解前修改订单池：只构造“重优化视图”，避免异常时污染全局状态。
+        replannable_assigned: dict[str, object] = {
+            oid: order
+            for oid, order in self.order_mgr.assigned_orders.items()
+            if order.status == TaskStatus.ASSIGNED
+        }
+        planning_pool = dict(self.order_mgr.pending_orders)
+        planning_pool.update(replannable_assigned)
+
+        if not planning_pool:
+            return DispatchPlan(
+                allocations=[],
+                cost_total=0.0,
+                summary={
+                    "total_orders": 0,
+                    "feasible": 0,
+                    "modes": {},
+                    "dispatch_type": "dynamic_replan",
+                },
+            )
+
+        plan = self.solver.dispatch_replan_current_state(
+            planning_pool,
+            current_time,
+            bbox,
+            scene_id=scene_id,
+        )
+        plan.summary["solver"] = self.solver_name
+        plan.summary["dispatch_type"] = "dynamic_replan"
+        plan.summary["replanned_assigned_orders"] = len(replannable_assigned)
+        plan.summary["new_orders"] = len(new_orders)
+
+        if self.solver_name != "market":
+            bad = [a.order_id for a in plan.allocations if a.mode == "B_DYNAMIC"]
+            if bad:
+                raise RuntimeError(
+                    f"当前求解器={self.solver_name}，但返回了 B_DYNAMIC 分配: {bad}"
+                )
+
+        self._accumulate_plan_metrics(plan)
+        self._apply_plan(plan, current_time, incremental=False)
+        self._build_drone_routes(plan, current_time)
+
+        logger.info(
+            "[DispatchDecisionEngine] 动态重优化完成: new=%d 回收旧单=%d 总待分配=%d 可行=%d",
+            len(new_orders),
+            len(replannable_assigned),
+            plan.summary.get("total_orders", 0),
+            plan.summary.get("feasible", 0),
+        )
+        return plan
+
+    def _accumulate_plan_metrics(self, plan: DispatchPlan) -> None:
+        """累计调度成本，用于运行时 KPI 展示。"""
+        total = float(plan.cost_total or 0.0)
+        if total > 0:
+            self._cum_cost_total += total
+        self._dispatch_count += 1
+
+    def _estimate_runtime_energy_wh(self) -> float:
+        """按实体真实运动累计估算系统总能耗（Wh）。"""
+        truck_wh = 0.0
+        for truck in self.entity_mgr.trucks.values():
+            dist_m = float(getattr(truck, "cumulative_distance_m", 0.0) or 0.0)
+            truck_wh += max(0.0, dist_m) * self._truck_energy_wh_per_meter
+
+        drone_wh = 0.0
+        for drone in self.entity_mgr.drones.values():
+            energy_j = float(getattr(drone, "cumulative_energy_j", 0.0) or 0.0)
+            drone_wh += max(0.0, energy_j) / 3600.0
+
+        return max(0.0, truck_wh + drone_wh)
+
+    def get_runtime_metrics(self) -> dict:
+        """返回调度运行时累计指标。"""
+        return {
+            "dispatch_count": self._dispatch_count,
+            "total_energy_cost_wh": self._estimate_runtime_energy_wh(),
+            "total_dispatch_cost": max(0.0, self._cum_cost_total),
+            "active_solver": self.solver_name,
+        }
+
     def try_fulfill_contracts(self, current_time: float) -> None:
         """尝试兑现已完成回收的契约。
 
@@ -180,12 +305,7 @@ class DispatchDecisionEngine:
         且当前时刻已超过 uav_arrival_time，则标记契约为 fulfilled。
         供仿真引擎在每个 tick 中调用。
         """
-        if not hasattr(self.solver, "fulfill_contract"):
-            return
-        if not hasattr(self.solver, "_active_contracts"):
-            return
-
-        for contract in self.solver._active_contracts:
+        for contract in self.solver.get_active_contracts():
             if contract.status != "active":
                 continue
             drone = self.entity_mgr.drones.get(contract.drone_id)
@@ -204,25 +324,37 @@ class DispatchDecisionEngine:
         """
         for alloc in plan.allocations:
             order = self.order_mgr.pending_orders.get(alloc.order_id)
+            source_pool = "pending"
+            if not order:
+                order = self.order_mgr.assigned_orders.get(alloc.order_id)
+                source_pool = "assigned"
             if not order:
                 continue
 
             if alloc.feasible:
                 # 将订单转入 assigned
-                self.order_mgr.pending_orders.pop(alloc.order_id, None)
+                if source_pool == "pending":
+                    self.order_mgr.pending_orders.pop(alloc.order_id, None)
                 self.order_mgr.assigned_orders[alloc.order_id] = order
 
                 # 更新订单的分配信息
                 order.assigned_vehicle_id = alloc.vehicle_id
                 order.assigned_mode = alloc.mode
                 
-                # 更新订单状态：PENDING → ASSIGNED
+                # 状态更新：新单执行 PENDING→ASSIGNED；重优化中的旧单保持 ASSIGNED。
                 from core.entities.primitives import TaskStatus
-                order.update_status(TaskStatus.ASSIGNED)
+                if order.status == TaskStatus.PENDING:
+                    order.update_status(TaskStatus.ASSIGNED)
+                elif order.status != TaskStatus.ASSIGNED:
+                    logger.warning(
+                        "[DispatchDecisionEngine] 订单 %s 当前状态=%s，不执行 ASSIGNED 覆盖",
+                        alloc.order_id,
+                        order.status.value,
+                    )
 
                 if alloc.mode in ("B_WAIT", "B_DYNAMIC"):
                     logger.info(
-                        "[DispatchDecisionEngine] 分配 %s 至 %s（模式 %s, 出发站 %s, 距离 %.1fm, 回收点 %s），状态转为 ASSIGNED",
+                        "[DispatchDecisionEngine] 分配 %s 至 %s（模式 %s, 出发站 %s, 距离 %.1fm, 回收点 %s）",
                         alloc.order_id,
                         alloc.vehicle_id,
                         alloc.mode,
@@ -232,7 +364,7 @@ class DispatchDecisionEngine:
                     )
                 else:
                     logger.info(
-                        "[DispatchDecisionEngine] 分配 %s 至 %s（模式 %s, 距离 %.1fm, 回收点 %s），状态转为 ASSIGNED",
+                        "[DispatchDecisionEngine] 分配 %s 至 %s（模式 %s, 距离 %.1fm, 回收点 %s）",
                         alloc.order_id,
                         alloc.vehicle_id,
                         alloc.mode,
@@ -342,16 +474,36 @@ class DispatchDecisionEngine:
                     "[DispatchDecisionEngine] 增量模式首次为卡车 %s 设置路由 (%d 节点)",
                     truck.truck_id, len(route_nodes),
                 )
+                self._sync_waiting_drone_launch_times_for_truck(truck, current_time)
             except Exception as e:
                 logger.exception("[DispatchDecisionEngine] 增量首次路由设置失败 %s: %s", truck.truck_id, e)
             return
 
-        # 提取新路由中需要追加的事件性节点（customer / recovery）
-        existing_ids = {s.get("node_id") for s in existing_stops}
+        # 仅对未执行区间做去重：已执行过的同站点在新批次中应允许再次停靠。
+        future_stops = existing_stops[cursor:]
+
+        def _stop_key(stop_dict: dict) -> tuple:
+            node_type = stop_dict.get("node_type", "")
+            node_id = stop_dict.get("node_id", "")
+            order_id = stop_dict.get("order_id", "")
+            if node_type == "customer":
+                return (node_type, node_id, order_id)
+            return (node_type, node_id)
+
+        existing_future_keys = {_stop_key(s) for s in future_stops}
+
+        # 提取新路由中需要追加的事件性节点（customer / recovery / station）
         new_stops = []
         for node in new_route.nodes:
             if node.node_type in ("customer", "recovery", "station"):
-                if node.node_id in existing_ids:
+                key = _stop_key(
+                    {
+                        "node_type": node.node_type,
+                        "node_id": node.node_id,
+                        "order_id": node.order_id,
+                    }
+                )
+                if key in existing_future_keys:
                     continue
                 new_stops.append({
                     "node_id": node.node_id,
@@ -361,6 +513,7 @@ class DispatchDecisionEngine:
                     "departure_time": node.departure_time,
                     "order_id": node.order_id,
                 })
+                existing_future_keys.add(key)
 
         if not new_stops:
             logger.debug(
@@ -369,17 +522,133 @@ class DispatchDecisionEngine:
             )
             return
 
-        # 将新停靠按 arrival_time 插入到未执行区间
-        future_stops = existing_stops[cursor:]
+        # 保护既有承诺：先执行原 future_stops，再追加新停靠，避免动态单打乱静态任务锚点。
         merged = future_stops + new_stops
-        merged.sort(key=lambda s: float(s.get("arrival_time", float("inf"))))
-        truck._planned_route_stops = existing_stops[:cursor] + merged
-        # cursor 不变，继续从之前的位置处理
+
+        # 重新按卡车当前位置进行后缀时序推演，避免“时刻表触发快于物理到达”。
+        retimed_future: list[dict] = []
+        cur_pos = truck.get_location(current_time)
+        cur_time = current_time
+        speed = max(1e-6, float(getattr(truck, "speed", 0.0)))
+        for stop in merged:
+            stop_pos = stop.get("position")
+            if stop_pos is None:
+                continue
+            travel_time = cur_pos.distance_2d(stop_pos) / speed
+            arrival = cur_time + travel_time
+            prev_arrival = float(stop.get("arrival_time", arrival))
+            prev_departure = float(stop.get("departure_time", prev_arrival))
+            service_time = max(0.0, prev_departure - prev_arrival)
+            departure = arrival + service_time
+
+            updated = dict(stop)
+            updated["arrival_time"] = arrival
+            updated["departure_time"] = departure
+            retimed_future.append(updated)
+
+            cur_pos = stop_pos
+            cur_time = departure
+
+        rebuilt_route = None
+        try:
+            rebuilt_route = self.solver.build_incremental_route_from_stops(
+                truck,
+                retimed_future,
+                current_time,
+            )
+        except Exception as e:
+            logger.exception(
+                "[DispatchDecisionEngine] OSM 后缀路线重建失败 %s: %s",
+                truck.truck_id,
+                e,
+            )
+
+        if rebuilt_route is not None and len(rebuilt_route.nodes) >= 2:
+            rebuilt_stops = [
+                {
+                    "node_id": n.node_id,
+                    "node_type": n.node_type,
+                    "position": n.position,
+                    "arrival_time": n.arrival_time,
+                    "departure_time": n.departure_time,
+                    "order_id": n.order_id,
+                }
+                for n in rebuilt_route.nodes
+                if n.node_type in ("customer", "recovery", "station")
+            ]
+            truck._planned_route_stops = existing_stops[:cursor] + rebuilt_stops
+            try:
+                truck.set_route(
+                    [n.node_id for n in rebuilt_route.nodes],
+                    [n.position for n in rebuilt_route.nodes],
+                    current_time,
+                    geometry=rebuilt_route.geometry,
+                )
+            except Exception as e:
+                logger.exception(
+                    "[DispatchDecisionEngine] 应用 OSM 后缀路线失败 %s: %s",
+                    truck.truck_id,
+                    e,
+                )
+        else:
+            # 兜底：无 OSM 重建能力时保留时刻表合并，避免增量单丢失。
+            truck._planned_route_stops = existing_stops[:cursor] + retimed_future
+
+        self._sync_waiting_drone_launch_times_for_truck(truck, current_time)
+
         logger.info(
             "[DispatchDecisionEngine] 增量模式追加 %d 个停靠到卡车 %s "
             "(cursor=%d, 总计 %d 停靠)",
             len(new_stops), truck.truck_id, cursor, len(truck._planned_route_stops),
         )
+
+    def _sync_waiting_drone_launch_times_for_truck(self, truck, current_time: float) -> None:
+        """将车上等待起飞无人机的 launch_time 对齐到卡车当前时刻表。"""
+        planned_stops: list[dict] = getattr(truck, "_planned_route_stops", None) or []
+        if not planned_stops:
+            return
+
+        arrival_by_node: dict[str, float] = {}
+        for stop in planned_stops:
+            node_id = stop.get("node_id")
+            if not node_id:
+                continue
+            arr = float(stop.get("arrival_time", float("inf")))
+            if not math.isfinite(arr):
+                continue
+            if node_id not in arrival_by_node or arr < arrival_by_node[node_id]:
+                arrival_by_node[node_id] = arr
+
+        updated = 0
+        for drone in self.entity_mgr.drones.values():
+            if getattr(drone, "transport_truck_id", "") != truck.truck_id:
+                continue
+
+            launch_station_id = getattr(drone, "launch_station_id", "")
+            if not launch_station_id:
+                continue
+
+            station_arrival = arrival_by_node.get(launch_station_id)
+            if station_arrival is None:
+                continue
+
+            target_launch = max(
+                current_time,
+                station_arrival + self.TRUCK_DRONE_LAUNCH_TIME,
+            )
+            prev_launch = float(getattr(drone, "scheduled_launch_time", target_launch))
+            if abs(prev_launch - target_launch) <= 1e-6:
+                continue
+
+            drone.scheduled_launch_time = target_launch
+            updated += 1
+
+        if updated > 0:
+            logger.info(
+                "[DispatchDecisionEngine] 卡车 %s 同步 %d 架等待无人机起飞时刻",
+                truck.truck_id,
+                updated,
+            )
 
     def _recalculate_truck_route_timing_for_b_wait(
         self,
