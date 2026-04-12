@@ -47,6 +47,16 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+def _bbox_cache_key(bbox: dict) -> tuple[float, float, float, float]:
+    """将 bbox 归一化为稳定键，便于复用路网缓存。"""
+    return (
+        round(float(bbox["minx"]), 6),
+        round(float(bbox["miny"]), 6),
+        round(float(bbox["maxx"]), 6),
+        round(float(bbox["maxy"]), 6),
+    )
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # 数据结构
 # ══════════════════════════════════════════════════════════════════════════════
@@ -158,6 +168,11 @@ class GreedyBaseline:
         self.entity_mgr = entity_mgr
         self.min_reserve_energy = 200.0   # 无人机绝对电量底线 [J]
         self.delivery_service_time = 30.0  # 配送点停留时间 [s]
+        self._road_graph_cache: Optional[nx.DiGraph] = None
+        self._road_nodes_cache: Optional[dict] = None
+        self._road_cache_scene_id: str | None = None
+        self._road_cache_bbox_key: tuple[float, float, float, float] | None = None
+        self._road_distance_memo: dict[tuple[float, float, float, float], float] = {}
 
         # 评分与能耗参数统一从配置读取，便于所有算法共享。
         energy_cfg = load_solver_energy_params()
@@ -200,34 +215,81 @@ class GreedyBaseline:
             bbox: 地图边界
             scene_id: 预设场景 ID，如 'default_test_4x4km'（可选）
         """
-        # 加载 OSM 路网：优先从缓存加载
-        road_graph = None
-        nodes = None
-        
-        if scene_id and load_osm_from_cache:
-            logger.info(f"[GreedyBaseline] 尝试从预设场景 '{scene_id}' 缓存加载 OSM...")
-            osm_xml, osm_geojson = load_osm_from_cache(scene_id)
-            if osm_xml:
-                try:
-                    road_graph, nodes = _osm_svc.build_road_graph(osm_xml)
-                    logger.info(f"[GreedyBaseline] 从缓存加载成功: {len(nodes)} 个节点，{len(road_graph.edges)} 条边")
-                except Exception as e:
-                    logger.warning(f"[GreedyBaseline] 从缓存构建失败: {e}，将重新下载")
-                    road_graph = None
-        
-        # 如果缓存加载失败或无预设场景，则下载 OSM
-        if road_graph is None:
-            logger.info("[GreedyBaseline] 下载 OSM 路网数据...")
-            try:
-                osm_xml = _osm_svc.download_osm(bbox["minx"], bbox["miny"], bbox["maxx"], bbox["maxy"])
-                road_graph, nodes = _osm_svc.build_road_graph(osm_xml)
-                logger.info(f"[GreedyBaseline] 构建路网图：{len(nodes)} 个节点，{len(road_graph.edges)} 条边")
-            except Exception as e:
-                raise RuntimeError(f"OSM 路网下载/构建失败，已终止调度: {e}") from e
+        return self._dispatch_impl(
+            pending_orders,
+            current_time,
+            bbox,
+            scene_id=scene_id,
+            incremental=False,
+        )
+
+    def dispatch_incremental(
+        self,
+        new_orders: dict[str, "Order"],
+        current_time: float,
+        bbox: dict,
+        scene_id: str | None = None,
+    ) -> DispatchPlan:
+        """增量调度：仅处理本轮新进入系统的订单，不全量重排既有订单。"""
+        return self._dispatch_impl(
+            new_orders,
+            current_time,
+            bbox,
+            scene_id=scene_id,
+            incremental=True,
+        )
+
+    def should_replan_unfinished(self) -> bool:
+        """Greedy 默认启用滚动重优化。"""
+        return True
+
+    def dispatch_replan_current_state(
+        self,
+        replan_orders: dict[str, "Order"],
+        current_time: float,
+        bbox: dict,
+        scene_id: str | None = None,
+    ) -> DispatchPlan:
+        """按当前实体状态重优化（卡车从当前位置继续建路）。"""
+        return self.dispatch_incremental(replan_orders, current_time, bbox, scene_id=scene_id)
+
+    def get_active_contracts(self) -> list:
+        """Greedy 无契约系统。"""
+        return []
+
+    def fulfill_contract(self, contract_id: str) -> None:
+        """Greedy 无契约系统，no-op。"""
+        return None
+
+    def _dispatch_impl(
+        self,
+        orders: dict[str, "Order"],
+        current_time: float,
+        bbox: dict,
+        scene_id: str | None = None,
+        incremental: bool = False,
+    ) -> DispatchPlan:
+        """统一调度实现，支持全量与增量两种入口。"""
+        if not orders:
+            return DispatchPlan(
+                allocations=[],
+                cost_total=0.0,
+                summary={
+                    "total_orders": 0,
+                    "feasible": 0,
+                    "modes": {},
+                    "dispatch_type": "incremental" if incremental else "full",
+                    "cost_breakdown": {"dist": 0.0, "energy": 0.0, "penalty": 0.0},
+                },
+            )
+
+        # 每轮调度重置距离缓存，避免跨批次污染。
+        self._road_distance_memo.clear()
+        road_graph, nodes = self._load_road_graph(bbox, scene_id)
 
         # ── Phase 1：排序 ──────────────────────────────────────────────────
         sorted_orders = sorted(
-            pending_orders.values(),
+            orders.values(),
             key=lambda o: (o.deadline - current_time, o.deadline),
         )
 
@@ -249,12 +311,11 @@ class GreedyBaseline:
                 mode_counter[result.mode] = mode_counter.get(result.mode, 0) + 1
                 if result.mode == "A" and result.vehicle_id in truck_node_map:
                     truck_node_map[result.vehicle_id]["orders"].append(order)
-                elif result.mode in ("B", "B_WAIT", "B_DYNAMIC", "C") and result.drone_id:
+                elif result.mode in ("B", "B_WAIT", "C") and result.drone_id:
                     allocated_drones.add(result.drone_id)
-                    if result.mode in ("B", "B_WAIT", "B_DYNAMIC") and result.vehicle_id in truck_node_map:
-                        if result.mode != "B_DYNAMIC":
-                            truck_node_map[result.vehicle_id]["recovery_stations"].append(result.recovery_station_id)
-                        if result.mode in ("B_WAIT", "B_DYNAMIC") and result.launch_station_id:
+                    if result.mode in ("B", "B_WAIT") and result.vehicle_id in truck_node_map:
+                        truck_node_map[result.vehicle_id]["recovery_stations"].append(result.recovery_station_id)
+                        if result.mode == "B_WAIT" and result.launch_station_id:
                             truck_node_map[result.vehicle_id]["recovery_stations"].append(result.launch_station_id)
 
         # ── Phase 3：构建卡车路径 ─────────────────────────────────────────
@@ -275,18 +336,35 @@ class GreedyBaseline:
                 continue
             truck = self.entity_mgr.trucks[truck_id]
             unique_recovery_stations = list(set(node_data["recovery_stations"]))
-            truck_routes[truck_id] = self._build_truck_route(
-                truck, node_data["orders"], unique_recovery_stations, current_time, road_graph, nodes,
-                recovery_station_wait_times,
-            )
+            if incremental:
+                truck_routes[truck_id] = self._build_truck_route(
+                    truck,
+                    node_data["orders"],
+                    unique_recovery_stations,
+                    current_time,
+                    road_graph,
+                    nodes,
+                    recovery_station_wait_times,
+                    start_pos=truck.get_location(current_time),
+                    return_to_depot=False,
+                )
+            else:
+                truck_routes[truck_id] = self._build_truck_route(
+                    truck,
+                    node_data["orders"],
+                    unique_recovery_stations,
+                    current_time,
+                    road_graph,
+                    nodes,
+                    recovery_station_wait_times,
+                )
 
-        cost_total = sum(
-            r.score_total for r in allocations
-            if r.feasible and math.isfinite(r.score_total)
+        cost_dist_total, cost_energy_total, cost_total = self._recalculate_plan_route_costs(
+            allocations,
+            truck_routes,
+            current_time,
+            orders,
         )
-
-        cost_dist_total = sum(r.cost_dist for r in allocations if r.feasible)
-        cost_energy_total = sum(r.cost_energy for r in allocations if r.feasible)
         cost_penalty_total = sum(r.cost_penalty for r in allocations if r.feasible)
 
         plan = DispatchPlan(
@@ -296,6 +374,7 @@ class GreedyBaseline:
                 "total_orders": len(allocations),
                 "feasible": sum(1 for r in allocations if r.feasible),
                 "modes": mode_counter,
+                "dispatch_type": "incremental" if incremental else "full",
                 "cost_breakdown": {
                     "dist": cost_dist_total,
                     "energy": cost_energy_total,
@@ -306,6 +385,311 @@ class GreedyBaseline:
         )
         logger.info("[GreedyBaseline] 分配完成：%s", plan.summary)
         return plan
+
+    def _load_road_graph(
+        self,
+        bbox: dict,
+        scene_id: str | None,
+    ) -> tuple[nx.DiGraph, dict]:
+        """加载或复用 OSM 路网缓存，减少动态调度重复开销。"""
+        bbox_key = _bbox_cache_key(bbox)
+        if (
+            self._road_graph_cache is not None
+            and self._road_nodes_cache is not None
+            and self._road_cache_bbox_key == bbox_key
+            and self._road_cache_scene_id == scene_id
+        ):
+            return self._road_graph_cache, self._road_nodes_cache
+
+        road_graph = None
+        nodes = None
+
+        if scene_id and load_osm_from_cache:
+            logger.info("[GreedyBaseline] 尝试从预设场景 '%s' 缓存加载 OSM...", scene_id)
+            osm_xml, _ = load_osm_from_cache(scene_id)
+            if osm_xml:
+                try:
+                    road_graph, nodes = _osm_svc.build_road_graph(osm_xml)
+                    logger.info(
+                        "[GreedyBaseline] 从缓存加载成功: %d 个节点，%d 条边",
+                        len(nodes),
+                        len(road_graph.edges),
+                    )
+                except Exception as e:
+                    logger.warning("[GreedyBaseline] 从缓存构建失败: %s，将重新下载", e)
+                    road_graph = None
+
+        if road_graph is None:
+            logger.info("[GreedyBaseline] 下载 OSM 路网数据...")
+            try:
+                osm_xml = _osm_svc.download_osm(
+                    bbox["minx"], bbox["miny"], bbox["maxx"], bbox["maxy"]
+                )
+                road_graph, nodes = _osm_svc.build_road_graph(osm_xml)
+                logger.info(
+                    "[GreedyBaseline] 构建路网图：%d 个节点，%d 条边",
+                    len(nodes),
+                    len(road_graph.edges),
+                )
+            except Exception as e:
+                raise RuntimeError(f"OSM 路网下载/构建失败，已终止调度: {e}") from e
+
+        self._road_graph_cache = road_graph
+        self._road_nodes_cache = nodes
+        self._road_cache_scene_id = scene_id
+        self._road_cache_bbox_key = bbox_key
+        return road_graph, nodes
+
+    def _recalculate_plan_route_costs(
+        self,
+        allocations: list[AllocationResult],
+        truck_routes: dict[str, TruckRoute],
+        current_time: float,
+        orders_by_id: dict[str, "Order"],
+    ) -> tuple[float, float, float]:
+        """按最终执行路径重算距离与能耗成本，避免局部评分与全局执行不一致。"""
+        truck_distance_total = sum(route.total_distance for route in truck_routes.values())
+        truck_energy_total = sum(
+            self._truck_energy_wh(route.total_distance)
+            for route in truck_routes.values()
+        )
+
+        uav_distance_total = 0.0
+        uav_energy_total = 0.0
+
+        for alloc in allocations:
+            if not alloc.feasible or alloc.mode == "A" or not alloc.drone_id:
+                continue
+
+            drone = self.entity_mgr.drones.get(alloc.drone_id)
+            if drone is None:
+                continue
+
+            order_obj = orders_by_id.get(alloc.order_id)
+            if order_obj is None:
+                continue
+
+            if alloc.mode == "B_WAIT":
+                launch_station = self.entity_mgr.stations.get(alloc.launch_station_id)
+                recovery = (
+                    self.entity_mgr.stations.get(alloc.recovery_station_id)
+                    or self.entity_mgr.depots.get(alloc.recovery_station_id)
+                )
+                if launch_station is None or recovery is None:
+                    continue
+                launch_loc = launch_station.location
+                recovery_loc = recovery.location
+            elif alloc.mode == "B":
+                truck = self.entity_mgr.trucks.get(alloc.vehicle_id)
+                recovery = (
+                    self.entity_mgr.stations.get(alloc.recovery_station_id)
+                    or self.entity_mgr.depots.get(alloc.recovery_station_id)
+                )
+                if truck is None or recovery is None:
+                    continue
+                launch_loc = truck.get_location(current_time)
+                recovery_loc = recovery.location
+            elif alloc.mode == "C":
+                depot = self.entity_mgr.depots.get(alloc.vehicle_id)
+                if depot is None:
+                    continue
+                launch_loc = depot.location
+                recovery_loc = depot.location
+            else:
+                continue
+
+            dist_out = self._dist(launch_loc, order_obj.delivery_loc)
+            dist_back = self._dist(order_obj.delivery_loc, recovery_loc)
+            uav_distance_total += dist_out + dist_back
+            uav_energy_total += self._uav_energy_wh(
+                drone, launch_loc, order_obj.delivery_loc, order_obj.payload_weight
+            )
+            uav_energy_total += self._uav_energy_wh(
+                drone, order_obj.delivery_loc, recovery_loc, 0.0
+            )
+
+        cost_dist_total = self.C_DIST_ET * truck_distance_total + self.C_DIST_UAV * uav_distance_total
+        cost_energy_total = self.C_ENERGY_ET * truck_energy_total + self.C_ENERGY_UAV * uav_energy_total
+        return cost_dist_total, cost_energy_total, cost_dist_total + cost_energy_total
+
+    def _road_dist(self, pos_a: Position3D, pos_b: Position3D) -> float:
+        """优先使用 OSM 路径距离；不可用时回退二维欧氏距离。"""
+        if self._road_graph_cache is None or self._road_nodes_cache is None:
+            return self._dist(pos_a, pos_b)
+        if len(self._road_graph_cache.nodes()) == 0:
+            return self._dist(pos_a, pos_b)
+
+        key = (
+            round(pos_a.x, 1),
+            round(pos_a.y, 1),
+            round(pos_b.x, 1),
+            round(pos_b.y, 1),
+        )
+        cached = self._road_distance_memo.get(key)
+        if cached is not None:
+            return cached
+
+        try:
+            graph = self._road_graph_cache
+            nodes = self._road_nodes_cache
+            start_node = _osm_svc.find_nearest_node(graph, nodes, pos_a.x, pos_a.y)
+            end_node = _osm_svc.find_nearest_node(graph, nodes, pos_b.x, pos_b.y)
+            if not start_node or not end_node:
+                dist = self._dist(pos_a, pos_b)
+            elif start_node == end_node:
+                dist = self._dist(pos_a, pos_b)
+            else:
+                path = _osm_svc.shortest_path(graph, start_node, end_node)
+                if not path:
+                    dist = self._dist(pos_a, pos_b)
+                else:
+                    dist = 0.0
+                    for i in range(len(path) - 1):
+                        dist += graph[path[i]][path[i + 1]]["weight"]
+        except Exception:
+            dist = self._dist(pos_a, pos_b)
+
+        self._road_distance_memo[key] = dist
+        return dist
+
+    def build_incremental_route_from_stops(
+        self,
+        truck: "Truck",
+        ordered_stops: list[dict],
+        current_time: float,
+    ) -> Optional[TruckRoute]:
+        """按给定停靠顺序重建增量后缀路线（严格走 OSM）。"""
+        if self._road_graph_cache is None or self._road_nodes_cache is None:
+            return None
+
+        road_graph = self._road_graph_cache
+        nodes = self._road_nodes_cache
+        if len(road_graph.nodes()) == 0:
+            return None
+
+        route = TruckRoute(truck_id=truck.truck_id)
+        start_pos = truck.get_location(current_time)
+        route.nodes.append(
+            TruckRouteNode(
+                node_id=f"{truck.truck_id}_origin",
+                node_type="origin",
+                position=start_pos,
+                arrival_time=current_time,
+                departure_time=current_time,
+            )
+        )
+        route.geometry.append(start_pos)
+
+        transformer = Transformer.from_crs("EPSG:4326", "EPSG:32651")
+        nearest_node_cache: dict[tuple[float, float], object] = {}
+        segment_cache: dict[tuple[object, object], tuple[float, list[Position3D]]] = {}
+
+        def get_nearest_node(pos: Position3D):
+            key = (round(pos.x, 2), round(pos.y, 2))
+            node = nearest_node_cache.get(key)
+            if node is None:
+                node = _osm_svc.find_nearest_node(road_graph, nodes, pos.x, pos.y)
+                nearest_node_cache[key] = node
+            return node
+
+        def calc_dist_and_geometry(pos1: Position3D, pos2: Position3D) -> tuple[float, list[Position3D]]:
+            start_node = get_nearest_node(pos1)
+            end_node = get_nearest_node(pos2)
+            if not start_node or not end_node:
+                raise RuntimeError("无法将坐标映射到 OSM 路网节点")
+
+            if start_node == end_node:
+                return pos1.distance_2d(pos2), [pos1, pos2]
+
+            cache_key = (start_node, end_node)
+            cached = segment_cache.get(cache_key)
+            if cached is not None:
+                core_dist, core_geometry = cached
+                seg_geometry: list[Position3D] = [pos1]
+                for p in core_geometry:
+                    if seg_geometry[-1].distance_2d(p) > 0.5:
+                        seg_geometry.append(p)
+                if seg_geometry[-1].distance_2d(pos2) > 0.5:
+                    seg_geometry.append(pos2)
+                seg_dist = sum(
+                    seg_geometry[i - 1].distance_2d(seg_geometry[i])
+                    for i in range(1, len(seg_geometry))
+                )
+                return seg_dist, seg_geometry
+
+            path = _osm_svc.shortest_path(road_graph, start_node, end_node)
+            if not path:
+                raise RuntimeError(f"OSM 路段不可达: {start_node} -> {end_node}")
+
+            dist = 0.0
+            segment_geometry: list[Position3D] = []
+            for i in range(len(path) - 1):
+                u, v = path[i], path[i + 1]
+                dist += road_graph[u][v]["weight"]
+                if not segment_geometry:
+                    lon_u, lat_u = nodes[u]
+                    x_u, y_u = transformer.transform(lat_u, lon_u)
+                    segment_geometry.append(Position3D(x=x_u, y=y_u, z=0))
+                lon_v, lat_v = nodes[v]
+                x_v, y_v = transformer.transform(lat_v, lon_v)
+                segment_geometry.append(Position3D(x=x_v, y=y_v, z=0))
+
+            segment_cache[cache_key] = (dist, segment_geometry)
+
+            seg_geometry: list[Position3D] = [pos1]
+            for p in segment_geometry:
+                if seg_geometry[-1].distance_2d(p) > 0.5:
+                    seg_geometry.append(p)
+            if seg_geometry[-1].distance_2d(pos2) > 0.5:
+                seg_geometry.append(pos2)
+            seg_dist = sum(
+                seg_geometry[i - 1].distance_2d(seg_geometry[i])
+                for i in range(1, len(seg_geometry))
+            )
+            return seg_dist, seg_geometry
+
+        cur_pos = start_pos
+        cur_time = current_time
+        total_dist = 0.0
+        speed = max(1e-6, float(getattr(truck, "speed", 0.0)))
+
+        for stop in ordered_stops:
+            stop_pos = stop.get("position")
+            node_id = stop.get("node_id")
+            node_type = stop.get("node_type")
+            if stop_pos is None or not node_id or not node_type:
+                continue
+
+            seg_dist, seg_geom = calc_dist_and_geometry(cur_pos, stop_pos)
+            if seg_geom:
+                route.geometry.extend(seg_geom[1:] if route.geometry else seg_geom)
+
+            arrival = cur_time + seg_dist / speed
+            prev_arrival = float(stop.get("arrival_time", arrival))
+            prev_departure = float(stop.get("departure_time", prev_arrival))
+            service_time = max(0.0, prev_departure - prev_arrival)
+            departure = arrival + service_time
+
+            route.nodes.append(
+                TruckRouteNode(
+                    node_id=node_id,
+                    node_type=node_type,
+                    position=stop_pos,
+                    arrival_time=arrival,
+                    departure_time=departure,
+                    order_id=stop.get("order_id", ""),
+                )
+            )
+
+            if node_type == "station":
+                route.charging_stop_ids.append(node_id)
+
+            total_dist += seg_dist
+            cur_pos = stop_pos
+            cur_time = departure
+
+        route.total_distance = total_dist
+        return route
 
     # ══════════════════════════════════════════════════════════════════════════
     # 单订单分配
@@ -355,7 +739,7 @@ class GreedyBaseline:
 
             for station_id, station_loc in predicted_stations:
                 truck_loc = truck.get_location(current_time)
-                truck_distance_to_launch = self._dist(truck_loc, station_loc)
+                truck_distance_to_launch = self._road_dist(truck_loc, station_loc)
                 launch_delay = (
                     truck_distance_to_launch / truck.speed
                     if truck.speed > 0 else float("inf")
@@ -591,13 +975,13 @@ class GreedyBaseline:
 
         nearest = min(
             trucks,
-            key=lambda t: self._dist(order.delivery_loc, t.get_location(current_time)),
+            key=lambda t: self._road_dist(order.delivery_loc, t.get_location(current_time)),
         )
         return AllocationResult(
             order_id=order.order_id,
             vehicle_id=nearest.truck_id,
             mode="A",
-            distance=self._dist(order.delivery_loc, nearest.get_location(current_time)),
+            distance=self._road_dist(order.delivery_loc, nearest.get_location(current_time)),
             feasible=True,
         )
 
@@ -614,6 +998,8 @@ class GreedyBaseline:
         road_graph: Optional[nx.DiGraph],
         nodes: dict,
         recovery_station_wait_times: Optional[dict[str, float]] = None,
+        start_pos: Optional[Position3D] = None,
+        return_to_depot: bool = True,
     ) -> TruckRoute:
         """
         为卡车构建配送路径（最近邻启发式）。
@@ -633,13 +1019,23 @@ class GreedyBaseline:
         depot    = depots[0] if depots else None
         stations = list(self.entity_mgr.stations.values())
 
-        if depot:
+        route_start_pos = start_pos if start_pos is not None else (depot.location if depot else truck.get_location(current_time))
+        if start_pos is None and depot:
             route.nodes.append(TruckRouteNode(
                 node_id=depot.depot_id, node_type="depot",
                 position=depot.location,
                 arrival_time=current_time, departure_time=current_time,
             ))
             route.geometry.append(depot.location)
+        else:
+            route.nodes.append(TruckRouteNode(
+                node_id=f"{truck.truck_id}_origin",
+                node_type="origin",
+                position=route_start_pos,
+                arrival_time=current_time,
+                departure_time=current_time,
+            ))
+            route.geometry.append(route_start_pos)
 
         # 合并待访问节点：客户订单 + 回收点
         unvisited_nodes = []
@@ -663,17 +1059,28 @@ class GreedyBaseline:
         if not unvisited_nodes:
             return route
 
-        cur_pos    = depot.location if depot else truck.get_location(current_time)
+        cur_pos    = route_start_pos
         cur_time   = current_time
         total_dist = 0.0
+        transformer = Transformer.from_crs("EPSG:4326", "EPSG:32651")
+        nearest_node_cache: dict[tuple[float, float], object] = {}
+        segment_cache: dict[tuple[object, object], tuple[float, list[Position3D]]] = {}
+
+        def get_nearest_node(pos: Position3D):
+            key = (round(pos.x, 2), round(pos.y, 2))
+            node = nearest_node_cache.get(key)
+            if node is None:
+                node = _osm_svc.find_nearest_node(road_graph, nodes, pos.x, pos.y)
+                nearest_node_cache[key] = node
+            return node
 
         def calc_dist_and_geometry(pos1: Position3D, pos2: Position3D) -> tuple[float, list[Position3D]]:
             """计算距离并返回对应几何（UTM）；严格使用 OSM，不允许近似回退。"""
             if road_graph is None or len(road_graph.nodes()) == 0:
                 raise RuntimeError("OSM 路网为空，无法进行卡车路径规划")
 
-            start_node = _osm_svc.find_nearest_node(road_graph, nodes, pos1.x, pos1.y)
-            end_node = _osm_svc.find_nearest_node(road_graph, nodes, pos2.x, pos2.y)
+            start_node = get_nearest_node(pos1)
+            end_node = get_nearest_node(pos2)
             if not start_node or not end_node:
                 raise RuntimeError("无法将坐标映射到 OSM 路网节点")
 
@@ -681,13 +1088,28 @@ class GreedyBaseline:
             if start_node == end_node:
                 return pos1.distance_2d(pos2), [pos1, pos2]
 
+            cache_key = (start_node, end_node)
+            cached = segment_cache.get(cache_key)
+            if cached is not None:
+                core_dist, core_geometry = cached
+                seg_geometry: list[Position3D] = [pos1]
+                for p in core_geometry:
+                    if seg_geometry[-1].distance_2d(p) > 0.5:
+                        seg_geometry.append(p)
+                if seg_geometry[-1].distance_2d(pos2) > 0.5:
+                    seg_geometry.append(pos2)
+                seg_dist = sum(
+                    seg_geometry[i - 1].distance_2d(seg_geometry[i])
+                    for i in range(1, len(seg_geometry))
+                )
+                return seg_dist, seg_geometry
+
             path = _osm_svc.shortest_path(road_graph, start_node, end_node)
             if not path:
                 raise RuntimeError(f"OSM 路段不可达: {start_node} -> {end_node}")
 
             dist = 0.0
             segment_geometry: list[Position3D] = []
-            transformer = Transformer.from_crs("EPSG:4326", "EPSG:32651")
             for i in range(len(path) - 1):
                 u, v = path[i], path[i+1]
                 dist += road_graph[u][v]['weight']
@@ -699,7 +1121,19 @@ class GreedyBaseline:
                 x_v, y_v = transformer.transform(lat_v, lon_v)
                 segment_geometry.append(Position3D(x=x_v, y=y_v, z=0))
 
-            return dist, segment_geometry
+            segment_cache[cache_key] = (dist, segment_geometry)
+
+            seg_geometry: list[Position3D] = [pos1]
+            for p in segment_geometry:
+                if seg_geometry[-1].distance_2d(p) > 0.5:
+                    seg_geometry.append(p)
+            if seg_geometry[-1].distance_2d(pos2) > 0.5:
+                seg_geometry.append(pos2)
+            seg_dist = sum(
+                seg_geometry[i - 1].distance_2d(seg_geometry[i])
+                for i in range(1, len(seg_geometry))
+            )
+            return seg_dist, seg_geometry
 
         def calc_dist(pos1: Position3D, pos2: Position3D) -> float:
             """仅返回距离，供贪心比较与站点插入判断使用。"""
@@ -768,7 +1202,7 @@ class GreedyBaseline:
             cur_time = depart
 
         # 返回仓库
-        if depot:
+        if return_to_depot and depot:
             d, g_back = calc_dist_and_geometry(cur_pos, depot.location)
             if g_back:
                 route.geometry.extend(g_back[1:] if route.geometry else g_back)
@@ -906,11 +1340,20 @@ class GreedyBaseline:
 
     def _get_available_drones(self) -> list:
         """返回当前空闲（IDLE）且电量高于底线的无人机列表。"""
-        return [
-            d for d in self.entity_mgr.drones.values()
-            if d.status == DroneStatus.IDLE
-            and d.battery_current > self.min_reserve_energy
-        ]
+        available = []
+        for d in self.entity_mgr.drones.values():
+            if d.status != DroneStatus.IDLE:
+                continue
+            if d.battery_current <= self.min_reserve_energy:
+                continue
+            if getattr(d, "carrying_order_id", None):
+                continue
+            if getattr(d, "waiting_recovery_station_id", ""):
+                continue
+            if getattr(d, "has_pending_route", False):
+                continue
+            available.append(d)
+        return available
 
     @staticmethod
     def _find_capable_drone(payload_weight: float, drones: list) -> Optional[object]:
@@ -998,7 +1441,7 @@ class GreedyBaseline:
             truck = self.entity_mgr.trucks.get(alloc.vehicle_id)
             if truck is None or truck.speed <= 0:
                 return float("inf"), 0.0, 0.0, 0.0
-            truck_distance = self._dist(truck.get_location(current_time), order.delivery_loc)
+            truck_distance = self._road_dist(truck.get_location(current_time), order.delivery_loc)
             truck_energy = self._truck_energy_wh(truck_distance)
             delivery_time_est = current_time + truck_distance / truck.speed + self.SERVICE_TIME_CUSTOMER
 
@@ -1013,7 +1456,7 @@ class GreedyBaseline:
                 if truck is None or launch_station is None or truck.speed <= 0:
                     return float("inf"), 0.0, 0.0, 0.0
                 launch_loc = launch_station.location
-                truck_distance = self._dist(truck.get_location(current_time), launch_loc)
+                truck_distance = self._road_dist(truck.get_location(current_time), launch_loc)
                 truck_energy = self._truck_energy_wh(truck_distance)
                 launch_time_est = (
                     alloc.launch_time
