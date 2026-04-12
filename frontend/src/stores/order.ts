@@ -9,6 +9,9 @@ export interface SimStats {
   orders_assigned:  number
   orders_completed: number
   orders_timeout:   number
+  total_energy_cost_wh?: number
+  total_dispatch_cost?: number
+  dispatch_count?: number
 }
 import { useEntityStore } from './entity'
 import { useSceneStore } from './scene'

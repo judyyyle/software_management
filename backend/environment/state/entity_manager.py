@@ -409,19 +409,38 @@ class EntityManager:
                         if current_time + 1e-6 < launch_time:
                             continue
 
-                        # 起飞时强制将无人机对齐到起飞站点/起飞航路点，避免“路中间放飞”。
+                        # 起飞前必须校验卡车已到达起飞站，防止增量改路由后“无人机瞬移放飞”。
                         launch_loc = None
-                        if drone.has_pending_route:
+                        launch_station_id = getattr(drone, "launch_station_id", "")
+                        launch_station = self.stations.get(launch_station_id) if launch_station_id else None
+                        if launch_station is not None:
+                            launch_loc = launch_station.location
+                        elif drone.has_pending_route:
                             launch_idx = drone.current_waypoint_index
                             if 0 <= launch_idx < len(drone.route_plan):
                                 launch_loc = drone.route_plan[launch_idx].loc
+
                         if launch_loc is None:
-                            launch_station_id = getattr(drone, "launch_station_id", "")
-                            launch_station = self.stations.get(launch_station_id)
-                            if launch_station is not None:
-                                launch_loc = launch_station.location
-                        if launch_loc is not None:
-                            drone.current_loc = launch_loc
+                            continue
+
+                        launch_tol_m = max(15.0, float(getattr(carrier, "speed", 0.0)) * 1.5)
+                        dist_to_launch = carrier.current_loc.distance_2d(launch_loc)
+                        if dist_to_launch > launch_tol_m:
+                            last_log_t = float(getattr(drone, "_last_launch_wait_log_time", -1e9))
+                            if current_time - last_log_t >= 10.0:
+                                logger.info(
+                                    "[EntityManager.tick_all] 无人机 %s 等待卡车 %s 到达起飞站 %s "
+                                    "(dist=%.1fm, tol=%.1fm)",
+                                    drone.drone_id,
+                                    carrier.truck_id,
+                                    launch_station_id or "-",
+                                    dist_to_launch,
+                                    launch_tol_m,
+                                )
+                                drone._last_launch_wait_log_time = current_time
+                            continue
+
+                        drone.current_loc = launch_loc
 
                         if drone.drone_id in carrier.docked_drones:
                             carrier.docked_drones.remove(drone.drone_id)
@@ -512,6 +531,9 @@ class EntityManager:
 
             if event_time > current_time + 1e-6:
                 break
+            if not self._truck_is_near_stop(truck, stop):
+                # 到时但尚未到点：不推进 cursor，等待卡车物理位置追上，避免“按时间瞬移触发”。
+                break
             self._handle_truck_stop_event(truck, stop, current_time)
             cursor += 1
 
@@ -530,8 +552,19 @@ class EntityManager:
             arrival = float(stop.get("arrival_time", float("inf")))
             departure = float(stop.get("departure_time", arrival))
             if arrival <= current_time + 1e-6 < departure - 1e-6:
+                if not self._truck_is_near_stop(truck, stop):
+                    continue
                 return stop
         return None
+
+    def _truck_is_near_stop(self, truck: Truck, stop: dict) -> bool:
+        """判定卡车是否已接近停靠点，防止仅按时刻触发导致位置跳变。"""
+        stop_pos = stop.get("position")
+        if stop_pos is None:
+            return False
+        # 允许少量误差：至少 15m，且与车速相关。
+        tol_m = max(15.0, float(getattr(truck, "speed", 0.0)) * 1.5)
+        return truck.current_loc.distance_2d(stop_pos) <= tol_m
 
     def _handle_truck_stop_event(self, truck: Truck, stop: dict, current_time: float) -> None:
         """处理单个卡车停靠事件。"""

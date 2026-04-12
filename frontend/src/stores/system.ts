@@ -7,7 +7,7 @@ import { useOrderStore } from './order'
 import { useSceneStore } from './scene'
 
 // ── 调试开关 ────────────────────────────────────────────────────
-const DEBUG_WEBSOCKET = true
+const DEBUG_WEBSOCKET = false
 
 /** 全局仿真系统状态 */
 export const useSystemStore = defineStore('system', () => {

@@ -61,6 +61,14 @@ class SimulationEngine:
         self._dispatch_bbox:     Optional[dict] = None
         self._dispatch_scene_id: Optional[str]  = None
         self._pending_snapshot: set[str] = set()
+        self._pending_incremental_ids: set[str] = set()
+        self._last_incremental_dispatch_sim_time: float = -1e9
+        self._last_new_order_sim_time: float = -1e9
+        self._first_pending_incremental_sim_time: float = -1e9
+        # 动态调度节流参数：最短间隔 + 防抖 + 最长等待，减少高频重规划抖动。
+        self._incremental_dispatch_min_interval_s: float = 2.0
+        self._incremental_dispatch_debounce_s: float = 1.0
+        self._incremental_dispatch_max_wait_s: float = 5.0
 
     # ══════════════════════════════════════════════════════════════════════════
     # 初始化注入
@@ -151,6 +159,10 @@ class SimulationEngine:
         self._dispatch_bbox    = None
         self._dispatch_scene_id = None
         self._pending_snapshot = set()
+        self._pending_incremental_ids = set()
+        self._last_incremental_dispatch_sim_time = -1e9
+        self._last_new_order_sim_time = -1e9
+        self._first_pending_incremental_sim_time = -1e9
         logger.info("[SimEngine] 仿真引擎已重置")
 
     def set_speed(self, speed_ratio: float) -> None:
@@ -244,21 +256,45 @@ class SimulationEngine:
         new_ids = current_ids - self._pending_snapshot
         self._pending_snapshot = current_ids
 
-        if not new_ids:
+        if new_ids:
+            self._pending_incremental_ids.update(new_ids)
+            self._last_new_order_sim_time = self.current_time
+            if self._first_pending_incremental_sim_time < -1e8:
+                self._first_pending_incremental_sim_time = self.current_time
+
+        if not self._pending_incremental_ids:
+            return
+
+        # 防抖：若新订单仍在连续到达，先短暂合批；但不超过最长等待上限。
+        since_last_new = self.current_time - self._last_new_order_sim_time
+        since_first_pending = self.current_time - self._first_pending_incremental_sim_time
+        if (
+            since_last_new < self._incremental_dispatch_debounce_s
+            and since_first_pending < self._incremental_dispatch_max_wait_s
+        ):
+            return
+
+        if (
+            self.current_time - self._last_incremental_dispatch_sim_time
+            < self._incremental_dispatch_min_interval_s
+        ):
             return
 
         new_orders = {
             oid: self._order_mgr.pending_orders[oid]
-            for oid in new_ids
+            for oid in sorted(self._pending_incremental_ids)
             if oid in self._order_mgr.pending_orders
         }
         if not new_orders:
+            self._pending_incremental_ids.clear()
+            self._first_pending_incremental_sim_time = -1e9
             return
 
         try:
             logger.info(
-                "[SimEngine] 检测到 %d 个新订单，触发增量调度: %s",
+                "[SimEngine] 批量触发动态调度：%d 单（首单等待 %.2fs）: %s",
                 len(new_orders),
+                max(0.0, since_first_pending),
                 list(new_orders.keys()),
             )
             self._dispatch_engine.execute_incremental(
@@ -267,10 +303,15 @@ class SimulationEngine:
                 self._dispatch_bbox,
                 scene_id=self._dispatch_scene_id,
             )
+            self._last_incremental_dispatch_sim_time = self.current_time
+            self._pending_incremental_ids.clear()
+            self._first_pending_incremental_sim_time = -1e9
             # 调度完成后刷新快照（feasible 的单已移入 assigned）
             self._pending_snapshot = set(self._order_mgr.pending_orders.keys())
         except Exception:
             logger.exception("[SimEngine] 动态订单增量调度失败")
+            # 失败后同样设置最小重试间隔，避免每帧抛错导致卡顿。
+            self._last_incremental_dispatch_sim_time = self.current_time
 
     def _build_tick_payload(self) -> dict:
         """
@@ -290,6 +331,12 @@ class SimulationEngine:
             # 推送所有订单的状态（pending + assigned + completed）
             orders = self._order_mgr.get_recent_orders(limit=500)
             stats = self._order_mgr.get_status_summary()
+
+        if self._dispatch_engine is not None and hasattr(self._dispatch_engine, "get_runtime_metrics"):
+            try:
+                stats.update(self._dispatch_engine.get_runtime_metrics())
+            except Exception:
+                pass
 
         return {
             "sim_time": round(self.current_time, 3),
@@ -315,6 +362,12 @@ class SimulationEngine:
 
         if self._order_mgr is not None:
             stats = self._order_mgr.get_status_summary()
+
+        if self._dispatch_engine is not None and hasattr(self._dispatch_engine, "get_runtime_metrics"):
+            try:
+                stats.update(self._dispatch_engine.get_runtime_metrics())
+            except Exception:
+                pass
 
         return {
             "type": "FULL_SNAPSHOT",

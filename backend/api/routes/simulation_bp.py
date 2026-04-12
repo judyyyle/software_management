@@ -767,6 +767,13 @@ def sim_dispatch():
             if route is not None:
                 drone_routes.append(route)
 
+        runtime_metrics = {}
+        if hasattr(_dispatch_engine, "get_runtime_metrics"):
+            try:
+                runtime_metrics = _dispatch_engine.get_runtime_metrics()
+            except Exception:
+                runtime_metrics = {}
+
         return jsonify({
             "status": "ok",
             "plan": {
@@ -791,6 +798,7 @@ def sim_dispatch():
                 "truck_routes": truck_routes,
                 "drone_routes": drone_routes,
             },
+            "runtime_metrics": runtime_metrics,
             "pending_count":  len(_order_mgr.pending_orders),
             "assigned_count": len(_order_mgr.assigned_orders),
             "timestamp":      current_time,

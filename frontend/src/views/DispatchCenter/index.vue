@@ -247,6 +247,11 @@ function toSimSeconds(value: number | undefined, timeDomain?: 'wall_ms' | 'sim_s
 }
 
 const kpiList = computed(() => {
+  const runtimeEnergyWh = Number(orderStore.stats?.total_energy_cost_wh)
+  const energyWhDisplay = Number.isFinite(runtimeEnergyWh) && runtimeEnergyWh >= 0
+    ? runtimeEnergyWh
+    : totalEnergyCostWh.value
+
   const orders = orderStore.generatedOrders
   const totalOrders = orders.length
   const completedOrders = orders.filter(o => o.status === 'COMPLETED')
@@ -299,7 +304,7 @@ const kpiList = computed(() => {
     {
       icon: '⚡',
       label: '总体能耗成本',
-      value: `${totalEnergyCostWh.value.toFixed(2)} Wh`,
+      value: `${energyWhDisplay.toFixed(2)} Wh`,
       change: '累计',
       up: false,
     },
@@ -465,6 +470,11 @@ async function doDispatch() {
 
     if (result.status === 'ok' && result.plan) {
       const plan = result.plan as DispatchPlan
+      const backendSolver = String((plan as any)?.solver || result.runtime_metrics?.active_solver || '')
+      if (backendSolver && backendSolver !== dispatchSolver.value) {
+        _log('warn', `⚠️ 算法不一致：前端选择 ${dispatchSolver.value}，后端生效 ${backendSolver}`)
+      }
+
       const modeStr = Object.entries(plan.modes || {})
         .map(([k, v]) => `${k}:${v}`)
         .join(' ')
@@ -477,10 +487,9 @@ async function doDispatch() {
 
       dispatchPlan.value = plan
 
-      // 累计能耗成本（Wh）用于 KPI 展示。
-      const energyWh = Number(plan.cost_breakdown?.energy ?? 0)
-      if (Number.isFinite(energyWh) && energyWh >= 0) {
-        totalEnergyCostWh.value += energyWh
+      const runtimeEnergyWh = Number(result.runtime_metrics?.total_energy_cost_wh)
+      if (Number.isFinite(runtimeEnergyWh) && runtimeEnergyWh >= 0) {
+        totalEnergyCostWh.value = runtimeEnergyWh
       }
 
       mapRef.value?.clearDispatchRoutes?.()
