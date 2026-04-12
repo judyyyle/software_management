@@ -96,6 +96,7 @@ class Drone:
 
         # ── 统计 ──────────────────────────────────────────────────────────────
         self.cumulative_distance: float = 0.0     # 累计飞行距离 [m]
+        self.cumulative_energy_j: float = 0.0     # 累计飞行耗能 [J]
 
     # ══════════════════════════════════════════════════════════════════════════
     # 属性访问
@@ -169,8 +170,10 @@ class Drone:
             return
 
         power = self.calculate_power(self.current_payload, self.cruise_speed)
-        self.battery_current -= power * dt
+        energy_j = max(0.0, power * dt)
+        self.battery_current -= energy_j
         self.cumulative_distance += self.cruise_speed * dt
+        self.cumulative_energy_j += energy_j
 
         if self.battery_current <= 0:
             self.battery_current = 0.0
@@ -401,6 +404,7 @@ class Drone:
             "current_waypoint_idx": self.current_waypoint_index,
             "current_action":       waypoint.action.value if waypoint else None,
             "cumulative_distance_m": round(self.cumulative_distance, 2),
+            "cumulative_energy_wh": round(self.cumulative_energy_j / 3600.0, 3),
             "remaining_range_m":    round(self.get_remaining_range(), 2),
         }
 
@@ -425,6 +429,7 @@ class Drone:
             "battery_ratio":         round(self.battery_ratio, 4),
             "carrying_order_id":     self.carrying_order_id,
             "cumulative_distance_m": round(self.cumulative_distance, 2),
+            "cumulative_energy_wh":  round(self.cumulative_energy_j / 3600.0, 3),
             "remaining_range_m":     round(self.get_remaining_range(), 2),
         }
 

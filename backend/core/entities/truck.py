@@ -93,6 +93,7 @@ class Truck(ChargingHost):
         self._route_data: list[_RouteNode] = []      # 内部带累计距离的路网数据
         self._departure_time: float = 0.0            # 开始沿当前路由行驶的仿真时间
         self._current_node_idx: int = 0              # 当前正在前往的节点下标
+        self.cumulative_distance_m: float = 0.0      # 累计地面行驶距离 [m]
 
     # ══════════════════════════════════════════════════════════════════════════
     # 路网路由设置
@@ -230,7 +231,9 @@ class Truck(ChargingHost):
         if not self.status.is_mobile or not self._route_data:
             return False
 
+        prev_loc = self.current_loc
         self.current_loc = self.get_location(current_time)
+        self.cumulative_distance_m += max(0.0, prev_loc.distance_2d(self.current_loc))
 
         # 检查是否到达终点
         elapsed = max(0.0, current_time - self._departure_time)
@@ -522,6 +525,7 @@ class Truck(ChargingHost):
             "parking_slots":    self.parking_slots,
             "available_slots":  self.available_slots,
             "swap_time":        self.swap_time,
+            "cumulative_distance_m": round(self.cumulative_distance_m, 2),
         }
 
     def to_dynamic_state(self) -> dict:
@@ -551,6 +555,7 @@ class Truck(ChargingHost):
             "inventory_count": len(self.inventory),
             "available_slots": self.available_slots,
             "docked_drones":   list(self.docked_drones),
+            "cumulative_distance_m": round(self.cumulative_distance_m, 2),
         }
 
     def __repr__(self) -> str:
