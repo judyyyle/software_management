@@ -1,5 +1,3 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
 """
 HiveLogix — 贪心调度算法（Baseline v2）
 
