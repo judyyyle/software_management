@@ -184,7 +184,7 @@
   "dynamic_orders": [
     {
       "order_id": "DYN-BENCH-01",
-      "spawn_sim_s": 60,
+      "spawn_sim_s": 120,
       "deadline_offset_s": 2400,
       "delivery_lng": 121.202,
       "delivery_lat": 31.048,
@@ -198,7 +198,7 @@
     },
     {
       "order_id": "DYN-BENCH-02",
-      "spawn_sim_s": 120,
+      "spawn_sim_s": 210,
       "deadline_offset_s": 1800,
       "delivery_lng": 121.214,
       "delivery_lat": 31.041,
@@ -212,7 +212,7 @@
     },
     {
       "order_id": "DYN-BENCH-03",
-      "spawn_sim_s": 180,
+      "spawn_sim_s": 450,
       "deadline_offset_s": 2100,
       "delivery_lng": 121.221,
       "delivery_lat": 31.036,
@@ -226,7 +226,7 @@
     },
     {
       "order_id": "DYN-BENCH-04",
-      "spawn_sim_s": 240,
+      "spawn_sim_s": 570,
       "deadline_offset_s": 3000,
       "delivery_lng": 121.206,
       "delivery_lat": 31.052,
@@ -240,7 +240,7 @@
     },
     {
       "order_id": "DYN-BENCH-05",
-      "spawn_sim_s": 300,
+      "spawn_sim_s": 870,
       "deadline_offset_s": 2400,
       "delivery_lng": 121.228,
       "delivery_lat": 31.044,
@@ -254,7 +254,7 @@
     },
     {
       "order_id": "DYN-BENCH-06",
-      "spawn_sim_s": 360,
+      "spawn_sim_s": 930,
       "deadline_offset_s": 3600,
       "delivery_lng": 121.198,
       "delivery_lat": 31.039,
@@ -268,7 +268,7 @@
     },
     {
       "order_id": "DYN-BENCH-07",
-      "spawn_sim_s": 420,
+      "spawn_sim_s": 1140,
       "deadline_offset_s": 1800,
       "delivery_lng": 121.216,
       "delivery_lat": 31.028,
@@ -282,7 +282,7 @@
     },
     {
       "order_id": "DYN-BENCH-08",
-      "spawn_sim_s": 480,
+      "spawn_sim_s": 1290,
       "deadline_offset_s": 3000,
       "delivery_lng": 121.232,
       "delivery_lat": 31.033,
@@ -296,7 +296,7 @@
     },
     {
       "order_id": "DYN-BENCH-09",
-      "spawn_sim_s": 540,
+      "spawn_sim_s": 1560,
       "deadline_offset_s": 2700,
       "delivery_lng": 121.211,
       "delivery_lat": 31.056,
@@ -310,7 +310,7 @@
     },
     {
       "order_id": "DYN-BENCH-10",
-      "spawn_sim_s": 600,
+      "spawn_sim_s": 1740,
       "deadline_offset_s": 2100,
       "delivery_lng": 121.224,
       "delivery_lat": 31.049,

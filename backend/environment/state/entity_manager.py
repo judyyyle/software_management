@@ -8,7 +8,7 @@ Depot / SwapStation / Truck / Drone 实例，并维护前端 UI 字段的 Sideca
 
 生命周期：
   1. POST /api/sim/init   → load_from_config(config_json) 重建所有实体
-  2. SimEngine 每 100ms  → tick_all(current_time, dt)     物理步进
+  2. SimEngine 每 100ms  → tick_all(current_time, dt, order_mgr)  物理步进（订单归档需传入 OrderManager）
   3. WebSocket 推送      → get_telemetry()                TICK 帧数据
   4. 建连/请求           → get_static_snapshot()          FULL_SNAPSHOT 数据
 
@@ -65,7 +65,6 @@ class EntityManager:
         self.trucks:   dict[str, Truck]       = {}
         self.drones:   dict[str, Drone]       = {}
         self._metadata: dict[str, dict]       = {}
-        self.order_mgr: Optional["OrderManager"] = None  # 订单管理器引用（由 sim_engine 注入）
 
         runtime_cfg = load_solver_energy_params()
         self.DRONE_SERVICE_TIME_ORDER = runtime_cfg.drone_service_time_order_s
@@ -319,7 +318,12 @@ class EntityManager:
     # 物理步进
     # ══════════════════════════════════════════════════════════════════════════
 
-    def tick_all(self, current_time: float, dt: float) -> None:
+    def tick_all(
+        self,
+        current_time: float,
+        dt: float,
+        order_mgr: Optional["OrderManager"] = None,
+    ) -> None:
         """
         驱动所有实体完成一个物理时间步。
 
@@ -330,6 +334,8 @@ class EntityManager:
         Args:
             current_time: 仿真累计时间（秒）
             dt:           本步推进的仿真时长（秒）= 0.1 × speed_ratio
+            order_mgr:    订单管理器；无人机/卡车完成配送归档时写入，与求解器类型无关。
+                          未传入时无法将订单移入 completed（会打日志告警）。
         """
         for depot in self.depots.values():
             try:
@@ -365,7 +371,7 @@ class EntityManager:
                     # 推进卡车位置（如果已设置路由）
                     truck.move_step(dt, current_time)
                 # 基于调度器下发的关键节点时序，执行 customer/recovery 事件。
-                self._process_truck_route_events(truck, current_time)
+                self._process_truck_route_events(truck, current_time, order_mgr)
                 if DEBUG_TRUCK_POSITION and truck.status.value == "DRIVING" and truck._route_data:
                     logger.debug(
                         "[EntityManager] Truck %s: status=%s, pos=(%f, %f), time=%.2f",
@@ -393,6 +399,7 @@ class EntityManager:
                                 released,
                                 current_time,
                                 source=f"drone {drone.drone_id}",
+                                order_mgr=order_mgr,
                             )
                     drone.delivery_service_end_time = 0.0
                     drone.pending_release_order_id = None
@@ -512,7 +519,12 @@ class EntityManager:
             except Exception:
                 logger.exception("[EntityManager.tick_all] Drone %s tick 异常", drone.drone_id)
 
-    def _process_truck_route_events(self, truck: Truck, current_time: float) -> None:
+    def _process_truck_route_events(
+        self,
+        truck: Truck,
+        current_time: float,
+        order_mgr: Optional["OrderManager"],
+    ) -> None:
         """按时间顺序执行卡车关键节点事件（customer/recovery）。"""
         planned_stops = getattr(truck, "_planned_route_stops", None)
         if not planned_stops:
@@ -532,9 +544,9 @@ class EntityManager:
             if event_time > current_time + 1e-6:
                 break
             if not self._truck_is_near_stop(truck, stop):
-                # 到时但尚未到点：不推进 cursor，等待卡车物理位置追上，避免“按时间瞬移触发”。
+                # 到时但尚未到点：等待卡车物理位置追上，避免“按时间瞬移触发”。
                 break
-            self._handle_truck_stop_event(truck, stop, current_time)
+            self._handle_truck_stop_event(truck, stop, current_time, order_mgr)
             cursor += 1
 
         truck._planned_route_cursor = cursor
@@ -566,7 +578,13 @@ class EntityManager:
         tol_m = max(15.0, float(getattr(truck, "speed", 0.0)) * 1.5)
         return truck.current_loc.distance_2d(stop_pos) <= tol_m
 
-    def _handle_truck_stop_event(self, truck: Truck, stop: dict, current_time: float) -> None:
+    def _handle_truck_stop_event(
+        self,
+        truck: Truck,
+        stop: dict,
+        current_time: float,
+        order_mgr: Optional["OrderManager"],
+    ) -> None:
         """处理单个卡车停靠事件。"""
         node_type = stop.get("node_type", "")
         if node_type == "customer":
@@ -576,6 +594,7 @@ class EntityManager:
                     order_id,
                     current_time,
                     source=f"truck {truck.truck_id}",
+                    order_mgr=order_mgr,
                 )
             return
 
@@ -615,15 +634,33 @@ class EntityManager:
                 truck.truck_id, station_id, recovered,
             )
 
-    def _complete_assigned_order(self, order_id: str, current_time: float, source: str) -> None:
+    def _complete_assigned_order(
+        self,
+        order_id: str,
+        current_time: float,
+        source: str,
+        order_mgr: Optional["OrderManager"] = None,
+    ) -> None:
         """将 assigned 订单推进到 COMPLETED 并归档。"""
-        if self.order_mgr is None:
-            logger.warning("[EntityManager] %s 完成订单 %s 失败：order_mgr 未初始化", source, order_id)
+        if order_mgr is None:
+            logger.warning("[EntityManager] %s 完成订单 %s 失败：未传入 order_mgr", source, order_id)
             return
 
-        order = self.order_mgr.assigned_orders.get(order_id)
+        order = order_mgr.assigned_orders.get(order_id)
         if order is None:
-            logger.debug("[EntityManager] %s 完成订单 %s：订单不在 assigned 列表", source, order_id)
+            for co in order_mgr.completed_orders:
+                if co.order_id == order_id:
+                    logger.info(
+                        "[EntityManager] %s 回调完成订单 %s：已在 completed 池（幂等忽略）",
+                        source,
+                        order_id,
+                    )
+                    return
+            logger.warning(
+                "[EntityManager] %s 完成订单 %s：订单不在 assigned 且未在 completed，无法归档",
+                source,
+                order_id,
+            )
             return
 
         from core.entities.primitives import TaskStatus
@@ -648,7 +685,7 @@ class EntityManager:
             logger.warning("[EntityManager] %s 完成订单 %s 失败: %s", source, order_id, exc)
             return
 
-        self.order_mgr.assigned_orders.pop(order_id, None)
-        if order not in self.order_mgr.completed_orders:
-            self.order_mgr.completed_orders.append(order)
+        order_mgr.assigned_orders.pop(order_id, None)
+        if order not in order_mgr.completed_orders:
+            order_mgr.completed_orders.append(order)
         logger.info("[EntityManager] %s 完成订单 %s，状态更新为 COMPLETED", source, order_id)
