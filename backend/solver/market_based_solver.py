@@ -23,15 +23,20 @@ HiveLogix — 市场拍卖调度算法（支持动态增量调度与时空契约
   - 接近生死线的锚点被选中时附加风险惩罚分
 
 工程说明（与实现同步维护）：solver/market_based.md
+
+订单池解耦：需读取 `assigned_orders` / `pending_orders` 的约束逻辑使用本类 `bind_order_manager(order_mgr)`
+（由 `DispatchDecisionEngine` 注入），**不**再依赖 `EntityManager.order_mgr`。
 """
 
 from __future__ import annotations
 
 import logging
 import math
+import os
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
+from core.entities.primitives import DroneStatus
 from solver.greedy_baseline import (
     AllocationResult,
     DispatchPlan,
@@ -47,6 +52,62 @@ if TYPE_CHECKING:
     from core.entities.truck import Truck
 
 logger = logging.getLogger(__name__)
+_ENTITY_MANAGER_LOGGER = logging.getLogger("entity_manager")
+_DECISION_ENGINE_LOGGER = logging.getLogger("solver.decision_engine")
+
+# 与本模块在终端上的 logging 输出一致，追加写入 solver 目录下的 market_debug_log
+_MARKET_DEBUG_LOG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "market_debug_log")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 自动flush的FileHandler
+# ══════════════════════════════════════════════════════════════════════════════
+
+class _AutoFlushFileHandler(logging.FileHandler):
+    """自定义FileHandler：每条日志立即flush到磁盘，避免程序pause时日志仅在缓冲区"""
+    def emit(self, record):
+        try:
+            super().emit(record)
+            self.flush()
+        except Exception:
+            self.handleError(record)
+
+
+def _attach_market_debug_file_handler(target_logger: logging.Logger) -> None:
+    abs_target = os.path.abspath(_MARKET_DEBUG_LOG_PATH)
+    for h in target_logger.handlers:
+        if isinstance(h, (logging.FileHandler, _AutoFlushFileHandler)):
+            try:
+                if os.path.abspath(h.baseFilename) == abs_target:
+                    return
+            except (AttributeError, OSError, ValueError):
+                continue
+    try:
+        fh = _AutoFlushFileHandler(_MARKET_DEBUG_LOG_PATH, mode="a", encoding="utf-8")
+    except OSError:
+        return
+    fh.setFormatter(
+        logging.Formatter(
+            "%(asctime)s [%(levelname)-8s] %(name)s: %(message)s",
+            datefmt="%H:%M:%S",
+        )
+    )
+    fh.setLevel(logging.DEBUG)
+    target_logger.addHandler(fh)
+    # 同时确保logger本身的级别足够低，不会过滤掉DEBUG日志
+    if target_logger.level == logging.NOTSET or target_logger.level > logging.DEBUG:
+        target_logger.setLevel(logging.DEBUG)
+
+
+def _ensure_market_debug_file_handler() -> None:
+    # market solver：竞价/授标；solver.decision_engine：下发无人机路由等编排日志；
+    # entity_manager：配送点停留与完成归档。
+    _attach_market_debug_file_handler(logger)
+    _attach_market_debug_file_handler(_DECISION_ENGINE_LOGGER)
+    _attach_market_debug_file_handler(_ENTITY_MANAGER_LOGGER)
+
+
+_ensure_market_debug_file_handler()
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -98,6 +159,11 @@ class MarketBasedSolver(GreedyBaseline):
     # 接近生死线的风险惩罚权重（已校正：降低以减少保守退化为卡车直递）
     DEADLINE_RISK_WEIGHT = 0.8
 
+    # ── 竞标准入约束参数 ──────────────────────────────────────────────
+    AUCTION_BUFFER_TIME = 15.0     # DELIVERING 无人机距终点 T_remain 小于此值时允许预调度
+    PATH_STITCH_TOLERANCE_M = 1.0  # 路径拼接坐标容差（米）
+    AUCTION_COMPUTE_DELTA_T = 0.5  # 拍卖计算预估耗时（用于起点预测）
+
     def __init__(self, entity_mgr) -> None:
         super().__init__(entity_mgr)
         self._auction_bid_count = 0
@@ -105,6 +171,152 @@ class MarketBasedSolver(GreedyBaseline):
         self._anchor_preview_routes: dict[str, object] = {}
         self._active_contracts: list[RendezvousContract] = []
         self._contract_seq = 0
+        # 订单视图仅用于市场约束（不可撤销、清空校验等），由 DispatchDecisionEngine 注入，避免挂在 EntityManager 上。
+        self._order_mgr: Any = None
+
+    def bind_order_manager(self, order_mgr: Any) -> None:
+        """由编排层在构造/切换求解器后调用，供增量过滤与车队安全校验读取订单池。"""
+        self._order_mgr = order_mgr
+
+    def _is_order_immutable(self, order_id: str, current_time: float = 0.0) -> bool:
+        """判断订单是否已进入不可撤销状态（履约临界点）。
+
+        基于地理围栏与物理状态：若持有该订单的实体真实位于客户附近（卸货中）
+        或处于飞行中、状态不为 PENDING，均视为已锁定。
+        """
+        from core.entities.primitives import TaskStatus
+        if not self._order_mgr:
+            return False
+
+        order = self._order_mgr.assigned_orders.get(order_id)
+        if order is None:
+            return False
+            
+        if order.status in (
+            TaskStatus.PICKED_UP,
+            TaskStatus.DELIVERING,
+            TaskStatus.COMPLETED,
+        ):
+            return True
+            
+        # 地理围栏补充校验：即使状态未及时同步，若物理上已被携带且到达目的地附近，禁止撤销
+        sole_executor = self._get_order_sole_executor(order_id)
+        if sole_executor:
+            drone = self.entity_mgr.drones.get(sole_executor)
+            if drone:
+                # 若无人机正持有此单且服务时间倒计时已启动，或正在飞行，或抵达卸货区
+                if getattr(drone, "delivery_service_end_time", 0) > current_time:
+                    return True
+                if drone.status.is_flying:
+                    return True
+                dist_to_customer = self._dist(drone.get_location(current_time), order.delivery_loc)
+                if dist_to_customer < 10.0:  # Geofencing
+                    return True
+                    
+            truck = self.entity_mgr.trucks.get(sole_executor)
+            if truck:
+                dist_to_customer = self._dist(truck.get_location(current_time), order.delivery_loc)
+                if dist_to_customer < 10.0:  # Geofencing
+                    return True
+
+        return False
+
+    def _get_order_sole_executor(self, order_id: str) -> str | None:
+        """获取订单的唯一履约实体 ID（carrying_order_id 持有者）。
+
+        系统保证：只有当前持有该订单 carrying_order_id 的实体才有权触发
+        COMPLETED 归档函数，杜绝"UAV-A 送了货，但后端认为订单还在 UAV-B 身上"。
+        """
+        for drone in self.entity_mgr.drones.values():
+            if getattr(drone, "carrying_order_id", None) == order_id:
+                return drone.drone_id
+        return None
+
+    def _revoke_stale_drone_assignments(self, plan: DispatchPlan, current_time: float) -> None:
+        """本计划将订单授予 winner 无人机时，清理其他无人机上同订单的挂载/卸货计时/航路。
+
+        不可撤销约束：若订单已处于 PICKED_UP / DELIVERING 状态，则跳过撤销，
+        保持原执行实体的绑定关系不变。
+        """
+        winners: list[tuple[str, str]] = [
+            (a.order_id, a.drone_id)
+            for a in plan.allocations
+            if a.feasible and a.drone_id and a.mode != "A"
+        ]
+        if not winners:
+            return
+
+        for order_id, winner_id in winners:
+            if self._is_order_immutable(order_id, current_time):
+                sole_executor = self._get_order_sole_executor(order_id)
+                if sole_executor and sole_executor != winner_id:
+                    logger.warning(
+                        "[MarketBasedSolver] 订单 %s 已处于履约状态，唯一执行者=%s，"
+                        "拒绝改派给 %s（不可撤销约束）",
+                        order_id, sole_executor, winner_id,
+                    )
+                    for a in plan.allocations:
+                        if a.order_id == order_id and a.drone_id == winner_id:
+                            a.feasible = False
+                            a.reason = "订单已进入不可撤销状态，拒绝改派"
+                continue
+
+            for drone in self.entity_mgr.drones.values():
+                if drone.drone_id == winner_id:
+                    continue
+
+                pend = getattr(drone, "pending_release_order_id", None) or ""
+                carry = getattr(drone, "carrying_order_id", None) or ""
+                idx = max(0, int(getattr(drone, "current_waypoint_index", 0)))
+                route = getattr(drone, "route_plan", None) or []
+                route_refs_order = any(
+                    getattr(wp, "target_entity_id", None) == order_id
+                    for wp in route[idx:]
+                )
+
+                if carry != order_id and pend != order_id and not route_refs_order:
+                    continue
+
+                # 再次检查：若该无人机正在物理执行该订单（飞行中），拒绝撤销
+                if carry == order_id and drone.status.is_flying:
+                    logger.warning(
+                        "[MarketBasedSolver] 订单 %s 正由无人机 %s 飞行执行中，"
+                        "拒绝改派给 %s（飞行中不可撤销）",
+                        order_id, drone.drone_id, winner_id,
+                    )
+                    for a in plan.allocations:
+                        if a.order_id == order_id and a.drone_id == winner_id:
+                            a.feasible = False
+                            a.reason = "订单正在飞行执行中，拒绝改派"
+                    break
+
+                logger.info(
+                    "[MarketBasedSolver] 订单 %s 改由 %s 执行，撤销无人机 %s 上的同单残留状态",
+                    order_id,
+                    winner_id,
+                    drone.drone_id,
+                )
+
+                if pend == order_id:
+                    drone.pending_release_order_id = None
+                    drone.delivery_service_end_time = 0.0
+
+                if carry == order_id:
+                    drone.release_order()
+
+                drone.route_plan = []
+                drone.current_waypoint_index = 0
+                drone.waiting_recovery_station_id = ""
+                tid = getattr(drone, "transport_truck_id", None)
+                if tid:
+                    truck = self.entity_mgr.trucks.get(tid)
+                    if truck is not None and drone.drone_id in truck.docked_drones:
+                        truck.docked_drones.remove(drone.drone_id)
+                    drone.transport_truck_id = None
+                drone.scheduled_launch_time = 0.0
+                drone.launch_station_id = ""
+                if drone.status.is_flying:
+                    drone.status = DroneStatus.IDLE
 
     # ══════════════════════════════════════════════════════════════════════════
     # 调度入口
@@ -141,6 +353,13 @@ class MarketBasedSolver(GreedyBaseline):
             self._auction_award_count,
             plan.summary["auction_stats"]["active_contracts"],
         )
+        self._revoke_stale_drone_assignments(plan, current_time)
+
+        # 全局闭环校验
+        self._validate_drone_route_closure(plan)
+        self._validate_truck_premature_return(plan, current_time)
+        self._ensure_idle_drones_return_to_depot(current_time)
+
         return plan
 
     def dispatch_incremental(
@@ -154,37 +373,77 @@ class MarketBasedSolver(GreedyBaseline):
 
         流程：
           1. 冻结状态：过期旧契约，获取当前卡车位置与活跃契约
-          2. 构建保证时刻表：基于已锁定契约生成基础时刻表
-          3. 增量拍卖：仅对 new_orders 收集投标并授标
-          4. 双向锁定：中标后生成新契约，更新无人机/卡车锁定状态
-          5. 返回增量计划（可与前序计划合并）
+          2. 不可变更过滤：将已处于 PICKED_UP/DELIVERING 的订单排除出拍卖池
+          3. 构建保证时刻表：基于已锁定契约生成基础时刻表
+          4. 增量拍卖：仅对 new_orders 收集投标并授标
+          5. 双向锁定：中标后生成新契约，更新无人机/卡车锁定状态
+          6. 返回增量计划（可与前序计划合并）
         """
         self._auction_bid_count = 0
         self._auction_award_count = 0
         self._expire_contracts(current_time)
         self._try_flexible_recovery(current_time)
 
-        if not self._anchor_preview_routes:
-            self._prepare_anchor_preview_routes(new_orders, current_time, bbox, scene_id)
+        # 不可变更过滤：排除已进入履约状态的订单
+        filtered_orders = {
+            oid: order for oid, order in new_orders.items()
+            if not self._is_order_immutable(oid, current_time)
+        }
+        skipped = len(new_orders) - len(filtered_orders)
+        if skipped > 0:
+            logger.info(
+                "[MarketBasedSolver] 增量调度过滤 %d 个不可变更订单（已处于 PICKED_UP/DELIVERING）",
+                skipped,
+            )
 
-        plan = super().dispatch(new_orders, current_time, bbox, scene_id=scene_id)
-        self._recalculate_actual_plan_costs(plan, new_orders, current_time)
+        if not self._anchor_preview_routes:
+            self._prepare_anchor_preview_routes(filtered_orders, current_time, bbox, scene_id)
+
+        plan = super().dispatch(filtered_orders, current_time, bbox, scene_id=scene_id)
+        self._recalculate_actual_plan_costs(plan, filtered_orders, current_time)
         plan.summary["solver"] = "market"
         plan.summary["dispatch_type"] = "incremental"
         plan.summary["auction_stats"] = {
             "bids": self._auction_bid_count,
             "awards": self._auction_award_count,
             "active_contracts": len([c for c in self._active_contracts if c.status == "active"]),
+            "immutable_orders_skipped": skipped,
         }
         logger.info(
-            "[MarketBasedSolver] 增量调度完成：new_orders=%d feasible=%d bids=%d awards=%d contracts=%d",
+            "[MarketBasedSolver] 增量调度完成：new_orders=%d feasible=%d bids=%d awards=%d contracts=%d skipped_immutable=%d",
             plan.summary.get("total_orders", 0),
             plan.summary.get("feasible", 0),
             self._auction_bid_count,
             self._auction_award_count,
             plan.summary["auction_stats"]["active_contracts"],
+            skipped,
         )
+        self._revoke_stale_drone_assignments(plan, current_time)
+
+        # 全局闭环校验
+        self._validate_drone_route_closure(plan)
+        self._validate_truck_premature_return(plan, current_time)
+        self._ensure_idle_drones_return_to_depot(current_time)
+
         return plan
+
+    def should_replan_unfinished(self) -> bool:
+        """Market 默认保持契约优先，不做未完成单重优化。"""
+        return False
+
+    def dispatch_replan_current_state(
+        self,
+        replan_orders: dict[str, "Order"],
+        current_time: float,
+        bbox: dict,
+        scene_id: str | None = None,
+    ) -> DispatchPlan:
+        """接口兼容：market 保持增量语义，直接按增量入口执行。"""
+        return self.dispatch_incremental(replan_orders, current_time, bbox, scene_id=scene_id)
+
+    def get_active_contracts(self) -> list[RendezvousContract]:
+        """返回当前契约列表，供编排层统一兑现。"""
+        return self._active_contracts
 
     # ══════════════════════════════════════════════════════════════════════════
     # 成本重算（总体能耗公式不变）
@@ -278,7 +537,7 @@ class MarketBasedSolver(GreedyBaseline):
             "uav_distance_total": uav_distance_total,
             "uav_energy_total": uav_energy_total,
         }
-        plan.cost_total = cost_dist_total + cost_energy_total + penalty_total
+        plan.cost_total = cost_dist_total + cost_energy_total
 
         logger.info(
             "[MarketBasedSolver] 按真实执行路径重算总成本: "
@@ -699,6 +958,10 @@ class MarketBasedSolver(GreedyBaseline):
         best = min(bids, key=lambda bid: bid.score_total)
         self._auction_award_count += 1
 
+        # 路径拼接约束：预测起点对齐 + 坐标跳变校验
+        if best.feasible and best.drone_id and best.mode != "A":
+            best = self._apply_path_stitching_constraints(best, order, current_time)
+
         # 中标后立即生成时空契约
         if best.mode == "B_WAIT" and best.feasible:
             self._create_contract(best, order, current_time)
@@ -712,6 +975,11 @@ class MarketBasedSolver(GreedyBaseline):
             best.drone_id or best.vehicle_id,
             best.score_total,
         )
+
+        # 把当前中标无人机记录进屏蔽列表，不依赖父类greedy_baseline，避免B_DYNAMIC在父类漏判导致一机多单
+        if best.feasible and best.drone_id and best.mode != "A":
+            allocated_drones.add(best.drone_id)
+
         return best
 
     def _must_assign_to_truck(self, order: "Order") -> bool:
@@ -721,6 +989,134 @@ class MarketBasedSolver(GreedyBaseline):
         max_payload = max(d.payload_capacity for d in self.entity_mgr.drones.values())
         return order.payload_weight > max_payload
 
+    # ── 竞标准入：无人机状态分级 ─────────────────────────────────────
+
+    def _classify_drone_eligibility(
+        self,
+        drone: "Drone",
+        current_time: float,
+        allocated_drones: set[str],
+        order: "Order",
+    ) -> tuple[str, "Position3D | None"]:
+        """根据无人机即时物理状态判定竞标准入等级与竞标起点。
+
+        Returns:
+            (eligibility, bid_origin)
+            eligibility: "IDLE" | "RETURNING" | "DELIVERING" | "LOCKED" | "REJECT"
+            bid_origin:  竞标起点坐标（REJECT/LOCKED 时为 None）
+        """
+        if drone.drone_id in allocated_drones:
+            return "REJECT", None
+        if self._is_drone_locked(drone.drone_id, current_time):
+            return "LOCKED", None
+        if drone.payload_capacity < order.payload_weight:
+            return "REJECT", None
+
+        # IDLE（含 CHARGING/QUEUING 之后恢复的空闲态）
+        if drone.status == DroneStatus.IDLE:
+            if getattr(drone, "carrying_order_id", None):
+                return "REJECT", None
+            if getattr(drone, "waiting_recovery_station_id", ""):
+                return "LOCKED", None
+            return "IDLE", drone.current_loc
+
+        # RETURNING_TO_DEPOT / FLYING_TO_STATION（归航中）：允许串联/接力模式
+        if drone.status in (
+            DroneStatus.RETURNING_TO_DEPOT,
+            DroneStatus.FLYING_TO_STATION,
+            DroneStatus.FLYING_TO_TRUCK,
+        ):
+            route_end = self._get_drone_route_endpoint(drone)
+            if route_end is None:
+                return "REJECT", None
+            energy_for_next = self._flight_energy(
+                drone, route_end, order.delivery_loc, order.payload_weight
+            )
+            safety_energy = energy_for_next * self.ENERGY_SAFETY_FACTOR
+            if drone.battery_current <= safety_energy:
+                return "REJECT", None
+            return "RETURNING", route_end
+
+        # DELIVERING（配送中）：仅当距终点时间 < AUCTION_BUFFER_TIME 时允许预调度
+        if drone.status in (DroneStatus.FLYING_TO_DELIVER,):
+            t_remain = self._estimate_remaining_flight_time(drone, current_time)
+            if t_remain > self.AUCTION_BUFFER_TIME:
+                return "REJECT", None
+            deliver_point = self._get_drone_delivery_endpoint(drone)
+            if deliver_point is None:
+                return "REJECT", None
+            return "DELIVERING", deliver_point
+
+        # FLYING_TO_PICKUP / LOADING / UNLOADING — 正在执行关键动作，不可打断
+        return "LOCKED", None
+
+    def _get_drone_route_endpoint(self, drone: "Drone") -> "Position3D | None":
+        """获取无人机当前路径的最终航路点坐标。"""
+        route = getattr(drone, "route_plan", None) or []
+        if not route:
+            return None
+        return route[-1].loc
+
+    def _get_drone_delivery_endpoint(self, drone: "Drone") -> "Position3D | None":
+        """获取 DELIVERING 无人机当前任务的送货点坐标。"""
+        from core.entities.primitives import WaypointAction
+        route = getattr(drone, "route_plan", None) or []
+        idx = max(0, int(getattr(drone, "current_waypoint_index", 0)))
+        for wp in route[idx:]:
+            if wp.action == WaypointAction.DELIVER:
+                return wp.loc
+        if route:
+            return route[-1].loc
+        return None
+
+    def _estimate_remaining_flight_time(self, drone: "Drone", current_time: float) -> float:
+        """估算无人机完成当前路径剩余飞行的时间。"""
+        if drone.cruise_speed <= 0:
+            return float("inf")
+        route = getattr(drone, "route_plan", None) or []
+        idx = max(0, int(getattr(drone, "current_waypoint_index", 0)))
+        total_dist = 0.0
+        pos = drone.current_loc
+        for wp in route[idx:]:
+            total_dist += self._dist(pos, wp.loc)
+            pos = wp.loc
+        return total_dist / drone.cruise_speed
+
+    def _predict_drone_position(
+        self, drone: "Drone", current_time: float, delta_t: float
+    ) -> "Position3D":
+        """预测无人机在 t + delta_t 时刻的位置（线性插值）。
+
+        用于拍卖起点对齐：竞标时的起点必须预测为 P(t + delta_t)，
+        严禁使用订单初始坐标或仓库坐标作为移动中实体的起点。
+        """
+        if not drone.status.is_flying or drone.cruise_speed <= 0:
+            return drone.current_loc
+
+        route = getattr(drone, "route_plan", None) or []
+        idx = max(0, int(getattr(drone, "current_waypoint_index", 0)))
+        if idx >= len(route):
+            return drone.current_loc
+
+        pos = drone.current_loc
+        remaining_dist = drone.cruise_speed * delta_t
+        for wp in route[idx:]:
+            seg_dist = self._dist(pos, wp.loc)
+            if seg_dist <= 0:
+                pos = wp.loc
+                continue
+            if remaining_dist < seg_dist:
+                ratio = remaining_dist / seg_dist
+                from core.entities.primitives import Position3D as Pos3D
+                return Pos3D(
+                    x=pos.x + (wp.loc.x - pos.x) * ratio,
+                    y=pos.y + (wp.loc.y - pos.y) * ratio,
+                    z=pos.z + (wp.loc.z - pos.z) * ratio,
+                )
+            remaining_dist -= seg_dist
+            pos = wp.loc
+        return pos
+
     def _collect_drone_bids(
         self,
         order: "Order",
@@ -728,57 +1124,64 @@ class MarketBasedSolver(GreedyBaseline):
         allocated_drones: set[str],
         diagnostics: dict | None = None,
     ) -> list[AllocationResult]:
-        """收集所有可用无人机的竞标结果。
+        """收集所有可用无人机的竞标结果（基于状态准入分级）。
 
-        包含两类竞标者：
-          1. IDLE 无人机 — 标准竞标（B_WAIT / C / B_DYNAMIC）
-          2. 执行中无人机 — 串联竞标（RELAY），以当前任务终点为起点
+        准入等级：
+          IDLE:       绝对准入，起点为当前精确物理坐标
+          RETURNING:  准入（串联/接力模式），起点为当前航段终点
+          DELIVERING: 准入（预调度模式），起点为当前任务送货点
+          LOCKED:     严禁准入（已锁定/起飞中/回收中）
+          REJECT:     不满足基本条件（已分配/载重不足/电量不足）
         """
-        idle_drones = self._get_available_drones()
-        available_drones = []
         excluded_allocated = 0
         excluded_payload = 0
         excluded_locked = 0
-        for drone in idle_drones:
-            if drone.drone_id in allocated_drones:
-                excluded_allocated += 1
-                continue
-            if self._is_drone_locked(drone.drone_id, current_time):
+        idle_count = 0
+        returning_count = 0
+        delivering_count = 0
+
+        eligible_idle: list[tuple["Drone", "Position3D"]] = []
+        eligible_returning: list[tuple["Drone", "Position3D"]] = []
+        eligible_delivering: list[tuple["Drone", "Position3D"]] = []
+
+        for drone in self.entity_mgr.drones.values():
+            eligibility, bid_origin = self._classify_drone_eligibility(
+                drone, current_time, allocated_drones, order
+            )
+            if eligibility == "IDLE":
+                idle_count += 1
+                eligible_idle.append((drone, bid_origin))
+            elif eligibility == "RETURNING":
+                returning_count += 1
+                eligible_returning.append((drone, bid_origin))
+            elif eligibility == "DELIVERING":
+                delivering_count += 1
+                eligible_delivering.append((drone, bid_origin))
+            elif eligibility == "LOCKED":
                 excluded_locked += 1
-                continue
-            if drone.payload_capacity < order.payload_weight:
-                excluded_payload += 1
-                continue
-            available_drones.append(drone)
+            else:  # REJECT
+                if drone.drone_id in allocated_drones:
+                    excluded_allocated += 1
+                elif drone.payload_capacity < order.payload_weight:
+                    excluded_payload += 1
 
         if diagnostics is not None:
-            diagnostics["idle_drones"] = len(idle_drones)
+            diagnostics["idle_drones"] = idle_count
+            diagnostics["returning_drones"] = returning_count
+            diagnostics["delivering_drones"] = delivering_count
             diagnostics["excluded_allocated"] = excluded_allocated
             diagnostics["excluded_payload"] = excluded_payload
             diagnostics["excluded_locked"] = excluded_locked
-            diagnostics["eligible_drones"] = len(available_drones)
+            diagnostics["eligible_drones"] = idle_count + returning_count + delivering_count
             diagnostics["drones"] = []
             diagnostics["relay_candidates"] = 0
             diagnostics["relay_feasible"] = 0
 
         bids: list[AllocationResult] = []
-        for drone in available_drones:
-            drone_diag = {
-                "drone_id": drone.drone_id,
-                "anchor_candidates": 0,
-                "anchor_feasible": 0,
-                "anchor_energy_rejected": 0,
-                "anchor_sync_rejected": 0,
-                "depot_feasible": 0,
-                "depot_energy_rejected": 0,
-                "moving_candidates": 0,
-                "moving_feasible": 0,
-                "moving_energy_rejected": 0,
-                "moving_sync_rejected": 0,
-                "b_dynamic_candidates": 0,
-                "b_dynamic_feasible": 0,
-                "b_dynamic_energy_rejected": 0,
-            }
+
+        # 1. IDLE 无人机 — 标准竞标（B_WAIT / C / B_DYNAMIC）
+        for drone, origin in eligible_idle:
+            drone_diag = self._make_drone_diag(drone.drone_id)
             bids.extend(self._collect_anchor_bids_for_drone(drone, order, current_time, drone_diag))
             depot_bid = self._build_depot_bid(drone, order, current_time, drone_diag)
             if depot_bid is not None:
@@ -789,25 +1192,239 @@ class MarketBasedSolver(GreedyBaseline):
             if diagnostics is not None:
                 diagnostics["drones"].append(drone_diag)
 
-        # 串联任务竞标：正在飞行的无人机以任务终点为起点竞标
-        relay_bids = self._collect_relay_bids(order, current_time, allocated_drones, diagnostics)
-        bids.extend(relay_bids)
+        # 2. RETURNING 无人机 — 串联/接力竞标，起点为航段终点
+        for drone, origin in eligible_returning:
+            relay_bids = self._build_returning_relay_bids(
+                drone, origin, order, current_time, diagnostics
+            )
+            bids.extend(relay_bids)
+
+        # 3. DELIVERING 无人机 — 预调度竞标，起点为送货点坐标
+        for drone, origin in eligible_delivering:
+            relay_bids = self._build_delivering_preschedule_bids(
+                drone, origin, order, current_time, diagnostics
+            )
+            bids.extend(relay_bids)
 
         return bids
+
+    def _make_drone_diag(self, drone_id: str) -> dict:
+        return {
+            "drone_id": drone_id,
+            "anchor_candidates": 0,
+            "anchor_feasible": 0,
+            "anchor_energy_rejected": 0,
+            "anchor_sync_rejected": 0,
+            "depot_feasible": 0,
+            "depot_energy_rejected": 0,
+            "moving_candidates": 0,
+            "moving_feasible": 0,
+            "moving_energy_rejected": 0,
+            "moving_sync_rejected": 0,
+            "b_dynamic_candidates": 0,
+            "b_dynamic_feasible": 0,
+            "b_dynamic_energy_rejected": 0,
+        }
+
+    def _build_returning_relay_bids(
+        self,
+        drone: "Drone",
+        relay_origin: "Position3D",
+        order: "Order",
+        current_time: float,
+        diagnostics: dict | None = None,
+    ) -> list[AllocationResult]:
+        """RETURNING 无人机串联竞标：以当前航段终点为起点飞往新订单后回仓。"""
+        depots = list(self.entity_mgr.depots.values())
+        if not depots:
+            return []
+        depot = depots[0]
+        bids: list[AllocationResult] = []
+
+        remaining_energy = self._estimate_relay_remaining_energy(drone, relay_origin)
+        if remaining_energy <= 0:
+            return bids
+
+        dist_to_customer = self._dist(relay_origin, order.delivery_loc)
+        dist_to_depot = self._dist(order.delivery_loc, depot.location)
+        energy_to_customer = self._flight_energy(
+            drone, relay_origin, order.delivery_loc, order.payload_weight
+        )
+        energy_to_depot = self._flight_energy(
+            drone, order.delivery_loc, depot.location, 0.0
+        )
+        energy_needed = (energy_to_customer + energy_to_depot) * self.ENERGY_SAFETY_FACTOR
+        if energy_needed > remaining_energy:
+            return bids
+
+        time_to_available = self._estimate_relay_available_time(drone, relay_origin, current_time)
+        time_to_customer = dist_to_customer / drone.cruise_speed if drone.cruise_speed > 0 else float("inf")
+        eta_at_customer = current_time + time_to_available + time_to_customer
+
+        if eta_at_customer > order.deadline:
+            return bids
+
+        if diagnostics is not None:
+            diagnostics["relay_candidates"] = diagnostics.get("relay_candidates", 0) + 1
+
+        bid = AllocationResult(
+            order_id=order.order_id,
+            vehicle_id=depot.depot_id,
+            mode="C",
+            distance=dist_to_customer + dist_to_depot,
+            feasible=True,
+            recovery_station_id=depot.depot_id,
+            drone_id=drone.drone_id,
+            launch_time=current_time + time_to_available,
+        )
+        bid._relay_origin = relay_origin
+        bid._is_relay = True
+
+        scored = self._score_standard_bid(bid, order, current_time)
+        if scored is not None:
+            scored._relay_origin = relay_origin
+            scored._is_relay = True
+            bids.append(scored)
+            if diagnostics is not None:
+                diagnostics["relay_feasible"] = diagnostics.get("relay_feasible", 0) + 1
+
+        return bids
+
+    def _build_delivering_preschedule_bids(
+        self,
+        drone: "Drone",
+        delivery_endpoint: "Position3D",
+        order: "Order",
+        current_time: float,
+        diagnostics: dict | None = None,
+    ) -> list[AllocationResult]:
+        """DELIVERING 无人机预调度竞标：以当前任务送货点为起点。"""
+        depots = list(self.entity_mgr.depots.values())
+        if not depots:
+            return []
+        depot = depots[0]
+        bids: list[AllocationResult] = []
+
+        remaining_energy = self._estimate_relay_remaining_energy(drone, delivery_endpoint)
+        if remaining_energy <= 0:
+            return bids
+
+        dist_to_customer = self._dist(delivery_endpoint, order.delivery_loc)
+        dist_to_depot = self._dist(order.delivery_loc, depot.location)
+        energy_to_customer = self._flight_energy(
+            drone, delivery_endpoint, order.delivery_loc, order.payload_weight
+        )
+        energy_to_depot = self._flight_energy(
+            drone, order.delivery_loc, depot.location, 0.0
+        )
+        energy_needed = (energy_to_customer + energy_to_depot) * self.ENERGY_SAFETY_FACTOR
+        if energy_needed > remaining_energy:
+            return bids
+
+        t_remain = self._estimate_remaining_flight_time(drone, current_time)
+        eta_at_customer = current_time + t_remain + self.delivery_service_time + (
+            dist_to_customer / drone.cruise_speed if drone.cruise_speed > 0 else float("inf")
+        )
+        if eta_at_customer > order.deadline:
+            return bids
+
+        if diagnostics is not None:
+            diagnostics["relay_candidates"] = diagnostics.get("relay_candidates", 0) + 1
+
+        bid = AllocationResult(
+            order_id=order.order_id,
+            vehicle_id=depot.depot_id,
+            mode="C",
+            distance=dist_to_customer + dist_to_depot,
+            feasible=True,
+            recovery_station_id=depot.depot_id,
+            drone_id=drone.drone_id,
+            launch_time=current_time + t_remain + self.delivery_service_time,
+        )
+        bid._relay_origin = delivery_endpoint
+        bid._is_relay = True
+
+        scored = self._score_standard_bid(bid, order, current_time)
+        if scored is not None:
+            scored._relay_origin = delivery_endpoint
+            scored._is_relay = True
+            bids.append(scored)
+            if diagnostics is not None:
+                diagnostics["relay_feasible"] = diagnostics.get("relay_feasible", 0) + 1
+
+        return bids
+
+    def _validate_truck_fleet_safety(
+        self,
+        truck: "Truck",
+        order: "Order",
+        current_time: float,
+    ) -> bool:
+        """卡车准入的契约冲突校验：新单路径偏移不得导致已挂载/已起飞无人机错过回收生死线。
+
+        校验范围：
+          1. 已有契约的时间窗（_validate_truck_insertion 已覆盖）
+          2. 车上正在运输的无人机的起飞站到达时间
+          3. 正在空中等待回收的无人机的电量续航
+        """
+        if not self._validate_truck_insertion(truck, order, current_time):
+            return False
+
+        truck_loc = truck.get_location(current_time)
+        if truck.speed <= 0:
+            return False
+
+        detour_dist = self._dist(truck_loc, order.delivery_loc)
+        detour_time = detour_dist / truck.speed + self.SERVICE_TIME_CUSTOMER
+
+        for drone in self.entity_mgr.drones.values():
+            if getattr(drone, "transport_truck_id", None) != truck.truck_id:
+                continue
+
+            launch_time = float(getattr(drone, "scheduled_launch_time", 0.0))
+            if launch_time <= 0:
+                continue
+
+            # 绕路会延迟到达起飞站，需确保不超过合理范围
+            new_launch_time = launch_time + detour_time
+            if drone.has_pending_route and drone.route_plan:
+                from core.entities.primitives import WaypointAction
+                for wp in drone.route_plan:
+                    if wp.action == WaypointAction.DELIVER:
+                        flight_time = (
+                            self._dist(wp.loc, drone.route_plan[-1].loc) / drone.cruise_speed
+                            if drone.cruise_speed > 0 else float("inf")
+                        )
+                        # 检查绕路后无人机是否仍能按时完成任务
+                        order_obj = None
+                        if self._order_mgr:
+                            order_obj = self._order_mgr.assigned_orders.get(
+                                getattr(drone, "carrying_order_id", "") or ""
+                            )
+                        if order_obj and hasattr(order_obj, "deadline"):
+                            if new_launch_time + flight_time > order_obj.deadline:
+                                logger.debug(
+                                    "[MarketBasedSolver] 卡车 %s 接单 %s 导致车载无人机 %s "
+                                    "错过订单截止时间",
+                                    truck.truck_id, order.order_id, drone.drone_id,
+                                )
+                                return False
+                        break
+        return True
 
     def _best_truck_bid(
         self,
         order: "Order",
         current_time: float,
     ) -> AllocationResult | None:
-        """卡车作为竞标者，对订单提交模式 A 的最低价投标（需通过契约合规校验）。"""
+        """卡车作为竞标者，对订单提交模式 A 的最低价投标（需通过契约+舰队安全校验）。"""
         trucks = list(self.entity_mgr.trucks.values())
         if not trucks:
             return None
 
         best_bid: AllocationResult | None = None
         for truck in trucks:
-            if not self._validate_truck_insertion(truck, order, current_time):
+            if not self._validate_truck_fleet_safety(truck, order, current_time):
                 continue
             bid = AllocationResult(
                 order_id=order.order_id,
@@ -970,87 +1587,6 @@ class MarketBasedSolver(GreedyBaseline):
 
         return bids
 
-    def _collect_relay_bids(
-        self,
-        order: "Order",
-        current_time: float,
-        allocated_drones: set[str],
-        diagnostics: dict | None = None,
-    ) -> list[AllocationResult]:
-        """串联任务竞标：正在飞行的无人机以当前任务终点为起点竞标新订单。
-
-        适用场景：无人机完成第一单配送后，若电量支持且有更近的动态订单，
-        可在不返回基站的情况下直接飞向下一单。第二单完成后强制飞回仓库。
-
-        竞标起点 = 当前任务的最终交付点（DELIVER 航路点坐标）。
-        """
-        depots = list(self.entity_mgr.depots.values())
-        if not depots:
-            return []
-        depot = depots[0]
-
-        bids: list[AllocationResult] = []
-        for drone in self.entity_mgr.drones.values():
-            if drone.drone_id in allocated_drones:
-                continue
-            if not drone.status.is_flying:
-                continue
-            if drone.payload_capacity < order.payload_weight:
-                continue
-
-            # 找到当前路径中的交付点作为串联起点
-            relay_origin = self._get_drone_relay_origin(drone)
-            if relay_origin is None:
-                continue
-            if diagnostics is not None:
-                diagnostics["relay_candidates"] = diagnostics.get("relay_candidates", 0) + 1
-
-            # 估算剩余电量（粗略：当前电量 - 完成当前任务所需的能量）
-            remaining_energy = self._estimate_relay_remaining_energy(drone, relay_origin)
-            if remaining_energy <= 0:
-                continue
-
-            # 串联路径：relay_origin → customer → depot
-            dist_to_customer = self._dist(relay_origin, order.delivery_loc)
-            dist_to_depot = self._dist(order.delivery_loc, depot.location)
-            energy_to_customer = self._flight_energy(drone, relay_origin, order.delivery_loc, order.payload_weight)
-            energy_to_depot = self._flight_energy(drone, order.delivery_loc, depot.location, 0.0)
-            energy_needed = (energy_to_customer + energy_to_depot) * self.ENERGY_SAFETY_FACTOR
-
-            if energy_needed > remaining_energy:
-                continue
-
-            # 估算可用时间
-            time_to_available = self._estimate_relay_available_time(drone, relay_origin, current_time)
-            time_to_customer = dist_to_customer / drone.cruise_speed
-            eta_at_customer = current_time + time_to_available + time_to_customer
-
-            if eta_at_customer > order.deadline:
-                continue
-
-            bid = AllocationResult(
-                order_id=order.order_id,
-                vehicle_id=depot.depot_id,
-                mode="C",
-                distance=dist_to_customer + dist_to_depot,
-                feasible=True,
-                recovery_station_id=depot.depot_id,
-                drone_id=drone.drone_id,
-                launch_time=current_time + time_to_available,
-            )
-            bid._relay_origin = relay_origin
-            bid._is_relay = True
-
-            scored = self._score_standard_bid(bid, order, current_time)
-            if scored is not None:
-                scored._relay_origin = relay_origin
-                scored._is_relay = True
-                bids.append(scored)
-                if diagnostics is not None:
-                    diagnostics["relay_feasible"] = diagnostics.get("relay_feasible", 0) + 1
-
-        return bids
-
     def _get_drone_relay_origin(self, drone) -> "Position3D | None":
         """获取无人机串联竞标的起点（当前路径中最后一个 DELIVER 点）。"""
         from core.entities.primitives import WaypointAction
@@ -1059,6 +1595,156 @@ class MarketBasedSolver(GreedyBaseline):
             if wp.action == WaypointAction.DELIVER:
                 last_deliver = wp.loc
         return last_deliver
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # 任务闭环约束 (Global Completeness)
+    # ══════════════════════════════════════════════════════════════════════════
+
+    def _validate_drone_route_closure(self, plan: DispatchPlan) -> None:
+        """闭环强制要求：任何无人机路径计划的最后一个 Waypoint 必须是 DOCK_DEPOT 或 DOCK_TRUCK。
+
+        若检测到违规分配（最终航路点不是归巢/回车动作），则在日志中警告。
+        此校验在计划返回前执行，作为最后的安全网。
+        """
+        from core.entities.primitives import WaypointAction
+
+        for alloc in plan.allocations:
+            if not alloc.feasible or alloc.mode == "A" or not alloc.drone_id:
+                continue
+
+            drone = self.entity_mgr.drones.get(alloc.drone_id)
+            if drone is None:
+                continue
+
+            route = getattr(drone, "route_plan", None) or []
+            if not route:
+                continue
+
+            last_action = route[-1].action
+            if last_action not in (WaypointAction.DOCK_DEPOT, WaypointAction.DOCK_TRUCK):
+                logger.warning(
+                    "[MarketBasedSolver][Closure] 无人机 %s 路径闭环校验失败: "
+                    "最后航路点动作=%s，应为 DOCK_DEPOT 或 DOCK_TRUCK。"
+                    "订单=%s 模式=%s",
+                    alloc.drone_id, last_action.value,
+                    alloc.order_id, alloc.mode,
+                )
+
+    def _ensure_idle_drones_return_to_depot(self, current_time: float) -> None:
+        """待命逻辑：若无人机在充电站完成配送且无后续任务，自动生成 ReturnToDepot 路径。
+
+        触发条件：
+          - 无人机状态为 IDLE
+          - 没有挂载订单、没有待执行路径
+          - 不在仓库、不在卡车上、不在等待回收
+        """
+        from core.entities.primitives import WaypointAction, RouteWaypoint
+
+        depots = list(self.entity_mgr.depots.values())
+        if not depots:
+            return
+        depot = depots[0]
+
+        for drone in self.entity_mgr.drones.values():
+            if drone.status != DroneStatus.IDLE:
+                continue
+            if getattr(drone, "carrying_order_id", None):
+                continue
+            if getattr(drone, "has_pending_route", False):
+                continue
+            if getattr(drone, "transport_truck_id", None):
+                continue
+            if getattr(drone, "waiting_recovery_station_id", ""):
+                continue
+            if getattr(drone, "pending_release_order_id", None):
+                continue
+
+            dist_to_depot = self._dist(drone.current_loc, depot.location)
+            if dist_to_depot < 5.0:
+                continue
+
+            energy_needed = self._flight_energy(
+                drone, drone.current_loc, depot.location, 0.0
+            ) * self.ENERGY_SAFETY_FACTOR
+            if energy_needed > drone.battery_current:
+                logger.warning(
+                    "[MarketBasedSolver][Closure] 无人机 %s 电量不足以返回仓库 "
+                    "(需%.1fJ > 当前%.1fJ)，标记为滞留",
+                    drone.drone_id, energy_needed, drone.battery_current,
+                )
+                continue
+
+            waypoints = [
+                RouteWaypoint(depot.location, WaypointAction.DOCK_DEPOT, depot.depot_id),
+            ]
+            drone.set_route(waypoints)
+            drone.status = DroneStatus.RETURNING_TO_DEPOT
+            logger.info(
+                "[MarketBasedSolver][Closure] 无人机 %s 无后续任务，自动生成归巢路径 "
+                "(距仓库 %.1fm)",
+                drone.drone_id, dist_to_depot,
+            )
+
+    def should_truck_return_to_depot(self, truck_id: str) -> bool:
+        """卡车清空校验：判断卡车是否满足返回仓库条件。
+
+        判定公式：
+          Status = (Pending_Orders == 0) ∧ (Assigned_Orders_In_Fleet == 0)
+
+        只要还有无人机在执行任务或等待回收，卡车必须保持在动态锚点或行驶状态。
+        """
+        truck = self.entity_mgr.trucks.get(truck_id)
+        if truck is None:
+            return False
+
+        # 检查 1：是否还有未完成的待分配订单
+        if self._order_mgr:
+            if self._order_mgr.pending_orders:
+                return False
+
+        # 检查 2：是否还有本车相关的活跃契约（有无人机在飞行中）
+        active_contracts = self._get_truck_contracts(truck_id)
+        if active_contracts:
+            return False
+
+        # 检查 3：是否还有无人机与本卡车绑定（挂载、在途、等待回收）
+        for drone in self.entity_mgr.drones.values():
+            if getattr(drone, "transport_truck_id", None) == truck_id:
+                return False
+            if getattr(drone, "waiting_recovery_station_id", ""):
+                for contract in self._active_contracts:
+                    if (contract.truck_id == truck_id
+                            and contract.drone_id == drone.drone_id
+                            and contract.status == "active"):
+                        return False
+
+        # 检查 4：是否还有任何无人机正在飞行（全局级清空）
+        for drone in self.entity_mgr.drones.values():
+            if drone.status.is_flying:
+                return False
+            if getattr(drone, "carrying_order_id", None):
+                return False
+
+        # 检查 5：是否还有 assigned 订单未完成
+        if self._order_mgr:
+            if self._order_mgr.assigned_orders:
+                return False
+
+        return True
+
+    def _validate_truck_premature_return(self, plan: DispatchPlan, current_time: float) -> None:
+        """在计划返回前校验卡车是否会提前回仓，防止无人机失去回收载体。"""
+        for truck_id, route in plan.truck_routes.items():
+            if not route.nodes:
+                continue
+            last_node = route.nodes[-1]
+            if last_node.node_type == "depot" and "_return" in last_node.node_id:
+                if not self.should_truck_return_to_depot(truck_id):
+                    logger.warning(
+                        "[MarketBasedSolver][Closure] 卡车 %s 计划提前返回仓库，"
+                        "但仍有活跃任务/契约未完成，不应生成回仓信号",
+                        truck_id,
+                    )
 
     def _estimate_relay_remaining_energy(self, drone, relay_origin) -> float:
         """估算无人机到达串联起点时的剩余电量。"""
@@ -1366,6 +2052,102 @@ class MarketBasedSolver(GreedyBaseline):
         if diagnostics is not None:
             diagnostics["anchor_feasible"] += 1
         return self._score_standard_bid(bid, order, current_time)
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # 路径拼接约束 (Path Stitching Constraints)
+    # ══════════════════════════════════════════════════════════════════════════
+
+    def _apply_path_stitching_constraints(
+        self,
+        alloc: AllocationResult,
+        order: "Order",
+        current_time: float,
+    ) -> AllocationResult:
+        """对中标结果执行路径拼接约束校验。
+
+        1. 预测起点对齐：移动中实体的起点预测为 P(t + delta_t)
+        2. 坐标跳变校验：新路径首帧与旧路径末帧误差必须 < PATH_STITCH_TOLERANCE_M
+        3. 若误差超标，系统自动标记需要线性插值补全
+        """
+        drone = self.entity_mgr.drones.get(alloc.drone_id)
+        if drone is None:
+            return alloc
+
+        is_relay = getattr(alloc, "_is_relay", False)
+
+        if is_relay and drone.status.is_flying:
+            # 串联任务：校验新路径起点与旧路径末帧的坐标连续性
+            old_endpoint = self._get_drone_route_endpoint(drone)
+            relay_origin = getattr(alloc, "_relay_origin", None)
+            if old_endpoint is not None and relay_origin is not None:
+                gap = self._dist(old_endpoint, relay_origin)
+                if gap > self.PATH_STITCH_TOLERANCE_M:
+                    logger.info(
+                        "[MarketBasedSolver][PathStitch] 无人机 %s 串联路径坐标跳变 %.2fm > %.2fm，"
+                        "将在编排层执行线性插值补全",
+                        alloc.drone_id, gap, self.PATH_STITCH_TOLERANCE_M,
+                    )
+                    alloc._needs_interpolation = True
+                    alloc._interpolation_from = old_endpoint
+                    alloc._interpolation_to = relay_origin
+
+        elif drone.status.is_flying:
+            # 非串联的移动中实体：使用预测起点
+            predicted_pos = self._predict_drone_position(
+                drone, current_time, self.AUCTION_COMPUTE_DELTA_T
+            )
+            launch_loc = self._resolve_alloc_launch_loc(alloc)
+            if launch_loc is not None:
+                gap = self._dist(predicted_pos, launch_loc)
+                if gap > self.PATH_STITCH_TOLERANCE_M:
+                    logger.debug(
+                        "[MarketBasedSolver][PathStitch] 无人机 %s 预测位置与发射点偏差 %.2fm",
+                        alloc.drone_id, gap,
+                    )
+
+        return alloc
+
+    def _resolve_alloc_launch_loc(self, alloc: AllocationResult) -> "Position3D | None":
+        """从分配结果中解析发射点坐标。"""
+        if alloc.launch_station_id:
+            station = self.entity_mgr.stations.get(alloc.launch_station_id)
+            if station is not None:
+                return station.location
+        if alloc.mode == "C":
+            depot = self.entity_mgr.depots.get(alloc.vehicle_id)
+            if depot is not None:
+                return depot.location
+        if alloc.mode == "B":
+            truck = self.entity_mgr.trucks.get(alloc.vehicle_id)
+            if truck is not None:
+                return truck.current_loc
+        return None
+
+    def validate_path_continuity(
+        self,
+        drone_id: str,
+        new_waypoints: list,
+        current_time: float,
+    ) -> tuple[bool, float]:
+        """外部编排层调用：校验新路径段首帧与无人机当前位置/路径末帧的连续性。
+
+        Returns:
+            (is_valid, gap_meters) — 是否满足容差，以及实际间隙距离
+        """
+        drone = self.entity_mgr.drones.get(drone_id)
+        if drone is None or not new_waypoints:
+            return True, 0.0
+
+        if drone.status.is_flying:
+            reference_pos = self._predict_drone_position(
+                drone, current_time, self.AUCTION_COMPUTE_DELTA_T
+            )
+        else:
+            reference_pos = drone.current_loc
+
+        first_wp_loc = new_waypoints[0].loc if hasattr(new_waypoints[0], "loc") else new_waypoints[0]
+        gap = self._dist(reference_pos, first_wp_loc)
+        return gap <= self.PATH_STITCH_TOLERANCE_M, gap
 
     # ══════════════════════════════════════════════════════════════════════════
     # 评分
