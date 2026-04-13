@@ -99,7 +99,19 @@ def get_buildings_from_cache(scene_id: str) -> dict | None:
     if os.path.exists(buildings_path):
         try:
             with open(buildings_path, "r", encoding="utf-8") as f:
-                features = json.load(f)
+                raw = json.load(f)
+
+            # 兼容两种缓存格式：
+            # 1) 直接 features 数组（历史格式）
+            # 2) 完整 FeatureCollection（标准 GeoJSON）
+            if isinstance(raw, dict) and raw.get("type") == "FeatureCollection":
+                features = raw.get("features", [])
+            elif isinstance(raw, list):
+                features = raw
+            else:
+                print("[WARN] buildings.geojson 格式异常，期望 FeatureCollection 或 Feature 数组")
+                return None
+
             # 转换为 /api/geo/query 的返回格式
             return {
                 "type": "FeatureCollection",

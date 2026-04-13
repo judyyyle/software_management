@@ -254,7 +254,9 @@ def load_preset_scene(preset_id: str) -> Optional[dict]:
             "scene_id": scene_id,
             "sel_bounds": sel_bounds,
             "threshold": threshold,
-            "height_column": "height",
+            # 预设场景不强制指定高度字段，交给 /api/geo/query 使用数据加载器自动检测值。
+            # 这样可避免 Shapefile 实际列名为 "Height" 等大小写差异时全部变成 0m。
+            "height_column": None,
             "meta": {
                 "road_source": "osm_preset",
                 "road_nodes": 0,
