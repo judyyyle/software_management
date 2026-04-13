@@ -88,7 +88,6 @@ class SimulationEngine:
         """
         self._entity_mgr = entity_mgr
         self._order_mgr  = order_mgr
-        entity_mgr.order_mgr = order_mgr
         logger.info("[SimEngine] 已挂载 EntityManager 和 OrderManager")
 
     def attach_dispatch_engine(
@@ -207,7 +206,11 @@ class SimulationEngine:
 
                 # ── 2. 物理步进 ─────────────────────────────────────────────
                 if self._entity_mgr is not None:
-                    self._entity_mgr.tick_all(self.current_time, dt)
+                    self._entity_mgr.tick_all(
+                        self.current_time,
+                        dt,
+                        self._order_mgr,
+                    )
 
                 # ── 3. 订单生成 & 超时检测 ──────────────────────────────────
                 if self._order_mgr is not None and self._entity_mgr is not None:
