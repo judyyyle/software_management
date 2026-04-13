@@ -51,16 +51,13 @@ try:
     threshold = 80
     state = get_state()
     height_column = state.get("height_column", "height")
-    
-    # 查询建筑物（转换为 UTM 坐标进行查询）
-    from pyproj import Transformer
-    transformer = Transformer.from_crs("EPSG:4326", "EPSG:32651")
-    minx_utm, miny_utm = transformer.transform(MIN_LAT, MIN_LON)
-    maxx_utm, maxy_utm = transformer.transform(MAX_LAT, MAX_LON)
+
+    # data_loader 会将建筑数据统一转换到 EPSG:4326，因此这里直接使用经纬度。
+    # query_buildings 参数顺序为 (minx=min_lng, miny=min_lat, maxx=max_lng, maxy=max_lat)。
     
     result = query_buildings(
         get_gdf(),
-        minx_utm, miny_utm, maxx_utm, maxy_utm,
+        MIN_LON, MIN_LAT, MAX_LON, MAX_LAT,
         threshold=threshold,
         h_col=height_column,
         max_feat=30000,
