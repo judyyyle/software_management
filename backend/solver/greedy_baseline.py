@@ -24,7 +24,7 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Optional
 
 from config.loader import load_solver_energy_params
-from core.entities.primitives import DroneStatus, Position3D
+from core.entities.primitives import DroneStatus, Position3D, SourceType, WaypointAction
 from pyproj import Transformer
 import osm_service as _osm_svc
 import sys
@@ -143,6 +143,7 @@ class GreedyBaseline:
     SERVICE_TIME_CUSTOMER = 60.0   # [s]
     MAX_DETOUR_RATIO      = 1.3
     ENERGY_SAFETY_FACTOR  = 1.2
+    DEPOT_LAUNCH_TOLERANCE_M = 30.0
     
     # 新增参数：控制无人机在充电站等待的成本权衡
     WAIT_PENALTY_FACTOR   = 0.5    # 每秒等待时间的成本系数（相对于距离）
@@ -250,8 +251,18 @@ class GreedyBaseline:
         bbox: dict,
         scene_id: str | None = None,
     ) -> DispatchPlan:
-        """按当前实体状态重优化（卡车从当前位置继续建路）。"""
-        return self.dispatch_incremental(replan_orders, current_time, bbox, scene_id=scene_id)
+        """按当前实体状态重优化（全局重排 + 从当前位置起步 + 保留回收承诺）。"""
+        return self._dispatch_impl(
+            replan_orders,
+            current_time,
+            bbox,
+            scene_id=scene_id,
+            incremental=False,
+            start_from_current_state=True,
+            include_runtime_commitments=True,
+            dispatch_type_override="dynamic_replan",
+            log_structured_routes=True,
+        )
 
     def get_active_contracts(self) -> list:
         """Greedy 无契约系统。"""
@@ -268,8 +279,13 @@ class GreedyBaseline:
         bbox: dict,
         scene_id: str | None = None,
         incremental: bool = False,
+        start_from_current_state: bool = False,
+        include_runtime_commitments: bool = False,
+        dispatch_type_override: str | None = None,
+        log_structured_routes: bool = False,
     ) -> DispatchPlan:
         """统一调度实现，支持全量与增量两种入口。"""
+        dispatch_type = dispatch_type_override or ("incremental" if incremental else "full")
         if not orders:
             return DispatchPlan(
                 allocations=[],
@@ -278,7 +294,7 @@ class GreedyBaseline:
                     "total_orders": 0,
                     "feasible": 0,
                     "modes": {},
-                    "dispatch_type": "incremental" if incremental else "full",
+                    "dispatch_type": dispatch_type,
                     "cost_breakdown": {"dist": 0.0, "energy": 0.0, "penalty": 0.0},
                 },
             )
@@ -303,28 +319,47 @@ class GreedyBaseline:
         # ── 追踪本次调度中已分配的无人机（防止同一个无人机被多次分配）────────
         allocated_drones: set[str] = set()
 
+        # ── 追踪卡车最后一个接单/停留点，用于计算边际插入成本 ───────────
+        truck_last_pos: dict[str, Position3D] = {
+            tid: truck.get_location(current_time)
+            for tid, truck in self.entity_mgr.trucks.items()
+        }
+
         # ── Phase 2：逐单分配 ─────────────────────────────────────────────
         for order in sorted_orders:
-            result = self._allocate_order(order, current_time, allocated_drones)
+            result = self._allocate_order(order, current_time, allocated_drones, truck_last_pos)
             allocations.append(result)
             if result.feasible:
                 mode_counter[result.mode] = mode_counter.get(result.mode, 0) + 1
                 if result.mode == "A" and result.vehicle_id in truck_node_map:
                     truck_node_map[result.vehicle_id]["orders"].append(order)
+                    # 更新卡车虚拟停留点为订单点
+                    truck_last_pos[result.vehicle_id] = order.delivery_loc
                 elif result.mode in ("B", "B_WAIT", "C") and result.drone_id:
                     allocated_drones.add(result.drone_id)
                     if result.mode in ("B", "B_WAIT") and result.vehicle_id in truck_node_map:
                         truck_node_map[result.vehicle_id]["recovery_stations"].append(result.recovery_station_id)
                         if result.mode == "B_WAIT" and result.launch_station_id:
                             truck_node_map[result.vehicle_id]["recovery_stations"].append(result.launch_station_id)
+                            # B_WAIT 模式下卡车一定会去充换电站（起飞站）
+                            launch_station = self.entity_mgr.stations.get(result.launch_station_id)
+                            if launch_station:
+                                truck_last_pos[result.vehicle_id] = launch_station.location
+
+        if include_runtime_commitments:
+            self._merge_runtime_commitments(truck_node_map, orders, current_time, allocations)
 
         # ── Phase 3：构建卡车路径 ─────────────────────────────────────────
         # 构建 recovery station wait times 映射：station_id -> wait_duration
         recovery_station_wait_times: dict[str, float] = {}
         for alloc in allocations:
             if alloc.feasible and alloc.mode in ("B", "B_WAIT") and alloc.recovery_station_id:
-                # 对于同一个站点被多个allocation使用的情况，取最大等待时间
-                wait_s = max(0.0, alloc.wait_duration) + self.TRUCK_DRONE_RECOVER_TIME
+                # 对于同一个站点被多个 allocation 使用的情况，取最大等待时间。
+                # B_WAIT 的 wait_duration 已包含回收操作时长；B 仍需补上回收操作时长。
+                if alloc.mode == "B_WAIT":
+                    wait_s = max(0.0, alloc.wait_duration)
+                else:
+                    wait_s = max(0.0, alloc.wait_duration) + self.TRUCK_DRONE_RECOVER_TIME
                 recovery_station_wait_times[alloc.recovery_station_id] = max(
                     recovery_station_wait_times.get(alloc.recovery_station_id, 0),
                     wait_s,
@@ -336,10 +371,11 @@ class GreedyBaseline:
                 continue
             truck = self.entity_mgr.trucks[truck_id]
             unique_recovery_stations = list(set(node_data["recovery_stations"]))
+            unique_orders = list({o.order_id: o for o in node_data["orders"]}.values())
             if incremental:
                 truck_routes[truck_id] = self._build_truck_route(
                     truck,
-                    node_data["orders"],
+                    unique_orders,
                     unique_recovery_stations,
                     current_time,
                     road_graph,
@@ -348,10 +384,22 @@ class GreedyBaseline:
                     start_pos=truck.get_location(current_time),
                     return_to_depot=False,
                 )
+            elif start_from_current_state:
+                truck_routes[truck_id] = self._build_truck_route(
+                    truck,
+                    unique_orders,
+                    unique_recovery_stations,
+                    current_time,
+                    road_graph,
+                    nodes,
+                    recovery_station_wait_times,
+                    start_pos=truck.get_location(current_time),
+                    return_to_depot=True,
+                )
             else:
                 truck_routes[truck_id] = self._build_truck_route(
                     truck,
-                    node_data["orders"],
+                    unique_orders,
                     unique_recovery_stations,
                     current_time,
                     road_graph,
@@ -374,7 +422,7 @@ class GreedyBaseline:
                 "total_orders": len(allocations),
                 "feasible": sum(1 for r in allocations if r.feasible),
                 "modes": mode_counter,
-                "dispatch_type": "incremental" if incremental else "full",
+                "dispatch_type": dispatch_type,
                 "cost_breakdown": {
                     "dist": cost_dist_total,
                     "energy": cost_energy_total,
@@ -384,7 +432,185 @@ class GreedyBaseline:
             truck_routes=truck_routes,
         )
         logger.info("[GreedyBaseline] 分配完成：%s", plan.summary)
+        if log_structured_routes and truck_routes:
+            self._log_structured_truck_routes(truck_routes, allocations)
         return plan
+
+    def _merge_runtime_commitments(
+        self,
+        truck_node_map: dict[str, dict],
+        orders: dict[str, "Order"],
+        current_time: float,
+        allocations: list[AllocationResult],
+    ) -> None:
+        """将运行中的刚性承诺并入重优化路由（在途订单 + 无人机回收锚点）。"""
+        customer_by_truck: dict[str, set[str]] = {tid: set() for tid in truck_node_map}
+        recovery_by_truck: dict[str, set[str]] = {tid: set() for tid in truck_node_map}
+        feasible_alloc_by_order: dict[str, AllocationResult] = {
+            alloc.order_id: alloc
+            for alloc in allocations
+            if alloc.feasible
+        }
+
+        # 保留当前卡车未来停靠承诺，避免重优化丢失既有回收/配送节点。
+        for truck_id, truck in self.entity_mgr.trucks.items():
+            if truck_id not in truck_node_map:
+                continue
+            planned_stops = getattr(truck, "_planned_route_stops", None) or []
+            cursor = int(getattr(truck, "_planned_route_cursor", 0) or 0)
+            for stop in planned_stops[cursor:]:
+                node_type = stop.get("node_type", "")
+                if node_type == "customer":
+                    oid = stop.get("order_id", "")
+                    if oid:
+                        customer_by_truck[truck_id].add(oid)
+                elif node_type == "recovery":
+                    sid = stop.get("node_id", "")
+                    if sid:
+                        recovery_by_truck[truck_id].add(sid)
+
+        # 从无人机实时状态提取回收锚点（待起飞、在飞、已到站待回收）。
+        for drone in self.entity_mgr.drones.values():
+            owner_truck_id = self._resolve_drone_owner_truck_id(drone)
+            if not owner_truck_id or owner_truck_id not in truck_node_map:
+                continue
+
+            waiting_station_id = getattr(drone, "waiting_recovery_station_id", "")
+            if waiting_station_id and waiting_station_id in self.entity_mgr.stations:
+                recovery_by_truck[owner_truck_id].add(waiting_station_id)
+
+            launch_station_id = getattr(drone, "launch_station_id", "")
+            scheduled_launch_time = float(getattr(drone, "scheduled_launch_time", 0.0) or 0.0)
+            transport_truck_id = getattr(drone, "transport_truck_id", "")
+            if (
+                transport_truck_id == owner_truck_id
+                and launch_station_id
+                and launch_station_id in self.entity_mgr.stations
+                and math.isfinite(scheduled_launch_time)
+                and scheduled_launch_time >= current_time - 1e-6
+            ):
+                recovery_by_truck[owner_truck_id].add(launch_station_id)
+
+            pending_station_id = self._get_pending_station_recovery_from_route(drone)
+            if pending_station_id:
+                recovery_by_truck[owner_truck_id].add(pending_station_id)
+
+        for truck_id, order_ids in customer_by_truck.items():
+            if not order_ids:
+                continue
+            existing_ids = {o.order_id for o in truck_node_map[truck_id]["orders"]}
+            for oid in order_ids:
+                alloc = feasible_alloc_by_order.get(oid)
+                if alloc is not None:
+                    # 若本轮已重分配为非 A，或 A 但已改派给其它卡车，
+                    # 则不能继续保留旧 customer 承诺，避免同单被卡车+无人机重复履约。
+                    if alloc.mode != "A" or alloc.vehicle_id != truck_id:
+                        continue
+                if oid in existing_ids:
+                    continue
+                order_obj = orders.get(oid)
+                if order_obj is not None:
+                    truck_node_map[truck_id]["orders"].append(order_obj)
+                    existing_ids.add(oid)
+
+        for truck_id, station_ids in recovery_by_truck.items():
+            if station_ids:
+                truck_node_map[truck_id]["recovery_stations"].extend(station_ids)
+
+    def _resolve_drone_owner_truck_id(self, drone: "Drone") -> str:
+        """解析无人机当前应归属的卡车，用于重优化时绑定回收承诺。"""
+        transport_truck_id = getattr(drone, "transport_truck_id", "")
+        if transport_truck_id in self.entity_mgr.trucks:
+            return transport_truck_id
+
+        home_type = getattr(drone, "home_type", None)
+        home_id = getattr(drone, "home_id", "")
+        if home_type == SourceType.TRUCK and home_id in self.entity_mgr.trucks:
+            return home_id
+
+        return ""
+
+    def _get_pending_station_recovery_from_route(self, drone: "Drone") -> str:
+        """从无人机剩余航路中提取待执行的站点回收锚点。"""
+        route_plan = getattr(drone, "route_plan", None) or []
+        if not route_plan:
+            return ""
+
+        start_idx = int(getattr(drone, "current_waypoint_index", 0) or 0)
+        start_idx = max(0, min(start_idx, len(route_plan)))
+        for wp in reversed(route_plan[start_idx:]):
+            if wp.action not in (WaypointAction.DOCK_DEPOT, WaypointAction.DOCK_TRUCK):
+                continue
+            target_id = wp.target_entity_id or ""
+            if target_id in self.entity_mgr.stations:
+                return target_id
+            return ""
+        return ""
+
+    def _log_structured_truck_routes(
+        self,
+        truck_routes: dict[str, TruckRoute],
+        allocations: list[AllocationResult],
+    ) -> None:
+        """输出结构化卡车路线日志，便于动态重优化诊断与前端联动核验。"""
+        for truck_id, route in truck_routes.items():
+            logger.info(
+                "[GreedyBaseline] 动态重优化卡车 %s 路径 %d 节点，里程 %.0fm，经停充电站 %s",
+                truck_id,
+                len(route.nodes),
+                route.total_distance,
+                route.charging_stop_ids or "（无）",
+            )
+            logger.info("[GreedyBaseline] 动态重优化卡车 %s 详细路线：", truck_id)
+            for idx, node in enumerate(route.nodes, start=1):
+                logger.info(
+                    "[GreedyBaseline]   [%d] %s (%s) - 到达: %.1fs, 离开: %.1fs | %s",
+                    idx,
+                    node.node_id,
+                    node.node_type,
+                    node.arrival_time,
+                    node.departure_time,
+                    self._describe_route_node_action(node, allocations),
+                )
+
+    def _describe_route_node_action(
+        self,
+        node: TruckRouteNode,
+        allocations: list[AllocationResult],
+    ) -> str:
+        """根据节点类型与分配结果生成路线动作描述。"""
+        if node.node_type == "depot":
+            if "_return" in node.node_id:
+                return "返回仓库"
+            return "从仓库出发"
+        if node.node_type == "origin":
+            return "从当前位置续行"
+        if node.node_type == "customer":
+            return f"配送订单 {node.order_id}"
+        if node.node_type == "station":
+            return "经停充电站（广播给无人机）"
+        if node.node_type == "recovery":
+            launch_orders = [
+                alloc.order_id
+                for alloc in allocations
+                if alloc.feasible and alloc.mode in ("B_WAIT", "B_DYNAMIC") and alloc.launch_station_id == node.node_id
+            ]
+            recovery_orders = [
+                alloc.order_id
+                for alloc in allocations
+                if alloc.feasible and alloc.mode in ("B", "B_WAIT", "B_DYNAMIC") and alloc.recovery_station_id == node.node_id
+            ]
+            if launch_orders and recovery_orders:
+                return (
+                    f"放飞+回收无人机（放飞订单: {', '.join(launch_orders)}；"
+                    f"回收订单: {', '.join(recovery_orders)}）"
+                )
+            if launch_orders:
+                return f"放飞无人机（订单: {', '.join(launch_orders)}）"
+            if recovery_orders:
+                return f"回收无人机（订单: {', '.join(recovery_orders)}）"
+            return "回收锚点停靠"
+        return "未知动作"
 
     def _load_road_graph(
         self,
@@ -695,7 +921,7 @@ class GreedyBaseline:
     # 单订单分配
     # ══════════════════════════════════════════════════════════════════════════
 
-    def _try_mode_b_with_waiting(self, order: "Order", current_time: float, allocated_drones: set[str]) -> AllocationResult:
+    def _try_mode_b_with_waiting(self, order: "Order", current_time: float, allocated_drones: set[str], truck_last_pos: dict[str, Position3D]) -> AllocationResult:
         """
         改进的模式 B（无人机在充电站等待）：
         无人机在卡车将要经过的充电站上等待 → 起飞 → 配送 → 回到充电站降落。
@@ -738,7 +964,7 @@ class GreedyBaseline:
             predicted_stations = self._predict_truck_charging_stations(truck, current_time)
 
             for station_id, station_loc in predicted_stations:
-                truck_loc = truck.get_location(current_time)
+                truck_loc = truck_last_pos.get(truck.truck_id) or truck.get_location(current_time)
                 truck_distance_to_launch = self._road_dist(truck_loc, station_loc)
                 launch_delay = (
                     truck_distance_to_launch / truck.speed
@@ -793,13 +1019,14 @@ class GreedyBaseline:
 
     # ══════════════════════════════════════════════════════════════════════════
 
-    def _allocate_order(self, order: "Order", current_time: float, allocated_drones: set[str]) -> AllocationResult:
+    def _allocate_order(self, order: "Order", current_time: float, allocated_drones: set[str], truck_last_pos: dict[str, Position3D]) -> AllocationResult:
         """在可行候选中选择统一评分最小的方案。
         
         Args:
             order: 待分配订单
             current_time: 当前仿真时刻
             allocated_drones: 本次调度中已分配的无人机ID集合（用于防止重复分配）
+            truck_last_pos: 卡车最后停留位置字典，用于通过边际增量计算路径评估成本
         """
         candidates: list[AllocationResult] = []
 
@@ -808,12 +1035,12 @@ class GreedyBaseline:
             try_fns.insert(1, self._try_mode_b)
 
         for try_fn in try_fns:
-            result = try_fn(order, current_time, allocated_drones)
+            result = try_fn(order, current_time, allocated_drones, truck_last_pos)
             if not result.feasible:
                 continue
 
             score_total, cost_dist, cost_energy, cost_penalty = self._score_allocation(
-                result, order, current_time
+                result, order, current_time, truck_last_pos
             )
             result.score_total = score_total
             result.cost_dist = cost_dist
@@ -853,12 +1080,12 @@ class GreedyBaseline:
             reason="无可用资源（无卡车、无人机或电量不足）",
         )
 
-    def _try_mode_b(self, order: "Order", current_time: float, allocated_drones: set[str]) -> AllocationResult:
+    def _try_mode_b(self, order: "Order", current_time: float, allocated_drones: set[str], truck_last_pos: dict[str, Position3D]) -> AllocationResult:
         """
         模式 B（卡-空协同）：卡车当前位置起飞 → 送达 → 最近合法回收点降落。
 
         前瞻能量校验：drone.battery_current ≥
-          (飞到配送点能耗 + 飞到最近回收点能耗) × ENERGY_SAFETY_FACTOR
+          (飞到配送点能耗 +飞到最近回收点能耗) × ENERGY_SAFETY_FACTOR
         """
         trucks = list(self.entity_mgr.trucks.values())
         if not trucks:
@@ -884,9 +1111,9 @@ class GreedyBaseline:
         # 按距离从近到远尝试卡车，找第一个能量可行的
         for truck in sorted(
             trucks,
-            key=lambda t: self._dist(order.delivery_loc, t.get_location(current_time)),
+            key=lambda t: self._dist(order.delivery_loc, truck_last_pos.get(t.truck_id) or t.get_location(current_time)),
         ):
-            launch_loc = truck.get_location(current_time)
+            launch_loc = truck_last_pos.get(truck.truck_id) or truck.get_location(current_time)
             recovery_id = self._check_energy_feasible(
                 drone=drone,
                 launch_loc=launch_loc,
@@ -913,7 +1140,7 @@ class GreedyBaseline:
             reason="无人机电量不足以完成送达并安全回收",
         )
 
-    def _try_mode_c(self, order: "Order", current_time: float, allocated_drones: set[str]) -> AllocationResult:
+    def _try_mode_c(self, order: "Order", current_time: float, allocated_drones: set[str], truck_last_pos: dict[str, Position3D]) -> AllocationResult:
         """
         模式 C（仓-空直递）：仓库 → 无人机 → 送达 → 仓库（往返）。
 
@@ -931,13 +1158,18 @@ class GreedyBaseline:
         # 获取未被分配过的可用无人机
         available_drones = self._get_available_drones()
         available_drones = [d for d in available_drones if d.drone_id not in allocated_drones]
+        available_drones = [
+            d for d in available_drones
+            if self._is_drone_ready_for_depot_launch(d, depot)
+        ]
         drone = self._find_capable_drone(
             order.payload_weight, available_drones
         )
         if drone is None:
             return AllocationResult(
                 order_id=order.order_id, vehicle_id="", mode="C",
-                distance=float("inf"), feasible=False, reason="无未分配的载重匹配无人机",
+                distance=float("inf"), feasible=False,
+                reason="无位于仓库且载重匹配的可用无人机",
             )
 
         energy_out  = self._flight_energy(drone, depot.location, order.delivery_loc, order.payload_weight)
@@ -964,8 +1196,8 @@ class GreedyBaseline:
             drone_id=drone.drone_id,
         )
 
-    def _try_mode_a(self, order: "Order", current_time: float, allocated_drones: set[str]) -> AllocationResult:
-        """模式 A（卡车直递）：选距离最近的卡车。"""
+    def _try_mode_a(self, order: "Order", current_time: float, allocated_drones: set[str], truck_last_pos: dict[str, Position3D]) -> AllocationResult:
+        """模式 A（卡车直递）：选边际距离最近的卡车。"""
         trucks = list(self.entity_mgr.trucks.values())
         if not trucks:
             return AllocationResult(
@@ -975,13 +1207,13 @@ class GreedyBaseline:
 
         nearest = min(
             trucks,
-            key=lambda t: self._road_dist(order.delivery_loc, t.get_location(current_time)),
+            key=lambda t: self._road_dist(truck_last_pos.get(t.truck_id) or t.get_location(current_time), order.delivery_loc),
         )
         return AllocationResult(
             order_id=order.order_id,
             vehicle_id=nearest.truck_id,
             mode="A",
-            distance=self._road_dist(order.delivery_loc, nearest.get_location(current_time)),
+            distance=self._road_dist(truck_last_pos.get(nearest.truck_id) or nearest.get_location(current_time), order.delivery_loc),
             feasible=True,
         )
 
@@ -1366,6 +1598,15 @@ class GreedyBaseline:
             return None
         return max(capable, key=lambda d: d.battery_current)
 
+    def _is_drone_ready_for_depot_launch(self, drone: "Drone", depot: "object") -> bool:
+        """判断无人机是否满足“仓库起飞”约束。"""
+        if getattr(drone, "transport_truck_id", None):
+            return False
+        for truck in self.entity_mgr.trucks.values():
+            if drone.drone_id in getattr(truck, "docked_drones", []):
+                return False
+        return drone.current_loc.distance_2d(depot.location) <= self.DEPOT_LAUNCH_TOLERANCE_M
+
     def _get_recovery_pool(self) -> list:
         """返回所有合法无人机降落点：充换电站 + 仓库。"""
         pool = []
@@ -1421,6 +1662,7 @@ class GreedyBaseline:
         alloc: AllocationResult,
         order: "Order",
         current_time: float,
+        truck_last_pos: dict[str, Position3D],
     ) -> tuple[float, float, float, float]:
         """
         统一评分：f = f_dist + f_energy + f_penalty。
@@ -1441,7 +1683,9 @@ class GreedyBaseline:
             truck = self.entity_mgr.trucks.get(alloc.vehicle_id)
             if truck is None or truck.speed <= 0:
                 return float("inf"), 0.0, 0.0, 0.0
-            truck_distance = self._road_dist(truck.get_location(current_time), order.delivery_loc)
+            
+            truck_loc = truck_last_pos.get(truck.truck_id) or truck.get_location(current_time)
+            truck_distance = self._road_dist(truck_loc, order.delivery_loc)
             truck_energy = self._truck_energy_wh(truck_distance)
             delivery_time_est = current_time + truck_distance / truck.speed + self.SERVICE_TIME_CUSTOMER
 
@@ -1455,8 +1699,10 @@ class GreedyBaseline:
                 launch_station = self.entity_mgr.stations.get(alloc.launch_station_id)
                 if truck is None or launch_station is None or truck.speed <= 0:
                     return float("inf"), 0.0, 0.0, 0.0
+                
+                truck_loc = truck_last_pos.get(truck.truck_id) or truck.get_location(current_time)
                 launch_loc = launch_station.location
-                truck_distance = self._road_dist(truck.get_location(current_time), launch_loc)
+                truck_distance = self._road_dist(truck_loc, launch_loc)
                 truck_energy = self._truck_energy_wh(truck_distance)
                 launch_time_est = (
                     alloc.launch_time
@@ -1467,7 +1713,9 @@ class GreedyBaseline:
                 truck = self.entity_mgr.trucks.get(alloc.vehicle_id)
                 if truck is None:
                     return float("inf"), 0.0, 0.0, 0.0
-                launch_loc = truck.get_location(current_time)
+                
+                truck_loc = truck_last_pos.get(truck.truck_id) or truck.get_location(current_time)
+                launch_loc = truck_loc
                 launch_time_est = current_time + self.TRUCK_DRONE_LAUNCH_TIME
 
             recovery = (
@@ -1574,6 +1822,7 @@ class GreedyBaseline:
             flight_time_back = dist_back / drone.cruise_speed if drone.cruise_speed > 0 else 1000
             flight_time_total = flight_time_out + self.delivery_service_time + flight_time_back
             launch_operation_time = self.TRUCK_DRONE_LAUNCH_TIME
+            recover_operation_time = self.TRUCK_DRONE_RECOVER_TIME
 
             # 统一评分：f = f_dist + f_energy + f_penalty
             delivery_time_est = (
@@ -1606,7 +1855,9 @@ class GreedyBaseline:
                     'launch_station_id': launch_station_id,
                     'launch_time': current_time + launch_delay + launch_operation_time,
                     'recovery_station_id': recovery_id,
-                    'wait_duration': launch_operation_time + flight_time_total,
+                    # 注意：wait_duration 从“卡车到达起飞站”起算，覆盖
+                    # 放飞操作 + 飞行往返 + 回收操作，避免边界时刻错过回收触发。
+                    'wait_duration': launch_operation_time + flight_time_total + recover_operation_time,
                     'score': best_score,
                     'distance': total_distance,
                     'energy_needed': total_energy_j,
