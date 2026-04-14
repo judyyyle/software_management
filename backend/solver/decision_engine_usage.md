@@ -31,7 +31,7 @@ def dispatch(
 建议参考：
 
 - `backend/solver/interfaces.py`
-- `backend/solver/greedy_baseline.py`
+- `backend/solver/greedy_mmce.py`
 
 ## 3. DispatchPlan 最小契约
 
@@ -90,7 +90,7 @@ backend/solver/
   decision_engine.py
   interfaces.py
   factory.py
-  greedy_baseline.py
+  greedy_mmce.py
   algorithms/
     alns_solver.py
     ga_solver.py

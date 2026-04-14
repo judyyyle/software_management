@@ -484,6 +484,8 @@ class EntityManager:
                     
                     # ── 处理航路点 action ──────────────────────────────────────
                     if action == WaypointAction.DOCK_DEPOT or action == WaypointAction.DOCK_TRUCK:
+                        dock_target = reached_target or "-"
+                        self._recharge_drone_to_full(drone, f"回收到 {dock_target}")
                         # 到达回收点后，若落在充电站则等待卡车回收；否则直接停靠空闲。
                         if reached_target and reached_target in self.stations:
                             drone.waiting_recovery_station_id = reached_target
@@ -525,7 +527,7 @@ class EntityManager:
         current_time: float,
         order_mgr: Optional["OrderManager"],
     ) -> None:
-        """按时间顺序执行卡车关键节点事件（customer/recovery）。"""
+        """按时间顺序执行卡车关键节点事件（customer/recovery/station）。"""
         planned_stops = getattr(truck, "_planned_route_stops", None)
         if not planned_stops:
             return
@@ -598,7 +600,7 @@ class EntityManager:
                 )
             return
 
-        if node_type == "recovery":
+        if node_type in {"recovery", "station"}:
             station_id = stop.get("node_id", "")
             if station_id:
                 self._recover_drones_from_station_to_truck(truck, station_id, current_time)
@@ -624,6 +626,7 @@ class EntityManager:
             drone.transport_truck_id = truck.truck_id
             drone.scheduled_launch_time = float("inf")
             drone.current_loc = truck.current_loc
+            self._recharge_drone_to_full(drone, f"卡车 {truck.truck_id} 在站点 {station_id} 回收")
             if drone.drone_id not in truck.docked_drones:
                 truck.docked_drones.append(drone.drone_id)
             recovered.append(drone.drone_id)
@@ -632,6 +635,19 @@ class EntityManager:
             logger.info(
                 "[EntityManager.tick_all] 卡车 %s 在站点 %s 回收无人机: %s",
                 truck.truck_id, station_id, recovered,
+            )
+
+    def _recharge_drone_to_full(self, drone: Drone, reason: str) -> None:
+        """统一补能入口：无人机回收到卡车/仓库/站点后立即满电。"""
+        prev_energy = drone.battery_current
+        drone.recharge_to_full()
+        if prev_energy < drone.battery_max - 1e-6:
+            logger.info(
+                "[EntityManager] 无人机 %s %s，电量补满: %.0fJ -> %.0fJ",
+                drone.drone_id,
+                reason,
+                prev_energy,
+                drone.battery_current,
             )
 
     def _complete_assigned_order(

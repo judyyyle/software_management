@@ -10,7 +10,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any, Protocol
 
-from solver.greedy_baseline import DispatchPlan
+from solver.greedy_mmce import DispatchPlan
 
 if TYPE_CHECKING:
     from core.entities.order import Order

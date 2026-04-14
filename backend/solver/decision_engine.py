@@ -9,7 +9,7 @@ HiveLogix — 调度决策编排层
   3. 记录调度日志供前端展示
 
 编排流程：
-  [OrderManager.pending_orders] → [GreedyBaseline.dispatch()]
+    [OrderManager.pending_orders] → [GreedyMMCE.dispatch()]
     → [DispatchDecisionEngine.execute_plan()]
     → [更新订单状态 + 触发实体行为]
 """
@@ -22,7 +22,7 @@ from typing import TYPE_CHECKING
 
 from config.loader import load_solver_energy_params
 from solver.factory import create_solver, list_solvers
-from solver.greedy_baseline import AllocationResult, DispatchPlan
+from solver.greedy_mmce import AllocationResult, DispatchPlan
 from solver.market_based_solver import MarketBasedSolver
 from solver.interfaces import DispatchSolver
 from core.entities.primitives import RouteWaypoint, WaypointAction, SourceType, DroneStatus
@@ -434,12 +434,23 @@ class DispatchDecisionEngine:
             if truck_route is None:
                 continue
 
-            launch_node = next(
-                (n for n in truck_route.nodes if n.node_id == alloc.launch_station_id),
-                None,
-            )
-            if launch_node is not None:
-                alloc.launch_time = launch_node.arrival_time + self.TRUCK_DRONE_LAUNCH_TIME
+            launch_candidates = [
+                n for n in truck_route.nodes
+                if n.node_id == alloc.launch_station_id
+            ]
+            if not launch_candidates:
+                continue
+
+            if alloc.launch_time > 0:
+                target_arrival = alloc.launch_time - self.TRUCK_DRONE_LAUNCH_TIME
+                launch_node = min(
+                    launch_candidates,
+                    key=lambda n: abs(n.arrival_time - target_arrival),
+                )
+            else:
+                launch_node = launch_candidates[0]
+
+            alloc.launch_time = launch_node.arrival_time + self.TRUCK_DRONE_LAUNCH_TIME
 
         # ── 第三步：应用无人机路由 ────────────────────────────────────────────
         self._setup_drone_routes(plan, current_time)
@@ -700,7 +711,24 @@ class DispatchDecisionEngine:
         for i in range(1, len(route.nodes)):
             travel_deltas.append(max(0.0, original_arrivals[i] - original_departures[i - 1]))
 
-        launch_arrivals: dict[str, float] = {}
+        observed_arrivals: dict[str, list[float]] = {}
+
+        def resolve_launch_arrival(alloc: "AllocationResult") -> float:
+            """在已到访记录中匹配该任务对应的起飞站到达时刻。"""
+            visits = observed_arrivals.get(alloc.launch_station_id, [])
+            if not visits:
+                if alloc.launch_time > 0:
+                    return alloc.launch_time - self.TRUCK_DRONE_LAUNCH_TIME
+                return current_time
+
+            if alloc.launch_time > 0:
+                target_arrival = alloc.launch_time - self.TRUCK_DRONE_LAUNCH_TIME
+                prior_visits = [t for t in visits if t <= target_arrival + 1e-6]
+                if prior_visits:
+                    return max(prior_visits)
+                return min(visits, key=lambda t: abs(t - target_arrival))
+
+            return visits[-1]
 
         for i, node in enumerate(route.nodes):
             if i == 0:
@@ -708,12 +736,12 @@ class DispatchDecisionEngine:
             else:
                 arrival = route.nodes[i - 1].departure_time + travel_deltas[i]
 
+            observed_arrivals.setdefault(node.node_id, []).append(arrival)
+
             if node.node_type == "recovery":
                 needed_departure = arrival
                 for alloc in allocs_by_recovery.get(node.node_id, []):
-                    launch_arrival = launch_arrivals.get(alloc.launch_station_id)
-                    if launch_arrival is None:
-                        launch_arrival = alloc.launch_time if alloc.launch_time > 0 else current_time
+                    launch_arrival = resolve_launch_arrival(alloc)
                     expected_recovery_time = launch_arrival + alloc.wait_duration
                     needed_departure = max(needed_departure, expected_recovery_time)
                 service_time = max(0.0, needed_departure - arrival)
@@ -733,9 +761,6 @@ class DispatchDecisionEngine:
             departure = arrival + service_time
             node.arrival_time = arrival
             node.departure_time = departure
-
-            if node.node_id not in launch_arrivals:
-                launch_arrivals[node.node_id] = arrival
 
     def _log_detailed_route(self, route: "TruckRoute", allocations: list["AllocationResult"]) -> None:
         """
@@ -882,7 +907,7 @@ class DispatchDecisionEngine:
                         logger.info(
                             "[DispatchDecisionEngine] 为无人机 %s 设置路由（模式 %s）："
                             "随卡车 %s 运输至充电站 %s（t=%.1fs）后起飞，"
-                            "飞行 %.1fs → 回收点 %s，订单: %s",
+                            "等待+任务总时长 %.1fs → 回收点 %s，订单: %s",
                             alloc.drone_id, alloc.mode, alloc.vehicle_id,
                             alloc.launch_station_id,
                             alloc.launch_time, wait_duration,
@@ -964,7 +989,7 @@ class DispatchDecisionEngine:
 
         将分配中的无人机路由转换为DroneRoute对象，包含完整的飞行路径坐标序列。
         """
-        from solver.greedy_baseline import DroneRoute
+        from solver.greedy_mmce import DroneRoute
 
         for alloc in plan.allocations:
             if not alloc.feasible or alloc.mode == "A" or not alloc.drone_id:
