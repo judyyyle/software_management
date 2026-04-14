@@ -69,7 +69,13 @@
                 :class="{ 'sc-btn--dispatch-active': dispatchSolver === 'greedy' }"
                 :disabled="!initDone || dispatchLoading"
                 @click="dispatchSolver = 'greedy'">
-                🧠 贪心算法
+                🧠 贪心（baseline）
+              </button>
+              <button class="sc-btn sc-btn--dispatch"
+                :class="{ 'sc-btn--dispatch-active': dispatchSolver === 'greedy_mmce' }"
+                :disabled="!initDone || dispatchLoading"
+                @click="dispatchSolver = 'greedy_mmce'">
+                🧩 贪心（多模式）
               </button>
               <button class="sc-btn sc-btn--dispatch"
                 :class="{ 'sc-btn--dispatch-active': dispatchSolver === 'market' }"
@@ -80,10 +86,10 @@
               <button class="sc-btn sc-btn--dispatch sc-btn--dispatch-run"
                 :disabled="!initDone || dispatchLoading"
                 @click="doDispatch">
-                {{ dispatchLoading ? '⏳ 调度中...' : (dispatchSolver === 'market' ? '🎯 批量市场拍卖调度' : '🎯 批量贪心调度') }}
+                {{ dispatchLoading ? '⏳ 调度中...' : `🎯 批量${dispatchSolverLabel(dispatchSolver)}调度` }}
               </button>
               <span class="dispatch-solver-tag">
-                当前算法：{{ dispatchSolver === 'market' ? '市场拍卖' : '贪心' }}
+                当前算法：{{ dispatchSolverLabel(dispatchSolver) }}
               </span>
               <span v-if="lastDispatchResult" class="dispatch-quick-stat">
                 ✓ {{ lastDispatchResult.plan.feasible }}/{{ lastDispatchResult.plan.total_orders }} 可行
@@ -232,7 +238,14 @@ const dispatchLoading = ref(false)
 const lastDispatchResult = ref<any>(null)
 const dispatchPlan = ref<DispatchPlan | null>(null)
 const totalEnergyCostWh = ref(0)
-const dispatchSolver = ref<'greedy' | 'market'>('greedy')
+type DispatchSolverName = 'greedy' | 'greedy_mmce' | 'market'
+const dispatchSolver = ref<DispatchSolverName>('greedy')
+
+function dispatchSolverLabel(solver: DispatchSolverName): string {
+  if (solver === 'greedy') return '贪心（baseline）'
+  if (solver === 'greedy_mmce') return '贪心（多模式）'
+  return '市场拍卖'
+}
 
 // 预设保存状态
 const savingPreset = ref(false)
@@ -437,7 +450,7 @@ async function doSetSpeed(ratio: number) {
 
 async function doDispatch() {
   dispatchLoading.value = true
-  _log('info', `🎯 正在执行${dispatchSolver.value === 'market' ? '市场拍卖' : '贪心'}调度算法...`)
+  _log('info', `🎯 正在执行${dispatchSolverLabel(dispatchSolver.value)}调度算法...`)
   try {
     // 检查是否有加载场景
     if (!sceneStore.context) {

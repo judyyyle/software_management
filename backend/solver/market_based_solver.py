@@ -4,7 +4,7 @@
 HiveLogix — 市场拍卖调度算法（支持动态增量调度与时空契约）
 
 设计原则：
-  1. 复用 GreedyBaseline 中已经稳定的能耗模型、卡车路径构建与 DispatchPlan 契约
+    1. 复用 GreedyMMCE 中已经稳定的能耗模型、卡车路径构建与 DispatchPlan 契约
   2. 将逐单"直接选模式"替换为"单任务顺序拍卖"
   3. 由协调器统一收集无人机 / 卡车投标，按综合成本最低授标
   4. 中标后即刻生成 RendezvousContract，锁定卡车锚点与无人机资源
@@ -37,10 +37,10 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 from core.entities.primitives import DroneStatus
-from solver.greedy_baseline import (
+from solver.greedy_mmce import (
     AllocationResult,
     DispatchPlan,
-    GreedyBaseline,
+    GreedyMMCE,
     _osm_svc,
     load_osm_from_cache,
 )
@@ -144,7 +144,7 @@ class RendezvousContract:
 # 市场拍卖调度器
 # ══════════════════════════════════════════════════════════════════════════════
 
-class MarketBasedSolver(GreedyBaseline):
+class MarketBasedSolver(GreedyMMCE):
     """基于锚点时刻表的单任务顺序拍卖调度器，支持动态增量拍卖与时空契约。"""
 
     T_MAX_WAIT = 60.0
@@ -976,7 +976,7 @@ class MarketBasedSolver(GreedyBaseline):
             best.score_total,
         )
 
-        # 把当前中标无人机记录进屏蔽列表，不依赖父类greedy_baseline，避免B_DYNAMIC在父类漏判导致一机多单
+        # 把当前中标无人机记录进屏蔽列表，不依赖父类greedy_mmce，避免B_DYNAMIC在父类漏判导致一机多单
         if best.feasible and best.drone_id and best.mode != "A":
             allocated_drones.add(best.drone_id)
 

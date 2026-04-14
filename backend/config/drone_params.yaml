@@ -53,13 +53,13 @@ solver_energy:
   c_energy_uav: 1.0
 
   # 时间惩罚权重
-  lambda_time: 1.0
+  lambda_time: 10.0
 
   # 能耗模型参数
   # 卡车能耗: 0.75 kWh/km
   truck_energy_kwh_per_km: 0.75
   # 无人机评分能耗模型: physics(复用 drone.py 功率模型) / alpha(线性经验模型)
-  uav_energy_model: physics
+  uav_energy_model: alpha
   # 无人机能耗: alpha_k in Wh/(kg·km)
   # 仅在 uav_energy_model=alpha 时生效
   uav_alpha_wh_per_kg_km: 0.24

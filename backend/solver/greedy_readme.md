@@ -2,7 +2,7 @@
 
 ## 1. 这个贪心算法在做什么？
 
-当前版本的贪心求解器是 `GreedyBaseline`（见 `backend/solver/greedy_baseline.py`），核心目标是：
+当前版本的贪心求解器是 `GreedyMMCE`（见 `backend/solver/greedy_mmce.py`），核心目标是：
 
 1. 尽快给每个待分配订单找到一个可执行模式（优先空地协同）。
 2. 在分配时做前瞻能量校验，避免“派得出去但回不来”的无人机任务。
@@ -15,7 +15,7 @@
 
 ## 2. 算法大致流程（当前实现）
 
-在 `GreedyBaseline.dispatch()` 里，流程分三阶段：
+在 `GreedyMMCE.dispatch()` 里，流程分三阶段：
 
 ### Phase 1: 订单排序
 
@@ -98,14 +98,14 @@ $$
 
 `DispatchDecisionEngine`（`backend/solver/decision_engine.py`）负责：
 
-1. 调用 `GreedyBaseline.dispatch()` 生成方案。
+1. 调用 `GreedyMMCE.dispatch()` 生成方案。
 2. 把分配写回订单状态机（`pending -> assigned -> ...`）。
 3. 把卡车/无人机路径下发到实体对象。
 4. 输出日志给前端展示。
 
 可以理解为：
 
-- `greedy_baseline.py` = “算方案”
+- `greedy_mmce.py` = “算方案”
 - `decision_engine.py` = “执行方案”
 
 ---
@@ -119,7 +119,7 @@ $$
 ```text
 backend/solver/
   decision_engine.py              # 统一编排入口
-  greedy_baseline.py              # 当前贪心基线
+  greedy_mmce.py                  # 当前贪心基线
   algorithms/                     # 新算法目录（建议新增）
     alns_solver.py
     ga_solver.py
@@ -155,7 +155,7 @@ backend/solver/
 
 ## 6. 当前版本定位
 
-`GreedyBaseline` 适合做：
+`GreedyMMCE` 适合做：
 
 - 快速可运行 baseline
 - 联调实体状态机与前端可视化
