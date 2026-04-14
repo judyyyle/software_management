@@ -243,7 +243,7 @@ export const useSystemStore = defineStore('system', () => {
    */
   async function dispatch(
     bbox: { minx: number; miny: number; maxx: number; maxy: number },
-    solver: 'greedy' | 'greedy_mmce' | 'market' = 'greedy',
+    solver: 'greedy' | 'greedy_mmce' | 'greedy_mmce_bi' | 'market' = 'greedy',
   ) {
     if (DEBUG_WEBSOCKET) {
       console.log('[system.dispatch] 被调用，bbox:', bbox)
