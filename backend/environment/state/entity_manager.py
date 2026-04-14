@@ -68,6 +68,13 @@ class EntityManager:
 
         runtime_cfg = load_solver_energy_params()
         self.DRONE_SERVICE_TIME_ORDER = runtime_cfg.drone_service_time_order_s
+        # 停靠触发容差：recovery/station 采用更宽容阈值，降低路网几何误差导致的漏触发。
+        self.STOP_PROXIMITY_BASE_M = 15.0
+        self.STOP_PROXIMITY_SPEED_FACTOR = 1.5
+        self.RECOVERY_PROXIMITY_BASE_M = 45.0
+        self.RECOVERY_PROXIMITY_SPEED_FACTOR = 4.0
+        # 超过该时长仍未命中的 recovery/station 视作过期，跳过以避免阻塞后续 customer 完成事件。
+        self.STALE_RECOVERY_SKIP_S = 20.0
 
     # ══════════════════════════════════════════════════════════════════════════
     # 初始化
@@ -546,6 +553,19 @@ class EntityManager:
             if event_time > current_time + 1e-6:
                 break
             if not self._truck_is_near_stop(truck, stop):
+                if node_type in {"recovery", "station"}:
+                    departure_time = float(stop.get("departure_time", event_time))
+                    overdue_s = current_time - departure_time
+                    if overdue_s >= self.STALE_RECOVERY_SKIP_S:
+                        logger.warning(
+                            "[EntityManager] 卡车 %s 跳过过期%s停靠 %s（overdue=%.1fs），避免阻塞后续事件",
+                            truck.truck_id,
+                            node_type,
+                            stop.get("node_id", ""),
+                            overdue_s,
+                        )
+                        cursor += 1
+                        continue
                 # 到时但尚未到点：等待卡车物理位置追上，避免“按时间瞬移触发”。
                 break
             self._handle_truck_stop_event(truck, stop, current_time, order_mgr)
@@ -576,8 +596,12 @@ class EntityManager:
         stop_pos = stop.get("position")
         if stop_pos is None:
             return False
-        # 允许少量误差：至少 15m，且与车速相关。
-        tol_m = max(15.0, float(getattr(truck, "speed", 0.0)) * 1.5)
+        node_type = str(stop.get("node_type", ""))
+        speed = float(getattr(truck, "speed", 0.0))
+        if node_type in {"recovery", "station"}:
+            tol_m = max(self.RECOVERY_PROXIMITY_BASE_M, speed * self.RECOVERY_PROXIMITY_SPEED_FACTOR)
+        else:
+            tol_m = max(self.STOP_PROXIMITY_BASE_M, speed * self.STOP_PROXIMITY_SPEED_FACTOR)
         return truck.current_loc.distance_2d(stop_pos) <= tol_m
 
     def _handle_truck_stop_event(
