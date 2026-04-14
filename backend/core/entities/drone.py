@@ -320,6 +320,10 @@ class Drone:
         logger.debug("[Drone %s] 释放订单 %s。", self.drone_id, released_id)
         return released_id
 
+    def recharge_to_full(self) -> None:
+        """将电量立即补满到 battery_max。"""
+        self.battery_current = self.battery_max
+
     # ══════════════════════════════════════════════════════════════════════════
     # 电量与可达性
     # ══════════════════════════════════════════════════════════════════════════
