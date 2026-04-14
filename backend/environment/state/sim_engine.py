@@ -67,7 +67,7 @@ class SimulationEngine:
         self._first_pending_incremental_sim_time: float = -1e9
         # 动态调度节流参数：最短间隔 + 防抖 + 最长等待，减少高频重规划抖动。
         self._incremental_dispatch_min_interval_s: float = 2.0
-        self._incremental_dispatch_debounce_s: float = 1.0
+        self._incremental_dispatch_debounce_s: float = 0.0
         self._incremental_dispatch_max_wait_s: float = 5.0
 
     # ══════════════════════════════════════════════════════════════════════════

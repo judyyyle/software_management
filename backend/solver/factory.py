@@ -12,6 +12,7 @@ from typing import Any, Callable
 
 from solver.greedy_baseline import GreedyBaseline
 from solver.greedy_mmce import GreedyMMCE
+from solver.greedy_mmce_bi import GreedyMMCEBackboneInsertion
 from solver.market_based_solver import MarketBasedSolver
 from solver.interfaces import DispatchSolver
 
@@ -22,6 +23,9 @@ SolverBuilder = Callable[[Any], DispatchSolver]
 _SOLVER_BUILDERS: dict[str, SolverBuilder] = {
     "greedy": lambda entity_mgr: GreedyBaseline(entity_mgr),
     "greedy_mmce": lambda entity_mgr: GreedyMMCE(entity_mgr),
+    "greedy_mmce_bi": lambda entity_mgr: GreedyMMCEBackboneInsertion(entity_mgr),
+    "mmce_backbone_insertion": lambda entity_mgr: GreedyMMCEBackboneInsertion(entity_mgr),
+    "mmce-bi": lambda entity_mgr: GreedyMMCEBackboneInsertion(entity_mgr),
     "market": lambda entity_mgr: MarketBasedSolver(entity_mgr),
 }
 
