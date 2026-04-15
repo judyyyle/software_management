@@ -21,7 +21,10 @@
         <span class="umap-legend__pin" style="background:#6d28d9">🕐</span>待分配订单
       </div>
       <div class="umap-legend__item">
-        <span class="umap-legend__pin" style="background:#0369a1">📍</span>配送中订单
+        <span class="umap-legend__pin" style="background:#0369a1">📍</span>卡车配送订单
+      </div>
+      <div class="umap-legend__item">
+        <span class="umap-legend__pin" style="background:#0284c7">🚀</span>无人机配送订单
       </div>
       <div class="umap-legend__item">
         <span class="umap-legend__pin" style="background:#16a34a">✅</span>已完成订单
