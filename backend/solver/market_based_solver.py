@@ -177,6 +177,7 @@ class MarketBasedSolver(GreedyMMCE):
         self._anchor_preview_routes: dict[str, object] = {}
         self._active_contracts: list[RendezvousContract] = []
         self._contract_seq = 0
+        self._current_round_bdynamic_launches: list[tuple[str, str, float]] = []
         # 订单视图仅用于市场约束（不可撤销、清空校验等），由 DispatchDecisionEngine 注入，避免挂在 EntityManager 上。
         self._order_mgr: Any = None
 
@@ -338,12 +339,14 @@ class MarketBasedSolver(GreedyMMCE):
         """执行一轮市场拍卖调度（全量批次），并在 summary 中附加拍卖统计信息。"""
         self._auction_bid_count = 0
         self._auction_award_count = 0
+        self._current_round_bdynamic_launches.clear()
         self._anchor_preview_routes = {}
         self._expire_contracts(current_time)
         self._try_flexible_recovery(current_time)
         self._prepare_anchor_preview_routes(pending_orders, current_time, bbox, scene_id)
 
         plan = super().dispatch(pending_orders, current_time, bbox, scene_id=scene_id)
+        self._patch_missing_truck_routes(plan, current_time, bbox, scene_id, return_to_depot=True)
         self._recalculate_actual_plan_costs(plan, pending_orders, current_time)
         plan.summary["solver"] = "market"
         plan.summary["auction_stats"] = {
@@ -387,6 +390,7 @@ class MarketBasedSolver(GreedyMMCE):
         """
         self._auction_bid_count = 0
         self._auction_award_count = 0
+        self._current_round_bdynamic_launches.clear()
         self._expire_contracts(current_time)
         self._try_flexible_recovery(current_time)
 
@@ -405,7 +409,8 @@ class MarketBasedSolver(GreedyMMCE):
         if not self._anchor_preview_routes:
             self._prepare_anchor_preview_routes(filtered_orders, current_time, bbox, scene_id)
 
-        plan = super().dispatch(filtered_orders, current_time, bbox, scene_id=scene_id)
+        plan = super().dispatch_incremental(filtered_orders, current_time, bbox, scene_id=scene_id)
+        self._patch_missing_truck_routes(plan, current_time, bbox, scene_id, return_to_depot=False)
         self._recalculate_actual_plan_costs(plan, filtered_orders, current_time)
         plan.summary["solver"] = "market"
         plan.summary["dispatch_type"] = "incremental"
@@ -450,6 +455,61 @@ class MarketBasedSolver(GreedyMMCE):
     def get_active_contracts(self) -> list[RendezvousContract]:
         """返回当前契约列表，供编排层统一兑现。"""
         return self._active_contracts
+
+    def _patch_missing_truck_routes(
+        self,
+        plan: DispatchPlan,
+        current_time: float,
+        bbox: dict,
+        scene_id: str | None,
+        return_to_depot: bool,
+    ) -> None:
+        """补充生成只被分配了 B_DYNAMIC 任务导致被 GreedyMMCE 基类误跳过的卡车路线。"""
+        missing_truck_ids = set()
+        for truck in self.entity_mgr.trucks.values():
+            if truck.truck_id in plan.truck_routes:
+                continue
+            needs_routing = False
+            for v_id, s_id, _ in getattr(self, "_current_round_bdynamic_launches", []):
+                if v_id == truck.truck_id and s_id:
+                    needs_routing = True
+                    break
+            if not needs_routing:
+                for drone in self.entity_mgr.drones.values():
+                    if getattr(drone, "transport_truck_id", None) == truck.truck_id:
+                        if getattr(drone, "launch_station_id", ""):
+                            needs_routing = True
+                            break
+            if needs_routing:
+                missing_truck_ids.add(truck.truck_id)
+
+        if not missing_truck_ids:
+            return
+
+        road_graph, nodes = self._load_road_graph_for_market(bbox, scene_id)
+        if not road_graph or not nodes:
+            return
+
+        for truck_id in missing_truck_ids:
+            truck = self.entity_mgr.trucks.get(truck_id)
+            if not truck:
+                continue
+            try:
+                route = self._build_truck_route(
+                    truck=truck,
+                    orders=[],
+                    recovery_station_ids=[],
+                    current_time=current_time,
+                    road_graph=road_graph,
+                    nodes=nodes,
+                    recovery_station_wait_times=None,
+                    start_pos=truck.get_location(current_time),
+                    return_to_depot=return_to_depot,
+                )
+                plan.truck_routes[truck_id] = route
+                logger.info("[MarketBasedSolver] 已为被基类跳过的卡车 %s 补建 B_DYNAMIC/无人机 起飞路网", truck_id)
+            except Exception as exc:
+                logger.warning("[MarketBasedSolver] 补建卡车 %s 路网失败: %s", truck_id, exc)
 
     # ══════════════════════════════════════════════════════════════════════════
     # 成本重算（总体能耗公式不变）
@@ -1020,8 +1080,69 @@ class MarketBasedSolver(GreedyMMCE):
                 return
 
     # ══════════════════════════════════════════════════════════════════════════
-    # 锚点预览路线
+    # 锚点预览路线与卡车路线构建
     # ══════════════════════════════════════════════════════════════════════════
+
+    def _build_truck_route(
+        self,
+        truck: "Truck",
+        orders: list["Order"],
+        recovery_station_ids: list[str],
+        current_time: float,
+        road_graph: Any,
+        nodes: Any,
+        recovery_station_wait_times: dict[str, float] | None = None,
+        start_pos: "Position3D | None" = None,
+        return_to_depot: bool = True,
+    ):
+        """重写 _build_truck_route 以修复基类对 B_DYNAMIC 起飞站点的遗漏。"""
+        if recovery_station_wait_times is None:
+            recovery_station_wait_times = {}
+
+        # 1. 注入本轮新分配给该卡车的 B_DYNAMIC 起飞站点
+        added_stations = []
+        for v_id, s_id, wait_time in getattr(self, "_current_round_bdynamic_launches", []):
+            if v_id == truck.truck_id and s_id:
+                if s_id not in recovery_station_ids:
+                    recovery_station_ids.append(s_id)
+                    added_stations.append(s_id)
+                res_wait = recovery_station_wait_times.get(s_id, 0.0)
+                recovery_station_wait_times[s_id] = max(res_wait, wait_time)
+
+        # 2. 防御性补丁：将已锁定的活跃契约的停靠锚点强制补充进 recovery 列表，防止部分重排逻辑漏掉
+        for contract in self._get_truck_contracts(truck.truck_id):
+            if contract.anchor_id and contract.anchor_id not in recovery_station_ids:
+                recovery_station_ids.append(contract.anchor_id)
+                added_stations.append(contract.anchor_id)
+            if contract.launch_anchor_id and contract.launch_anchor_id not in recovery_station_ids:
+                recovery_station_ids.append(contract.launch_anchor_id)
+                added_stations.append(contract.launch_anchor_id)
+
+        # 3. 防防御性补丁 2：检查当前挂载在本车上尚未起飞的无人机目标站（补偿跨批次 B_DYNAMIC 任务）
+        for drone in self.entity_mgr.drones.values():
+            if getattr(drone, "transport_truck_id", None) == truck.truck_id:
+                s_id = getattr(drone, "launch_station_id", "")
+                if s_id and s_id not in recovery_station_ids:
+                    recovery_station_ids.append(s_id)
+                    added_stations.append(s_id)
+
+        if added_stations:
+            logger.debug(
+                "[MarketBasedSolver] 为卡车 %s 补充路径必须途径站点(B_DYNAMIC起飞站/契约锚点): %s",
+                truck.truck_id, added_stations
+            )
+
+        return super()._build_truck_route(
+            truck=truck,
+            orders=orders,
+            recovery_station_ids=recovery_station_ids,
+            current_time=current_time,
+            road_graph=road_graph,
+            nodes=nodes,
+            recovery_station_wait_times=recovery_station_wait_times,
+            start_pos=start_pos,
+            return_to_depot=return_to_depot,
+        )
 
     def _prepare_anchor_preview_routes(
         self,
@@ -1237,6 +1358,10 @@ class MarketBasedSolver(GreedyMMCE):
         # 把当前中标无人机记录进屏蔽列表，不依赖父类greedy_mmce，避免B_DYNAMIC在父类漏判导致一机多单
         if best.feasible and best.drone_id and best.mode != "A":
             allocated_drones.add(best.drone_id)
+            if best.mode == "B_DYNAMIC" and best.launch_station_id:
+                self._current_round_bdynamic_launches.append(
+                    (best.vehicle_id, best.launch_station_id, self.TRUCK_DRONE_LAUNCH_TIME)
+                )
 
         return best
 
@@ -2004,9 +2129,17 @@ class MarketBasedSolver(GreedyMMCE):
                 if not self.should_truck_return_to_depot(truck_id):
                     logger.warning(
                         "[MarketBasedSolver][Closure] 卡车 %s 计划提前返回仓库，"
-                        "但仍有活跃任务/契约未完成，不应生成回仓信号",
+                        "但仍有活跃任务/契约未完成，正在移除回仓信号",
                         truck_id,
                     )
+                    # 移除最后一个 _return 节点
+                    route.nodes.pop()
+                    if plan.allocations:  # 尝试将卡车的总距离等还原一下（粗略）
+                        route.total_distance = sum(
+                            route.geometry[i - 1].distance_2d(route.geometry[i])
+                            for i in range(1, len(route.geometry))
+                            # 但完整的卡车几何路径不好裁剪，我们简单处理：后续逻辑由 decision engine 控制物理轨迹
+                        )
 
     def _estimate_relay_remaining_energy(self, drone, relay_origin) -> float:
         """估算无人机到达串联起点时的剩余电量。"""
