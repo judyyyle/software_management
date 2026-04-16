@@ -546,35 +546,42 @@ class DispatchDecisionEngine:
                 existing_future_keys.add(key)
 
         if not new_stops:
-            # 即便无新增停靠，也需要应用本批次后缀时序（例如 recovery 等待时长更新）。
-            refreshed_stops = [
-                {
-                    "node_id": node.node_id,
-                    "node_type": node.node_type,
-                    "position": node.position,
-                    "arrival_time": node.arrival_time,
-                    "departure_time": node.departure_time,
-                    "order_id": node.order_id,
-                }
-                for node in new_route.nodes
-                if node.node_type in ("customer", "recovery", "station")
-            ]
-            if refreshed_stops:
-                truck._planned_route_stops = existing_stops[:cursor] + refreshed_stops
-                try:
+            # 即便无新增停靠，也需要应用本批次后缀更新（例如 recovery 等待时长更新）。
+            # 只更新已有 future_stops 的时间，切勿截断其他未来停靠点。
+            refreshed_future = [dict(stop) for stop in future_stops]
+            for node in new_route.nodes:
+                if node.node_type in ("customer", "recovery", "station"):
+                    node_key = _stop_key({"node_type": node.node_type, "node_id": node.node_id})
+                    for stop in refreshed_future:
+                        if _stop_key(stop) == node_key:
+                            # 累加等待时间或取最大值，保持原有业务逻辑（至少确保 departure_time 合理）
+                            stop["departure_time"] = max(
+                                float(stop.get("departure_time", 0)),
+                                float(node.departure_time)
+                            )
+            
+            truck._planned_route_stops = existing_stops[:cursor] + refreshed_future
+            # 重新构建物理路由，保证旧停靠点不丢失
+            try:
+                rebuilt_route = self.solver.build_incremental_route_from_stops(
+                    truck,
+                    refreshed_future,
+                    current_time,
+                )
+                if rebuilt_route and len(rebuilt_route.nodes) >= 2:
                     truck.set_route(
-                        [n.node_id for n in new_route.nodes],
-                        [n.position for n in new_route.nodes],
+                        [n.node_id for n in rebuilt_route.nodes],
+                        [n.position for n in rebuilt_route.nodes],
                         current_time,
-                        geometry=new_route.geometry,
+                        geometry=rebuilt_route.geometry,
                     )
-                except Exception as e:
-                    logger.exception(
-                        "[DispatchDecisionEngine] 增量无新增停靠时应用后缀失败 %s: %s",
-                        truck.truck_id,
-                        e,
-                    )
-                self._sync_waiting_drone_launch_times_for_truck(truck, current_time)
+            except Exception as e:
+                logger.exception(
+                    "[DispatchDecisionEngine] 增量无新增停靠时应用后缀失败 %s: %s",
+                    truck.truck_id,
+                    e,
+                )
+            self._sync_waiting_drone_launch_times_for_truck(truck, current_time)
             logger.info(
                 "[DispatchDecisionEngine] 增量模式卡车 %s 无新增停靠，已刷新后缀时序",
                 truck.truck_id,
