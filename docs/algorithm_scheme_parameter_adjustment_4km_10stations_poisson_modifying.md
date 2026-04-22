@@ -186,6 +186,256 @@ P0 阶段不应再以“抽象 4km 场景”表述，而应改成：
 - 无人机场景下的 `drone_id`
 - 无人机场景下的 `recovery_station_id`
 
+### 2.4 必须先补齐的环境语义闭环
+
+旧文档主要提供了参数调优建议，但离线训练与离线验证真正落地前，还必须先把“问题定义 -> 环境语义 -> 动作约束 -> 奖励与验证指标”补成闭环。当前阶段至少要明确 4 个方面：
+
+1. 模式 C 的合法回收动作语义
+2. 错过卡车后的软失败 / 硬失败机制
+3. 主目标与奖励函数的严格对应关系
+4. FIFO、工位容量、等待、终端清场的状态变量与事件逻辑
+
+### 2.4.1 模式 C 的正式语义修正
+
+模式 C 不再保留“返回最近卡车”这种容易引发误解的表述，而应正式改写为：
+
+- 无人机从仓库出发执行配送
+- 配送完成后，不允许飞向道路中途的运动中卡车本体
+- 无人机只能返回“卡车未来将经过的合法交接节点”
+
+这里的合法交接节点只允许是：
+
+- `depot`
+- `station`
+
+因此，“返回卡车”在本方案中的唯一合法解释是：
+
+- 返回卡车未来路径中的某个仓库或充换电站节点
+- 由该节点完成回收、换电或重新挂载
+
+### 2.4.2 模式 C 回收动作的保留条件
+
+对任一模式 C 返程候选回收点 `r_j`，动作至少需要同时满足以下条件，才能进入候选动作集并保留在 `action_mask` 中：
+
+1. `r_j` 是卡车未来将经过的合法节点
+   - `node_type(r_j) ∈ {station, depot}`
+   - `ETA_truck(r_j) > t_deliver`
+
+2. 无人机到达时序早于卡车
+   - `ETA_uav(deliver -> r_j) + delta_safe <= ETA_truck(r_j)`
+   - 其中 `delta_safe` 是防止“理论刚好赶上、实现里错过”的安全裕度
+
+3. 无人机剩余电量足以支撑返程
+   - `E_need(deliver -> r_j) + E_safe <= E_rem`
+   - 其中 `E_safe` 为返程电量安全余量
+
+### 2.4.3 模式 C 的回收优先级与保底规则
+
+订单送达后，返程回收目标按以下顺序判断：
+
+1. 首选满足时序与电量约束的“卡车未来合法交接节点”
+2. 若不存在这样的节点，则尝试返回仓库
+3. 若仓库也不可达，则直接飞往最近可达充换电站
+4. 若连任何合法安全节点都不可达，则记为硬失败
+
+这里需要特别保留你的业务语义：
+
+- 如果无人机返程时，电量不足以支撑到最近汇合点与仓库，则直接飞往最近可达充换电站
+- 如果最近可达充换电站也不可达，则不能再保留该动作，应直接进入硬失败
+
+### 2.4.4 错过卡车后的状态与惩罚
+
+“错过卡车”发生在无人机已经完成送货之后的返程阶段，因此要与“订单未完成”严格区分。
+
+正式定义如下：
+
+1. 订单状态
+   - 订单保持 `delivered`
+   - 不回滚为未完成
+
+2. 失败语义
+   - 失败的是“返程回收子任务”
+   - 不是订单交付本身失败
+
+3. 触发条件
+   - 无人机已选择某个卡车未来合法交接节点作为返程目标
+   - 但推进过程中出现 `ETA_uav(r_j) > ETA_truck(r_j)` 或卡车已离开该节点
+
+4. 状态转移
+   - 无人机进入 `fallback_recovery`
+   - 重新选择最近可达合法安全节点作为后续目标
+
+### 2.4.5 软失败与硬失败的正式定义
+
+本方案将返程失败拆成两类：
+
+#### A. 软失败：错过卡车但仍可自救
+
+触发条件：
+
+- 无人机已完成送货
+- 错过原定回收节点上的卡车
+- 仍可飞往某个后续合法安全节点
+
+后续目标选择顺序：
+
+1. 最近可达充换电站
+2. 若仓库可达且更优，也可回仓库
+
+软惩罚定义为：
+
+- `soft_miss_penalty = lambda_miss * T_fallback`
+
+其中：
+
+- `T_fallback` 为无人机从“确认错过卡车”的时刻起，飞往下一个目标地所用时间
+- 这与当前业务要求一致，即“无人机失败后飞往下一个目标地所用时间乘上惩罚系数”
+
+#### B. 硬失败：空中能源失效 / 无合法安全节点可达
+
+触发条件：
+
+- 无人机当前不在 `station` / `truck` / `depot`
+- 剩余电量不足以飞往任何下一个合法充换电站或仓库
+- 或者已经出现半空中停电
+
+硬失败定义为：
+
+- `airborne_energy_failure`
+
+硬惩罚应同时具有两层含义：
+
+1. 状态层面
+   - 该无人机进入不可继续执行状态
+   - 后续不再参与当前 episode 内的可用无人机集合
+
+2. 目标层面
+   - 记为大惩罚项，且量级应显著高于普通等待或排队惩罚
+
+### 2.4.6 主目标函数的统一定义
+
+当前方案的主目标正式定义为：
+
+- `总完成时间 + 小惩罚项 + 大惩罚项`
+
+其中不再把距离、能耗、slack bonus 等代理项与主目标并列混写。距离和能耗仍可作为：
+
+- 状态特征
+- 候选动作可行性评估量
+- 调试与诊断指标
+
+但不应继续作为与主目标并列的第一层优化目标。
+
+建议将主目标统一写成：
+
+```text
+J =
+  T_complete
+  + lambda_wait * T_wait
+  + lambda_queue * T_queue
+  + lambda_miss * T_fallback
+  + Lambda_hard * N_hard_fail
+```
+
+其中：
+
+- `T_complete`：订单总完成时间或总完成时长汇总，实施时必须在环境中选定唯一口径并全程保持一致
+- `T_wait`：卡车与无人机互相等待时间总和；其中“无人机等待卡车”必须纳入小惩罚项
+- `T_queue`：无人机在充换电站点排队的总时间
+- `T_fallback`：错过卡车后飞往下一个站点或仓库所用总时间
+- `N_hard_fail`：无人机半空停电或剩余电量不足以飞往任何合法安全节点的事件数
+
+这里的设计要求是：
+
+1. 小惩罚项必须是主目标的组成部分，而不是游离的代理奖励
+2. 大惩罚项必须明显高一个量级，防止策略通过“赌电量”换取局部时间收益
+3. 离线验证指标必须直接回到这套主目标及其分解项上，而不是只看 PPO reward
+
+### 2.4.7 必须落到环境中的状态变量与事件逻辑
+
+为了保证上述语义可执行，环境层必须至少显式维护以下状态：
+
+1. 无人机状态
+   - `idle`
+   - `flying_to_deliver`
+   - `delivered`
+   - `return_to_rendezvous`
+   - `return_to_depot`
+   - `return_to_station`
+   - `queueing_at_station`
+   - `charging_or_swap`
+   - `fallback_recovery`
+   - `recovered`
+   - `airborne_energy_failure`
+
+2. 站点状态
+   - 当前占用工位数
+   - FIFO 队列
+   - 每架无人机入队时刻
+
+3. 卡车状态
+   - 当前节点
+   - 未来路径节点序列
+   - 各未来合法站点 `ETA`
+
+### 2.4.8 必须显式处理的关键事件
+
+环境实现不应只停留在参数层，而应最少实现以下关键事件：
+
+1. 订单送达
+   - 订单记为完成
+   - 无人机进入返程决策
+
+2. 返程回收点选择
+   - 构造未来合法回收节点集合
+   - 做时序与电量可行性筛选
+   - 选择 rendezvous / depot / nearest reachable station / hard failure
+
+3. 卡车到站
+   - 若对应无人机已在场等待，则完成回收
+   - 若无人机尚未到达，则继续按规则推进并可能触发 miss
+
+4. 无人机到达站点
+   - 若卡车在场则回收
+   - 若卡车未到且允许等待，则进入等待状态
+   - 若需要换电或充电，则进入 FIFO 队列
+
+5. 错过卡车
+   - 订单不回滚
+   - 无人机进入 `fallback_recovery`
+   - 增加软惩罚
+
+6. 硬失败
+   - 无人机进入 `airborne_energy_failure`
+   - 记录大惩罚
+   - 从后续可用集合中移除
+
+### 2.4.9 FIFO、工位容量与终端清场要求
+
+FIFO、工位容量、站点等待和终端清场不应再只作为参数存在，而应在环境中形成正式规则：
+
+1. `parking_slots` 决定站点可同时服务的无人机数量
+2. 超过容量的无人机必须进入 FIFO 队列
+3. `swap_time` / `charge_time` 结束后释放工位，并唤醒队首无人机
+4. 站点等待时间必须从“入队时刻到开始服务时刻”精确累计
+5. episode 结束时必须清点：
+   - 已完成订单
+   - 超时订单
+   - 仍在返程中的无人机
+   - 仍在排队中的无人机
+   - 仍在等待卡车的无人机
+   - 已发生硬失败的无人机
+
+### 2.4.10 对环境推进方式的要求
+
+上述语义对 `ETA`、赶上/错过卡车、FIFO 等都高度敏感，因此离线训练和离线验证的环境层建议采用“事件驱动或至少准事件驱动”的推进方式。
+
+不建议把这些过程全部粗化成固定大时间步近似，否则会引入大量伪 miss / 伪 catch 事件，导致：
+
+- `action_mask` 不稳定
+- reward 噪声增大
+- 训练与验证结果缺乏物理一致性
+
 ---
 
 ## 3. 参数体系重构（结合当前项目实际情况修正）
@@ -404,15 +654,13 @@ alns:
   operator_update_every: 40
 
 reward:
-  objective_weight_truck_dist: 1.0
-  objective_weight_uav_dist: 1.0
-  objective_weight_truck_energy: 1.0
-  objective_weight_uav_energy: 1.0
-  objective_weight_time: 10.0
-  queue_penalty_coef: 0.20
-  overdue_penalty_coef: 1.80
-  slack_reward_coef: 1.20
-  nearby_station_bonus_coef: 0.40
+  completion_time_coef: 1.0
+  wait_penalty_coef: 0.10
+  queue_penalty_coef: 0.10
+  miss_fallback_time_penalty_coef: 0.15
+  hard_failure_penalty_coef: 10.0
+  rendezvous_eta_safe_margin_sec: 15
+  energy_safe_margin_ratio: 0.10
 
 training:
   ppo_learning_rate: 0.0001
@@ -430,6 +678,20 @@ curriculum:
   swap_time_noise: 0.0
 ```
 
+这里需要强调 3 点：
+
+1. 上述 `reward` 段已经按新的主目标重写
+   - 主目标是“总完成时间 + 小惩罚项 + 大惩罚项”
+   - 不再把距离权重和能耗权重作为第一层主目标参数
+
+2. 距离、能耗相关量仍然保留工程价值
+   - 它们可以继续作为状态特征、可行性评估量、日志指标与离线分析指标
+   - 但不再作为当前主目标的第一层优化系数
+
+3. `rendezvous_eta_safe_margin_sec` 与 `energy_safe_margin_ratio` 必须进入配置
+   - 前者用于防止“理论刚好赶上、实现里错过”
+   - 后者用于防止模式 C 返程动作在电量上过于激进
+
 ### 3.3.1 4km × 4km 场景下的关键推荐值
 
 结合旧文档和当前项目，推荐先使用下面这一组首轮联调参数：
@@ -446,6 +708,12 @@ curriculum:
 | `candidate.max_candidate_actions` | `160` | 回收候选增加后给动作空间留余量 |
 | `alns.iters` | `250` | 高频重规划下每轮求解不宜过重 |
 | `alns.destroy_ratio` | `0.12` | 降低破坏强度，减少高频重规划抖动 |
+| `reward.rendezvous_eta_safe_margin_sec` | `15` | 给模式 C 回收动作保留最小时间安全余度 |
+| `reward.energy_safe_margin_ratio` | `0.10` | 防止返程阶段过度压榨剩余电量 |
+| `reward.wait_penalty_coef` | `0.10` | 将卡车/无人机互等纳入小惩罚项 |
+| `reward.queue_penalty_coef` | `0.10` | 将站点排队纳入小惩罚项 |
+| `reward.miss_fallback_time_penalty_coef` | `0.15` | 用于错过卡车后的返程软惩罚 |
+| `reward.hard_failure_penalty_coef` | `10.0` | 对半空停电或无安全节点可达施加大惩罚 |
 
 ### 3.3.2 关于 `map_width_m/map_height_m` 的修正结论
 
@@ -687,6 +955,7 @@ curriculum:
 - 能生成训练 episode
 - 能导出首版权重
 - 能导出 `meta.json` 并供前端/后端在线接入时复用
+- 能按第 2.4 节的模式语义、失败机制和事件逻辑稳定推进
 
 ### 4.1.1 离线优先的 SUMO 可视化验证链路
 
@@ -857,6 +1126,31 @@ curriculum:
 3. 后端读取同一份 `meta.json`，对 `order_gen_config`、`entities`、`bbox`、`solver` 做一致性校验
 4. 若校验失败，接口应明确返回“模型版本与在线参数不匹配”
 
+## 5.7 当前最大的剩余风险不是工程接入，而是环境语义未闭环
+
+现状：
+
+- 旧文档更偏参数调优
+- 如果不先把模式 C、错过卡车、FIFO 队列和主目标写成正式规则，后续 `env_adapter`、`candidate_builder`、`validate_*` 都会各自实现一套理解
+
+问题：
+
+- 这会直接导致训练出来的权重与问题定义脱节
+- 表面上“训练能跑通”，但离线验证和线上推理都可能出现物理语义不一致
+
+修正建议：
+
+1. 把第 2.4 节视为离线训练前必须冻结的环境语义契约
+2. `action_mask` 必须按模式 C 合法回收条件裁剪
+3. `compute_reward()` 必须与第 2.4.6 节的主目标一一对应
+4. `SimulationEngine` 或离线训练环境必须显式支持 FIFO、工位容量、等待与终端清场
+5. benchmark 与 stochastic 两类验证都必须单独输出：
+   - miss 次数
+   - fallback 次数
+   - hard failure 次数
+   - 站点排队时间
+   - 无人机等待卡车时间
+
 ---
 
 ## 6. 实施优先级清单
@@ -865,14 +1159,16 @@ curriculum:
 
 1. 新增 `backend/config/rh_alns_cmrappo.yaml`
 2. 新增对应 loader
-3. 新增 `train_cmrappo.py`，先形成离线训练最小闭环
-4. 训练阶段导出 `backend/weights/rh_alns_cmrappo/<version>/policy.pt`
-5. 训练阶段导出 `backend/weights/rh_alns_cmrappo/<version>/meta.json`
-6. 直接复用 `backend/test_data/default_scene` 作为首轮固定场景输入
-7. 增加“默认场景 OSM/SUMO 地图 + 当前设施分布算法”的离线场景生成链路
-8. 将 depot / station 坐标写入 SUMO additional 文件，在 `sumo-gui` 中先完成离线可视化复核
-9. 先基于 `orders.json.static_orders + dynamic_orders` 完成首轮离线推理/回放验证
-10. 确认固定 benchmark 结果可解释、可复现后，再扩展到随机泊松训练
+3. 按第 2.4 节冻结模式 C、错过卡车、主目标和 FIFO 事件逻辑
+4. 新增 `train_cmrappo.py`，先形成离线训练最小闭环
+5. 训练阶段导出 `backend/weights/rh_alns_cmrappo/<version>/policy.pt`
+6. 训练阶段导出 `backend/weights/rh_alns_cmrappo/<version>/meta.json`
+7. 直接复用 `backend/test_data/default_scene` 作为首轮固定场景输入
+8. 增加“默认场景 OSM/SUMO 地图 + 当前设施分布算法”的离线场景生成链路
+9. 将 depot / station 坐标写入 SUMO additional 文件，在 `sumo-gui` 中先完成离线可视化复核
+10. 先基于 `orders.json.static_orders + dynamic_orders` 完成首轮离线推理/回放验证
+11. benchmark 报告中必须输出 miss / fallback / hard failure / queue / wait 指标
+12. 确认固定 benchmark 结果可解释、可复现后，再扩展到随机泊松训练
 
 ## 6.2 P1（强烈建议）
 
@@ -918,6 +1214,13 @@ curriculum:
 1. 训练脚本可运行并保存权重
 2. 权重可被后端加载
 3. 至少保存一组可复现实验元数据
+4. `action_mask` 不会保留物理非法的模式 C 回收动作
+5. 训练与验证报告能单独解释：
+   - 错过卡车次数
+   - fallback 时间
+   - 站点排队时间
+   - 无人机等待卡车时间
+   - 硬失败次数
 
 ---
 
@@ -954,15 +1257,23 @@ curriculum:
    - 后端负责最终强校验
    - 这样才能真正保证“训练时参数”和“上线时参数”统一
 
+8. 当前方案中最需要补齐的不是更多调参项，而是环境语义闭环
+   - 模式 C 必须限定为“返回卡车未来合法交接节点”
+   - 错过卡车必须拆成软失败与硬失败
+   - 主目标必须统一为“总完成时间 + 小惩罚 + 大惩罚”
+   - FIFO、工位容量、等待与清场必须进入正式事件逻辑
+
 ---
 
 ## 9. 下一步建议
 
 推荐按以下顺序推进：
 
-1. 先补 `rh_alns_cmrappo.yaml + loader + solver skeleton`
-2. 再补工厂注册和前端算法枚举
-3. 跑通“在线推理返回可视化结果”的最小闭环
-4. 最后补训练脚本、权重加载、自适应重规划和课程学习
+1. 先冻结第 2.4 节的环境语义，并同步到 `env_adapter` / `candidate_builder` 的设计
+2. 再补 `rh_alns_cmrappo.yaml + loader + 训练环境骨架`
+3. 基于 `default_scene` 先跑固定 benchmark 的离线训练与离线验证
+4. 用 SUMO 完成离线可视化复核
+5. 固定 benchmark 稳定后，再扩展到随机泊松训练
+6. 最后再做后端 solver 接入、前端枚举和参数锁定 UI
 
-这样能最大程度复用当前项目架构，同时避免把旧文档中的抽象参数直接照搬到当前代码里造成命名和实现脱节。
+这样能先把“问题定义正确性”与“平台联调正确性”拆开，避免在环境语义尚未冻结时过早进入前后端接入阶段。
