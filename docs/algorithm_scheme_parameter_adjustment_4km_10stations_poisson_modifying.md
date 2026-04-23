@@ -97,6 +97,50 @@
 - 本次调整不是推翻平台结构；
 - 而是在既有平台上重构“策略层”与“重规划层”的职责分工。
 
+### 1.3 基于当前项目真实资产的参数标定依据
+
+为避免参数停留在抽象推荐值，本方案后续采用的关键默认值，统一以当前仓库内真实资产为标定依据：
+
+1. 地图尺度
+   - `scene_config.json.bounds` 对应的实测宽高约为 `4011.5m × 4011.5m`
+
+2. 站点空间分布
+   - 站点最近邻间距最小/均值/最大约为 `720m / 949m / 1479m`
+   - depot 到各 station 的距离最小/均值/最大约为 `1018m / 2207m / 3279m`
+
+3. 订单空间分布
+   - depot 到订单的一跳距离最小/均值/最大约为 `613m / 2201m / 3406m`
+   - 订单到最近 station 的距离最小/均值/最大约为 `203m / 500m / 869m`
+
+4. 动态订单强度
+   - `default_scene/orders.json.dynamic_orders` 的 `10` 个动态单分布在 `120s ~ 1740s`
+   - 其 benchmark 强度约为 `0.33 ~ 0.37 单/分钟`
+   - 因而本文把 `arrival_rate ≈ 0.35~0.40/min` 作为首轮默认动态强度，是有项目内数据支撑的，不是凭空设定
+
+5. 真实运载能力约束
+   - 全部 `20` 个 benchmark 订单中：
+     - 仅 `7` 个订单可由 `LightDrone` 承运
+     - `16` 个订单可由 `HeavyDrone` 承运
+     - 有 `4` 个订单超过 `HeavyDrone.payload_capacity=10kg`
+   - 这说明 `mode A` 在当前项目里不是边缘模式，而是刚性必要模式，不能并入 UAV local policy
+
+6. 真实速度与续航约束
+   - 当前共享配置中：
+     - `truck.speed = 15 m/s`
+     - `light_drone.cruise_speed = 20 m/s`
+     - `heavy_drone.cruise_speed = 15 m/s`
+   - 轻型机满载理论航程约 `31km`，重型机满载理论航程约 `32km`
+   - 这意味着当前 4km 场景下，电量约束更多体现为“安全余量 + 回收链路合法性”，而不是“平飞距离绝对不够”
+
+7. 站点切换时间量级
+   - 按当前真实速度估算，切换到最近邻 station 的平均时间约为：
+     - `LightDrone ≈ 47s`
+     - `HeavyDrone ≈ 63s`
+   - `HeavyDrone` 的最大最近邻切换时间约 `99s`
+   - 因此，只要某站的预测等待时间达到 `240s` 量级，继续死等通常就不再划算
+
+本节结论会直接约束后文的 `support_radius_km`、`station_wait_threshold_sec`、`coarse_replan_interval_sec`、`mode A` 边界和 reward 标定。
+
 ---
 
 ## 2. 新架构总览：Phase 5 轻量替代为 RH-ALNS + Shared PPO-Lite
@@ -1146,7 +1190,7 @@ candidate:
   max_candidate_orders: 32
   max_candidate_recovery_per_order: 4
   max_candidate_actions: 128
-  station_wait_threshold_sec: 480
+  station_wait_threshold_sec: 240
   rendezvous_eta_safe_margin_sec: 15
   energy_safe_margin_ratio: 0.10
 
@@ -1172,7 +1216,7 @@ policy:
   shared_policy: true
   encoder_type: attn_lstm_lite
   d_model: 128
-  nhead: 4
+  nhead: 8
   ff_dim: 256
   lstm_hidden: 128
   lstm_layers: 1
@@ -1214,20 +1258,37 @@ curriculum:
 
 1. `coarse_replan_interval_sec = 420`
    - 让 RH-ALNS 明确退到低频层
+   - 按 benchmark 动态强度 `0.33~0.37/min` 估算，每 `420s` 平均新增约 `2.3~2.6` 单，恰好落在“每次粗规划处理约 2~3 个新单”的合理区间
 
 2. `coarse_new_order_trigger = 3`
-   - 对 `arrival_rate ≈ 0.4/min` 的泊松场景更合理
+   - 与上面的 `420s` 周期配套
+   - 不会因 1 个新单就频繁触发 RH-ALNS，也不会积压到 4~5 单才重规划
 
-3. `max_candidate_actions = 128`
-   - 兼顾订单、模式与回收节点展开后的动作空间
+3. `station_wait_threshold_sec = 240`
+   - 基于当前真实场景，最近邻站点切换平均只需 `47~63s`
+   - `240s` 约等于 `4` 个 `swap_time=60s` 服务周期，也约为一次平均换站成本的 `4~5` 倍
+   - 继续采用旧的 `480s` 会过度容忍单站死等，与 10 站点密集布局不匹配
 
-4. `hist_len = 6`
+4. `max_candidate_actions = 128`
+   - 在严格 gating、`mode A` 排除、factorized action 的前提下，`128` 足够覆盖首轮组合动作预算
+   - 对当前 benchmark 规模是稳健上限，不会过早因动作截断损失可行解
+
+5. `nhead = 8`
+   - 回归论文已验证的稳定默认值
+   - `d_model=128` 配 `8` 头时每头维度为 `16`，是标准而稳定的设置
+   - 在当前 token 数量级下，没有必要为了压缩模型而先退到 `4` 头
+
+6. `hist_len = 6`
    - 与论文中的时间窗口设置保持一致数量级
 
-5. `clip_coef = 0.2`
+7. `clip_coef = 0.2`
    - 与论文 PPO 设置一致，稳定且工程上常用
 
-6. `inference_mode = greedy`
+8. `hard_failure_penalty_sec = 1200`
+   - 当前 4km 场景下，一次严重但可恢复的 miss/fallback/queue 链通常在数百秒量级
+   - 取 `1200s` 能保证 hard failure 明显劣于任意单次可恢复扰动
+
+9. `inference_mode = greedy`
    - 明确线上默认策略，不再模糊
 
 ### 7.6 当前仅前端静态订单生成器生效的字段
