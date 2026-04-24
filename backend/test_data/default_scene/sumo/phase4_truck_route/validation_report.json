@@ -9,6 +9,8 @@
   "execution_stop_count": 7,
   "future_recovery_node_count": 2,
   "generated_files": [
+    "phase4_debug_trace.json",
+    "phase4_gui.view.xml",
     "poi.add.xml",
     "route_drift_ref.json",
     "truck_backbone_route.json",
