@@ -1,0 +1,34 @@
+{
+  "all_expected_customers_visited": true,
+  "all_expected_fixed_nodes_visited": true,
+  "all_segments_connected": true,
+  "backbone_node_count": 2,
+  "bounds_ok": true,
+  "eta_monotonic": true,
+  "execution_customer_count": 4,
+  "execution_stop_count": 7,
+  "future_recovery_node_count": 2,
+  "generated_files": [
+    "poi.add.xml",
+    "route_drift_ref.json",
+    "truck_backbone_route.json",
+    "truck_eta_map.json",
+    "truck_execution_route.json",
+    "truck_route.net.xml",
+    "truck_route.rou.xml",
+    "truck_route.sumocfg",
+    "validation_report.json"
+  ],
+  "max_snap_distance_m": 87.406766,
+  "min_future_fixed_nodes_ok": true,
+  "snap_within_warn_threshold": false,
+  "sumo_edge_sequence_non_empty": true,
+  "sumo_export_dir": "/Users/myx/Documents/GitHub/HiveLogix/backend/test_data/default_scene/sumo/phase4_truck_route",
+  "truck_order_count": 4,
+  "truck_order_ids": [
+    "ORD-STATIC-09",
+    "ORD-STATIC-03",
+    "ORD-STATIC-08",
+    "ORD-STATIC-06"
+  ]
+}

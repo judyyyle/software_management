@@ -102,9 +102,10 @@ class CoarsePlanView:
     # 本版 coarse plan 的理论有效截止时刻；超出后应考虑重规划。
     valid_until: SimTimeSec
 
-    # 卡车未来骨架路线的节点序列，作为 mode C、launch trigger、route drift 的参考基线。
+    # 卡车未来骨架路线的固定节点序列，作为 mode C、launch trigger、route drift 的参考基线。
+    # 仅包含未来会经过的固定交接节点（station / depot），不包含 customer。
     truck_backbone_route: tuple[NodeId, ...]
-    # 卡车到骨架路线各节点的参考 ETA（仿真秒）。
+    # 卡车到骨架路线各固定节点的参考 ETA（仿真秒）。
     truck_eta_map: Mapping[NodeId, EtaSec]
 
     # 当前 coarse planner 放行给 PPO 的订单子集；PPO 只能在该集合内选订单。
