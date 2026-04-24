@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -600,29 +601,58 @@ def _write_poi_file(
         shape = " ".join(f"{x:.2f},{y:.2f}" for x, y in route_points)
         lines.append(
             '    <poly id="TRK-TEST-01-route" type="truck_route"'
-            ' color="255,96,0" fill="false" layer="8" lineWidth="6"'
+            ' color="255,96,0,255" fill="false" layer="8" lineWidth="10"'
             f' shape="{shape}"/>'
         )
 
+    selected_fixed_nodes = {
+        stop.node_id
+        for stop in execution_route.stops
+        if stop.node_type in {"depot", "station"}
+    }
+
     for depot_id, depot in scene_ctx.depots.items():
         x, y = local_xy(depot.location)
+        lines.append(
+            _format_marker_poly_xml(
+                marker_id=f"{depot_id}-marker",
+                x=x,
+                y=y,
+                radius=95.0,
+                color="0,128,255,255",
+                marker_type="selected_depot",
+                layer=12,
+            )
+        )
         lines.append(
             _format_poi_xml(
                 poi_id=depot_id,
                 x=x,
                 y=y,
-                color="0,128,255",
+                color="0,128,255,255",
                 poi_type="depot",
             )
         )
     for station_id, station in scene_ctx.stations.items():
         x, y = local_xy(station.location)
+        selected = station_id in selected_fixed_nodes
+        lines.append(
+            _format_marker_poly_xml(
+                marker_id=f"{station_id}-marker",
+                x=x,
+                y=y,
+                radius=80.0 if selected else 58.0,
+                color="0,180,0,255" if selected else "0,180,0,55",
+                marker_type="selected_station" if selected else "unselected_station",
+                layer=11 if selected else 5,
+            )
+        )
         lines.append(
             _format_poi_xml(
                 poi_id=station_id,
                 x=x,
                 y=y,
-                color="0,180,0",
+                color="0,180,0,255" if selected else "0,180,0,55",
                 poi_type="station",
             )
         )
@@ -631,11 +661,22 @@ def _write_poi_file(
             continue
         x, y = local_xy(stop.position)
         lines.append(
+            _format_marker_poly_xml(
+                marker_id=f"{stop.node_id}-marker",
+                x=x,
+                y=y,
+                radius=72.0,
+                color="255,64,64,255",
+                marker_type="order",
+                layer=12,
+            )
+        )
+        lines.append(
             _format_poi_xml(
                 poi_id=stop.node_id,
                 x=x,
                 y=y,
-                color="255,64,64",
+                color="255,64,64,255",
                 poi_type="order",
             )
         )
@@ -657,6 +698,29 @@ def _format_poi_xml(
     )
 
 
+def _format_marker_poly_xml(
+    *,
+    marker_id: str,
+    x: float,
+    y: float,
+    radius: float,
+    color: str,
+    marker_type: str,
+    layer: int,
+) -> str:
+    points = []
+    for idx in range(16):
+        angle = 2.0 * math.pi * idx / 16.0
+        points.append(
+            f"{x + math.cos(angle) * radius:.2f},{y + math.sin(angle) * radius:.2f}"
+        )
+    shape = " ".join(points)
+    return (
+        f'    <poly id="{marker_id}" type="{marker_type}" color="{color}"'
+        f' fill="true" layer="{layer}" shape="{shape}"/>'
+    )
+
+
 def _write_route_file(execution_route: TruckExecutionRoute, output_path: Path) -> None:
     if not execution_route.sumo_edge_sequence:
         raise ValueError("SUMO 路由 edge 序列为空，无法生成 route 文件")
@@ -665,7 +729,8 @@ def _write_route_file(execution_route: TruckExecutionRoute, output_path: Path) -
         '<?xml version="1.0" encoding="UTF-8"?>',
         '<routes xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"',
         '        xsi:noNamespaceSchemaLocation="http://sumo.dlr.de/xsd/routes_file.xsd">',
-        '    <vType id="truck_phase4" accel="1.0" decel="4.5" sigma="0.0" length="8.0" maxSpeed="15.0"/>',
+        '    <vType id="truck_phase4" accel="1.0" decel="4.5" sigma="0.0"'
+        ' length="16.0" width="4.0" maxSpeed="15.0" color="255,160,0" guiShape="truck"/>',
         f'    <route id="truck_route" edges="{route_edges}"/>',
         f'    <vehicle id="{execution_route.truck_id}" type="truck_phase4" route="truck_route" depart="0"/>',
         "</routes>",

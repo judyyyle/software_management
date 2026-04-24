@@ -1,14 +1,14 @@
 <?xml version="1.0" encoding="UTF-8"?>
 
-<!-- generated on 2026-04-24T21:43:31.433221+08:00 by Eclipse SUMO netconvert 1.26.0
+<!-- generated on 2026-04-24T23:25:24.617024+08:00 by Eclipse SUMO netconvert 1.26.0
 <netconvertConfiguration xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="http://sumo.dlr.de/xsd/netconvertConfiguration.xsd">
 
     <input>
-        <sumo-net-file value="/Users/myx/Documents/GitHub/HiveLogix/backend/test_data/default_scene/sumo/phase4_truck_route/truck_route.net.xml"/>
+        <sumo-net-file value="backend/test_data/default_scene/sumo/phase4_truck_route/truck_route.net.xml"/>
     </input>
 
     <output>
-        <output-file value="/Users/myx/Documents/GitHub/HiveLogix/backend/test_data/default_scene/sumo/phase4_truck_route/truck_route.net.netconvert.tmp.xml"/>
+        <output-file value="backend/test_data/default_scene/sumo/phase4_truck_route/truck_route.net.netconvert.tmp.xml"/>
     </output>
 
     <processing>
