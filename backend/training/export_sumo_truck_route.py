@@ -119,9 +119,9 @@ def export_phase4_truck_route(
 
     truck_orders = _select_truck_orders(scene_ctx)
     ordered_orders = _order_truck_orders(truck_orders, depot.location)
-    execution_plan = _build_initial_execution_plan(depot_id, depot.location, ordered_orders)
-    execution_plan = _ensure_min_future_fixed_nodes(
-        execution_plan,
+    initial_execution_plan = _build_initial_execution_plan(depot_id, depot.location, ordered_orders)
+    execution_plan, inserted_fixed_nodes = _ensure_min_future_fixed_nodes(
+        initial_execution_plan,
         stations=scene_ctx.stations,
         min_future_fixed_nodes=min_future_fixed_nodes,
     )
@@ -153,6 +153,7 @@ def export_phase4_truck_route(
     _write_poi_file(
         scene_ctx=scene_ctx,
         execution_route=execution_route,
+        inserted_fixed_nodes=inserted_fixed_nodes,
         road_nodes=road_nodes,
         net_artifacts=net_artifacts,
         output_path=export_dir / "poi.add.xml",
@@ -162,6 +163,7 @@ def export_phase4_truck_route(
         execution_route=execution_route,
         output_path=export_dir / "truck_route.sumocfg",
     )
+    _write_gui_settings(export_dir / "phase4_gui.view.xml")
     _write_json(
         export_dir / "truck_execution_route.json",
         _build_execution_route_payload(execution_route),
@@ -175,6 +177,18 @@ def export_phase4_truck_route(
     )
     _write_json(export_dir / "truck_eta_map.json", dict(truck_eta_map))
     _write_json(export_dir / "route_drift_ref.json", route_drift_ref)
+    _write_json(
+        export_dir / "phase4_debug_trace.json",
+        _build_phase4_debug_trace(
+            truck_id=truck_id,
+            ordered_orders=ordered_orders,
+            initial_execution_plan=initial_execution_plan,
+            execution_plan=execution_plan,
+            inserted_fixed_nodes=inserted_fixed_nodes,
+            execution_route=execution_route,
+            min_future_fixed_nodes=min_future_fixed_nodes,
+        ),
+    )
 
     validation_report = _build_validation_report(
         scene_ctx=scene_ctx,
@@ -301,11 +315,12 @@ def _ensure_min_future_fixed_nodes(
     *,
     stations: Mapping[str, Any],
     min_future_fixed_nodes: int,
-) -> list[dict[str, Any]]:
+) -> tuple[list[dict[str, Any]], tuple[dict[str, Any], ...]]:
     if min_future_fixed_nodes < 1:
         raise ValueError("min_future_fixed_nodes 必须 >= 1")
 
     plan = list(execution_plan)
+    inserted: list[dict[str, Any]] = []
     used_station_ids = {stop["node_id"] for stop in plan if stop["node_type"] == "station"}
     while _count_future_fixed_nodes(plan) < min_future_fixed_nodes:
         best_station = None
@@ -336,8 +351,17 @@ def _ensure_min_future_fixed_nodes(
             best_index,
             _make_plan_stop("station", best_station.station_id, best_station.location),
         )
+        inserted.append(
+            {
+                "node_type": "station",
+                "node_id": best_station.station_id,
+                "insert_index": best_index,
+                "reason": "min_future_fixed_nodes",
+                "detour_cost_manhattan_m": float(best_cost[0]),
+            }
+        )
         used_station_ids.add(best_station.station_id)
-    return plan
+    return plan, tuple(inserted)
 
 
 def _make_plan_stop(
@@ -577,6 +601,7 @@ def _write_poi_file(
     *,
     scene_ctx: TrainingSceneContext,
     execution_route: TruckExecutionRoute,
+    inserted_fixed_nodes: Sequence[Mapping[str, Any]],
     road_nodes: Mapping[str, tuple[float, float]],
     net_artifacts: Any,
     output_path: Path,
@@ -610,6 +635,11 @@ def _write_poi_file(
         for stop in execution_route.stops
         if stop.node_type in {"depot", "station"}
     }
+    inserted_station_ids = {
+        str(item["node_id"])
+        for item in inserted_fixed_nodes
+        if item.get("node_type") == "station"
+    }
 
     for depot_id, depot in scene_ctx.depots.items():
         x, y = local_xy(depot.location)
@@ -631,6 +661,7 @@ def _write_poi_file(
                 y=y,
                 color="0,128,255,255",
                 poi_type="depot",
+                label=f"DEPOT:{depot_id}",
             )
         )
     for station_id, station in scene_ctx.stations.items():
@@ -654,6 +685,13 @@ def _write_poi_file(
                 y=y,
                 color="0,180,0,255" if selected else "0,180,0,55",
                 poi_type="station",
+                label=(
+                    f"ADDED:{station_id}"
+                    if station_id in inserted_station_ids
+                    else f"VISITED:{station_id}"
+                    if selected
+                    else f"STATION:{station_id}"
+                ),
             )
         )
     for stop in execution_route.stops:
@@ -678,6 +716,7 @@ def _write_poi_file(
                 y=y,
                 color="255,64,64,255",
                 poi_type="order",
+                label=f"ORDER:{stop.node_id}",
             )
         )
     lines.append("</additional>")
@@ -691,10 +730,18 @@ def _format_poi_xml(
     y: float,
     color: str,
     poi_type: str,
+    label: str | None = None,
 ) -> str:
+    if label is None:
+        return (
+            f'    <poi id="{poi_id}" type="{poi_type}" color="{color}" '
+            f'x="{x:.2f}" y="{y:.2f}" layer="10"/>'
+        )
     return (
         f'    <poi id="{poi_id}" type="{poi_type}" color="{color}" '
-        f'x="{x:.2f}" y="{y:.2f}" layer="10"/>'
+        f'x="{x:.2f}" y="{y:.2f}" layer="10">\n'
+        f'        <param key="PARAM_TEXT" value="{label}"/>\n'
+        "    </poi>"
     )
 
 
@@ -764,6 +811,28 @@ def _write_sumocfg(
     output_path.write_text("\n".join(lines), encoding="utf-8")
 
 
+def _write_gui_settings(output_path: Path) -> None:
+    lines = [
+        '<?xml version="1.0" encoding="UTF-8"?>',
+        "<viewsettings>",
+        '    <scheme name="phase4_debug">',
+        '        <vehicles vehicleName_show="1" vehicleName_size="80.00"'
+        ' vehicleName_color="0,220,255" vehicleName_bgColor="180,0,0,0"'
+        ' vehicleName_constantSize="1" vehicleName_onlySelected="0"/>',
+        '        <pois poiTextParam="PARAM_TEXT" poi_minSize="0.00"'
+        ' poi_exaggeration="1.00" poi_constantSize="0" poiDetail="16"'
+        ' poiName_show="0" poiText_show="1" poiText_size="95.00"'
+        ' poiText_color="255,255,255" poiText_bgColor="190,0,0,0"'
+        ' poiText_constantSize="1" poiText_onlySelected="0"/>',
+        '        <polys poly_minSize="0.00" poly_exaggeration="1.00"'
+        ' poly_constantSize="0" polyName_show="0" polyType_show="0"/>',
+        "    </scheme>",
+        '    <delay value="250"/>',
+        "</viewsettings>",
+    ]
+    output_path.write_text("\n".join(lines), encoding="utf-8")
+
+
 def _build_execution_route_payload(execution_route: TruckExecutionRoute) -> dict[str, Any]:
     return {
         "truck_id": execution_route.truck_id,
@@ -800,6 +869,77 @@ def _build_execution_route_payload(execution_route: TruckExecutionRoute) -> dict
             for segment in execution_route.segments
         ],
     }
+
+
+def _build_phase4_debug_trace(
+    *,
+    truck_id: str,
+    ordered_orders: Sequence[Phase4TruckOrder],
+    initial_execution_plan: Sequence[Mapping[str, Any]],
+    execution_plan: Sequence[Mapping[str, Any]],
+    inserted_fixed_nodes: Sequence[Mapping[str, Any]],
+    execution_route: TruckExecutionRoute,
+    min_future_fixed_nodes: int,
+) -> dict[str, Any]:
+    visited_orders = [
+        stop for stop in execution_route.stops if stop.node_type == "customer"
+    ]
+    visited_stations = [
+        stop for stop in execution_route.stops if stop.node_type == "station"
+    ]
+    visited_fixed_nodes = [
+        stop for stop in execution_route.stops if stop.node_type in {"station", "depot"}
+    ]
+    return {
+        "truck_id": truck_id,
+        "min_future_fixed_nodes": min_future_fixed_nodes,
+        "ordered_truck_orders": [
+            {
+                "seq": idx,
+                "order_id": item.order.order_id,
+                "deadline": float(item.deadline),
+                "fulfillment_mode": item.fulfillment_mode,
+                "delivery_x": round(float(item.order.delivery_loc.x), 6),
+                "delivery_y": round(float(item.order.delivery_loc.y), 6),
+            }
+            for idx, item in enumerate(ordered_orders)
+        ],
+        "initial_execution_plan": _serialize_execution_plan(initial_execution_plan),
+        "final_execution_plan": _serialize_execution_plan(execution_plan),
+        "inserted_fixed_nodes": [dict(item) for item in inserted_fixed_nodes],
+        "visited_order_ids": [stop.node_id for stop in visited_orders],
+        "visited_station_ids": [stop.node_id for stop in visited_stations],
+        "visited_fixed_node_ids": [stop.node_id for stop in visited_fixed_nodes],
+        "execution_stop_trace": [
+            {
+                "seq": stop.seq,
+                "node_type": stop.node_type,
+                "node_id": stop.node_id,
+                "order_id": stop.order_id,
+                "arrival_time_sec": round(float(stop.arrival_time_sec), 6),
+                "departure_time_sec": round(float(stop.departure_time_sec), 6),
+                "nearest_osm_node_id": stop.nearest_osm_node_id,
+                "snap_distance_m": round(float(stop.snap_distance_m), 6),
+            }
+            for stop in execution_route.stops
+        ],
+    }
+
+
+def _serialize_execution_plan(
+    execution_plan: Sequence[Mapping[str, Any]],
+) -> list[dict[str, Any]]:
+    return [
+        {
+            "seq": idx,
+            "node_type": str(stop["node_type"]),
+            "node_id": str(stop["node_id"]),
+            "order_id": stop.get("order_id"),
+            "x": round(float(stop["position"].x), 6),
+            "y": round(float(stop["position"].y), 6),
+        }
+        for idx, stop in enumerate(execution_plan)
+    ]
 
 
 def _build_validation_report(

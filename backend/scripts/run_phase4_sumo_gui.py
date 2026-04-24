@@ -15,6 +15,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import shutil
 import subprocess
@@ -41,6 +42,10 @@ DEFAULT_SUMOCFG = (
     / "phase4_truck_route"
     / "truck_route.sumocfg"
 )
+
+
+DEFAULT_GUI_SETTINGS_NAME = "phase4_gui.view.xml"
+DEFAULT_DEBUG_TRACE_NAME = "phase4_debug_trace.json"
 
 
 def _resolve_sumo_gui(binary_override: str | None) -> str:
@@ -137,6 +142,11 @@ def main(argv: list[str] | None = None) -> int:
         default=250.0,
         help="GUI 自动运行时每步延迟毫秒数；越大越慢",
     )
+    parser.add_argument(
+        "--no-debug-print",
+        action="store_true",
+        help="不在启动前打印 Phase 4 调试摘要",
+    )
     args = parser.parse_args(argv)
 
     if args.regenerate:
@@ -155,9 +165,14 @@ def main(argv: list[str] | None = None) -> int:
         sumocfg=sumocfg,
         netconvert_bin=_resolve_netconvert(sumo_gui_bin),
     )
+    if not args.no_debug_print:
+        _print_debug_trace_summary(sumocfg.parent / DEFAULT_DEBUG_TRACE_NAME)
     env = os.environ.copy()
     env.setdefault("QT_X11_NO_MITSHM", "1")
     command = [sumo_gui_bin, "-c", str(sumocfg), "--disable-textures"]
+    gui_settings = sumocfg.parent / DEFAULT_GUI_SETTINGS_NAME
+    if gui_settings.is_file():
+        command.extend(["--gui-settings-file", str(gui_settings)])
     if not args.no_start:
         command.extend(["--start", "--delay", str(args.delay_ms)])
     subprocess.run(
@@ -167,6 +182,19 @@ def main(argv: list[str] | None = None) -> int:
         env=env,
     )
     return 0
+
+
+def _print_debug_trace_summary(debug_trace_path: Path) -> None:
+    if not debug_trace_path.is_file():
+        return
+    payload = json.loads(debug_trace_path.read_text(encoding="utf-8"))
+    print("[Phase4 Debug]")
+    print(f"  truck_id: {payload.get('truck_id')}")
+    print(f"  visited_order_ids: {payload.get('visited_order_ids', [])}")
+    print(f"  visited_station_ids: {payload.get('visited_station_ids', [])}")
+    print(f"  visited_fixed_node_ids: {payload.get('visited_fixed_node_ids', [])}")
+    print(f"  inserted_fixed_nodes: {payload.get('inserted_fixed_nodes', [])}")
+    print(f"  debug_json: {debug_trace_path}")
 
 
 if __name__ == "__main__":
