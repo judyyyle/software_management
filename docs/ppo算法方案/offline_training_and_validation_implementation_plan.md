@@ -844,6 +844,68 @@ r_t =
   - `10` dynamic orders
 - 多次加载结果一致，可复现
 
+### 4.2.1 仓库现状核对（2026-04-24）
+
+对当前仓库代码的核对结论如下。
+
+**已经存在、可直接复用的能力**
+
+- 场景原始资产读取已经存在：
+  - `backend/environment/geo/preset_scenes.py:get_preset_scene()`
+    可直接读取 `scene_config.json`、`entities.json`、`orders.json`、`osm_network.geojson`
+  - `backend/environment/geo/preset_scenes.py:load_osm_from_cache()`
+    可直接读取 `osm_network.xml` 与 `osm_network.geojson`
+- 实体实例化已经存在：
+  - `backend/environment/state/entity_manager.py:EntityManager.load_from_config()`
+    已能把 `depots/stations/trucks/drones` 转成内部对象，包含坐标转换、类型分发与资产注册
+- benchmark 动态单按仿真秒回放语义已经存在：
+  - `backend/environment/state/order_manager.py:OrderManager.set_scheduled_dynamic_orders()`
+  - `backend/environment/state/order_manager.py:OrderManager._order_from_scheduled_entry()`
+    已支持 `spawn_sim_s`、`deadline_offset_s`、`deadline_sim_s`
+- 泊松订单与 deadline 生成规则已经存在：
+  - `backend/environment/state/order_manager.py:OrderManager._create_order()`
+    与 `backend/config/rh_alns_cmrappo.yaml` 中
+    `scene.order_window_min_min` / `scene.order_window_max_min` 的配置口径一致
+- 训练侧元数据契约已经冻结一部分：
+  - `backend/training/contracts.py:BenchmarkMeta`
+  - `backend/training/contracts.py:TrainingInputMeta`
+  - `backend/training/contracts.py:TrainingRunMeta`
+
+**需要明确的边界**
+
+- 当前仓库里还没有训练期入口把“场景文件读取 + 实体对象构建 + 静态订单/动态订单拆分 + 路网引用”组装成统一的 `TrainingSceneContext`
+- `backend/environment/scene/scene_service.py:load_preset_scene()` 返回的是前端/场景服务用的 `SceneContext`
+  - 它不返回训练期内部对象
+  - 不产出 `Depot / SwapStation / Truck / Drone / Order` 这套训练期结构
+  - 还会重新生成随机 `scene_id`
+  - 因此不能直接代替 `scene_loader`
+- 当前训练包 `backend/training/` 中只有契约层文件，尚不存在：
+  - `scene_loader.py`
+  - `TrainingSceneContext`
+  - `load_default_scene()` 训练入口
+- 静态订单目前没有训练侧标准装载器
+  - 仓库中确实已有在线仿真入口 `backend/api/routes/simulation_bp.py:_load_initial_orders()`
+    可把订单字典转成 `Order`
+  - 但它属于 API 初始化胶水逻辑，不是训练模块，也不会输出标准化训练场景上下文
+- “卡车未来路径节点信息”当前也不是现成的场景装载产物
+  - `backend/core/entities/truck.py` 只提供运行时 `route_nodes` 容器
+  - `backend/solver/greedy_mmce.py:TruckRoute` 与 `_build_truck_route()` 属于求解器运行时构建逻辑
+  - `backend/solver/decision_engine.py` 在应用调度结果时才调用 `truck.set_route()`
+  - 因此，文档要求的 `truck_backbone_route` / 未来路径节点信息，当前不能通过静态场景读取直接得到
+
+**对 Phase 2 的评估结论**
+
+- “已有若干可复用片段，但还不能直接满足 Phase 2” 这一判断是正确的
+- Phase 2 当前缺的不是底层能力，而是训练侧编排层：
+  - 统一场景装载入口
+  - 标准化 `TrainingSceneContext`
+  - 静态订单/动态订单的训练期拆分与挂接
+  - 路网资产引用统一输出
+- 需特别注意 `Phase 2` 与 `Phase 4` 的边界：
+  - `Phase 2` 至少要保留生成卡车骨架路线所需的静态资产与字段
+  - 完整的 `truck_backbone_route`、ETA 与 SUMO 校验产物更接近 `Phase 4` 的职责
+  - 实现时不应把这两阶段混成一个“只靠读取 JSON 就自动得到完整卡车未来路径”的错误预期
+
 ## 4.3 Phase 3：实现订单源适配（`benchmark` / `poisson` / `hybrid`）
 
 目标：
@@ -872,7 +934,7 @@ r_t =
 3. 复用 `backend/environment/state/order_manager.py` 现有规则：
    - 泊松到达过程复用 `random.expovariate(arrival_rate / 60.0)`
    - 泊松订单 deadline 复用 `_create_order()` 的 `window_min/window_max`
-   - benchmark 动态订单回放复用 `_parse_scheduled_dynamic_order()` 的 `spawn_sim_s / deadline_sim_s / deadline_offset_s`
+   - benchmark 动态订单回放复用 `_order_from_scheduled_entry()` 的 `spawn_sim_s / deadline_sim_s / deadline_offset_s`
 4. 提供统一入口：
    - `build_order_source(scene_ctx, mode, seed, overrides)`
 5. 明确模式约束：

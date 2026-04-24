@@ -11,3 +11,18 @@ HiveLogix — 离线训练子包。
   - env_adapter
 """
 
+from .scene_loader import (
+    BenchmarkDynamicOrder,
+    TrainingRoadNetwork,
+    TrainingSceneContext,
+    load_default_scene,
+    load_training_scene,
+)
+
+__all__ = [
+    "BenchmarkDynamicOrder",
+    "TrainingRoadNetwork",
+    "TrainingSceneContext",
+    "load_default_scene",
+    "load_training_scene",
+]
