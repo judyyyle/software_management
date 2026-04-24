@@ -40,6 +40,10 @@
 3. 第一版采用严格 gating，local policy 不得越过 coarse plan 授权边界
 4. 训练阶段固定采用 `centralized_train_only critic`，优先保证训练稳定性
 
+同时补充冻结一条强约束：
+
+5. **禁止支持“无人机等待卡车”**：UAV 在 `station/depot` 回收节点若先于卡车到达，不允许进入等待状态，必须立即触发 fallback 或重决策
+
 ---
 
 ## 1. 现有代码与场景基线（继续复用）
@@ -240,6 +244,7 @@ a = (order_i, mode, recover_node_j)
 
 - “返回卡车”在本方案中的唯一合法解释，是返回卡车未来路径上的合法交接节点；
 - 绝不允许写成“飞向道路中运动中的 truck 实体”。
+- 本版本明确禁止“无人机到点后等待卡车”；若 UAV 先到，必须立即 fallback 或重决策。
 
 ### 3.3 模式 C 合法性判定
 
@@ -251,6 +256,11 @@ a = (order_i, mode, recover_node_j)
 
 2. 时序合法：
    - `ETA_uav(deliver -> r_j) + delta_safe <= ETA_truck(r_j)`
+
+补充本版本约束：
+
+- 不支持 UAV 到点后等待卡车，因此不允许“明显提前到达后原地等待”的方案进入执行；
+- 当事件推进到 UAV 先到且卡车未到时，该回收动作立即失效并触发 fallback/replan。
 
 3. 能量合法：
    - `E_need(deliver -> r_j) + E_safe <= E_rem`
@@ -286,6 +296,7 @@ a = (order_i, mode, recover_node_j)
 3. 实际推进后发生以下任一情况：
    - `ETA_uav(r_j) > ETA_truck(r_j)`
    - 卡车已离开 `r_j`
+   - UAV 先到 `r_j` 且卡车未到（本版本不允许等待）
    - 节点状态变化导致等待已无意义
 4. 仍存在其他合法安全节点可飞往
 
@@ -377,7 +388,7 @@ soft_miss_penalty = lambda_miss * T_fallback
 
 5. 无人机到站
    - 若卡车在场则回收
-   - 若卡车未到且允许等待，则进入等待
+   - 若卡车未到，则不允许等待，立即进入 `fallback_recovery` 或触发重决策
    - 若需要换电，则进入 FIFO 队列
 
 6. reservation timeout
@@ -450,6 +461,7 @@ tau_res = alpha * ETA_uav(deliver -> r_j)
 2. 能量仍然可达
 3. 节点未被关闭
 4. route drift 未超过失效阈值
+5. UAV 未出现“先到回收节点且卡车未到”的禁用等待场景
 
 则 reservation 持续有效。
 
@@ -533,6 +545,7 @@ reservation timeout 在以下任一时机进行检查：
 timeout(res) =
     (t_now >= t_res_expire)
  OR (ETA_uav + delta_safe > ETA_truck)
+ OR (uav_arrived_before_truck == true)  // 本版本：禁止无人机等待卡车
  OR (energy_feasible == false)
  OR (route_drift_invalid == true)
  OR (node_available == false)
@@ -988,7 +1001,7 @@ J =
 其中：
 
 - `T_complete`：总完成时间或总完成时长汇总
-- `T_wait`：卡车与无人机互相等待总时间
+- `T_wait`：兼容保留字段；本版本禁用“无人机等待卡车”，该项应为 `0`（不再计入互等语义）
 - `T_queue`：站点排队总时间
 - `T_fallback`：miss 后飞往下一合法节点的总时间
 - `T_res_timeout`：reservation timeout 造成的总局部损失
@@ -1499,7 +1512,7 @@ curriculum:
    - fallback 时间
    - reservation timeout 次数
    - 站点排队时间
-   - 无人机等待卡车时间
+   - 无人机等待卡车时间（应为 0）
    - hard failure 次数
 
 ### 11.4 前端验收

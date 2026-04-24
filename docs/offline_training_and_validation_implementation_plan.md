@@ -60,19 +60,38 @@
 - `backend/test_data/default_scene/osm_network.xml`
 - `backend/test_data/default_scene/osm_network.geojson`
 
-其中需要明确区分两类订单输入：
+订单使用策略如下：
 
-1. 固定 benchmark 订单
-   - `orders.json.static_orders`
-   - `orders.json.dynamic_orders`
+1. **卡车路径规划依据（固定，不参与 PPO 训练）**
+   - `orders.json.static_orders`（10 个）
+   - 其中 4 个超过 HeavyDrone 上限（10kg）的订单由卡车直送（mode A），
+     其余 6 个在 HeavyDrone 范围内的静态订单也可作为卡车路径节点依据
+   - 第一阶段卡车路径固定，不在训练中优化
 
-2. 随机训练扩展订单
-   - 由 `arrival_rate > 0` 的泊松流额外生成
+2. **PPO 训练订单源（泊松流，完全替换原始动态订单）**
+   - `orders.json.dynamic_orders` 在训练阶段**不使用**，不作为背景事件注入
+   - 训练时动态订单完全由泊松流生成，`arrival_rate > 0`
+   - 泊松流订单重量上限设为 `heavy_drone.payload_capacity = 10kg`，
+     确保所有训练订单均可由无人机处理（LightDrone ≤ 2kg，HeavyDrone ≤ 10kg）
+   - 这样训练集干净，不混入固定背景订单，有利于泛化
+
+   **泊松流订单 deadline 生成规则**（与 `backend/environment/state/order_manager.py` 保持一致）：
+   - 每条泊松流订单的 deadline 由 `OrderManager._create_order` 生成：
+     ```text
+     deadline = spawn_time + random.uniform(window_min_s, window_max_s)
+     window_min_s = window_min * 60   // 默认 window_min=20 分钟 → 1200s
+     window_max_s = window_max * 60   // 默认 window_max=60 分钟 → 3600s
+     ```
+   - 预定义动态订单（`set_scheduled_dynamic_orders`）优先使用 `deadline_sim_s`，
+     否则使用 `spawn_sim_s + deadline_offset_s`（默认 `deadline_offset_s=900s`）
+   - 训练阶段统一使用 `window_min=20, window_max=60`（分钟），与现有在线参数一致；
+     可通过 `rh_alns_cmrappo.yaml` 的 `scene.order_window_min_min` / `order_window_max_min` 覆盖
 
 实施原则：
 
-- 第一阶段先跑固定 benchmark
-- 第二阶段再叠加随机泊松流
+- 第一阶段：卡车路径固定 + 泊松流训练，验证 PPO 局部决策能力
+- 第二阶段（离线验证）：用 `orders.json.dynamic_orders` 作为固定 benchmark 验证集，
+  评估模型在真实动态订单分布上的表现
 
 ## 2.1 当前阶段必须先冻结的环境语义契约
 
@@ -139,35 +158,66 @@
 
 ### 2.1.4 当前阶段统一采用的主目标
 
+> **注意**：本节为早期版本，完整权威定义见 Section 4.1.4 和 4.1.4.1，以 4.1.4 为准。
+
 当前阶段统一采用以下主目标：
 
 ```text
 J =
   T_complete
   + lambda_wait * T_wait
+  + wait_idle_penalty_coef * T_idle
   + lambda_queue * T_queue
   + lambda_miss * T_fallback
-   + lambda_res_timeout * T_res_timeout
+  + lambda_res_timeout * T_res_timeout
+  + lambda_overdue * T_overdue
   + Lambda_hard * N_hard_fail
+  + Lambda_hard_overdue * N_hard_overdue
 ```
 
 含义如下：
 
-- `T_complete`：所有订单从生成时刻到完成时刻的时长总和，定义为
-   `T_complete = sum_i (t_complete_i - t_generate_i)`
-   示例：3 个订单分别耗时 10 分钟、20 分钟、40 分钟，则
+- `T_complete`：所有订单从进入可调度池到完成配送的时长总和，定义为
+   `T_complete = sum_i (t_delivered_i - t_spawn_i)`
+   其中 `t_spawn_i` 是订单进入可调度池的时刻（对应 `spawn_sim_s`，静态订单取 `0`），
+   `t_delivered_i` 是无人机完成配送的时刻（不含 `drone_service_time_order_s`，
+   若有服务时长则取服务完成时刻，需与环境实现保持一致）。
+   示例：3 个订单分别在进入池后耗时 10 分钟、20 分钟、40 分钟完成配送，则
    `T_complete = 70 分钟`。
-   该目标强调“整体尽早完成”，避免大量订单被长期拖延
-- `T_wait`：卡车与无人机互相等待时间总和，其中无人机等待卡车必须纳入小惩罚
+   该目标只计入策略可影响的时间段，避免将订单预设延迟等系统不可控时间纳入 reward
+- `T_wait`：物理等待时间总和，仅指 UAV 在节点处被动等待卡车到来的时间，
+   不包含显式 WAIT 动作产生的 idle 时间（两者必须分开累计，不允许重复计入）
+- `T_idle`：UAV 显式选择 WAIT 动作后产生的 idle 时间总和，定义为
+   `T_idle = sum_k delta_t_wait_k`
+   其中 `delta_t_wait_k` 是第 k 次 WAIT 动作对应的仿真时间推进量。
+   即时惩罚为 `r_wait_step = -wait_idle_penalty_coef * delta_t_wait_k`，
+   与 `lambda_wait` 保持同一口径（首轮建议 `wait_idle_penalty_coef = 0.10`，
+   与 `lambda_wait` 相同，后续可通过 curriculum 衰减）。
+   注意：排队（`T_queue`）、站点容量导致的被动等待不计入 `T_idle`，
+   避免与 `T_wait` / `T_queue` 重复扣罚
 - `T_queue`：无人机在充换电站排队总时间
 - `T_fallback`：错过卡车后飞往下一个站点或仓库的总时间
 - `T_res_timeout`：reservation timeout 造成的总局部损失
+- `T_overdue`：所有未送达且已超时订单的累计超时时长，定义为
+   `T_overdue = sum_i max(0, t_now - deadline_i)`（对所有未送达订单，每步累加）。
+   **必须在每个仿真步实时累加，不允许等到送达时才结算**，原因是：若仅在送达时结算，
+   模型会学到"不送超时订单"可规避惩罚，导致超时订单被系统性忽略。
+   实时累加后，送达超时订单会停止该订单的累加，模型仍有动力去送。
+   送达时不再叠加额外惩罚，避免双重计入。
+   首轮建议 `lambda_overdue = 0.20`（高于 `lambda_wait`，体现超时的更高优先级）
+- `N_hard_overdue`：超时时长超过 `max_overdue_sec` 仍未送达的订单数。
+   超过该阈值后订单从可调度池中强制移除，记一次固定惩罚 `Lambda_hard_overdue`，
+   避免模型长期持有无法挽回的"死单"。
+   首轮建议 `max_overdue_sec = 600`，`Lambda_hard_overdue = 600`
 - `N_hard_fail`：半空停电或无合法安全节点可达的事件数
 
 要求：
 
 - 训练 reward 必须来自这套主目标及其分解项
 - benchmark 与 stochastic 验证也必须回到这套指标，不允许只看 PPO reward
+- `T_overdue` 的即时惩罚必须在 `env_adapter` 的 `compute_reward()` 里逐步结算，
+   不能只在 episode 末端累计，否则梯度信号仍然稀释
+- `T_idle` 的即时惩罚同样必须逐步结算（同上）
 
 ### 2.1.5 当前阶段建议采用事件驱动环境
 
@@ -179,6 +229,35 @@ J =
 - `action_mask` 不稳定
 - miss / catch 统计不可靠
 - 奖励噪声异常增大
+
+---
+
+## 2.2 系统运行基础约束（必须先冻结）
+
+以下约束是系统业务语义的基础事实，必须在实现任何环境逻辑之前明确冻结，不允许在实现过程中各自理解。
+
+1. **无人机单次只携带一个订单**
+   - 无人机每次出发只能携带并配送一个订单的货物
+   - 飞行途中不能接新单，必须完成当前订单的配送与返程后才能进入下一轮决策
+
+2. **卡车与仓库货物均充足，无人机可在卡车上或仓库直接取货**
+   - 货物为同质化货物，仅有重量差别
+   - 卡车货物充足，无人机在卡车上时可直接取货，无需返回仓库
+   - 仓库货物同样充足，从仓库出发的无人机直接取货出发
+
+3. **卡车上配备充换电设施，无人机在卡车上可完成充换电**
+   - 无人机被卡车回收后（mode C 成功），可在卡车上充换电
+   - 卡车上充换电不占用站点 FIFO 队列，由卡车服务时长（`truck_drone_recover_time_s`）决定
+   - 充换电完成后，无人机进入 `riding_with_truck` 状态，等待下一个决策点
+
+4. **"哪些无人机搭车出发"在系统启动时由外部预设决定，不是 PPO 或 ALNS 的决策范围**
+   - 由于预订单的存在，卡车在系统启动时即出发
+   - 哪些无人机随卡车出发、哪些从仓库直飞，是系统初始化时的外部配置，不进入训练决策空间
+
+5. **无人机在卡车上时，取货点由当前位置自然决定**
+   - 处于 `riding_with_truck` 状态的无人机，起飞时直接从卡车取货
+   - 处于 `idle_at_depot` 状态的无人机，出发时从仓库取货
+   - 不存在"在卡车上但要飞回仓库取货"的场景
 
 ---
 
@@ -251,8 +330,40 @@ CMRAPPO 是本阶段唯一需要训练的组件，其职责是：
 4. 模式约束采用双层语义：
    - `planner_mode_cap={A,B,C}`：上层规划器语义边界
    - `policy_mode_mask={WAIT,B,C}`：真正给 PPO actor 的可选模式掩码
-4. 训练阶段固定使用 `centralized_train_only critic`
-5. 推理阶段默认使用 `greedy` 动作选择
+5. 训练阶段固定使用 `centralized_train_only critic`
+6. 推理阶段默认使用 `greedy` 动作选择
+
+**PPO 决策触发时机（两类，结构完全统一）**
+
+PPO 在以下两类时机触发，动作空间结构相同：
+
+- **`idle` 触发**：无人机在 depot 或 station 完成充换电后进入 idle，触发 PPO 决策
+- **`riding_with_truck` 触发**：卡车到达某个站点，且该站点在 `CoarsePlanView.launch_candidate_stations` 中，触发该卡车上所有 `riding_with_truck` 无人机的 PPO 决策
+
+两类触发的动作空间完全一致：`(order_i, mode, recover_node_j)`。
+
+`WAIT` 动作在两类触发中的语义：
+- `idle` 状态下：保持当前位置不动，等待下一个环境事件
+- `riding_with_truck` 状态下：继续搭车到下一站，不起飞（语义等价于 STAY_ON_TRUCK）
+
+**`riding_with_truck` 状态下的候选集构建（实时计算）**
+
+与 `idle` 状态不同，`riding_with_truck` 触发时的回收候选点不由 ALNS 预算，而是在 PPO 决策时根据当前时刻实时计算：
+
+```text
+当卡车到达站点 S_k（S_k ∈ launch_candidate_stations）时：
+  对每个候选订单 order_i：
+    t_deliver = t_now + fly_time(S_k → order_i.location)
+    recovery_pool(order_i) = {
+      r_j | node_type(r_j) ∈ {station, depot}
+          AND ETA_truck(r_j) > t_deliver
+          AND ETA_uav(order_i.location → r_j) + delta_safe <= ETA_truck(r_j)
+          AND E_need(order_i.location → r_j) + E_safe <= E_rem
+          AND predicted_queue_time(r_j) <= station_wait_threshold_sec
+    }
+```
+
+这样设计的原因是：起飞时刻（`t_now`）决定了 `t_deliver`，进而决定了哪些回收节点在时序上合法。ALNS 无法在粗规划时预知精确的起飞时刻，因此回收候选点必须实时计算。
 
 **ALNS ↔ PPO 正式接口契约（`CoarsePlanView`）**
 
@@ -273,8 +384,16 @@ CoarsePlanView {
   recovery_pool: {order_id -> [node_id]}
   node_load_budget: {node_id -> int}
   route_drift_ref: {node_id -> (eta_ref, route_index_ref)}
+  launch_candidate_stations: [node_id]
 }
 ```
+
+`launch_candidate_stations` 说明：
+
+- 由 ALNS 基于订单分布粗筛，筛选规则为：卡车未来路线上的站点，且该站点周边 `support_radius_km` 内存在未分配订单
+- 仅用于决定"卡车到达哪些站点时触发 `riding_with_truck` 无人机的 PPO 决策点"
+- 不预算具体的回收候选点，回收候选点在 PPO 决策时实时计算（见 CMRAPPO 职责描述）
+- `plan_version` 更新时，`launch_candidate_stations` 同步更新；已在飞行中的无人机不受影响
 
 PPO 的权限严格限定为：
 
@@ -303,9 +422,10 @@ PPO 的权限严格限定为：
    - `orders.json`
    - `osm_network.xml/geojson`
 
-2. 定义两类订单源：
-   - 固定 benchmark：`static_orders + dynamic_orders`
-   - 随机扩展：基于 `arrival_rate` 的泊松流（第二阶段启用）
+2. 定义订单使用策略：
+   - 卡车路径规划依据：`static_orders`（固定，第一阶段路径不优化）
+   - PPO 训练订单源：泊松流（`arrival_rate > 0`，重量上限 ≤ 10kg）
+   - `dynamic_orders` 训练阶段不使用，保留作为离线验证 benchmark
 
 3. 定义训练专属配置文件：
    - `backend/config/rh_alns_cmrappo.yaml`
@@ -397,36 +517,158 @@ r_timeout = - lambda_res_timeout * T_timeout_cost
 4. 排队时间按"入队时刻到开始服务时刻"精确累计
 5. episode 结束时必须清点：已完成订单、超时订单、仍在返程/排队/等待卡车/已硬失败的无人机
 
+**（6）超时订单惩罚机制**
+
+超时订单的惩罚必须采用实时累加方式，不允许仅在送达时结算：
+
+- 每个仿真步，对所有未送达且已超时的订单，实时累加超时惩罚：
+  ```text
+  r_overdue_step = -lambda_overdue * sum_i max(0, t_now - deadline_i) * dt
+  ```
+- 送达超时订单时，停止该订单的累加，不再叠加额外惩罚（避免双重计入）
+- 若订单超时时长超过 `max_overdue_sec` 仍未送达，强制从可调度池移除，记一次 `Lambda_hard_overdue` 惩罚
+
+**为什么必须实时累加**：若仅在送达时结算，模型会学到"不送超时订单"可规避惩罚，
+导致超时订单被系统性忽略。实时累加后，不送的代价持续增大，送达则停止累加，
+模型始终有动力去送超时订单。
+
+参数：
+- `lambda_overdue = 0.20`（首轮建议值，高于 `lambda_wait`，体现超时的更高优先级）
+- `max_overdue_sec = 600`（超过此阈值强制移除）
+- `Lambda_hard_overdue = 600`（强制移除时的固定惩罚，秒级等价）
+
+**（7）`riding_with_truck` 状态语义**
+
+`riding_with_truck` 是无人机的一个正式状态，进入条件为：
+
+- 系统启动时被预设为搭车出发的无人机，初始状态为 `riding_with_truck`
+- 无人机通过 mode C 被卡车成功回收后，完成卡车上充换电，进入 `riding_with_truck`
+
+该状态下的行为规则：
+
+1. **决策触发**：卡车到达某个站点 `S_k`，且 `S_k ∈ CoarsePlanView.launch_candidate_stations`，则触发该卡车上所有 `riding_with_truck` 无人机的 PPO 决策点
+
+**`launch_candidate_stations` 的选择与更新规则**
+
+选择依据为订单密度，而非卡车路线形态。卡车路线本身已由 RH-ALNS 保证不走回头路、不大绕路，路线上的每个站点卡车都会经过，因此 `launch_candidate_stations` 只需在"卡车已确定会经过的站点"中，按订单密度筛选值得触发 PPO 决策的子集。
+
+筛选规则（每次 ALNS 重规划时执行）：
+
+```text
+对卡车未来路线上的每个站点 S_k（卡车尚未经过）：
+  如果 count(未分配订单 within support_radius_km of S_k) >= min_orders_to_trigger
+  → 加入 launch_candidate_stations
+```
+
+参数：
+- `support_radius_km = 1.2`（与现有候选集参数一致）
+- `min_orders_to_trigger = 1`（首轮默认值；若训练中 WAIT 动作被选得过于频繁，可调至 2）
+
+更新时机（三种）：
+
+1. **ALNS 重规划时**（主要路径）：重新计算 `launch_candidate_stations`，与 `CoarsePlanView` 其他字段同步刷新，`plan_version` 递增
+2. **卡车经过某站点后**：该站点自动从 `launch_candidate_stations` 中移除，无需等待 ALNS 重规划（轻量实时维护）
+3. **某站点周边订单全部被分配后**：该站点从 `launch_candidate_stations` 中移除，避免无人机在此起飞后无订单可选只能 WAIT
+2. **候选集实时构建**：对每个候选订单 `order_i`，实时计算：
+   ```text
+   t_deliver = t_now + fly_time(S_k → order_i.location)
+   recovery_pool(order_i) = {r_j | 满足时序 + 电量 + 容量约束，基于 t_deliver}
+   ```
+3. **动作空间与 idle 完全统一**：`(order_i, mode ∈ {WAIT/B/C}, recover_node_j)`
+4. **WAIT 语义**：在 `riding_with_truck` 状态下，选择 WAIT = 继续搭车到下一站，不起飞
+5. **不触发决策的站点**：若卡车到达的站点不在 `launch_candidate_stations` 中，无人机继续搭车，不触发 PPO 决策
+6. **卡车上充换电**：无人机在卡车上充换电不占用站点 FIFO 队列，由 `truck_drone_recover_time_s` 决定服务时长；充换电完成后重新进入 `riding_with_truck` 状态
+7. **取货**：起飞时直接从卡车取货，无需返回仓库
+
 ### 4.1.4 主目标函数（本阶段统一采用）
 
 ```text
 J =
   T_complete
   + lambda_wait * T_wait
+  + wait_idle_penalty_coef * T_idle
   + lambda_queue * T_queue
   + lambda_miss * T_fallback
   + lambda_res_timeout * T_res_timeout
+  + lambda_overdue * T_overdue
   + Lambda_hard * N_hard_fail
+  + Lambda_hard_overdue * N_hard_overdue
 ```
 
 含义：
 
-- `T_complete`：所有订单从生成时刻到完成时刻的时长总和，定义为
-   `T_complete = sum_i (t_complete_i - t_generate_i)`
-   示例：3 个订单分别耗时 10 分钟、20 分钟、40 分钟，则
+- `T_complete`：所有订单从进入可调度池到完成配送的时长总和，定义为
+   `T_complete = sum_i (t_delivered_i - t_spawn_i)`
+   其中 `t_spawn_i` 是订单进入可调度池的时刻（对应 `spawn_sim_s`，静态订单取 `0`），
+   `t_delivered_i` 是无人机完成配送的时刻（不含 `drone_service_time_order_s`，
+   若有服务时长则取服务完成时刻，需与环境实现保持一致）。
+   示例：3 个订单分别在进入池后耗时 10 分钟、20 分钟、40 分钟完成配送，则
    `T_complete = 70 分钟`。
-   该目标强调“整体尽早完成”，避免大量订单被长期拖延
-- `T_wait`：卡车与无人机互相等待时间总和
+   该目标只计入策略可影响的时间段，避免将订单预设延迟等系统不可控时间纳入 reward
+- `T_wait`：UAV 在节点处被动等待卡车到来的物理等待时间总和，
+   不包含显式 WAIT 动作产生的 idle 时间（两者必须分开累计，不允许重复计入）
+- `T_idle`：UAV 显式选择 WAIT 动作后产生的 idle 时间总和，定义为
+   `T_idle = sum_k delta_t_wait_k`（`delta_t_wait_k` 为第 k 次 WAIT 动作的仿真时间推进量）。
+   即时惩罚 `r_wait_step = -wait_idle_penalty_coef * delta_t_wait_k` 在每步立即结算，
+   不在 episode 末端累计，以保证梯度信号清晰。
+   首轮建议 `wait_idle_penalty_coef = 0.10`，与 `lambda_wait` 同口径。
+   排队（`T_queue`）、站点容量导致的被动等待不计入 `T_idle`
 - `T_queue`：无人机在充换电站排队总时间
 - `T_fallback`：错过卡车后飞往下一个站点或仓库的总时间
 - `T_res_timeout`：reservation timeout 造成的总局部损失
+- `T_overdue`：所有未送达且已超时订单的累计超时时长，定义为
+   `T_overdue = sum_i max(0, t_now - deadline_i)`（对所有未送达订单，每步累加）。
+   **必须在每个仿真步实时累加，不允许等到送达时才结算**，原因是：若仅在送达时结算，
+   模型会学到"不送超时订单"可规避惩罚，导致超时订单被系统性忽略。
+   实时累加后，送达超时订单会停止该订单的累加，模型仍有动力去送。
+   送达时不再叠加额外惩罚，避免双重计入。
+   首轮建议 `lambda_overdue = 0.20`（高于 `lambda_wait`，体现超时的更高优先级）
+- `N_hard_overdue`：超时时长超过 `max_overdue_sec` 仍未送达的订单数。
+   超过该阈值后订单从可调度池中强制移除，记一次固定惩罚 `Lambda_hard_overdue`，
+   避免模型长期持有无法挽回的"死单"。
+   首轮建议 `max_overdue_sec = 600`，`Lambda_hard_overdue = 600`
 - `N_hard_fail`：硬失败次数
 
 要求：
 
-- 训练 reward 必须来自这套主目标及其分解项
-- benchmark 与 stochastic 验证也必须回到这套指标，不允许只看 PPO reward
+- `J` 仅作为评估指标，不直接用于 PPO 梯度更新
+- benchmark 与 stochastic 验证必须回到这套指标，不允许只看 PPO reward
 - `Lambda_hard` 首轮建议值为 `1200`（秒级等价损失），必须显著大于一次最坏可恢复扰动
+- `T_complete` 仅用于评估，不计入训练 reward（见 4.1.4.1 节）
+- `T_overdue` 的即时惩罚必须在 `env_adapter` 的 `compute_reward()` 里逐步结算，不能只在 episode 末端累计
+- `T_idle` 的即时惩罚必须在 `env_adapter` 的 `compute_reward()` 里逐步结算
+
+### 4.1.4.1 PPO 训练用每步奖励 r_t
+
+`J` 是 episode 级评估指标，PPO 实际用于梯度更新的是每步奖励 `r_t`。
+`r_t` 是 `J` 各项的增量版本（去掉 `T_complete`），满足 `sum_t r_t ≈ -J_train`。
+
+`T_complete` 不计入 `r_t`，原因是：送达时一次性扣 `(t_delivered - t_spawn)` 会使送达本身产生大额负奖励，
+模型可能学到"慢送或不送"来规避这笔扣分。`T_overdue` 实时累加 + `R_delivery_bonus` 已足够驱动模型及时送达。
+
+```text
+r_t =
+
+  [每步累加项，每个仿真步 dt 结算一次]
+  - lambda_overdue * sum_i max(0, t_now - deadline_i) * dt   // 超时订单实时惩罚（仅无人机订单）
+  - lambda_wait    * delta_wait_t                             // UAV 被动等待卡车
+  - wait_idle_coef * delta_idle_t                             // UAV 主动选 WAIT 动作
+  - lambda_queue   * delta_queue_t                            // 充换电站排队
+  - lambda_miss    * delta_fallback_t                         // 错过卡车后飞往备用点
+
+  [事件触发项，事件发生时一次性结算]
+  + R_delivery_bonus                                          // 无人机成功送达一单（正奖励）
+  - lambda_res_timeout * T_timeout_cost                       // reservation timeout
+  - Lambda_hard                                               // 硬失败（半空停电等）
+  - Lambda_hard_overdue                                       // 订单超时被强制移除
+```
+
+说明：
+
+- `T_overdue` 只对无人机可配送订单（weight ≤ 10kg）累加；mode A 卡车订单无超时惩罚，其 `T_complete` 贡献由环境自动结算，不影响 PPO 梯度
+- `R_delivery_bonus` 是唯一的正奖励项，确保模型始终有动力送达订单，即使订单已超时
+- 首轮建议 `R_delivery_bonus = 60`（秒级等价，量级约为一次小惩罚）
+- 所有每步累加项必须在 `env_adapter.compute_reward()` 中逐步结算，不允许在 episode 末端批量累计
 
 ### 4.1.5 参数分层要求
 
@@ -442,7 +684,7 @@ J =
   - `action_space`：动作空间类型（`factorized`）、`enable_wait_action=true`、`include_mode_a_in_policy=false`
   - `reservation`：timeout 参数（`alpha=1.5`、`beta=1.2`、`gamma=0.3` 等）
   - `policy`：模型结构（`encoder_type=attn_lstm_lite`、`d_model=128`、`nhead=8`、`lstm_hidden=128`、`hist_len=6`、`critic_mode=centralized_train_only`、`inference_mode=greedy` 等）
-  - `reward`：惩罚权重（`lambda_wait=0.10`、`lambda_queue=0.10`、`lambda_miss=0.15`、`lambda_res_timeout=0.10`、`hard_failure_penalty_sec=1200` 等）
+  - `reward`：惩罚权重（`lambda_wait=0.10`、`wait_idle_penalty_coef=0.10`、`lambda_queue=0.10`、`lambda_miss=0.15`、`lambda_res_timeout=0.10`、`lambda_overdue=0.20`、`R_delivery_bonus=60`、`max_overdue_sec=600`、`hard_overdue_penalty_sec=600`、`hard_failure_penalty_sec=1200` 等）
   - `training`：PPO 超参数（`ppo_learning_rate=0.0003`、`rollout_steps=4096`、`batch_size=512` 等）
   - `curriculum`：课程学习噪声（首轮全部为 0）
 
@@ -461,7 +703,7 @@ J =
 - `CoarsePlanView` 接口契约已定义，后续实现可直接对照
 - 主目标函数已包含 `lambda_res_timeout * T_res_timeout` 项，与算法方案文档一致
 
-## 4.2 Phase 2：实现离线场景装载器
+## 4.2 Phase 2：实现离线场景装载器（含卡车路径初始化）
 
 目标：
 
@@ -512,7 +754,51 @@ J =
   - `10` dynamic orders
 - 多次加载结果一致，可复现
 
-## 4.3 Phase 3：实现训练环境适配器
+## 4.3 Phase 3：SUMO 卡车路径验证（env_adapter 前置）
+
+目标：
+
+- 在实现 env_adapter 之前，先用 SUMO 验证卡车路径规划的正确性
+- 确认 ETA、经过节点、mode C 合法回收节点集合在物理上是可信的
+
+**为什么必须在 env_adapter 之前做**
+
+卡车路径决定了 env_adapter 里三件核心事：
+
+1. mode C 的合法回收节点集合（`recovery_pool`）
+2. 各 station/depot 的 `ETA_truck`（直接影响 `action_mask`）
+3. `CoarsePlanView.truck_backbone_route` 的内容
+
+如果路径有问题，训练时 `action_mask` 会基于错误的 ETA 构建，模型学到错误的 mode C 行为，且无法区分是模型问题还是路径问题。
+
+建议新增文件：
+
+- `backend/training/export_sumo_truck_route.py`
+
+职责：
+
+1. 读取 `static_orders` 和 `osm_network.xml`，生成卡车骨架路线
+2. 把卡车路线、depot/station 坐标导出为 SUMO 可加载文件（`poi.add.xml`、路线文件）
+3. 在 `sumo-gui` 中验证：
+   - 卡车路线是否连通
+   - 是否经过预期的 station/depot 节点
+   - 各节点的 ETA 是否符合物理约束（`truck.speed = 15 m/s`）
+   - 路线覆盖的地理范围是否与 `scene_config.json.bounds` 一致
+
+产物：
+
+- `poi.add.xml`（depot/station 坐标）
+- 卡车路线导出文件
+- 各节点 ETA 列表（供 env_adapter 直接使用，作为 `CoarsePlanView` 的初始输入）
+
+验收标准：
+
+- `sumo-gui` 能正确加载路线和设施
+- 卡车路线经过所有预期 station/depot
+- ETA 与手工估算（距离 / 速度）误差在合理范围内
+- 确认至少有 2 个以上合法 mode C 回收节点存在于路线中
+
+## 4.4 Phase 4：实现训练环境适配器
 
 目标：
 
@@ -549,6 +835,16 @@ J =
 3. 奖励在什么时刻结算
 4. 终止条件是什么
 
+   episode 终止条件（任一满足即触发 `is_done() = True`）：
+   ```text
+   1. t_now >= upper_horizon_sec（默认 3600s，仿真时间上限）
+   2. 所有订单已送达或已被强制移除（pending + assigned 均为空，N_hard_overdue 覆盖超时死单）
+   3. 所有无人机均处于 airborne_energy_failure 状态（无可用无人机）
+   ```
+   说明：条件 1 是主要终止路径；条件 2 是提前终止（所有任务完成）；
+   条件 3 是灾难性终止，应触发大额惩罚后结束。
+   三者均不满足时 episode 继续推进。
+
 这一阶段必须明确实现以下状态和事件：
 
 1. 无人机状态
@@ -563,6 +859,7 @@ J =
    - `fallback_recovery`
    - `recovered`
    - `airborne_energy_failure`
+   - `riding_with_truck`（新增：无人机在卡车上，含初始搭车出发和 mode C 回收后）
 
 2. 关键事件
    - 订单送达
@@ -573,13 +870,19 @@ J =
    - 错过卡车（触发 fallback_recovery）
    - FIFO 入队 / 出队
    - 半空中能源硬失败
+   - 卡车到达 `launch_candidate_station`（新增：触发 `riding_with_truck` 无人机的 PPO 决策点）
+   - 无人机在卡车上完成充换电（新增：`charging_on_truck` → `riding_with_truck`）
+   - 无人机从卡车起飞（新增：`riding_with_truck` → `flying_to_deliver`）
 
 3. 奖励与惩罚来源（必须与主目标逐项对应）
    - `T_complete`
-   - `T_wait`
+   - `T_wait`（UAV 被动等待卡车的物理等待时间，episode 级累计）
+   - `T_idle`（UAV 显式选择 WAIT 动作的 idle 时间，**每步即时结算**，不在 episode 末端累计）
    - `T_queue`
    - `T_fallback`
    - `T_res_timeout`（reservation timeout 造成的局部损失）
+   - `T_overdue`（未送达超时订单的累计超时时长，**每步即时结算**，不在 episode 末端累计）
+   - `N_hard_overdue`（超时超过 `max_overdue_sec` 被强制移除的订单数，一次性固定惩罚）
    - `N_hard_fail`
 
 4. 局部承诺状态（reservation）
@@ -610,7 +913,7 @@ J =
 - 站点排队和工位释放逻辑可复现
 - reservation timeout 能正确触发 fallback 并记录 `T_res_timeout`
 
-## 4.4 Phase 4：实现候选动作与上层规划骨架
+## 4.5 Phase 5：实现候选动作与上层规划骨架
 
 目标：
 
@@ -629,12 +932,22 @@ J =
    - 构建候选回收点（在 `recovery_pool[order]` 范围内）
    - 构建 factorized action mask（order → mode → recover_node 三阶段）
    - 实现 `max_candidate_actions` 截断逻辑（先按 `order_pre_score` 截断低优先级订单，再截断较差 recovery 候选，不允许截掉 `WAIT`）
+   - **新增**：支持 `riding_with_truck` 触发的候选集构建：
+     - 输入：当前站点 `S_k`、当前时刻 `t_now`、卡车剩余路线与 ETA
+     - 对每个候选订单实时计算 `t_deliver = t_now + fly_time(S_k → order_i.location)`
+     - 基于实时 `t_deliver` 计算合法 `recovery_pool(order_i)`
+     - 构建与 `idle` 状态完全一致的 factorized action mask
 
 2. `planner_bridge.py`
    - 承接 RH-ALNS 上层骨架，输出 `CoarsePlanView`
    - 管理重规划周期（`coarse_replan_interval_sec=420`）
    - 管理 `plan_version` 更新与失效规则
    - 本阶段 ALNS 可以简化实现（如基于贪心或固定规则），但接口必须满足 `CoarsePlanView` 契约
+   - **新增**：输出 `launch_candidate_stations`，筛选规则为：
+     - 卡车未来路线上尚未经过的站点，且该站点周边 `support_radius_km` 内存在至少 `min_orders_to_trigger` 个未分配订单
+     - 卡车路线约束（不绕路）已在路线规划阶段保证，此处只做订单密度筛选
+     - 更新时机：ALNS 重规划时全量重算；卡车经过某站点后实时移除；某站点周边订单全部被分配后实时移除
+     - 首轮参数：`min_orders_to_trigger = 1`，可通过调高该值减少触发频率
 
 这一阶段必须先固定以下参数：
 
@@ -674,7 +987,7 @@ J =
 - mask 与候选动作一一对应
 - `CoarsePlanView` 输出满足接口契约，PPO 可直接消费
 
-## 4.5 Phase 5：实现 PPO 训练主循环
+## 4.6 Phase 6：实现 PPO 训练主循环
 
 目标：
 
@@ -714,7 +1027,9 @@ J =
 
 **观测张量规范（5 类 token）**
 
-1. `uav_self_token`：当前决策 UAV 的单个 token（位置、剩余电量、状态、剩余时间、reservation 状态、`plan_version_delta`）
+1. `uav_self_token`：当前决策 UAV 的单个 token（位置、剩余电量、状态、剩余时间、reservation 状态、`plan_version_delta`、`is_riding_truck`、`drone_source_type`）
+   - `is_riding_truck: bool`：是否处于 `riding_with_truck` 状态，用于区分两类决策触发
+   - `drone_source_type: {depot, truck}`：当前无人机的取货来源类型（从仓库出发 or 从卡车起飞）
 2. `order_tokens`：最多 `max_candidate_orders=32` 个候选订单 token
 3. `recovery_tokens`：对当前所选订单的回收节点候选（最多 `max_candidate_recovery_per_order=4` 个）
 4. `infra_tokens`：truck 骨架摘要 + station/depot 摘要（queue、ETA、parking_slots、node_load_budget）
@@ -756,7 +1071,7 @@ Padding/Masking 规则：
 - 固定 benchmark 回放指标出现提升趋势
 - reward 提升时，主目标分解项（含 `T_res_timeout`）也能同步解释，而不是只表现为黑盒数值变化
 
-## 4.6 Phase 6：固定 benchmark 离线验证
+## 4.7 Phase 7：固定 benchmark 离线验证
 
 目标：
 
@@ -797,6 +1112,8 @@ Padding/Masking 规则：
 - fallback 总时间（`T_fallback`）
 - reservation timeout 次数（`T_res_timeout`）
 - hard failure 次数（`N_hard_fail`）
+- 超时订单累计惩罚（`T_overdue`）
+- 强制移除订单数（`N_hard_overdue`）
 - greedy 推理下的吞吐与稳定性指标
 
 这一阶段最重要的是：
@@ -815,7 +1132,7 @@ Padding/Masking 规则：
 - 至少有一项核心指标优于当前基线，或策略行为明显更合理
 - 至少能解释模式 C 回收成功率、miss 率与 hard failure 率
 
-## 4.7 Phase 7：随机扩展离线验证
+## 4.8 Phase 8：随机扩展离线验证
 
 目标：
 
@@ -860,56 +1177,38 @@ Padding/Masking 规则：
 - 中强度场景下结果稳定
 - 高强度下即使性能下降，也不出现明显策略崩坏
 
-## 4.8 Phase 8：SUMO 可视化验证
+## 4.9 Phase 9：SUMO 调度行为回放验证（训练后）
 
 目标：
 
-- 把离线验证结果放进 `sumo-gui` 里看，而不是先接前端
+- 把训练好的模型的调度行为导出到 SUMO，验证 mode C rendezvous、miss、fallback 在时间轴上是否可解释
+- 与 Phase 3 的路径验证不同，这里验证的是策略行为，而不是路径本身
 
 建议新增文件：
 
-- `backend/training/export_sumo_facilities.py`
 - `backend/training/export_sumo_replay.py`
 
 职责：
 
-1. `export_sumo_facilities.py`
-   - 把 depot / station 导出为 `poi.add.xml` 或类似 SUMO additional 文件
-
-2. `export_sumo_replay.py`
-   - 把离线验证产生的路线、事件、订单结果导出成 SUMO 可观察文件
-
-数据来源优先顺序：
-
-1. 优先直接复用 `default_scene` 中已有设施坐标
-2. 如果需要测试“重新布局算法”，再增加 `gridLayoutSplit` 的 Python 同构版
-3. 先不要和现有前端坐标同步逻辑混用
+- 把离线验证（Phase 7）产生的路线、事件、订单结果导出成 SUMO 可观察文件
 
 这一阶段主要看：
 
-- depot / station 布局是否合理
-- 路径是否与场景拓扑一致
 - 调度行为是否出现明显不合理绕行或聚集
 - 模式 C 的 rendezvous、miss 与 fallback 行为是否在时间轴上可解释
 - 是否出现明显违反站点容量或空中失效后仍继续派单的错误
 
 产物：
 
-- `poi.add.xml`
 - 回放导出文件
 - SUMO 运行说明
 
 验收标准：
 
 - `sumo-gui` 能正确加载
-- 设施和路径位置正确
 - 至少完成 1 个 benchmark 回放可视化
 
-## 4.9 Phase 9：模型产物固化
-
-目标：
-
-- 为下一阶段“在线接入”做好准备
+## 4.10 Phase 10：模型产物固化
 
 每个训练版本建议固化为如下目录：
 
@@ -950,23 +1249,21 @@ backend/weights/rh_alns_cmrappo/<version>/
 
 1. 先做 `backend/config/rh_alns_cmrappo.yaml`（含完整分层结构）
 2. 再冻结第 4.1.3 节的环境语义契约（含 reservation timeout 机制）
-3. 再做 `backend/training/scene_loader.py`
-4. 再做 `backend/training/env_adapter.py`（含 reservation timeout 状态与事件）
-5. 再做 `backend/training/candidate_builder.py` 和 `planner_bridge.py`（固定 RH-ALNS 骨架，输出 `CoarsePlanView`）
-6. 先跑固定 benchmark，不开泊松流
+3. 再做 `backend/training/scene_loader.py`（含卡车路径初始化）
+4. 再做 `backend/training/export_sumo_truck_route.py`，用 SUMO 验证卡车路径和 ETA
+5. 再做 `backend/training/env_adapter.py`（含 reservation timeout 状态与事件，ETA 直接使用 Phase 3 产物）
+6. 再做 `backend/training/candidate_builder.py` 和 `planner_bridge.py`（固定 RH-ALNS 骨架，输出 `CoarsePlanView`）
 7. 再做 `backend/training/train_cmrappo.py`（Shared PPO-Lite，factorized action space，centralized_train_only critic）
 8. 训练出第一版 `policy.pt + meta.json`
-9. 做 `backend/training/validate_benchmark.py`（greedy inference）
+9. 做 `backend/training/validate_benchmark.py`（greedy inference，用 `dynamic_orders` 作为验证集）
 10. 再做 `backend/training/validate_stochastic.py`
-11. 最后做 SUMO 导出
+11. 最后做 `backend/training/export_sumo_replay.py`（调度行为回放）
 
 原因：
 
-- 先把固定 benchmark 跑通，最容易暴露环境定义问题
-- RH-ALNS 固定后，PPO 的输入分布稳定，训练更容易收敛
-- reservation timeout 必须在 env_adapter 阶段就实现，不能推迟
-- 随机泊松流和 SUMO 都应该放在模型能工作之后
-- 否则会同时面对环境 bug、训练 bug、可视化 bug 三类问题
+- SUMO 路径验证（步骤 4）必须在 env_adapter 之前，因为 ETA 是 `action_mask` 的前置输入
+- 先把路径正确性确认，再实现环境，避免训练时无法区分路径 bug 和模型 bug
+- 随机泊松流验证和行为回放放在模型能工作之后，避免同时面对多类 bug
 
 ---
 
@@ -976,7 +1273,7 @@ backend/weights/rh_alns_cmrappo/<version>/
 
 1. 能稳定产出 `policy.pt + meta.json`
 2. 能在 `default_scene` 上完成固定 benchmark 回放（greedy inference）
-3. 能输出 benchmark 指标报告（含 `T_res_timeout`、reservation timeout 次数）
+3. 能输出 benchmark 指标报告（含 `T_res_timeout`、`T_overdue`、`N_hard_overdue`、reservation timeout 次数）
 4. 能做至少一组随机泊松扩展验证
 5. 能导出 SUMO 可视化文件并复核结果
 6. 已明确哪些参数属于后续在线必须锁定
