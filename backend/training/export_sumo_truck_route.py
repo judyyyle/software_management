@@ -7,8 +7,17 @@ HiveLogix — Phase 4 卡车路线导出与 SUMO 验证产物生成。
   - 区分卡车完整执行路线与 `truck_backbone_route`；
   - 完整执行路线包含 `depot / customer / station`；
   - `truck_backbone_route` 仅保留未来固定节点（`station / depot`）；
-  - 订单访问顺序：deadline 为主，UTM 曼哈顿距离为 tie-break；
+  - 订单访问顺序：deadline 为主，OSM 路网最短路径距离为 tie-break；
+  - 充换电站插入：以路网绕路代价最小为准，沿路站点绕路代价自然接近 0；
   - ETA 使用 OSM 实际可达路径长度 / `truck.speed` 计算，不使用曼哈顿距离。
+
+执行流程：
+  1. 加载场景（depot / truck / orders / stations / OSM 路网）；
+  2. 构建 OSM 路网图（DiGraph）与 SUMO net 中间产物——必须在规划前完成；
+  3. 按 deadline + 路网距离贪心排序订单；
+  4. 插入充换电站，满足 min_future_fixed_nodes 约束；
+  5. 物化执行路线：对每段 stop-to-stop 跑 Dijkstra，映射到 SUMO edge 序列；
+  6. 导出 net.xml / rou.xml / poi.add.xml / sumocfg 及各 JSON 产物。
 """
 
 from __future__ import annotations
@@ -37,7 +46,7 @@ from environment.geo.exporters.sumo_net_osm import (
     build_sumo_net_artifacts,
     write_sumo_net_artifacts,
 )
-from environment.geo.osm_service import build_road_graph, find_nearest_node, shortest_path
+from environment.geo.osm_service import build_road_graph, find_nearest_node, shortest_path, shortest_path_length
 from training.scene_loader import DEFAULT_CONFIG_PATH, TrainingSceneContext, load_default_scene
 
 
@@ -117,15 +126,6 @@ def export_phase4_truck_route(
     depot_id, depot = _require_singleton(scene_ctx.depots, "depot")
     truck_id, truck = _require_singleton(scene_ctx.trucks, "truck")
 
-    truck_orders = _select_truck_orders(scene_ctx)
-    ordered_orders = _order_truck_orders(truck_orders, depot.location)
-    initial_execution_plan = _build_initial_execution_plan(depot_id, depot.location, ordered_orders)
-    execution_plan, inserted_fixed_nodes = _ensure_min_future_fixed_nodes(
-        initial_execution_plan,
-        stations=scene_ctx.stations,
-        min_future_fixed_nodes=min_future_fixed_nodes,
-    )
-
     osm_xml_path = scene_ctx.road_network.xml_path
     if not osm_xml_path:
         raise ValueError("scene_loader 未提供 osm_network.xml 路径，无法执行 Phase 4")
@@ -134,6 +134,17 @@ def export_phase4_truck_route(
     net_artifacts = build_sumo_net_artifacts(
         osm_xml,
         _scene_bounds_tuple(scene_ctx.bounds),
+    )
+
+    truck_orders = _select_truck_orders(scene_ctx)
+    ordered_orders = _order_truck_orders(truck_orders, depot.location, road_graph, road_nodes)
+    initial_execution_plan = _build_initial_execution_plan(depot_id, depot.location, ordered_orders)
+    execution_plan, inserted_fixed_nodes = _ensure_min_future_fixed_nodes(
+        initial_execution_plan,
+        stations=scene_ctx.stations,
+        min_future_fixed_nodes=min_future_fixed_nodes,
+        road_graph=road_graph,
+        road_nodes=road_nodes,
     )
 
     execution_route = _materialize_execution_route(
@@ -266,7 +277,11 @@ def _select_truck_orders(scene_ctx: TrainingSceneContext) -> tuple[Phase4TruckOr
 def _order_truck_orders(
     truck_orders: Sequence[Phase4TruckOrder],
     depot_pos: Position3D,
+    road_graph: Any,
+    road_nodes: Mapping[str, tuple[float, float]],
 ) -> tuple[Phase4TruckOrder, ...]:
+    # 先按 deadline 分组，组内用路网最短距离贪心选最近的下一个订单。
+    # 使用路网距离而非曼哈顿距离，确保排序结果与实际行驶路线一致。
     grouped: dict[float, list[Phase4TruckOrder]] = {}
     for item in truck_orders:
         grouped.setdefault(item.deadline, []).append(item)
@@ -279,7 +294,7 @@ def _order_truck_orders(
             next_item = min(
                 pending,
                 key=lambda item: (
-                    _manhattan_distance(current_pos, item.order.delivery_loc),
+                    _road_distance(road_graph, road_nodes, current_pos, item.order.delivery_loc),
                     item.order.order_id,
                 ),
             )
@@ -315,7 +330,12 @@ def _ensure_min_future_fixed_nodes(
     *,
     stations: Mapping[str, Any],
     min_future_fixed_nodes: int,
+    road_graph: Any,
+    road_nodes: Mapping[str, tuple[float, float]],
 ) -> tuple[list[dict[str, Any]], tuple[dict[str, Any], ...]]:
+    # 反复插入绕路代价最小的未使用站点，直到满足 min_future_fixed_nodes。
+    # 绕路代价 = dist(prev→站) + dist(站→next) - dist(prev→next)，均为路网距离。
+    # 沿路站点的绕路代价自然接近 0，无需额外的"沿路优先"逻辑。
     if min_future_fixed_nodes < 1:
         raise ValueError("min_future_fixed_nodes 必须 >= 1")
 
@@ -334,9 +354,9 @@ def _ensure_min_future_fixed_nodes(
                 prev_stop = plan[insert_at - 1]
                 next_stop = plan[insert_at]
                 detour_cost = (
-                    _manhattan_distance(prev_stop["position"], station_pos)
-                    + _manhattan_distance(station_pos, next_stop["position"])
-                    - _manhattan_distance(prev_stop["position"], next_stop["position"])
+                    _road_distance(road_graph, road_nodes, prev_stop["position"], station_pos)
+                    + _road_distance(road_graph, road_nodes, station_pos, next_stop["position"])
+                    - _road_distance(road_graph, road_nodes, prev_stop["position"], next_stop["position"])
                 )
                 candidate = (detour_cost, station_id, insert_at)
                 if best_cost is None or candidate < best_cost:
@@ -357,7 +377,7 @@ def _ensure_min_future_fixed_nodes(
                 "node_id": best_station.station_id,
                 "insert_index": best_index,
                 "reason": "min_future_fixed_nodes",
-                "detour_cost_manhattan_m": float(best_cost[0]),
+                "detour_cost_road_m": float(best_cost[0]),
             }
         )
         used_station_ids.add(best_station.station_id)
@@ -391,6 +411,8 @@ def _materialize_execution_route(
     road_nodes: Mapping[str, tuple[float, float]],
     directed_step_to_edge: Mapping[tuple[str, str], str],
 ) -> TruckExecutionRoute:
+    # 对每段 stop-to-stop 跑 Dijkstra，得到 OSM 节点路径，
+    # 再通过 directed_step_to_edge 映射成 SUMO edge 序列，同时累计 ETA。
     if truck_speed <= 0:
         raise ValueError(f"truck.speed 必须为正数: {truck_speed}")
 
@@ -514,6 +536,8 @@ def _segment_distance_with_snap(
     path: Sequence[str],
     road_nodes: Mapping[str, tuple[float, float]],
 ) -> float:
+    # 路段距离 = snap 到起点 + OSM 路径折线 + snap 到终点，
+    # 避免纯用 OSM 节点距离时忽略 stop 坐标与最近节点之间的偏移。
     geometry = [from_stop.position]
     for osm_node_id in path:
         pos = _osm_node_position(road_nodes, osm_node_id)
@@ -554,6 +578,8 @@ def _osm_path_to_sumo_edges(
 
 
 def _project_backbone_route(execution_route: TruckExecutionRoute) -> tuple[str, ...]:
+    # 从完整执行路线中提取 station + depot 节点，作为 PPO 训练的骨架路线。
+    # 不允许重复节点，depot 回程只取一次。
     route = []
     for stop in execution_route.stops[1:]:
         if stop.node_type not in {"station", "depot"}:
@@ -1025,6 +1051,23 @@ def _scene_bounds_tuple(bounds: Mapping[str, float]) -> tuple[float, float, floa
 
 def _manhattan_distance(a: Position3D, b: Position3D) -> float:
     return abs(a.x - b.x) + abs(a.y - b.y)
+
+
+def _road_distance(
+    road_graph: Any,
+    road_nodes: Mapping[str, tuple[float, float]],
+    pos_a: Position3D,
+    pos_b: Position3D,
+) -> float:
+    """路网最短距离（米）；不可达时 fallback 到曼哈顿距离。"""
+    node_a = find_nearest_node(road_graph, road_nodes, pos_a.x, pos_a.y)
+    node_b = find_nearest_node(road_graph, road_nodes, pos_b.x, pos_b.y)
+    if node_a == node_b:
+        return pos_a.distance_2d(pos_b)
+    dist = shortest_path_length(road_graph, node_a, node_b)
+    if dist is None:
+        return _manhattan_distance(pos_a, pos_b)
+    return dist
 
 
 def _print_summary(result: Phase4ExportResult) -> None:

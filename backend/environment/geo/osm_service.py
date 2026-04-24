@@ -165,3 +165,11 @@ def shortest_path(G: nx.DiGraph, start_node: str, end_node: str) -> list[str]:
         return path
     except (nx.NetworkXNoPath, nx.NodeNotFound):
         return []
+
+
+def shortest_path_length(G: nx.DiGraph, start_node: str, end_node: str) -> float | None:
+    """返回最短路径总距离（米），不可达时返回 None。"""
+    try:
+        return float(nx.shortest_path_length(G, start_node, end_node, weight='weight'))
+    except (nx.NetworkXNoPath, nx.NodeNotFound):
+        return None
