@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<additional xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+           xsi:noNamespaceSchemaLocation="http://sumo.dlr.de/xsd/additional_file.xsd">
+    <poi id="DEP-TEST-01" type="depot" color="0,128,255" x="329911.50" y="3437187.13" layer="10"/>
+    <poi id="STA-TEST-01" type="station" color="0,180,0" x="328126.77" y="3434492.48" layer="10"/>
+    <poi id="STA-TEST-02" type="station" color="0,180,0" x="329868.11" y="3435203.64" layer="10"/>
+    <poi id="STA-TEST-03" type="station" color="0,180,0" x="330909.79" y="3435506.86" layer="10"/>
+    <poi id="STA-TEST-04" type="station" color="0,180,0" x="331158.40" y="3434775.42" layer="10"/>
+    <poi id="STA-TEST-05" type="station" color="0,180,0" x="329845.20" y="3435929.49" layer="10"/>
+    <poi id="STA-TEST-06" type="station" color="0,180,0" x="328417.32" y="3435542.81" layer="10"/>
+    <poi id="STA-TEST-07" type="station" color="0,180,0" x="330908.77" y="3436980.23" layer="10"/>
+    <poi id="STA-TEST-08" type="station" color="0,180,0" x="330054.78" y="3433924.20" layer="10"/>
+    <poi id="STA-TEST-09" type="station" color="0,180,0" x="329458.96" y="3434328.27" layer="10"/>
+    <poi id="STA-TEST-10" type="station" color="0,180,0" x="328475.07" y="3436904.48" layer="10"/>
+</additional>

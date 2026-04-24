@@ -28,17 +28,25 @@ from .order_source_adapter import (
     ensure_mode_allowed,
     preview_dynamic_order_stream,
 )
+from .export_sumo_truck_route import (
+    Phase4ExportResult,
+    TruckExecutionRoute,
+    export_phase4_truck_route,
+)
 
 __all__ = [
     "BenchmarkDynamicOrder",
     "OrderSourceConfig",
     "OrderSourceMode",
     "PoissonOrderGenConfig",
+    "Phase4ExportResult",
     "TrainingRoadNetwork",
     "TrainingSceneContext",
+    "TruckExecutionRoute",
     "build_order_source",
     "build_order_source_preview_summary",
     "configure_order_manager_for_source",
+    "export_phase4_truck_route",
     "ensure_mode_allowed",
     "load_default_scene",
     "load_training_scene",

@@ -83,7 +83,11 @@ def osm_to_geojson(osm_xml: str) -> dict:
     return {"type": "FeatureCollection", "features": features}
 
 
-def build_road_graph(osm_xml: str) -> tuple[nx.DiGraph, dict]:
+def build_road_graph(
+    osm_xml: str,
+    *,
+    respect_osm_oneway: bool = False,
+) -> tuple[nx.DiGraph, dict]:
     """
     从 OSM XML 构建道路图，用于路径计算。
     
@@ -104,6 +108,9 @@ def build_road_graph(osm_xml: str) -> tuple[nx.DiGraph, dict]:
         hw = tags.get("highway", "")
         if hw not in HW_SPEED:
             continue
+        is_oneway = (
+            tags.get("oneway", "no") in ("yes", "1", "true") or hw in ONEWAY_HW
+        )
         nd_refs = [r.get("ref") for r in way.iter("nd") if r.get("ref") in nodes]
         for i in range(len(nd_refs) - 1):
             u = nd_refs[i]
@@ -114,7 +121,12 @@ def build_road_graph(osm_xml: str) -> tuple[nx.DiGraph, dict]:
             x2, y2 = transformer.transform(lat2, lon2)
             dist = ((x2 - x1)**2 + (y2 - y1)**2)**0.5
             G.add_edge(u, v, weight=dist)
-            if hw not in ONEWAY_HW:
+            if respect_osm_oneway:
+                add_reverse = not is_oneway
+            else:
+                # 兼容仓库内既有求解器：历史上仅把 motorway 系列视为单向。
+                add_reverse = hw not in ONEWAY_HW
+            if add_reverse:
                 G.add_edge(v, u, weight=dist)
 
     return G, nodes
