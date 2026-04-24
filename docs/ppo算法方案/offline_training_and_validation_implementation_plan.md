@@ -1081,6 +1081,174 @@ r_t =
 - ETA 与手工估算（距离 / 速度）误差在合理范围内
 - 确认至少有 2 个以上合法 mode C 回收节点存在于路线中
 
+### 4.4.1 本阶段已明确的路线语义
+
+为避免把“卡车真实送货路线”和“PPO 可见的固定节点骨架”混成一个对象，本阶段将两条路线正式分开：
+
+1. **`truck_execution_route`**：卡车真实执行路线
+   - 节点类型允许为：`depot / customer / station`
+   - 必须从 `depot` 出发，最后回到 `depot`
+   - 用于 SUMO 导出、几何连通性检查、客户点是否被实际经过的验证
+2. **`truck_backbone_route`**：`CoarsePlanView` 使用的固定节点骨架
+   - 仅允许包含 `station / depot`
+   - 不包含 `customer`
+   - 表示卡车从“当前时刻起未来还会经过的合法固定交接节点序列”
+   - 起点仓库不计入 future node；终点回仓库可保留，因为它仍是 future recovery 节点
+
+这两个对象的职责必须保持分离：
+
+- `truck_execution_route` 服务于物理验证与 SUMO 回放
+- `truck_backbone_route` 服务于 `recovery_pool`、`truck_eta_map`、`route_drift_ref`、`launch_candidate_stations`
+
+### 4.4.2 路线构建规则（已实现口径）
+
+`backend/training/export_sumo_truck_route.py` 当前按以下固定规则构建路线：
+
+1. 从 `static_orders` 中筛选卡车相关订单
+   - 当前筛选口径：`fulfillment_mode` 含 `TRUCK`
+2. 先生成卡车完整执行路线 `truck_execution_route`
+   - 起点：唯一 `depot`
+   - 中间节点：卡车相关订单的客户送达地
+   - 如有需要，插入 `station`
+   - 终点：回到同一 `depot`
+3. 客户访问顺序规则：
+   - 主排序键：订单 `deadline`
+   - 次排序键：UTM 米制坐标下的曼哈顿距离 `|dx| + |dy|`
+4. 为保证 mode C 至少存在足够的 future fixed nodes，允许在完整执行路线中插入 `station`
+   - 插站目标不是替代客户点，而是补充未来合法 recovery 节点
+   - 插站选择标准为“对当前完整执行路线的最小曼哈顿绕路代价”
+5. 完整执行路线生成后，再从中投影出 `truck_backbone_route`
+   - 只保留 `station / depot`
+   - 去掉起点 `depot`
+   - 保留终点 `depot`
+   - 不允许重复固定节点
+
+### 4.4.3 ETA 与可达性计算规则
+
+本阶段明确区分：
+
+- 曼哈顿距离：只用于排序与插站启发式
+- 实际 ETA：必须基于 OSM 路网最短可达路径长度计算
+
+具体口径如下：
+
+1. 使用 `osm_network.xml` 构建道路图
+2. 将执行路线中相邻停靠点吸附到 OSM 最近节点
+3. 对每一段相邻停靠点计算 OSM 最短路径
+4. 用该段实际路径长度除以 `truck.speed = 15 m/s` 得到 `travel_time`
+5. 累加得到：
+   - `truck_execution_route` 各 stop 的 `arrival_time`
+   - `truck_backbone_route` 各固定节点的 `truck_eta_map`
+   - `route_drift_ref`
+
+因此，本阶段 `truck_eta_map` 的口径是：
+
+- 来自完整执行路线中对应 future fixed node 的首次到达时刻
+- 不是曼哈顿距离估算值
+- 不是客户点 ETA
+
+### 4.4.4 “至少两个合法 recovery 节点”的实现口径
+
+这里必须说清楚，本阶段能保证的是**路线级合法 recovery 节点**，不是“对任意订单都可回收”。
+
+本阶段的硬约束是：
+
+- `truck_backbone_route` 中至少保留 `2` 个 future fixed nodes
+- 这些节点必须属于 `station / depot`
+- 每个节点都必须在实际 OSM 路网上可达
+- 每个节点都必须有严格递增的 ETA
+
+而“某个订单在某个时刻能否把该节点作为 `mode C` recovery 节点”，仍然要在后续 `candidate_builder / env_adapter` 中继续叠加：
+
+- `ETA_truck(r_j) > t_deliver`
+- `ETA_uav + safe_margin <= ETA_truck(r_j)`
+- 电量可行
+
+### 4.4.5 Phase 4 当前导出产物（已实现）
+
+`backend/training/export_sumo_truck_route.py` 当前会在场景目录下导出以下文件：
+
+- `truck_execution_route.json`
+  - 卡车完整执行路线
+  - 包含 `depot / customer / station` 停靠点顺序、每段距离、每段 OSM 路径、SUMO edge 序列
+- `truck_backbone_route.json`
+  - 仅包含 `station / depot` 的 future fixed node 序列
+- `truck_eta_map.json`
+  - `truck_backbone_route` 各固定节点 ETA
+- `route_drift_ref.json`
+  - 供 `CoarsePlanView.route_drift_ref` 直接复用
+- `validation_report.json`
+  - 记录客户点是否全部被经过、骨架节点数、ETA 单调性、路网连通性、边界检查、snap 误差等
+- `poi.add.xml`
+  - depot / station 的 SUMO POI 叠加层
+- `truck_route.net.xml`
+  - 由 `osm_network.xml` 生成的 SUMO `net.xml`
+- `truck_route.rou.xml`
+  - 基于完整执行路线生成的卡车 SUMO 路由文件
+- `truck_route.sumocfg`
+  - 用于 `sumo-gui` 直接加载的配置文件
+
+其中：
+
+- `truck_execution_route` 用于物理回放与路径审计
+- `truck_backbone_route / truck_eta_map / route_drift_ref` 用于 Phase 5/6 直接消费
+
+另外，仓库中已补充启动脚本：
+
+- `backend/scripts/run_phase4_sumo_gui.py`
+
+本机安装 SUMO 后，可直接运行：
+
+```bash
+python backend/scripts/run_phase4_sumo_gui.py
+```
+
+若希望启动前重新生成最新 Phase 4 产物，可运行：
+
+```bash
+python backend/scripts/run_phase4_sumo_gui.py --regenerate
+```
+
+若 `sumo-gui` 不在系统 `PATH` 中，可显式指定：
+
+```bash
+python backend/scripts/run_phase4_sumo_gui.py \
+  --sumo-gui-bin /path/to/sumo-gui \
+  --regenerate
+```
+
+### 4.4.6 为 Phase 4 新增的底层支持
+
+为保证 SUMO 导出与 OSM 路径映射使用完全一致的边语义，本阶段对地理工具层做了两处补充：
+
+1. `backend/environment/geo/exporters/sumo_net_osm.py`
+   - 保留原有 `osm_to_sumo_net(osm_xml, orig_bounds, path)` 对外接口不变
+   - 新增中间结果构建函数，用于同时生成：
+     - SUMO `net.xml`
+     - OSM step → SUMO edge 的映射表
+   - 这样 `truck_route.rou.xml` 与 `truck_route.net.xml` 保证来自同一套 edge 切分规则
+2. `backend/environment/geo/osm_service.py`
+   - `build_road_graph()` 新增可选参数 `respect_osm_oneway`
+   - 默认值保持兼容旧行为，不影响仓库内既有求解器调用
+   - 只有 `Phase 4` 导出链路显式使用 `respect_osm_oneway=True`
+   - 这样可以保证：
+     - Phase 4 的 OSM 最短路与 SUMO 单行线方向一致
+     - 旧求解器路径逻辑不会被这次改动悄悄改变
+
+### 4.4.7 当前 Phase 4 的代码边界
+
+本阶段已经明确：
+
+- `CoarsePlanView` 只继续保留：
+  - `truck_backbone_route`
+  - `truck_eta_map`
+  - `route_drift_ref`
+- `truck_execution_route` 不进入 `CoarsePlanView`
+  - 它属于 Phase 4 的验证与导出产物
+  - 不属于 PPO 粗规划边界对象
+
+因此，后续实现不得把 customer 节点重新塞回 `truck_backbone_route`，也不得把 `truck_execution_route` 与 `truck_backbone_route` 重新混成一个变量。
+
 ## 4.5 Phase 5：实现训练环境适配器
 
 目标：
