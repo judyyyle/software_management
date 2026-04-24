@@ -223,12 +223,6 @@ def write_sumo_net_artifacts(artifacts: SumoNetArtifacts, path: str) -> tuple[in
         '              projParameter="+proj=utm +zone=51 +ellps=WGS84 +datum=WGS84 +units=m +no_defs"/>',
     ]
 
-    for nid in artifacts.junction_nodes:
-        x, y = artifacts.utm_nodes[nid]
-        lines.append(
-            f'    <node id="n{nid}" x="{x - artifacts.ox:.2f}" y="{y - artifacts.oy:.2f}" type="priority"/>'
-        )
-
     for edge in artifacts.edges:
         shape = " ".join(
             f"{x - artifacts.ox:.2f},{y - artifacts.oy:.2f}"
@@ -246,9 +240,25 @@ def write_sumo_net_artifacts(artifacts: SumoNetArtifacts, path: str) -> tuple[in
             )
         lines.append("    </edge>")
 
+    incoming_lanes = _dd(list)
+    for edge in artifacts.edges:
+        incoming_lanes[edge.to_node].extend(
+            f"{edge.edge_id}_{lane_idx}" for lane_idx in range(edge.num_lanes)
+        )
+
+    for nid in artifacts.junction_nodes:
+        x, y = artifacts.utm_nodes[nid]
+        incoming = " ".join(incoming_lanes.get(nid, []))
+        lines.append(
+            f'    <junction id="n{nid}" type="priority" x="{x - artifacts.ox:.2f}"'
+            f' y="{y - artifacts.oy:.2f}" incLanes="{incoming}" intLanes=""'
+            f' shape="{x - artifacts.ox:.2f},{y - artifacts.oy:.2f}"/>'
+        )
+
     for from_edge, to_edge in artifacts.connections:
         lines.append(
-            f'    <connection from="{from_edge}" to="{to_edge}" fromLane="0" toLane="0"/>'
+            f'    <connection from="{from_edge}" to="{to_edge}" fromLane="0"'
+            f' toLane="0" dir="s" state="M"/>'
         )
 
     lines.append("</net>")
