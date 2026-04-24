@@ -178,13 +178,13 @@ J =
 含义如下：
 
 - `T_complete`：所有订单从进入可调度池到完成配送的时长总和，定义为
-   `T_complete = sum_i (t_delivered_i - t_spawn_i)`
+   `T_complete = sum_i (t_delivered_i - t_spawn_i)`，**仅对无人机可配送订单统计**（`weight <= 10kg`）
    其中 `t_spawn_i` 是订单进入可调度池的时刻（对应 `spawn_sim_s`，静态订单取 `0`），
    `t_delivered_i` 是无人机完成配送的时刻（不含 `drone_service_time_order_s`，
    若有服务时长则取服务完成时刻，需与环境实现保持一致）。
    示例：3 个订单分别在进入池后耗时 10 分钟、20 分钟、40 分钟完成配送，则
    `T_complete = 70 分钟`。
-   该目标只计入策略可影响的时间段，避免将订单预设延迟等系统不可控时间纳入 reward
+   该目标只计入策略可影响的无人机订单时间段，避免将 `mode A` 卡车背景订单混入 PPO 主评估口径
 - `T_wait`：物理等待时间总和，仅指 UAV 在节点处被动等待卡车到来的时间，
    不包含显式 WAIT 动作产生的 idle 时间（两者必须分开累计，不允许重复计入）
 - `T_idle`：UAV 显式选择 WAIT 动作后产生的 idle 时间总和，定义为
@@ -215,6 +215,7 @@ J =
 
 - 训练 reward 必须来自这套主目标及其分解项
 - benchmark 与 stochastic 验证也必须回到这套指标，不允许只看 PPO reward
+- `mode A` 背景订单不进入这套 PPO 主指标；其执行结果只进入单独的系统上下文统计区
 - `T_overdue` 的即时惩罚必须在 `env_adapter` 的 `compute_reward()` 里逐步结算，
    不能只在 episode 末端累计，否则梯度信号仍然稀释
 - `T_idle` 的即时惩罚同样必须逐步结算（同上）
@@ -427,18 +428,25 @@ PPO 的权限严格限定为：
    - PPO 训练订单源：泊松流（`arrival_rate > 0`，重量上限 ≤ 10kg）
    - `dynamic_orders` 训练阶段不使用，保留作为离线验证 benchmark
 
-3. 定义训练专属配置文件：
-   - `backend/config/rh_alns_cmrappo.yaml`
-   - 配置文件必须按以下分层组织：`scene` / `planner` / `candidate` / `action_space` / `reservation` / `policy` / `reward` / `training` / `curriculum`
+3. 定义统一订单源模式：
+   - `order_source_mode = benchmark | poisson | hybrid`
+   - 训练主循环只允许 `poisson`
+   - `validate_benchmark.py` 只允许 `benchmark`
+   - `validate_stochastic.py` 允许 `poisson` 或 `hybrid`
+   - 泊松流复用 `backend/environment/state/order_manager.py` 的订单生成与 deadline 语义，不再单独重写一套离线规则
 
-4. 定义模型元数据文件格式：
+4. 定义训练专属配置文件：
+   - `backend/config/rh_alns_cmrappo.yaml`
+   - 配置文件必须按以下分层组织：`scene` / `data` / `planner` / `candidate` / `action_space` / `reservation` / `policy` / `reward` / `training` / `curriculum`
+
+5. 定义模型元数据文件格式：
    - `backend/weights/rh_alns_cmrappo/<version>/meta.json`
 
-5. 冻结环境语义契约（见 4.1.3 节）
+6. 冻结环境语义契约（见 4.1.3 节）
 
 ### 4.1.3 必须先冻结的环境语义契约
 
-离线训练与离线验证不能只依赖参数文件，还必须先冻结以下 5 件事：
+离线训练与离线验证不能只依赖参数文件，还必须先冻结以下 7 件事：
 
 **（1）模式 C 的合法回收动作**
 
@@ -597,14 +605,14 @@ J =
 
 含义：
 
-- `T_complete`：所有订单从进入可调度池到完成配送的时长总和，定义为
-   `T_complete = sum_i (t_delivered_i - t_spawn_i)`
-   其中 `t_spawn_i` 是订单进入可调度池的时刻（对应 `spawn_sim_s`，静态订单取 `0`），
+- `T_complete`：无人机可配送订单从进入可调度池到完成配送的时长总和，定义为
+   `T_complete = sum_i (t_delivered_i - t_spawn_i)`，其中 `i` 仅遍历 `weight <= 10kg` 的无人机订单，
+   `t_spawn_i` 是订单进入可调度池的时刻（对应 `spawn_sim_s`，静态订单取 `0`），
    `t_delivered_i` 是无人机完成配送的时刻（不含 `drone_service_time_order_s`，
    若有服务时长则取服务完成时刻，需与环境实现保持一致）。
    示例：3 个订单分别在进入池后耗时 10 分钟、20 分钟、40 分钟完成配送，则
    `T_complete = 70 分钟`。
-   该目标只计入策略可影响的时间段，避免将订单预设延迟等系统不可控时间纳入 reward
+   该目标只计入策略可影响的无人机订单时间段，避免把 `mode A` 卡车背景订单混入 PPO 主评估口径
 - `T_wait`：UAV 在节点处被动等待卡车到来的物理等待时间总和，
    不包含显式 WAIT 动作产生的 idle 时间（两者必须分开累计，不允许重复计入）
 - `T_idle`：UAV 显式选择 WAIT 动作后产生的 idle 时间总和，定义为
@@ -632,11 +640,12 @@ J =
 要求：
 
 - `J` 仅作为评估指标，不直接用于 PPO 梯度更新
-- benchmark 与 stochastic 验证必须回到这套指标，不允许只看 PPO reward
+- benchmark 与 stochastic 验证必须回到这套 UAV-scope 指标，不允许只看 PPO reward
 - `Lambda_hard` 首轮建议值为 `1200`（秒级等价损失），必须显著大于一次最坏可恢复扰动
 - `T_complete` 仅用于评估，不计入训练 reward（见 4.1.4.1 节）
 - `T_overdue` 的即时惩罚必须在 `env_adapter` 的 `compute_reward()` 里逐步结算，不能只在 episode 末端累计
 - `T_idle` 的即时惩罚必须在 `env_adapter` 的 `compute_reward()` 里逐步结算
+- `mode A` 背景订单不进入 `J` 与 PPO-vs-baseline 核心比较指标，仅进入单独的系统上下文统计区
 
 ### 4.1.4.1 PPO 训练用每步奖励 r_t
 
@@ -665,7 +674,7 @@ r_t =
 
 说明：
 
-- `T_overdue` 只对无人机可配送订单（weight ≤ 10kg）累加；mode A 卡车订单无超时惩罚，其 `T_complete` 贡献由环境自动结算，不影响 PPO 梯度
+- `T_overdue` 只对无人机可配送订单（weight ≤ 10kg）累加；`mode A` 卡车背景订单无超时惩罚，也不进入 `T_complete` 与 PPO 主评估
 - `R_delivery_bonus` 是唯一的正奖励项，确保模型始终有动力送达订单，即使订单已超时
 - 首轮建议 `R_delivery_bonus = 60`（秒级等价，量级约为一次小惩罚）
 - 所有每步累加项必须在 `env_adapter.compute_reward()` 中逐步结算，不允许在 episode 末端批量累计
@@ -679,6 +688,7 @@ r_t =
 
 - **算法专属参数**（统一放在 `backend/config/rh_alns_cmrappo.yaml`）：
   - `scene`：地图尺度派生规则
+  - `data`：订单源模式与数据注入规则（`order_source_mode`、`benchmark_use_dynamic_orders=true`、`poisson_arrival_rate`、`poisson_seed`、`poisson_weight_max=10kg`、`order_window_min_min=20`、`order_window_max_min=60`、`hybrid_background_dynamic_orders` 等）
   - `planner`：RH-ALNS 低频触发参数（`coarse_replan_interval_sec=420` 等）
   - `candidate`：候选集参数（`max_candidate_orders=32`、`max_candidate_recovery_per_order=4`、`max_candidate_actions=128`、`station_wait_threshold_sec=240` 等）
   - `action_space`：动作空间类型（`factorized`）、`enable_wait_action=true`、`include_mode_a_in_policy=false`
@@ -703,11 +713,12 @@ r_t =
 - `CoarsePlanView` 接口契约已定义，后续实现可直接对照
 - 主目标函数已包含 `lambda_res_timeout * T_res_timeout` 项，与算法方案文档一致
 
-## 4.2 Phase 2：实现离线场景装载器（含卡车路径初始化）
+## 4.2 Phase 2：实现静态场景装载器
 
 目标：
 
-- 把 `default_scene` 变成训练和验证都能直接读取的标准内部对象
+- 把 `default_scene` 的静态资产变成训练和验证都能直接读取的标准内部对象
+- 只负责装载场景资产，不在这一阶段决定运行时采用哪种订单源模式
 
 建议新增文件：
 
@@ -719,7 +730,7 @@ r_t =
 2. 读取 `entities.json`
 3. 读取 `orders.json`
 4. 读取 `osm_network.xml/geojson`
-5. 输出统一的训练场景对象
+5. 输出统一的静态场景上下文对象
 
 建议输出结构：
 
@@ -754,7 +765,62 @@ r_t =
   - `10` dynamic orders
 - 多次加载结果一致，可复现
 
-## 4.3 Phase 3：SUMO 卡车路径验证（env_adapter 前置）
+## 4.3 Phase 3：实现订单源适配（`benchmark` / `poisson` / `hybrid`）
+
+目标：
+
+- 把“场景资产”与“运行时订单注入模式”解耦
+- 明确训练、benchmark 验证、stochastic 验证分别使用哪一种订单源
+- 复用现有 `OrderManager` 的泊松生成与 deadline 逻辑，不单独复制实现
+
+建议新增文件：
+
+- `backend/training/order_source_adapter.py`
+
+核心职责：
+
+1. 定义统一模式：
+   - `benchmark`：`static_orders + dynamic_orders`，并强制 `arrival_rate = 0`
+     其中 `dynamic_orders` 作为 PPO 主验证订单，`static_orders` 作为卡车骨架与 `mode A` 背景任务
+   - `poisson`：`static_orders` 保留为卡车骨架/`mode A` 背景订单，动态订单仅由泊松流生成，不注入 `dynamic_orders`
+   - `hybrid`：`static_orders + dynamic_orders + 泊松流`
+2. 统一输出运行时订单源配置：
+   - `scheduled_dynamic_orders`
+   - `poisson_gen_config`
+   - `arrival_rate`
+   - `seed`
+   - deadline/window 参数快照
+3. 复用 `backend/environment/state/order_manager.py` 现有规则：
+   - 泊松到达过程复用 `random.expovariate(arrival_rate / 60.0)`
+   - 泊松订单 deadline 复用 `_create_order()` 的 `window_min/window_max`
+   - benchmark 动态订单回放复用 `_parse_scheduled_dynamic_order()` 的 `spawn_sim_s / deadline_sim_s / deadline_offset_s`
+4. 提供统一入口：
+   - `build_order_source(scene_ctx, mode, seed, overrides)`
+5. 明确模式约束：
+   - `train_cmrappo.py` 仅允许 `poisson`
+   - `validate_benchmark.py` 仅允许 `benchmark`
+   - `validate_stochastic.py` 仅允许 `poisson` 或 `hybrid`
+
+实现要求：
+
+- 同一 `seed` 下，泊松订单流必须可复现
+- `poisson` 模式下不得把 `dynamic_orders` 当作背景事件偷偷注入
+- `benchmark` 模式下必须显式关闭泊松流（`arrival_rate = 0`）
+- 所有订单源配置必须写入训练配置快照和 `meta.json`
+
+产物：
+
+- `order_source_adapter.py`
+- 订单源模式说明
+- 至少 1 个自测脚本：分别打印三种模式下的订单源摘要
+
+验收标准：
+
+- 三种模式的输入边界明确且互不混淆
+- `poisson` 模式能稳定复现订单数、seed 与 deadline 分布
+- `benchmark` 模式下结果只受固定订单回放影响，不受泊松流扰动
+
+## 4.4 Phase 4：SUMO 卡车路径验证（env_adapter 前置）
 
 目标：
 
@@ -798,7 +864,7 @@ r_t =
 - ETA 与手工估算（距离 / 速度）误差在合理范围内
 - 确认至少有 2 个以上合法 mode C 回收节点存在于路线中
 
-## 4.4 Phase 4：实现训练环境适配器
+## 4.5 Phase 5：实现训练环境适配器
 
 目标：
 
@@ -812,18 +878,28 @@ r_t =
 
 - `reset()`
 - `step(action)`
-- `build_observation()`
-- `build_action_mask()`
+- `advance_to_decision_event()`
+- `build_runtime_state_view()`
 - `compute_reward()`
 - `is_done()`
+
+职责边界（必须固定）：
+
+- `env_adapter` 是唯一的运行时真相源，负责事件推进、状态转移、奖励结算、终止判定
+- `env_adapter` 不再单独重实现一套候选动作筛选或 `action_mask` 逻辑
+- 当环境推进到决策事件时：
+  1. `env_adapter` 调用 `planner_bridge.maybe_replan(...)` 刷新 `CoarsePlanView`
+  2. `env_adapter` 调用 `candidate_builder.build(...)` 生成 `observation + action_mask + action_lookup`
+  3. policy 或 baseline 在该上下文上选动作
+  4. `env_adapter.step(action)` 执行真实状态转移并结算 reward
 
 第一版环境建议：
 
 - 场景固定为 `default_scene`
-- 订单源先只支持：
-  - `static_orders`
-  - `dynamic_orders`
-- 暂不启用随机泊松扩展
+- 运行时订单源通过 `order_source_adapter` 注入
+- 训练阶段默认 `order_source_mode = poisson`
+- benchmark 验证阶段默认 `order_source_mode = benchmark`
+- stochastic 验证阶段默认 `order_source_mode = poisson | hybrid`
 - 每个 `step` 对应一次调度决策窗口
 - 不要求一开始就是全精度连续物理仿真，但必须优先保证事件状态转移正确
 - 环境推进建议采用事件驱动或准事件驱动，而不是粗时间步近似
@@ -863,6 +939,7 @@ r_t =
 
 2. 关键事件
    - 订单送达
+   - truck-side `mode A` 背景订单完成
    - 返程回收点选择（factorized action）
    - reservation 建立与 timeout 检查
    - 卡车到站
@@ -875,7 +952,7 @@ r_t =
    - 无人机从卡车起飞（新增：`riding_with_truck` → `flying_to_deliver`）
 
 3. 奖励与惩罚来源（必须与主目标逐项对应）
-   - `T_complete`
+   - `T_complete`（仅无人机订单）
    - `T_wait`（UAV 被动等待卡车的物理等待时间，episode 级累计）
    - `T_idle`（UAV 显式选择 WAIT 动作的 idle 时间，**每步即时结算**，不在 episode 末端累计）
    - `T_queue`
@@ -891,6 +968,12 @@ r_t =
    - `reservation_count(node)` 作为拥挤信号
    - timeout 后自动进入 `fallback_recovery` 并施加软惩罚
 
+5. 系统上下文统计（不进入 PPO 主指标）
+   - `mode_a_background_order_count`
+   - `mode_a_background_completion_time_sum`
+   - `truck_total_mileage`
+   - `truck_background_order_completion_events`
+
 动作建议：
 
 - 采用 factorized action space：先选订单，再选模式（`WAIT`/`B`/`C`），再选回收节点
@@ -902,7 +985,7 @@ r_t =
 
 - `env_adapter.py`
 - 一个最小可运行 episode
-- observation / action / reward 说明
+- runtime state / reward / done 说明
 
 验收标准：
 
@@ -913,7 +996,7 @@ r_t =
 - 站点排队和工位释放逻辑可复现
 - reservation timeout 能正确触发 fallback 并记录 `T_res_timeout`
 
-## 4.5 Phase 5：实现候选动作与上层规划骨架
+## 4.6 Phase 6：实现候选动作与上层规划骨架
 
 目标：
 
@@ -928,6 +1011,8 @@ r_t =
 职责拆分：
 
 1. `candidate_builder.py`
+   - 只读 `env_adapter` 当前运行时状态与 `CoarsePlanView`
+   - 输出 policy/baseline 直接消费的 `observation + action_mask + action_lookup`
    - 构建候选订单（在 `authorized_orders` 范围内）
    - 构建候选回收点（在 `recovery_pool[order]` 范围内）
    - 构建 factorized action mask（order → mode → recover_node 三阶段）
@@ -939,15 +1024,25 @@ r_t =
      - 构建与 `idle` 状态完全一致的 factorized action mask
 
 2. `planner_bridge.py`
+   - 低频读取全局运行时状态，生成或刷新只读 `CoarsePlanView`
    - 承接 RH-ALNS 上层骨架，输出 `CoarsePlanView`
    - 管理重规划周期（`coarse_replan_interval_sec=420`）
    - 管理 `plan_version` 更新与失效规则
+   - 不直接推进环境事件，不直接结算奖励
    - 本阶段 ALNS 可以简化实现（如基于贪心或固定规则），但接口必须满足 `CoarsePlanView` 契约
    - **新增**：输出 `launch_candidate_stations`，筛选规则为：
      - 卡车未来路线上尚未经过的站点，且该站点周边 `support_radius_km` 内存在至少 `min_orders_to_trigger` 个未分配订单
      - 卡车路线约束（不绕路）已在路线规划阶段保证，此处只做订单密度筛选
      - 更新时机：ALNS 重规划时全量重算；卡车经过某站点后实时移除；某站点周边订单全部被分配后实时移除
      - 首轮参数：`min_orders_to_trigger = 1`，可通过调高该值减少触发频率
+
+固定调用链：
+
+1. `env_adapter.advance_to_decision_event()`
+2. `planner_bridge.maybe_replan(runtime_state) -> CoarsePlanView`
+3. `candidate_builder.build(runtime_state, coarse_plan) -> observation + action_mask + action_lookup`
+4. `policy` 或 `baseline` 选择动作
+5. `env_adapter.step(action)` 执行真实状态转移并结算 reward
 
 这一阶段必须先固定以下参数：
 
@@ -977,7 +1072,7 @@ r_t =
 产物：
 
 - 候选动作生成器（factorized）
-- action mask 生成器（三阶段）
+- observation / action mask / action lookup 生成器（三阶段）
 - 上层规划骨架入口（`CoarsePlanView` 输出）
 
 验收标准：
@@ -987,7 +1082,7 @@ r_t =
 - mask 与候选动作一一对应
 - `CoarsePlanView` 输出满足接口契约，PPO 可直接消费
 
-## 4.6 Phase 6：实现 PPO 训练主循环
+## 4.7 Phase 7：实现 PPO 训练主循环
 
 目标：
 
@@ -1051,11 +1146,17 @@ Padding/Masking 规则：
 
 训练建议分两阶段：
 
-1. 固定 benchmark 过拟合阶段
-   - 目的：确认模型、奖励、动作空间没有定义错
+1. 固定 seed 的小规模 `poisson` 过拟合阶段
+   - 目的：确认模型、奖励、动作空间、订单源接入没有定义错
 
-2. benchmark + 随机扩展阶段
-   - 目的：逐步获得泛化能力
+2. 多 seed `poisson` 扩展阶段
+   - 目的：逐步获得对泊松动态订单的泛化能力
+
+订单源要求：
+
+- `train_cmrappo.py` 运行时强制校验 `order_source_mode == poisson`
+- 训练配置快照必须记录 `arrival_rate`、`seed`、deadline 窗口参数
+- 若用户误传 `benchmark` 或 `hybrid` 到训练主循环，应直接报错，避免训练分布漂移
 
 训练输出必须包含：
 
@@ -1068,10 +1169,10 @@ Padding/Masking 规则：
 
 - 训练前几轮不会直接发散或崩溃
 - 能稳定保存权重和元数据
-- 固定 benchmark 回放指标出现提升趋势
+- 固定 benchmark 的 UAV-scope 回放指标出现提升趋势
 - reward 提升时，主目标分解项（含 `T_res_timeout`）也能同步解释，而不是只表现为黑盒数值变化
 
-## 4.7 Phase 7：固定 benchmark 离线验证
+## 4.8 Phase 8：固定 benchmark 离线验证
 
 目标：
 
@@ -1080,6 +1181,7 @@ Padding/Masking 规则：
 建议新增文件：
 
 - `backend/training/validate_benchmark.py`
+- `backend/training/baselines/greedy_local_policy.py`
 
 输入：
 
@@ -1093,19 +1195,47 @@ Padding/Masking 规则：
 - 固定 `static_orders + dynamic_orders`
 - 关闭随机泊松流：`arrival_rate = 0`
 - 多次重复跑同一组场景
-- 与基线算法对比
+- 与确定性 greedy baseline 对比
+- PPO 与 baseline 的核心比较范围仅限无人机订单；`mode A` 背景订单只作为系统上下文统计保留
+
+baseline 设计（本阶段正式采用）：
+
+1. baseline 与 PPO 共用完全相同的：
+   - `env_adapter`
+   - `planner_bridge`
+   - `candidate_builder`
+   - `CoarsePlanView`
+   - factorized action space 与 `action_mask`
+2. baseline 为确定性策略，不做训练，不引入额外随机性
+3. 候选订单选择规则采用加权贪心分数：
+   ```text
+   score(order_i) =
+       w_priority * order_pre_score_i
+     - w_eta      * eta_to_deliver_i
+     - w_queue    * predicted_queue_time(best_recovery_i)
+     - w_risk     * miss_risk_i
+     - w_overdue  * projected_overdue_cost_i
+   ```
+4. 模式选择规则：
+   - 若存在满足安全时序、电量和队列约束的 `mode C`，且 `ETA_margin >= greedy_c_margin_min_sec`，优先选 `C`
+   - 否则选 `B`
+   - 若无合法配送动作，才选 `WAIT`
+5. 回收点选择规则：
+   - 在合法候选中选择 `ETA_margin` 更大、`predicted_queue_time` 更小、额外 detour 更低的点
+6. `validate_benchmark.py` 必须支持：
+   - `policy_source=ppo`
+   - `policy_source=greedy_baseline`
 
 建议至少统计这些指标：
 
-- 完成订单数
-- 准时率
-- 超时数
-- 主目标值（`J`）及各分解项
-- 卡车总里程
+- 无人机订单完成数
+- 无人机订单准时率
+- 无人机订单超时数
+- UAV-scope 主目标值（`J`）及各分解项
 - 无人机总里程
 - 回收站平均等待
 - 模式分布（mode B / C 采用比例）
-- 每单平均响应时延
+- 每单平均响应时延（仅无人机订单）
 - 无人机等待卡车时间（`T_wait`）
 - 站点排队总时间（`T_queue`）
 - miss 次数
@@ -1116,23 +1246,34 @@ Padding/Masking 规则：
 - 强制移除订单数（`N_hard_overdue`）
 - greedy 推理下的吞吐与稳定性指标
 
+系统上下文统计区至少保留：
+
+- `mode_a_background_order_count`
+- `mode_a_background_completion_time_sum`
+- `truck_total_mileage`
+- `truck_background_order_completion_events`
+
 这一阶段最重要的是：
 
 - 可复现性
 - 可解释性
+- 公平对比（同一环境、同一 coarse plan、同一 action mask）
 
 产物：
 
 - `benchmark_report.json`
 - `benchmark_summary.md`
+- baseline 对比结果表
+- 系统上下文统计区
 
 验收标准：
 
 - 同一权重、同一输入，多次运行结果一致或波动极小
-- 至少有一项核心指标优于当前基线，或策略行为明显更合理
+- PPO 与 greedy baseline 在同一设置下可直接对比
+- 至少有一项 UAV-scope 核心指标优于 greedy baseline，或策略行为明显更合理
 - 至少能解释模式 C 回收成功率、miss 率与 hard failure 率
 
-## 4.8 Phase 8：随机扩展离线验证
+## 4.9 Phase 9：随机扩展离线验证
 
 目标：
 
@@ -1145,10 +1286,10 @@ Padding/Masking 规则：
 验证方式：
 
 - 保持 `default_scene` 的设施和地图不变
-- 订单源改为：
-  - `static_orders` 可保留或关闭
-  - `dynamic_orders` 可保留作为背景事件
-  - 再叠加 `arrival_rate > 0` 的泊松流
+- 订单源模式限定为：
+  - `poisson`
+  - `hybrid`
+- `validate_stochastic.py` 不允许 `benchmark` 模式
 - 按多个随机 seed 评估
 
 建议分档：
@@ -1177,12 +1318,12 @@ Padding/Masking 规则：
 - 中强度场景下结果稳定
 - 高强度下即使性能下降，也不出现明显策略崩坏
 
-## 4.9 Phase 9：SUMO 调度行为回放验证（训练后）
+## 4.10 Phase 10：SUMO 调度行为回放验证（训练后）
 
 目标：
 
 - 把训练好的模型的调度行为导出到 SUMO，验证 mode C rendezvous、miss、fallback 在时间轴上是否可解释
-- 与 Phase 3 的路径验证不同，这里验证的是策略行为，而不是路径本身
+- 与 Phase 4 的路径验证不同，这里验证的是策略行为，而不是路径本身
 
 建议新增文件：
 
@@ -1190,7 +1331,7 @@ Padding/Masking 规则：
 
 职责：
 
-- 把离线验证（Phase 7）产生的路线、事件、订单结果导出成 SUMO 可观察文件
+- 把离线验证（Phase 8）产生的路线、事件、订单结果导出成 SUMO 可观察文件
 
 这一阶段主要看：
 
@@ -1208,7 +1349,7 @@ Padding/Masking 规则：
 - `sumo-gui` 能正确加载
 - 至少完成 1 个 benchmark 回放可视化
 
-## 4.10 Phase 10：模型产物固化
+## 4.11 Phase 11：模型产物固化
 
 每个训练版本建议固化为如下目录：
 
@@ -1218,6 +1359,8 @@ backend/weights/rh_alns_cmrappo/<version>/
   meta.json
   benchmark_report.json
   stochastic_report.json
+  baseline_benchmark_report.json
+  system_context_report.json
   train_metrics.jsonl
   sumo/
     poi.add.xml
@@ -1249,20 +1392,23 @@ backend/weights/rh_alns_cmrappo/<version>/
 
 1. 先做 `backend/config/rh_alns_cmrappo.yaml`（含完整分层结构）
 2. 再冻结第 4.1.3 节的环境语义契约（含 reservation timeout 机制）
-3. 再做 `backend/training/scene_loader.py`（含卡车路径初始化）
-4. 再做 `backend/training/export_sumo_truck_route.py`，用 SUMO 验证卡车路径和 ETA
-5. 再做 `backend/training/env_adapter.py`（含 reservation timeout 状态与事件，ETA 直接使用 Phase 3 产物）
-6. 再做 `backend/training/candidate_builder.py` 和 `planner_bridge.py`（固定 RH-ALNS 骨架，输出 `CoarsePlanView`）
-7. 再做 `backend/training/train_cmrappo.py`（Shared PPO-Lite，factorized action space，centralized_train_only critic）
-8. 训练出第一版 `policy.pt + meta.json`
-9. 做 `backend/training/validate_benchmark.py`（greedy inference，用 `dynamic_orders` 作为验证集）
-10. 再做 `backend/training/validate_stochastic.py`
-11. 最后做 `backend/training/export_sumo_replay.py`（调度行为回放）
+3. 再做 `backend/training/scene_loader.py`（只负责静态场景资产装载）
+4. 再做 `backend/training/order_source_adapter.py`（统一 `benchmark / poisson / hybrid` 三种模式）
+5. 再做 `backend/training/export_sumo_truck_route.py`，用 SUMO 验证卡车路径和 ETA
+6. 再做 `backend/training/env_adapter.py`（含 reservation timeout 状态与事件，ETA 直接使用 Phase 4 产物）
+7. 再做 `backend/training/candidate_builder.py` 和 `planner_bridge.py`（固定 RH-ALNS 骨架，输出 `CoarsePlanView`）
+8. 再做 `backend/training/train_cmrappo.py`（Shared PPO-Lite，`order_source_mode=poisson`，factorized action space，centralized_train_only critic）
+9. 训练出第一版 `policy.pt + meta.json`
+10. 做 `backend/training/validate_benchmark.py` 与 `backend/training/baselines/greedy_local_policy.py`（固定 benchmark，对比 PPO 与 greedy baseline）
+11. 再做 `backend/training/validate_stochastic.py`
+12. 最后做 `backend/training/export_sumo_replay.py`（调度行为回放）
 
 原因：
 
-- SUMO 路径验证（步骤 4）必须在 env_adapter 之前，因为 ETA 是 `action_mask` 的前置输入
+- 订单源模式必须先固定，否则训练、benchmark、stochastic 三条链路会混用订单注入语义
+- SUMO 路径验证（步骤 5）必须在 env_adapter 之前，因为 ETA 是 `action_mask` 的前置输入
 - 先把路径正确性确认，再实现环境，避免训练时无法区分路径 bug 和模型 bug
+- baseline 对比放在 benchmark 阶段最合适，因为它要求完全相同的环境与动作空间
 - 随机泊松流验证和行为回放放在模型能工作之后，避免同时面对多类 bug
 
 ---
@@ -1273,12 +1419,13 @@ backend/weights/rh_alns_cmrappo/<version>/
 
 1. 能稳定产出 `policy.pt + meta.json`
 2. 能在 `default_scene` 上完成固定 benchmark 回放（greedy inference）
-3. 能输出 benchmark 指标报告（含 `T_res_timeout`、`T_overdue`、`N_hard_overdue`、reservation timeout 次数）
+3. 能输出 UAV-scope benchmark 指标报告（含 `T_res_timeout`、`T_overdue`、`N_hard_overdue`、reservation timeout 次数）
 4. 能做至少一组随机泊松扩展验证
 5. 能导出 SUMO 可视化文件并复核结果
 6. 已明确哪些参数属于后续在线必须锁定
 7. 模式 C、miss、fallback、reservation timeout、FIFO 与 hard failure 语义已在环境和验证中闭环
 8. RH-ALNS 与 CMRAPPO 的职责边界在代码层面已明确分离（`planner_bridge.py` 与 `env_adapter.py` 各司其职）
+9. `mode A` 背景订单已从 PPO 主指标中剥离，并单独输出系统上下文统计（订单数、完成时间、卡车里程）
 
 ---
 
