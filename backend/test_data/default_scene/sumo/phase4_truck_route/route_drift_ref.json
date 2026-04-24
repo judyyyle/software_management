@@ -1,0 +1,10 @@
+{
+  "DEP-TEST-01": {
+    "eta_ref": 1456.1324600946575,
+    "route_index_ref": 1
+  },
+  "STA-TEST-01": {
+    "eta_ref": 640.7913931434268,
+    "route_index_ref": 0
+  }
+}
