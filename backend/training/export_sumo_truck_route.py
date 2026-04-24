@@ -149,7 +149,13 @@ def export_phase4_truck_route(
 
     net_path = export_dir / "truck_route.net.xml"
     write_sumo_net_artifacts(net_artifacts, str(net_path))
-    _write_poi_file(scene_ctx, export_dir / "poi.add.xml")
+    _write_poi_file(
+        scene_ctx=scene_ctx,
+        execution_route=execution_route,
+        road_nodes=road_nodes,
+        net_artifacts=net_artifacts,
+        output_path=export_dir / "poi.add.xml",
+    )
     _write_route_file(execution_route, export_dir / "truck_route.rou.xml")
     _write_sumocfg(
         execution_route=execution_route,
@@ -566,30 +572,71 @@ def _build_route_drift_ref(
     }
 
 
-def _write_poi_file(scene_ctx: TrainingSceneContext, output_path: Path) -> None:
+def _write_poi_file(
+    *,
+    scene_ctx: TrainingSceneContext,
+    execution_route: TruckExecutionRoute,
+    road_nodes: Mapping[str, tuple[float, float]],
+    net_artifacts: Any,
+    output_path: Path,
+) -> None:
+    def local_xy(position: Position3D) -> tuple[float, float]:
+        return position.x - net_artifacts.ox, position.y - net_artifacts.oy
+
     lines = [
         '<?xml version="1.0" encoding="UTF-8"?>',
         '<additional xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"',
         '           xsi:noNamespaceSchemaLocation="http://sumo.dlr.de/xsd/additional_file.xsd">',
     ]
+
+    route_points: list[tuple[float, float]] = []
+    for segment in execution_route.segments:
+        for osm_node_id in segment.osm_node_path:
+            pos = _osm_node_position(road_nodes, osm_node_id)
+            point = local_xy(pos)
+            if not route_points or route_points[-1] != point:
+                route_points.append(point)
+    if len(route_points) >= 2:
+        shape = " ".join(f"{x:.2f},{y:.2f}" for x, y in route_points)
+        lines.append(
+            '    <poly id="TRK-TEST-01-route" type="truck_route"'
+            ' color="255,96,0" fill="false" layer="8" lineWidth="6"'
+            f' shape="{shape}"/>'
+        )
+
     for depot_id, depot in scene_ctx.depots.items():
+        x, y = local_xy(depot.location)
         lines.append(
             _format_poi_xml(
                 poi_id=depot_id,
-                x=depot.location.x,
-                y=depot.location.y,
+                x=x,
+                y=y,
                 color="0,128,255",
                 poi_type="depot",
             )
         )
     for station_id, station in scene_ctx.stations.items():
+        x, y = local_xy(station.location)
         lines.append(
             _format_poi_xml(
                 poi_id=station_id,
-                x=station.location.x,
-                y=station.location.y,
+                x=x,
+                y=y,
                 color="0,180,0",
                 poi_type="station",
+            )
+        )
+    for stop in execution_route.stops:
+        if stop.node_type != "customer":
+            continue
+        x, y = local_xy(stop.position)
+        lines.append(
+            _format_poi_xml(
+                poi_id=stop.node_id,
+                x=x,
+                y=y,
+                color="255,64,64",
+                poi_type="order",
             )
         )
     lines.append("</additional>")
