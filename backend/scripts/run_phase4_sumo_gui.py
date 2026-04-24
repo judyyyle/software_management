@@ -126,6 +126,17 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="启动前先重新生成 Phase 4 导出产物",
     )
+    parser.add_argument(
+        "--no-start",
+        action="store_true",
+        help="只加载场景，不自动开始仿真",
+    )
+    parser.add_argument(
+        "--delay-ms",
+        type=float,
+        default=80.0,
+        help="GUI 自动运行时每步延迟毫秒数；越大越慢",
+    )
     args = parser.parse_args(argv)
 
     if args.regenerate:
@@ -146,9 +157,11 @@ def main(argv: list[str] | None = None) -> int:
     )
     env = os.environ.copy()
     env.setdefault("QT_X11_NO_MITSHM", "1")
-    env.setdefault("LIBGL_ALWAYS_INDIRECT", "1")
+    command = [sumo_gui_bin, "-c", str(sumocfg), "--disable-textures"]
+    if not args.no_start:
+        command.extend(["--start", "--delay", str(args.delay_ms)])
     subprocess.run(
-        [sumo_gui_bin, "-c", str(sumocfg), "--disable-textures"],
+        command,
         check=True,
         cwd=str(sumocfg.parent),
         env=env,
