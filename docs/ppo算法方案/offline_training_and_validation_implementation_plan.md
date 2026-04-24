@@ -961,6 +961,82 @@ r_t =
 - `poisson` 模式能稳定复现订单数、seed 与 deadline 分布
 - `benchmark` 模式下结果只受固定订单回放影响，不受泊松流扰动
 
+### 4.3.1 本轮已完成实现记录
+
+本轮已按本节要求完成 `Phase 3` 的第一版落地，实现文件如下：
+
+- `backend/training/order_source_adapter.py`
+- `backend/scripts/inspect_order_sources.py`
+
+同时为支撑 `Phase 3` 契约补充了两处配套改动：
+
+- `backend/training/scene_loader.py`
+  - `TrainingSceneContext` 新增 `scene_config_path`、`entities_json_path`、`orders_json_path`
+  - 其中 `orders_json_path` 供 `BenchmarkMeta.orders_json` 与文件 SHA256 摘要生成使用
+- `backend/environment/state/order_manager.py`
+  - 将泊松订单 ID 生成从 `uuid4()` 改为基于当前随机流的确定性 `hex8-seq`
+  - 目的不是改变业务语义，而是满足“同一 `seed` 下订单流完全可复现”的 Phase 3 验收要求
+
+当前 `order_source_adapter` 已实现的职责：
+
+1. 提供统一入口 `build_order_source(scene_ctx, mode, seed, overrides)`
+2. 定义并固化三种订单源模式：
+   - `benchmark`：保留 `dynamic_orders` 回放，强制 `arrival_rate = 0`
+   - `poisson`：只保留 `static_orders` 作为卡车骨架 / mode A 背景，不注入 `dynamic_orders`
+   - `hybrid`：同时保留 `dynamic_orders` 与泊松流
+3. 输出统一运行时订单源配置：
+   - `background_static_orders`
+   - `scheduled_dynamic_orders`
+   - `poisson_gen_config`
+   - `arrival_rate`
+   - `seed`
+   - `benchmark`
+   - `training_input_meta`
+4. 复用 `OrderManager` 现有语义而不是重写一套生成逻辑：
+   - scheduled dynamic replay 继续走 `set_scheduled_dynamic_orders()`
+   - 泊松流配置继续走 `configure()` + `tick()`
+   - deadline/window 参数仍与 `_create_order()` 保持同一配置口径
+5. 提供后续入口可直接复用的辅助函数：
+   - `configure_order_manager_for_source(...)`
+   - `preview_dynamic_order_stream(...)`
+   - `build_order_source_preview_summary(...)`
+   - `ensure_mode_allowed(...)`
+
+当前 `Phase 3` 已验证通过的边界：
+
+- `benchmark` 模式下 `arrival_rate = 0.0`，不会再混入泊松流
+- `poisson` 模式下 `scheduled_dynamic_orders = 0`，不会偷偷注入 `dynamic_orders`
+- `hybrid` 模式下同时包含 benchmark 动态单与泊松流
+- benchmark 动态单经 `scheduled_dynamic_orders -> OrderManager._order_from_scheduled_entry()`
+  回放后，`Order.source_type` 与 `scene_loader` 直读路径保持同一枚举语义
+- 相同 `seed` 下，泊松订单预览流的订单数、ID、创建时间、deadline、重量与坐标快照完全一致
+- 不同 `seed` 下，泊松订单预览流会发生变化
+
+本轮自测脚本与结果：
+
+- `python backend/scripts/inspect_training_scene.py`
+  - 通过，确认 `Phase 2` 场景装载未被破坏
+- `python backend/scripts/inspect_order_sources.py`
+  - 通过，已打印三种模式摘要并校验上述模式边界与 seed 可复现性
+- `python -m compileall backend/training backend/scripts/inspect_order_sources.py backend/environment/state/order_manager.py`
+  - 通过，确认新增模块可正常编译
+
+结论：
+
+- `Phase 3` 的“订单源适配层”已具备进入后续 `train_cmrappo.py`、`validate_benchmark.py`、`validate_stochastic.py` 接入的条件
+- 后续训练/验证入口应直接复用本节实现，不应再各自维护独立的订单注入分支，以避免 `benchmark` / `poisson` / `hybrid` 语义再次漂移
+
+备注：
+
+- “所有订单源配置必须写入训练配置快照和 `meta.json`”这条要求在当前阶段已完成到“对象准备完成”的程度：
+  - `order_source_adapter` 已产出 `benchmark` 与 `training_input_meta`
+  - 这两部分可以被后续训练入口直接消费
+- 真正的写盘动作仍属于 `Phase 7（train_cmrappo.py）` 的职责：
+  - 训练完成后应构造 `TrainingRunMeta`
+  - 再调用 `build_meta_json_dict(MetaJson(...), TrainingRunMeta(...))`
+  - 最终写入模型目录下的 `meta.json`
+- 因此，本阶段不再重复实现一次“临时写盘”，避免 Phase 3 与 Phase 7 各自维护一套不一致的 `meta.json` 生成流程
+
 ## 4.4 Phase 4：SUMO 卡车路径验证（env_adapter 前置）
 
 目标：
