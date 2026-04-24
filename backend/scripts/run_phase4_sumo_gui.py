@@ -134,7 +134,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--delay-ms",
         type=float,
-        default=80.0,
+        default=250.0,
         help="GUI 自动运行时每步延迟毫秒数；越大越慢",
     )
     args = parser.parse_args(argv)
