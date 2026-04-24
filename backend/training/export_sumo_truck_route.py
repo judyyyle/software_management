@@ -601,7 +601,7 @@ def _write_poi_file(
         shape = " ".join(f"{x:.2f},{y:.2f}" for x, y in route_points)
         lines.append(
             '    <poly id="TRK-TEST-01-route" type="truck_route"'
-            ' color="255,96,0,255" fill="false" layer="8" lineWidth="10"'
+            ' color="255,96,0,180" fill="false" layer="7" lineWidth="6"'
             f' shape="{shape}"/>'
         )
 
@@ -730,9 +730,11 @@ def _write_route_file(execution_route: TruckExecutionRoute, output_path: Path) -
         '<routes xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"',
         '        xsi:noNamespaceSchemaLocation="http://sumo.dlr.de/xsd/routes_file.xsd">',
         '    <vType id="truck_phase4" accel="1.0" decel="4.5" sigma="0.0"'
-        ' length="16.0" width="4.0" maxSpeed="15.0" color="255,160,0" guiShape="truck"/>',
+        ' length="42.0" width="12.0" minGap="2.5" maxSpeed="15.0"'
+        ' color="0,220,255" guiShape="truck"/>',
         f'    <route id="truck_route" edges="{route_edges}"/>',
-        f'    <vehicle id="{execution_route.truck_id}" type="truck_phase4" route="truck_route" depart="0"/>',
+        f'    <vehicle id="{execution_route.truck_id}" type="truck_phase4" route="truck_route"'
+        ' depart="0" departPos="0" departSpeed="0" color="0,220,255"/>',
         "</routes>",
     ]
     output_path.write_text("\n".join(lines), encoding="utf-8")
