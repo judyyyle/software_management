@@ -251,14 +251,16 @@ class Truck(ChargingHost):
 
     def arrive(self, drone_id: str, current_time: float) -> None:
         """
-        无人机降落至卡车起降平台，进入充换电流程。
+        无人机降落至卡车起降平台，进入车载充换电流程。
 
         重写基类 arrive()，增加起降平台物理占位检查：
           1. 若 docked_drones 数量 < parking_slots → 停靠并进入换电队列
-          2. 否则 → 加入 wait_queue 等待平台空位
+          2. 否则 → 加入 wait_queue 等待车载补能服务空位
 
         注意：起降平台占位（docked_drones）与换电槽位（serving_drones）均受
         parking_slots 约束，两者不做独立计数，平台占位即服务开始。
+        这里的等待队列表示“已经被卡车成功回收后的车载服务等待”，
+        不表示 mode C 中等待与卡车汇合的阶段。
 
         Args:
             drone_id:    降落的无人机 ID
@@ -298,7 +300,7 @@ class Truck(ChargingHost):
         换电完成，无人机从平台离机（等待起飞指令）。
 
         移除 docked_drones 和 serving_drones 中的记录；
-        若 wait_queue 非空，从队列拉取下一架无人机停靠。
+        若 wait_queue 非空，从队列拉取下一架无人机停靠并进入车载补能服务。
 
         Args:
             drone_id:    完成换电的无人机 ID
