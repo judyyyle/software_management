@@ -53,6 +53,8 @@ from training.scene_loader import DEFAULT_CONFIG_PATH, TrainingSceneContext, loa
 CUSTOMER_SERVICE_TIME_SEC = 0.0
 DEFAULT_OUTPUT_SUBDIR = Path("sumo") / "phase4_truck_route"
 SNAP_WARN_THRESHOLD_M = 60.0
+# 绕路代价低于此值视为"顺路"，无论数量多少都直接加入路线。
+STATION_ONROUTE_DETOUR_THRESHOLD_M = 100.0
 
 
 @dataclass(frozen=True)
@@ -333,54 +335,77 @@ def _ensure_min_future_fixed_nodes(
     road_graph: Any,
     road_nodes: Mapping[str, tuple[float, float]],
 ) -> tuple[list[dict[str, Any]], tuple[dict[str, Any], ...]]:
-    # 反复插入绕路代价最小的未使用站点，直到满足 min_future_fixed_nodes。
-    # 绕路代价 = dist(prev→站) + dist(站→next) - dist(prev→next)，均为路网距离。
-    # 沿路站点的绕路代价自然接近 0，无需额外的"沿路优先"逻辑。
+    # 两阶段插入：
+    #   Phase 1 — 把所有绕路代价 < STATION_ONROUTE_DETOUR_THRESHOLD_M 的站点全部加入，
+    #             这些站点本来就顺路，不应跳过。每次插入后重新计算，因为计划结构已变。
+    #   Phase 2 — 若 Phase 1 结束后 station 数量仍不足 min_future_fixed_nodes，
+    #             按绕路代价从小到大继续补足，直到满足约束。
     if min_future_fixed_nodes < 1:
         raise ValueError("min_future_fixed_nodes 必须 >= 1")
 
     plan = list(execution_plan)
     inserted: list[dict[str, Any]] = []
     used_station_ids = {stop["node_id"] for stop in plan if stop["node_type"] == "station"}
-    while _count_future_fixed_nodes(plan) < min_future_fixed_nodes:
-        best_station = None
-        best_index = None
-        best_cost = None
-        for station_id, station in stations.items():
-            if station_id in used_station_ids:
-                continue
-            station_pos = station.location
-            for insert_at in range(1, len(plan)):
-                prev_stop = plan[insert_at - 1]
-                next_stop = plan[insert_at]
-                detour_cost = (
-                    _road_distance(road_graph, road_nodes, prev_stop["position"], station_pos)
-                    + _road_distance(road_graph, road_nodes, station_pos, next_stop["position"])
-                    - _road_distance(road_graph, road_nodes, prev_stop["position"], next_stop["position"])
-                )
-                candidate = (detour_cost, station_id, insert_at)
-                if best_cost is None or candidate < best_cost:
-                    best_cost = candidate
-                    best_station = station
-                    best_index = insert_at
 
-        if best_station is None or best_index is None:
-            raise ValueError("没有可插入的 station，无法满足最少 recovery 节点约束")
+    def _best_insertion(station_pos: Position3D) -> tuple[float, int] | tuple[None, None]:
+        best_cost: float | None = None
+        best_index: int | None = None
+        for insert_at in range(1, len(plan)):
+            cost = (
+                _road_distance(road_graph, road_nodes, plan[insert_at - 1]["position"], station_pos)
+                + _road_distance(road_graph, road_nodes, station_pos, plan[insert_at]["position"])
+                - _road_distance(road_graph, road_nodes, plan[insert_at - 1]["position"], plan[insert_at]["position"])
+            )
+            if best_cost is None or cost < best_cost:
+                best_cost = cost
+                best_index = insert_at
+        return best_cost, best_index
 
-        plan.insert(
-            best_index,
-            _make_plan_stop("station", best_station.station_id, best_station.location),
-        )
+    def _do_insert(station: Any, insert_index: int, detour_cost: float, reason: str) -> None:
+        plan.insert(insert_index, _make_plan_stop("station", station.station_id, station.location))
         inserted.append(
             {
                 "node_type": "station",
-                "node_id": best_station.station_id,
-                "insert_index": best_index,
-                "reason": "min_future_fixed_nodes",
-                "detour_cost_road_m": float(best_cost[0]),
+                "node_id": station.station_id,
+                "insert_index": insert_index,
+                "reason": reason,
+                "detour_cost_road_m": float(detour_cost),
             }
         )
-        used_station_ids.add(best_station.station_id)
+        used_station_ids.add(station.station_id)
+
+    # Phase 1: 顺路站点全部加入
+    changed = True
+    while changed:
+        changed = False
+        candidates = []
+        for station_id, station in stations.items():
+            if station_id in used_station_ids:
+                continue
+            cost, idx = _best_insertion(station.location)
+            if cost is not None and cost < STATION_ONROUTE_DETOUR_THRESHOLD_M:
+                candidates.append((cost, station_id, station, idx))
+        if candidates:
+            candidates.sort(key=lambda c: (c[0], c[1]))
+            cost, _, station, idx = candidates[0]
+            _do_insert(station, idx, cost, "on_route")
+            changed = True
+
+    # Phase 2: 数量不足时按绕路代价从小到大补足
+    while _count_future_fixed_nodes(plan) < min_future_fixed_nodes:
+        candidates = []
+        for station_id, station in stations.items():
+            if station_id in used_station_ids:
+                continue
+            cost, idx = _best_insertion(station.location)
+            if cost is not None:
+                candidates.append((cost, station_id, station, idx))
+        if not candidates:
+            raise ValueError("没有可插入的 station，无法满足最少 recovery 节点约束")
+        candidates.sort(key=lambda c: (c[0], c[1]))
+        cost, _, station, idx = candidates[0]
+        _do_insert(station, idx, cost, "min_future_fixed_nodes")
+
     return plan, tuple(inserted)
 
 
