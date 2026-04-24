@@ -79,6 +79,9 @@ class TrainingSceneContext:
 
     scene_id: str
     scene_bundle_dir: str
+    scene_config_path: str
+    entities_json_path: str
+    orders_json_path: str
     scene_config: Mapping[str, Any]
     bounds: Mapping[str, float]
     depots: Mapping[str, Any]
@@ -98,6 +101,7 @@ class TrainingSceneContext:
         return {
             "scene_id": self.scene_id,
             "scene_bundle_dir": self.scene_bundle_dir,
+            "orders_json_path": self.orders_json_path,
             "depots": len(self.depots),
             "stations": len(self.stations),
             "trucks": len(self.trucks),
@@ -198,6 +202,9 @@ def load_training_scene(
     context = TrainingSceneContext(
         scene_id=scene_id,
         scene_bundle_dir=str(bundle_dir),
+        scene_config_path=str(scene_config_path),
+        entities_json_path=str(entities_path),
+        orders_json_path=str(orders_path),
         scene_config=copy.deepcopy(scene_config),
         bounds=copy.deepcopy(scene_config.get("bounds", {})),
         depots=dict(entity_manager.depots),

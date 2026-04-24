@@ -18,11 +18,29 @@ from .scene_loader import (
     load_default_scene,
     load_training_scene,
 )
+from .order_source_adapter import (
+    OrderSourceConfig,
+    OrderSourceMode,
+    PoissonOrderGenConfig,
+    build_order_source,
+    build_order_source_preview_summary,
+    configure_order_manager_for_source,
+    ensure_mode_allowed,
+    preview_dynamic_order_stream,
+)
 
 __all__ = [
     "BenchmarkDynamicOrder",
+    "OrderSourceConfig",
+    "OrderSourceMode",
+    "PoissonOrderGenConfig",
     "TrainingRoadNetwork",
     "TrainingSceneContext",
+    "build_order_source",
+    "build_order_source_preview_summary",
+    "configure_order_manager_for_source",
+    "ensure_mode_allowed",
     "load_default_scene",
     "load_training_scene",
+    "preview_dynamic_order_stream",
 ]
