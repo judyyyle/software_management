@@ -302,7 +302,7 @@ J =
 1. 生成 truck 的未来骨架路线（`truck_backbone_route`）
 2. 给订单池做粗粒度优先级排序与窗口分桶（`order_priority_band`）
 3. 生成 station/depot 支持半径与可行 recovery 池（`recovery_pool`）
-4. 给未来一段时间内的回收节点分配粗粒度负载预算（`node_load_budget`）
+4. 给未来一段时间内的固定充换电节点分配粗粒度服务软预算（`node_charge_load_budget`）
 5. 提供 route drift 参考基线（`route_drift_ref`）
 
 本阶段 RH-ALNS 的触发规则固定为：
@@ -360,11 +360,16 @@ PPO 在以下两类时机触发，动作空间结构相同：
           AND ETA_truck(r_j) > t_deliver
           AND ETA_uav(order_i.location → r_j) + delta_safe <= ETA_truck(r_j)
           AND E_need(order_i.location → r_j) + E_safe <= E_rem
-          AND predicted_queue_time(r_j) <= station_wait_threshold_sec
     }
 ```
 
 这样设计的原因是：起飞时刻（`t_now`）决定了 `t_deliver`，进而决定了哪些回收节点在时序上合法。ALNS 无法在粗规划时预知精确的起飞时刻，因此回收候选点必须实时计算。
+
+这里需要特别固定一个业务口径：
+
+- **mode C 的等待回收合法性**只由时序、安全可达性和能量可行性决定
+- **充换电容量/排队**只在 UAV 被成功回收后的服务阶段生效，不构成“等待被回收”动作本身的非法性条件
+- 因此，`predicted_queue_time(node)` 可以作为候选排序、软截断或 reward 估计的输入，但不应作为 mode C 等待回收动作的硬性合法性判据
 
 **ALNS ↔ PPO 正式接口契约（`CoarsePlanView`）**
 
@@ -383,7 +388,7 @@ CoarsePlanView {
    planner_mode_cap: {order_id -> {A,B,C}}
    policy_mode_mask: {order_id -> {WAIT,B,C}}
   recovery_pool: {order_id -> [node_id]}
-  node_load_budget: {node_id -> int}
+  node_charge_load_budget: {node_id -> int}
   route_drift_ref: {node_id -> (eta_ref, route_index_ref)}
   launch_candidate_stations: [node_id]
 }
@@ -395,6 +400,15 @@ CoarsePlanView {
 - 仅用于决定"卡车到达哪些站点时触发 `riding_with_truck` 无人机的 PPO 决策点"
 - 不预算具体的回收候选点，回收候选点在 PPO 决策时实时计算（见 CMRAPPO 职责描述）
 - `plan_version` 更新时，`launch_candidate_stations` 同步更新；已在飞行中的无人机不受影响
+
+`node_charge_load_budget` 说明：
+
+- `node_charge_load_budget` 保留在 `CoarsePlanView` 中
+- 它只针对固定充换电节点：`station` / `depot`
+- 它表示 coarse planner 对未来一段时间内节点**充换电服务阶段**承压的软预算
+- 它不是物理工位容量，也不是 mode C 等待回收人数上限
+- 其作用是给 `candidate_builder` / baseline / critic 提供固定节点拥挤先验，避免策略在 coarse 层面把过多 UAV 都导向同一个充换电节点
+- 因此它仍然应该出现在当前 `CoarsePlanView` 契约中，但只能作为固定节点补能服务的规划侧引导信号，不能被解释为“等待回收容量”
 
 PPO 的权限严格限定为：
 
@@ -461,7 +475,12 @@ PPO 的权限严格限定为：
 1. 该节点在卡车未来路径上，且仍未经过（`ETA_truck(r_j) > t_deliver`）
 2. 无人机预计到达时刻早于卡车到达该节点（`ETA_uav(deliver -> r_j) + delta_safe <= ETA_truck(r_j)`）
 3. 无人机剩余电量足以飞到该节点并保留安全余量（`E_need + E_safe <= E_rem`）
-4. 节点容量与站点状态未被硬性否决
+
+补充说明：
+
+- UAV 在 `station` / `depot` 等待被卡车回收，本身不受充换电工位容量限制
+- `parking_slots`、FIFO 队列和 `predicted_queue_time` 只约束**回收成功后的充换电服务阶段**
+- 因此，站点充换电容量不应作为 mode C 等待回收动作的直接非法性条件
 
 **（2）模式 C 返程的保底规则**
 
@@ -476,7 +495,7 @@ PPO 的权限严格限定为：
 
 本阶段必须实现 reservation timeout，这是 CCT 机制在本项目的正式映射：
 
-- reservation 是"软预留、非排他、容量感知"的局部承诺，不是物理工位锁
+- reservation 是"软预留、非排他、后续服务排队感知"的局部承诺，不是物理工位锁
 - 每个 mode C 动作建立后，启动 timeout 计时器：
 
 ```text
@@ -519,11 +538,12 @@ r_timeout = - lambda_res_timeout * T_timeout_cost
 
 **（5）FIFO、工位容量与终端清场**
 
-1. `parking_slots` 决定并行服务上限
-2. 超出容量必须进入 FIFO 队列
+1. `parking_slots` 只决定**充换电服务**的并行上限
+2. 超出服务容量后必须进入 FIFO 队列
 3. `swap_time` / `charge_time` 结束后释放工位并唤醒队首
 4. 排队时间按"入队时刻到开始服务时刻"精确累计
-5. episode 结束时必须清点：已完成订单、超时订单、仍在返程/排队/等待卡车/已硬失败的无人机
+5. UAV 在节点等待被卡车回收，不属于充换电 FIFO 排队
+6. episode 结束时必须清点：已完成订单、超时订单、仍在返程/排队/等待卡车/已硬失败的无人机
 
 **（6）超时订单惩罚机制**
 
@@ -580,13 +600,19 @@ r_timeout = - lambda_res_timeout * T_timeout_cost
 2. **候选集实时构建**：对每个候选订单 `order_i`，实时计算：
    ```text
    t_deliver = t_now + fly_time(S_k → order_i.location)
-   recovery_pool(order_i) = {r_j | 满足时序 + 电量 + 容量约束，基于 t_deliver}
+   recovery_pool(order_i) = {r_j | 满足时序 + 电量约束，基于 t_deliver}
    ```
 3. **动作空间与 idle 完全统一**：`(order_i, mode ∈ {WAIT/B/C}, recover_node_j)`
 4. **WAIT 语义**：在 `riding_with_truck` 状态下，选择 WAIT = 继续搭车到下一站，不起飞
 5. **不触发决策的站点**：若卡车到达的站点不在 `launch_candidate_stations` 中，无人机继续搭车，不触发 PPO 决策
 6. **卡车上充换电**：无人机在卡车上充换电不占用站点 FIFO 队列，由 `truck_drone_recover_time_s` 决定服务时长；充换电完成后重新进入 `riding_with_truck` 状态
 7. **取货**：起飞时直接从卡车取货，无需返回仓库
+
+补充说明：
+
+- 对 mode C 而言，`predicted_queue_time(node)` 可以作为“回收后若进入该节点充换电服务，预计会多拥挤”的软信号
+- 它可以用于候选排序、soft penalty 估计、critic 特征或 heuristic 打分
+- 但不应因为某节点后续充换电队列较长，就把“等待被卡车回收”这个动作直接判为非法
 
 ### 4.1.4 主目标函数（本阶段统一采用）
 
@@ -712,6 +738,59 @@ r_t =
 - RH-ALNS 与 CMRAPPO 的职责边界已明确写入文档，`env_adapter` 的后续实现不会再对模式 C / miss / queue / reservation timeout 语义各自理解
 - `CoarsePlanView` 接口契约已定义，后续实现可直接对照
 - 主目标函数已包含 `lambda_res_timeout * T_res_timeout` 项，与算法方案文档一致
+
+### 4.1.8 Phase 1 当前已完成内容（截至本轮）
+
+本轮已完成以下 Phase 1 落地工作：
+
+1. 已创建算法专属统一配置文件：
+   - `backend/config/rh_alns_cmrappo.yaml`
+   - 完成了 `scene / data / planner / candidate / action_space / reservation / policy / reward / training / curriculum` 的完整分层
+   - 默认参数已按当前 `4×4km` 地图、`10` 个充换电站、`1` 辆卡车、`12` 架无人机的规模进行标定，并显式固化了训练与验证的复现参数（seed、order source mode、评估频率等）
+
+2. 已创建训练期共享契约文件（`CoarsePlanView` 契约）：
+   - `backend/training/contracts.py`
+   - 已将文档中的 `CoarsePlanView` 正式收敛为代码级只读契约
+   - 已定义 `RouteDriftRef`
+   - 已定义相关基础类型与模式枚举：`NodeId`、`OrderId`、`PlannerMode`、`PolicyMode` 等
+   - 已在契约层加入基础一致性校验，避免后续 `planner_bridge` 产出不完整或自相矛盾的 coarse plan
+
+3. 已创建训练子包入口：
+   - `backend/training/__init__.py`
+   - 为后续 `scene_loader`、`order_source_adapter`、`planner_bridge`、`candidate_builder`、`env_adapter` 的实现预留统一包路径
+
+4. 已在 `contracts.py` 中固化 `meta.json` schema（代码级契约）：
+   - 新增 `MetaJson`：Phase 1 可冻结的结构参数契约，包含八个子契约：
+     - `PolicyMeta`：模型结构参数（`d_model`、`nhead`、`lstm_hidden`、`hist_len`、`inference_mode` 等）
+     - `ActionSpaceMeta`：动作空间定义（`factorized_head_order`、`policy_modes`、`planner_modes` 等）
+     - `CandidateMeta`：候选集参数（`max_candidate_orders`、`max_candidate_actions`、安全余量等）
+     - `PlannerMeta`：上层规划触发参数（`coarse_replan_interval_sec`、`support_radius_km` 等）
+     - `RewardMeta`：奖惩权重（`lambda_*`、`R_delivery_bonus`、`hard_failure_penalty_sec` 等）
+     - `SharedRuntimeParamsSnapshot`：共享运行时参数快照（对应 `backend/config/drone_params.yaml` 的物理参数、能耗参数、服务时长参数）
+     - `EnvSemanticContractMeta`：环境语义契约摘要（mode C 回收节点类型、reservation timeout 开关、overdue 惩罚模式等）
+     - `OnlineLockParams`：在线锁参数策略骨架（`locked_fields` / `tunable_fields`）
+   - 新增 `TrainingRunMeta`：训练完成后才能填充的运行时字段（`model_version`、`trained_at`、`scene_id`、`scene_bundle_dir`、`training_input`）
+   - 新增 `BenchmarkMeta`：benchmark 身份快照（`orders.json` 路径、整体摘要、`static_orders` / `dynamic_orders` 数量、`benchmark_use_dynamic_orders`）
+   - 新增 `TrainingInputMeta`：训练输入快照（订单源模式、benchmark 身份、泊松参数、seed、总步数）
+   - 新增 `build_meta_json_dict(meta, run)`：合并两部分生成完整 meta.json 内容
+   - 设计原则：结构参数（Phase 1 冻结，`MetaJson`）与运行时字段（Phase 7 填充，`TrainingRunMeta`）分离，避免 `Optional` 字段弱化契约强度
+   - 说明：更严格的 `meta.json` 完整性校验（例如训练主循环真实填充值校验、数值范围校验、写盘前终检）放到 Phase 7 的 `train_cmrappo.py` 中继续完善；Phase 1 先冻结字段结构与最小非空约束
+
+5. 当前仍未完成、需要在后续继续推进的项：
+   - `CoarsePlanView` 的实际生成逻辑（`planner_bridge.py`，Phase 6）
+   - `CoarsePlanView` 消费侧的 `candidate_builder.py`（Phase 6）
+
+说明：
+
+- 本轮只完成了”契约与配置冻结”，尚未实现 `planner_bridge` 或任何真实 coarse planning 逻辑
+- `contracts.py` 当前放在 `backend/training/` 下，是因为后续 Phase 2~Phase 7 的新模块都按文档规划落在该目录；若你后续希望将契约层上移到更通用的包路径（例如 `backend/core/contracts/`），建议尽早统一，避免后续导入路径扩散
+
+后续 Phase 注意事项（与 meta.json 契约相关）：
+
+- **Phase 2（scene_loader）**：`TrainingRunMeta.scene_id` 与 `scene_bundle_dir` 必须与 `scene_config.json` 中的实际值对齐；`scene_loader` 加载完成后应输出可直接填入 `TrainingRunMeta` 的字段值，不允许在 `train_cmrappo.py` 中再次硬编码场景路径
+- **Phase 3（order_source_adapter）**：`TrainingInputMeta` 的所有字段必须从 `rh_alns_cmrappo.yaml` 的 `data` / `training` 节读取；`order_source_adapter` 应在构建订单源配置时同步输出可填入 `TrainingInputMeta` 的字段快照
+- **Phase 7（train_cmrappo）**：训练完成时必须构造 `TrainingRunMeta`，调用 `build_meta_json_dict(MetaJson(...), TrainingRunMeta(...))` 序列化为 meta.json；`trained_at` 使用 ISO 8601 格式；不允许手写裸字典绕过契约；`MetaJson` 的各子契约字段值必须与本次训练实际使用的 yaml 参数严格一致，不允许复制粘贴旧版本值；并在写盘前补做完整性终检（benchmark 身份快照、共享运行时参数快照、scene_id / model_version / trained_at 等运行时字段齐全性）
+- **Phase 11（模型产物固化）**：meta.json 由 `build_meta_json_dict` 生成后直接写入 `backend/weights/rh_alns_cmrappo/<version>/meta.json`；`benchmark_report.json` / `stochastic_report.json` 等报告文件路径在本阶段不进入 meta.json，但目录结构必须与 §4.11 保持一致，以便后续在线接入时直接定位
 
 ## 4.2 Phase 2：实现静态场景装载器
 
@@ -1065,7 +1144,7 @@ r_t =
 1. 模式 C 候选回收点只能来自卡车未来合法交接节点或保底合法节点
 2. 若 `ETA_uav + delta_safe > ETA_truck`，该回收动作必须直接裁掉
 3. 若电量不足以到达候选回收点并保留安全余量，该动作必须直接裁掉
-4. 若 `predicted_queue_time(node) > station_wait_threshold_sec`，该节点必须从候选集中剔除
+4. `predicted_queue_time(node)` 可作为排序或软截断信号，但不应单独作为 mode C 等待回收动作的硬性非法判据
 5. 若模式 C 原候选失效，fallback 只能指向最近可达充换电站或仓库
 6. `WAIT` 必须始终存在于模式阶段动作域中，不允许被 mask 掉
 
@@ -1127,7 +1206,9 @@ r_t =
    - `drone_source_type: {depot, truck}`：当前无人机的取货来源类型（从仓库出发 or 从卡车起飞）
 2. `order_tokens`：最多 `max_candidate_orders=32` 个候选订单 token
 3. `recovery_tokens`：对当前所选订单的回收节点候选（最多 `max_candidate_recovery_per_order=4` 个）
-4. `infra_tokens`：truck 骨架摘要 + station/depot 摘要（queue、ETA、parking_slots、node_load_budget）
+4. `infra_tokens`：truck 骨架摘要 + station/depot 摘要（queue、ETA、parking_slots、node_charge_load_budget）
+   - 其中 `queue` / `parking_slots` 描述充换电服务阶段负载
+   - `node_charge_load_budget` 描述固定节点充换电服务的 planner 侧软预算，不表示等待回收容量
 5. `history_tokens`：最近 `hist_len=6` 个局部决策事件摘要
 
 Padding/Masking 规则：
@@ -1156,6 +1237,7 @@ Padding/Masking 规则：
 
 - `train_cmrappo.py` 运行时强制校验 `order_source_mode == poisson`
 - 训练配置快照必须记录 `arrival_rate`、`seed`、deadline 窗口参数
+- 写入 `meta.json` 时必须同时记录 benchmark 身份快照（当前建议使用 `orders.json` 路径/摘要 + `static_orders` / `dynamic_orders` 数量），并与泊松参数、随机种子一起构成订单源确定性描述
 - 若用户误传 `benchmark` 或 `hybrid` 到训练主循环，应直接报错，避免训练分布漂移
 
 训练输出必须包含：
@@ -1217,11 +1299,11 @@ baseline 设计（本阶段正式采用）：
      - w_overdue  * projected_overdue_cost_i
    ```
 4. 模式选择规则：
-   - 若存在满足安全时序、电量和队列约束的 `mode C`，且 `ETA_margin >= greedy_c_margin_min_sec`，优先选 `C`
+   - 若存在满足安全时序与电量约束的 `mode C`，且其后续服务拥挤代价可接受、`ETA_margin >= greedy_c_margin_min_sec`，优先选 `C`
    - 否则选 `B`
    - 若无合法配送动作，才选 `WAIT`
 5. 回收点选择规则：
-   - 在合法候选中选择 `ETA_margin` 更大、`predicted_queue_time` 更小、额外 detour 更低的点
+   - 在合法候选中选择 `ETA_margin` 更大、后续服务拥挤代价更小、额外 detour 更低的点
 6. `validate_benchmark.py` 必须支持：
    - `policy_source=ppo`
    - `policy_source=greedy_baseline`
@@ -1375,7 +1457,7 @@ backend/weights/rh_alns_cmrappo/<version>/
 - 奖励/惩罚参数（含 `lambda_res_timeout` 和 `hard_failure_penalty_sec`）
 - 共享运行时参数快照
 - 训练所用场景 ID
-- 训练所用 benchmark 版本
+- 训练所用 benchmark 身份快照（当前建议记录 `orders.json` 路径/摘要、`static_orders` / `dynamic_orders` 数量；再结合泊松参数与随机种子确定订单源）
 - 后续在线锁参数策略骨架
 - 当前版本冻结的环境语义契约摘要（含 reservation timeout 机制版本）
 

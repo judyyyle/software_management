@@ -11,6 +11,10 @@ Depot 是整个物流网络的资源起点与归宿：
 
 与 SwapStation 不同，仓库在换电完成后需要将无人机重新加入 idle_drones，
 因此其 tick_update() 提供了回调钩子供仿真引擎注册处理逻辑。
+
+语义边界：
+  - Depot 继承的队列逻辑只表示“返仓后的充换电服务队列”；
+  - 不表示 mode C 中等待卡车回收的阶段。
 """
 
 from __future__ import annotations
@@ -180,7 +184,7 @@ class Depot(ChargingHost):
 
     def receive_drone(self, drone_id: str, current_time: float) -> None:
         """
-        接收返仓的无人机，进入充换电队列。
+        接收返仓的无人机，进入充换电服务队列。
 
         换电完成后由 tick_update() → _on_charge_complete() 自动将无人机
         加回 idle_drones，无需调用方手动操作。
@@ -190,7 +194,7 @@ class Depot(ChargingHost):
             current_time: 当前仿真时间（秒）
         """
         self.arrive(drone_id, current_time)
-        logger.debug("[Depot %s] 接收 drone %s 返仓，进入充换电队列。",
+        logger.debug("[Depot %s] 接收 drone %s 返仓，进入充换电服务队列。",
                      self.depot_id, drone_id)
 
     # ══════════════════════════════════════════════════════════════════════════

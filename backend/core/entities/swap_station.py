@@ -8,6 +8,10 @@ SwapStation 是固定地面节点，提供无人机电池快速更换服务。
   - get_location()：固定坐标，忽略时间参数
   - to_telemetry_dict()：序列化为 WGS84 供前端渲染
 
+语义边界：
+  - 电站的 queue_length / wait_queue 只表示进入电站后的充换电服务等待；
+  - 不表示 mode C 中等待被卡车回收的阶段。
+
 根据前端规划，充换电站在地图上需要可视化：
   - 当前槽位占用状态（available_slots / parking_slots）
   - 等待队列长度（queue_length）
