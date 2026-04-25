@@ -1095,7 +1095,12 @@ def _road_distance(
     return dist
 
 
+def format_execution_route_id_sequence(execution_route: TruckExecutionRoute) -> str:
+    return " -> ".join(stop.node_id for stop in execution_route.stops)
+
+
 def _print_summary(result: Phase4ExportResult) -> None:
+    print(f"truck_execution_route: {format_execution_route_id_sequence(result.execution_route)}")
     print(
         json.dumps(
             {

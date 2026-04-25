@@ -29,8 +29,10 @@ BACKEND_DIR = REPO_ROOT / "backend"
 if str(BACKEND_DIR) not in sys.path:
     sys.path.insert(0, str(BACKEND_DIR))
 
-
-from training.export_sumo_truck_route import export_phase4_truck_route
+from training.export_sumo_truck_route import (
+    export_phase4_truck_route,
+    format_execution_route_id_sequence,
+)
 
 
 DEFAULT_SUMOCFG = (
@@ -144,7 +146,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     args = parser.parse_args(argv)
 
-    export_phase4_truck_route()
+    result = export_phase4_truck_route()
 
     sumocfg = Path(args.sumocfg).resolve()
     if not sumocfg.is_file():
@@ -160,6 +162,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     if not args.no_debug_print:
         _print_debug_trace_summary(sumocfg.parent / DEFAULT_DEBUG_TRACE_NAME)
+        print(f"truck_execution_route: {format_execution_route_id_sequence(result.execution_route)}")
     env = os.environ.copy()
     env.setdefault("QT_X11_NO_MITSHM", "1")
     command = [sumo_gui_bin, "-c", str(sumocfg), "--disable-textures"]
