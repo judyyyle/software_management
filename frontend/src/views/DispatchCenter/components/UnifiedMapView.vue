@@ -97,6 +97,11 @@ function initMap() {
   droneMarkerPane.style.zIndex = '690'
   droneMarkerPane.style.pointerEvents = 'none'
 
+  // 卡车道具图层：z-index 高于无人机，重叠时始终卡车在上
+  const truckMarkerPane = map.createPane('truckMarkerPane')
+  truckMarkerPane.style.zIndex = '700'
+  truckMarkerPane.style.pointerEvents = 'auto'
+
   L.tileLayer(
     'https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}{r}.png',
     { attribution: '© CARTO · © OpenStreetMap 贡献者', maxZoom: 19 }
@@ -534,23 +539,40 @@ function updateTruck(truckId: string, lng: number, lat: number, status: string =
     truckGroup = L.layerGroup().addTo(map)
   }
 
-  const truck = entityStore.trucks.find(t => t.truck_id === truckId)
-  const name = truck?.name || truckId
+  // 从静态配置中找名字
+  const truckConfig = entityStore.trucks.find(t => t.truck_id === truckId)
+  const name = truckConfig?.name || truckId
+
+  // 从运行时数据获取装载信息
+  const rtTruck = entityStore.rtTrucks.find(t => t.truck_id === truckId)
+  const dockedCount = rtTruck?.docked_drones?.length || 0
+  const dockedStr = dockedCount > 0 && rtTruck?.docked_drones
+    ? rtTruck.docked_drones.join(', ')
+    : '无'
+
+  const speedStr = truckConfig?.speed != null
+    ? truckConfig.speed.toFixed(1)
+    : '—'
+
+  const popupHtml = `<div class="fac-popup">
+        <div class="fac-popup__title">🚛 ${name}</div>
+        <div class="fac-popup__row"><span>状态</span><span>${status}</span></div>
+        <div class="fac-popup__row"><span>速度</span><span>${speedStr} m/s</span></div>
+        <div class="fac-popup__row"><span>载机数量</span><span>${dockedCount} 架</span></div>
+        ${dockedCount > 0 ? `<div class="fac-popup__row"><span>载机ID</span><span style="font-size: 10px; max-width: 140px; word-break: break-all;">${dockedStr}</span></div>` : ''}
+        <div class="fac-popup__row"><span>坐标</span><span>${lng.toFixed(5)}, ${lat.toFixed(5)}</span></div>
+      </div>`
 
   if (truckMarkers.has(truckId)) {
     const marker = truckMarkers.get(truckId)!
     marker.setLatLng([lat, lng])
     marker.setIcon(_truckIcon(name, status))
+    marker.getPopup()?.setContent(popupHtml)
   } else {
-    const marker = L.marker([lat, lng], { icon: _truckIcon(name, status) })
+    const marker = L.marker([lat, lng], { icon: _truckIcon(name, status), pane: 'truckMarkerPane' })
       .bindPopup(
-        `<div class="fac-popup">
-          <div class="fac-popup__title">🚛 ${name}</div>
-          <div class="fac-popup__row"><span>状态</span><span>${status}</span></div>
-          <div class="fac-popup__row"><span>速度</span><span>${truck?.speed.toFixed(1) || '—'} m/s</span></div>
-          <div class="fac-popup__row"><span>坐标</span><span>${lng.toFixed(5)}, ${lat.toFixed(5)}</span></div>
-        </div>`,
-        { maxWidth: 200, className: 'fac-popup-wrap' }
+        popupHtml,
+        { maxWidth: 220, className: 'fac-popup-wrap' }
       )
       .addTo(truckGroup)
     truckMarkers.set(truckId, marker)
@@ -567,12 +589,25 @@ function updateDrone(droneId: string, lng: number, lat: number, status: string =
   const drone = entityStore.drones.find(d => d.drone_id === droneId)
   const name = drone?.name || droneId
 
+  // 检查无人机是否在卡车上（与卡车重叠时由卡车图层压盖，并隐藏/禁用本标记交互）
+  const isOnTruck = entityStore.rtTrucks.some(t => t.docked_drones?.includes(droneId))
+  const displayOpacity = isOnTruck ? 0 : 1
+
   if (droneMarkers.has(droneId)) {
     const marker = droneMarkers.get(droneId)!
     marker.setLatLng([lat, lng])
     marker.setIcon(_droneIcon(name, status))
+    marker.setOpacity(displayOpacity)
+    const el = marker.getElement()
+    if (el) {
+      el.style.pointerEvents = isOnTruck ? 'none' : 'auto'
+    }
   } else {
-    const marker = L.marker([lat, lng], { icon: _droneIcon(name, status) })
+    const marker = L.marker([lat, lng], {
+      icon: _droneIcon(name, status),
+      opacity: displayOpacity,
+      pane: 'droneMarkerPane',
+    })
       .bindPopup(
         `<div class="fac-popup">
           <div class="fac-popup__title">🚁 ${name}</div>
@@ -584,6 +619,12 @@ function updateDrone(droneId: string, lng: number, lat: number, status: string =
       )
       .addTo(droneGroup)
     droneMarkers.set(droneId, marker)
+
+    // 与 DOM 就绪后设置 pointer-events（divIcon 子节点）
+    requestAnimationFrame(() => {
+      const el = marker.getElement()
+      if (el) el.style.pointerEvents = isOnTruck ? 'none' : 'auto'
+    })
   }
 }
 
