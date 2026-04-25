@@ -118,22 +118,6 @@
             </div>
           </div>
         </div>
-
-        <!-- 后端响应日志 -->
-        <div class="sc-log">
-          <div class="sc-log__head">
-            📋 后端响应日志
-            <button class="sc-log__clear" @click="ctrlLogs = []">清空</button>
-          </div>
-          <div v-if="!ctrlLogs.length" class="sc-log__empty">
-            点击「初始化」后，后端响应与控制结果将显示在这里
-          </div>
-          <div v-for="(l, i) in ctrlLogs" :key="i"
-            class="sc-log__row" :class="`sc-log__row--${l.type}`">
-            <span class="sc-log__ts">{{ l.ts }}</span>
-            <span class="sc-log__msg">{{ l.msg }}</span>
-          </div>
-        </div>
       </div>
 
       <!-- ── 三栏主体 ── -->
@@ -855,43 +839,6 @@ onBeforeUnmount(() => {
 }
 .sc-spd:hover      { border-color: var(--hl-primary); color: var(--hl-primary); }
 .sc-spd--active    { background: var(--hl-primary); color: #fff; border-color: var(--hl-primary); font-weight: 600; }
-
-/* 后端响应日志 */
-.sc-log {
-  max-height: 140px;
-  background: #0f172a;
-  border-radius: var(--hl-card-radius);
-  overflow-y: auto;
-  display: flex; flex-direction: column;
-}
-.sc-log__head {
-  display: flex; align-items: center; justify-content: space-between;
-  padding: 7px 14px; position: sticky; top: 0;
-  font-size: 12px; font-weight: 500;
-  color: #94a3b8; background: #0f172a;
-  border-bottom: 1px solid #1e293b;
-}
-.sc-log__clear {
-  font-size: 11px; color: #64748b; background: none; border: none;
-  cursor: pointer; padding: 0 4px;
-}
-.sc-log__clear:hover { color: #94a3b8; }
-.sc-log__empty {
-  padding: 16px; text-align: center;
-  font-size: 12px; color: #475569;
-}
-.sc-log__row {
-  display: flex; gap: 10px; align-items: baseline;
-  padding: 3px 14px;
-  font-size: 12px; font-family: 'Courier New', monospace;
-  border-bottom: 1px solid #1e293b;
-}
-.sc-log__ts  { color: #475569; white-space: nowrap; flex-shrink: 0; }
-.sc-log__msg { color: #e2e8f0; word-break: break-all; }
-.sc-log__row--success .sc-log__msg { color: #4ade80; }
-.sc-log__row--error   .sc-log__msg { color: #f87171; }
-.sc-log__row--warn    .sc-log__msg { color: #fbbf24; }
-.sc-log__row--info    .sc-log__msg { color: #94a3b8; }
 
 /* ── 三栏主体 ─────────────────────────────────────────────────────── */
 .dispatch-main {
