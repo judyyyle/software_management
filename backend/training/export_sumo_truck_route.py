@@ -133,8 +133,13 @@ def export_phase4_truck_route(
     *,
     config_path: str | Path = DEFAULT_CONFIG_PATH,
     output_dir: str | Path | None = None,
-    min_future_fixed_nodes: int = 2,
+    min_future_fixed_nodes: int | None = None,
 ) -> Phase4ExportResult:
+    config_path = Path(config_path)
+    resolved_min_future_fixed_nodes = _resolve_min_future_fixed_nodes(
+        config_path=config_path,
+        override=min_future_fixed_nodes,
+    )
     scene_ctx = load_default_scene(config_path=config_path)
     export_dir = _resolve_output_dir(scene_ctx, output_dir)
     export_dir.mkdir(parents=True, exist_ok=True)
@@ -158,7 +163,7 @@ def export_phase4_truck_route(
     execution_plan, inserted_fixed_nodes = _ensure_min_future_fixed_nodes(
         initial_execution_plan,
         stations=scene_ctx.stations,
-        min_future_fixed_nodes=min_future_fixed_nodes,
+        min_future_fixed_nodes=resolved_min_future_fixed_nodes,
         road_graph=road_graph,
         road_nodes=road_nodes,
     )
@@ -213,7 +218,7 @@ def export_phase4_truck_route(
             execution_plan=execution_plan,
             inserted_fixed_nodes=inserted_fixed_nodes,
             execution_route=execution_route,
-            min_future_fixed_nodes=min_future_fixed_nodes,
+            min_future_fixed_nodes=resolved_min_future_fixed_nodes,
         ),
     )
 
@@ -223,7 +228,7 @@ def export_phase4_truck_route(
         execution_route=execution_route,
         truck_backbone_route=truck_backbone_route,
         truck_eta_map=truck_eta_map,
-        min_future_fixed_nodes=min_future_fixed_nodes,
+        min_future_fixed_nodes=resolved_min_future_fixed_nodes,
         export_dir=export_dir,
     )
     _write_json(export_dir / "validation_report.json", validation_report)
@@ -240,6 +245,36 @@ def export_phase4_truck_route(
         route_drift_ref=route_drift_ref,
         validation_report=validation_report,
     )
+
+
+def _resolve_min_future_fixed_nodes(
+    *,
+    config_path: str | Path,
+    override: int | None,
+) -> int:
+    if override is not None:
+        return int(override)
+
+    try:
+        import yaml  # type: ignore[import]
+    except ImportError as exc:
+        raise ImportError(
+            "缺少 PyYAML 依赖，无法读取 rh_alns_cmrappo.yaml"
+        ) from exc
+
+    with Path(config_path).open("r", encoding="utf-8") as fh:
+        raw_cfg = yaml.safe_load(fh)
+    if not isinstance(raw_cfg, Mapping):
+        raise ValueError(f"YAML 顶层必须为对象: {config_path}")
+
+    planner_cfg = raw_cfg.get("planner")
+    if not isinstance(planner_cfg, Mapping):
+        raise ValueError(f"配置缺少 planner 段: {config_path}")
+
+    value = int(planner_cfg.get("phase4_min_future_fixed_nodes", 2))
+    if value < 1:
+        raise ValueError("planner.phase4_min_future_fixed_nodes 必须 >= 1")
+    return value
 
 
 def _resolve_output_dir(
@@ -442,7 +477,9 @@ def _make_plan_stop(
 
 
 def _count_future_fixed_nodes(execution_plan: Sequence[Mapping[str, Any]]) -> int:
-    return sum(1 for stop in execution_plan[1:] if stop["node_type"] in {"station", "depot"})
+    # min_future_fixed_nodes 只计 station，不含 depot。
+    # depot 是终点保底节点，不应被算作"可插入的 recovery 节点"数量。
+    return sum(1 for stop in execution_plan[1:] if stop["node_type"] == "station")
 
 
 def _materialize_execution_route(
@@ -1054,7 +1091,10 @@ def _build_validation_report(
             for stop in execution_route.stops
         ),
         "bounds_ok": _route_within_bounds(execution_route, scene_ctx.bounds),
-        "min_future_fixed_nodes_ok": len(truck_backbone_route) >= min_future_fixed_nodes,
+        "min_future_fixed_nodes_ok": sum(
+            1 for nid in truck_backbone_route
+            if any(s.node_id == nid and s.node_type == "station" for s in execution_route.stops)
+        ) >= min_future_fixed_nodes,
         "sumo_edge_sequence_non_empty": bool(execution_route.sumo_edge_sequence),
         "sumo_export_dir": str(export_dir),
     }
@@ -1150,7 +1190,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument(
         "--min-future-fixed-nodes",
         type=int,
-        default=2,
+        default=None,
         help="`truck_backbone_route` 至少保留的 future fixed nodes 数量",
     )
     args = parser.parse_args(argv)
