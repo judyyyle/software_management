@@ -183,15 +183,25 @@ def build_sumo_net_artifacts(
         outgoing[edge.from_node].append(edge.edge_id)
         incoming[edge.to_node].append(edge.edge_id)
 
+    # 允许双向道路在同一节点上掉头。当前 Phase 4 路由会把 stop snap 到 OSM
+    # 路径中的中间节点；映射回 SUMO chunk edge 后，可能出现 “反向进入该 chunk，
+    # 再沿正向离开该 chunk” 的相邻 edge。若这里强行禁掉回头连接，SUMO 会在
+    # route 载入阶段直接报 no valid route。
+    edge_by_id = {edge.edge_id: edge for edge in edges}
     connections = []
+    seen_connections = set()
     for node in used_j:
         for ie in incoming.get(node, []):
             for oe in outgoing.get(node, []):
-                incoming_edge = next(edge for edge in edges if edge.edge_id == ie)
-                outgoing_edge = next(edge for edge in edges if edge.edge_id == oe)
-                if incoming_edge.from_node == outgoing_edge.to_node:
+                incoming_edge = edge_by_id[ie]
+                outgoing_edge = edge_by_id[oe]
+                if incoming_edge == outgoing_edge:
                     continue
-                connections.append((ie, oe))
+                pair = (ie, oe)
+                if pair in seen_connections:
+                    continue
+                seen_connections.add(pair)
+                connections.append(pair)
 
     return SumoNetArtifacts(
         ox=ox,
