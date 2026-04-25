@@ -1054,9 +1054,12 @@ r_t =
 
 如果路径有问题，训练时 `action_mask` 会基于错误的 ETA 构建，模型学到错误的 mode C 行为，且无法区分是模型问题还是路径问题。
 
-建议新增文件：
+本阶段已新增/修改的关键文件：
 
 - `backend/training/export_sumo_truck_route.py`
+- `backend/environment/geo/osm_service.py`
+- `backend/environment/geo/exporters/sumo_net_osm.py`
+- `backend/scripts/run_phase4_sumo_gui.py`
 
 职责：
 
@@ -1112,11 +1115,15 @@ r_t =
    - 如有需要，插入 `station`
    - 终点：回到同一 `depot`
 3. 客户访问顺序规则：
-   - 主排序键：订单 `deadline`
-   - 次排序键：UTM 米制坐标下的曼哈顿距离 `|dx| + |dy|`
+   - 先按订单 `deadline` 分组
+   - 同一 `deadline` 组内，按“从当前位置到候选订单的 OSM 路网最短距离”做贪心选点
+   - 若路网距离相同，再按 `order_id` 稳定排序
 4. 为保证 mode C 至少存在足够的 future fixed nodes，允许在完整执行路线中插入 `station`
    - 插站目标不是替代客户点，而是补充未来合法 recovery 节点
-   - 插站选择标准为“对当前完整执行路线的最小曼哈顿绕路代价”
+   - 插站代价口径已改为“路网绕路代价”，不再使用曼哈顿距离
+   - 具体分两阶段：
+     - 先把绕路代价 `< 100m` 的顺路站点全部加入
+     - 若 future fixed nodes 数量仍不足 `min_future_fixed_nodes`，再按绕路代价从小到大补齐
 5. 完整执行路线生成后，再从中投影出 `truck_backbone_route`
    - 只保留 `station / depot`
    - 去掉起点 `depot`
@@ -1179,8 +1186,12 @@ r_t =
   - 供 `CoarsePlanView.route_drift_ref` 直接复用
 - `validation_report.json`
   - 记录客户点是否全部被经过、骨架节点数、ETA 单调性、路网连通性、边界检查、snap 误差等
+- `phase4_debug_trace.json`
+  - 记录订单排序结果、初始/最终执行计划、插站原因、stop trace，便于人工审计
+- `phase4_gui.view.xml`
+  - GUI 视图配置，默认把车辆名、POI 文本、路线覆盖层直接打开
 - `poi.add.xml`
-  - depot / station 的 SUMO POI 叠加层
+  - depot / station / customer 的 SUMO POI 与 marker 叠加层，并额外绘制卡车完整路线折线
 - `truck_route.net.xml`
   - 由 `osm_network.xml` 生成的 SUMO `net.xml`
 - `truck_route.rou.xml`
@@ -1203,18 +1214,19 @@ r_t =
 python backend/scripts/run_phase4_sumo_gui.py
 ```
 
-若希望启动前重新生成最新 Phase 4 产物，可运行：
-
-```bash
-python backend/scripts/run_phase4_sumo_gui.py --regenerate
-```
+当前脚本会在启动前直接调用 `export_phase4_truck_route()`，因此默认就会重新生成最新 Phase 4 产物，不再需要单独的 `--regenerate` 参数。
 
 若 `sumo-gui` 不在系统 `PATH` 中，可显式指定：
 
 ```bash
 python backend/scripts/run_phase4_sumo_gui.py \
-  --sumo-gui-bin /path/to/sumo-gui \
-  --regenerate
+  --sumo-gui-bin /path/to/sumo-gui
+```
+
+若只想载入后停在 GUI 中人工检查，不自动播放，可运行：
+
+```bash
+python backend/scripts/run_phase4_sumo_gui.py --no-start
 ```
 
 ### 4.4.6 为 Phase 4 新增的底层支持
@@ -1223,10 +1235,13 @@ python backend/scripts/run_phase4_sumo_gui.py \
 
 1. `backend/environment/geo/exporters/sumo_net_osm.py`
    - 保留原有 `osm_to_sumo_net(osm_xml, orig_bounds, path)` 对外接口不变
-   - 新增中间结果构建函数，用于同时生成：
+   - 新增 `SumoNetEdge`、`SumoNetArtifacts` 两个中间结构
+   - 新增 `build_sumo_net_artifacts()` / `write_sumo_net_artifacts()`，用于同时生成：
      - SUMO `net.xml`
-     - OSM step → SUMO edge 的映射表
-   - 这样 `truck_route.rou.xml` 与 `truck_route.net.xml` 保证来自同一套 edge 切分规则
+     - `directed_step_to_edge` 映射表
+     - junction / connection 元数据
+   - 双向道路现在会同时生成正反两个 directed edge
+   - 在 junction 连接上显式允许必要的掉头/反向切换，避免 Phase 4 route 在 SUMO 载入时报 `no valid route`
 2. `backend/environment/geo/osm_service.py`
    - `build_road_graph()` 新增可选参数 `respect_osm_oneway`
    - 默认值保持兼容旧行为，不影响仓库内既有求解器调用
@@ -1234,8 +1249,39 @@ python backend/scripts/run_phase4_sumo_gui.py \
    - 这样可以保证：
      - Phase 4 的 OSM 最短路与 SUMO 单行线方向一致
      - 旧求解器路径逻辑不会被这次改动悄悄改变
+   - 同时补齐 `shortest_path_length()`，供订单排序、插站绕路代价、ETA 估算统一复用
 
-### 4.4.7 当前 Phase 4 的代码边界
+### 4.4.7 本次实际修改记录（对应四个文件）
+
+1. `backend/training/export_sumo_truck_route.py`
+   - 已落地完整的 Phase 4 主流程：
+     - 加载默认训练场景
+     - 用 `respect_osm_oneway=True` 构建 OSM `DiGraph`
+     - 生成 SUMO net 中间结果
+     - 过滤卡车订单
+     - 生成 `truck_execution_route`
+     - 投影出 `truck_backbone_route`
+     - 计算 `truck_eta_map` 与 `route_drift_ref`
+     - 导出 SUMO / JSON / debug 产物
+   - 客户顺序已经不是“deadline + 曼哈顿距离”，而是“deadline 分组 + 组内路网最短距离贪心”
+   - `station` 插入已经不是一次性最短绕路，而是“顺路站点全加 + 不足时继续补齐”的两阶段策略
+   - ETA 已按 stop-to-stop 的 OSM 实际路径长度 / `truck.speed` 计算，并把 snap 偏移计入距离
+   - 新增 `validation_report`、`phase4_debug_trace`、GUI 视图文件导出
+2. `backend/environment/geo/osm_service.py`
+   - `build_road_graph()` 现在可按 OSM `oneway` 严格建图
+   - 新增 `shortest_path_length()`，供路线排序与插站代价计算
+   - 旧调用方仍可继续走兼容模式，不会被 Phase 4 改动破坏
+3. `backend/environment/geo/exporters/sumo_net_osm.py`
+   - 从“直接写 net.xml”扩展成“先构建 artifacts，再落盘”
+   - 导出了 OSM step 到 SUMO edge 的映射，保证 `truck_route.rou.xml` 与 `truck_route.net.xml` 完全同源
+   - 连接规则已放宽到支持 Phase 4 路由需要的反向切换场景，减少 SUMO 载入失败
+4. `backend/scripts/run_phase4_sumo_gui.py`
+   - 脚本启动前会直接重新导出最新 Phase 4 产物
+   - 会自动查找 `sumo-gui`，并在可用时用 `netconvert` 先规范化 net
+   - 启动前会打印 `phase4_debug_trace.json` 摘要和 `truck_execution_route`
+   - 已支持 `--sumocfg`、`--sumo-gui-bin`、`--no-start`、`--delay-ms`、`--no-debug-print`
+
+### 4.4.8 当前 Phase 4 的代码边界
 
 本阶段已经明确：
 
@@ -1248,6 +1294,21 @@ python backend/scripts/run_phase4_sumo_gui.py \
   - 不属于 PPO 粗规划边界对象
 
 因此，后续实现不得把 customer 节点重新塞回 `truck_backbone_route`，也不得把 `truck_execution_route` 与 `truck_backbone_route` 重新混成一个变量。
+
+### 4.4.9 当前仍未完成或仍需人工验收的部分
+
+1. `sumo-gui` 的最终验收仍是人工步骤
+   - 当前代码已能导出并启动 GUI
+   - 但“路线视觉上是否经过预期 station/depot”“GUI 中是否无异常跳边”仍需人工打开 `sumo-gui` 确认
+2. “ETA 与手工估算误差”尚未自动化成报告项
+   - 当前 `validation_report.json` 只校验 ETA 单调性、路网连通性、边界、snap 距离等
+   - 还没有单独输出“手工估算距离 / 速度”对比误差表
+3. `mode C` 的订单时刻级合法性还没有在 Phase 4 闭环
+   - 当前只能保证路线级 future fixed nodes 存在，且 ETA 递增、物理可达
+   - 订单在具体投递时刻能否把某节点作为 recovery node，仍要在后续 `candidate_builder / env_adapter` 里叠加 `ETA_truck > t_deliver`、安全裕量、电量约束
+4. `run_phase4_sumo_gui.py` 对自定义 `--sumocfg` 的再生成功能还不完全对齐
+   - 当前脚本会先按默认场景调用 `export_phase4_truck_route()`
+   - 若传入的是其他目录下的自定义 `sumocfg`，脚本会加载该文件，但不会按该路径同步重导对应产物
 
 ## 4.5 Phase 5：实现训练环境适配器
 
