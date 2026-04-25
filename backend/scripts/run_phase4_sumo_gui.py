@@ -127,11 +127,6 @@ def main(argv: list[str] | None = None) -> int:
         help="sumo-gui 可执行文件路径；为空时自动从 PATH 查找",
     )
     parser.add_argument(
-        "--regenerate",
-        action="store_true",
-        help="启动前先重新生成 Phase 4 导出产物",
-    )
-    parser.add_argument(
         "--no-start",
         action="store_true",
         help="只加载场景，不自动开始仿真",
@@ -149,15 +144,13 @@ def main(argv: list[str] | None = None) -> int:
     )
     args = parser.parse_args(argv)
 
-    if args.regenerate:
-        export_phase4_truck_route()
+    export_phase4_truck_route()
 
     sumocfg = Path(args.sumocfg).resolve()
     if not sumocfg.is_file():
         raise FileNotFoundError(
             f"SUMO 配置文件不存在: {sumocfg}\n"
-            "请先运行 `python backend/training/export_sumo_truck_route.py` "
-            "或加上 `--regenerate`。"
+            "请先运行 `python backend/training/export_sumo_truck_route.py`。"
         )
 
     sumo_gui_bin = _resolve_sumo_gui(args.sumo_gui_bin or None)

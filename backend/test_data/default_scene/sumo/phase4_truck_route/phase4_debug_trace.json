@@ -188,7 +188,7 @@
       "reason": "min_future_fixed_nodes"
     }
   ],
-  "min_future_fixed_nodes": 2,
+  "min_future_fixed_nodes": 3,
   "ordered_truck_orders": [
     {
       "deadline": 1800.0,
