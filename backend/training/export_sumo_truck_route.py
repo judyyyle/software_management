@@ -31,6 +31,7 @@ from pathlib import Path
 from typing import Any, Mapping, Sequence
 
 
+
 REPO_ROOT = Path(__file__).resolve().parents[2]
 BACKEND_DIR = REPO_ROOT / "backend"
 GEO_DIR = BACKEND_DIR / "environment" / "geo"
@@ -55,6 +56,19 @@ DEFAULT_OUTPUT_SUBDIR = Path("sumo") / "phase4_truck_route"
 SNAP_WARN_THRESHOLD_M = 60.0
 # 绕路代价低于此值视为"顺路"，无论数量多少都直接加入路线。
 STATION_ONROUTE_DETOUR_THRESHOLD_M = 100.0
+
+_DRONE_PARAMS_PATH = BACKEND_DIR / "config" / "drone_params.yaml"
+
+
+def _load_heavy_drone_payload_capacity() -> float:
+    import yaml
+    with open(_DRONE_PARAMS_PATH, encoding="utf-8") as f:
+        params = yaml.safe_load(f)
+    return float(params["heavy_drone"]["payload_capacity"])
+
+
+# 超过此重量的订单无人机无法配送，由卡车直送。
+HEAVY_DRONE_PAYLOAD_CAPACITY_KG: float = _load_heavy_drone_payload_capacity()
 
 
 @dataclass(frozen=True)
@@ -255,13 +269,14 @@ def _select_truck_orders(scene_ctx: TrainingSceneContext) -> tuple[Phase4TruckOr
 
     truck_orders = []
     for entry in static_raw:
-        fulfillment_mode = str(entry.get("fulfillment_mode", "")).upper()
-        if "TRUCK" not in fulfillment_mode:
-            continue
         order_id = str(entry["order_id"])
         order = order_by_id.get(order_id)
         if order is None:
             raise ValueError(f"scene_loader 未找到静态订单对象: {order_id}")
+        # 超过 HeavyDrone 载重上限的订单无人机无法配送，由卡车直送。
+        if float(order.payload_weight) <= HEAVY_DRONE_PAYLOAD_CAPACITY_KG:
+            continue
+        fulfillment_mode = str(entry.get("fulfillment_mode", "")).upper()
         truck_orders.append(
             Phase4TruckOrder(
                 order=order,
@@ -272,7 +287,10 @@ def _select_truck_orders(scene_ctx: TrainingSceneContext) -> tuple[Phase4TruckOr
         )
 
     if not truck_orders:
-        raise ValueError("未找到任何卡车相关 static_orders，无法生成 Phase 4 路线")
+        raise ValueError(
+            f"未找到重量超过 HeavyDrone 上限（{HEAVY_DRONE_PAYLOAD_CAPACITY_KG} kg）的 static_orders，"
+            "无法生成 Phase 4 路线"
+        )
     return tuple(truck_orders)
 
 
