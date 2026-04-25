@@ -51,33 +51,43 @@
       "snap_distance_m": 83.102197
     },
     {
-      "arrival_time_sec": 804.402408,
-      "departure_time_sec": 804.402408,
+      "arrival_time_sec": 741.439536,
+      "departure_time_sec": 741.439536,
+      "nearest_osm_node_id": "859872265",
+      "node_id": "STA-TEST-08",
+      "node_type": "station",
+      "order_id": null,
+      "seq": 5,
+      "snap_distance_m": 42.90158
+    },
+    {
+      "arrival_time_sec": 829.498885,
+      "departure_time_sec": 829.498885,
       "nearest_osm_node_id": "7743084366",
       "node_id": "ORD-STATIC-07",
       "node_type": "customer",
       "order_id": "ORD-STATIC-07",
-      "seq": 5,
+      "seq": 6,
       "snap_distance_m": 27.764065
     },
     {
-      "arrival_time_sec": 862.701168,
-      "departure_time_sec": 862.701168,
+      "arrival_time_sec": 887.797645,
+      "departure_time_sec": 887.797645,
       "nearest_osm_node_id": "1601488743",
       "node_id": "STA-TEST-09",
       "node_type": "station",
       "order_id": null,
-      "seq": 6,
+      "seq": 7,
       "snap_distance_m": 16.131889
     },
     {
-      "arrival_time_sec": 1079.162248,
-      "departure_time_sec": 1079.162248,
+      "arrival_time_sec": 1104.258725,
+      "departure_time_sec": 1104.258725,
       "nearest_osm_node_id": "13340772659",
       "node_id": "DEP-TEST-01",
       "node_type": "depot",
       "order_id": null,
-      "seq": 7,
+      "seq": 8,
       "snap_distance_m": 13.66971
     }
   ],
@@ -123,10 +133,18 @@
       "y": 3434403.622656
     },
     {
+      "node_id": "STA-TEST-08",
+      "node_type": "station",
+      "order_id": null,
+      "seq": 5,
+      "x": 330054.7848,
+      "y": 3433924.198188
+    },
+    {
       "node_id": "ORD-STATIC-07",
       "node_type": "customer",
       "order_id": "ORD-STATIC-07",
-      "seq": 5,
+      "seq": 6,
       "x": 328904.916466,
       "y": 3433946.343896
     },
@@ -134,7 +152,7 @@
       "node_id": "STA-TEST-09",
       "node_type": "station",
       "order_id": null,
-      "seq": 6,
+      "seq": 7,
       "x": 329458.957408,
       "y": 3434328.271882
     },
@@ -142,7 +160,7 @@
       "node_id": "DEP-TEST-01",
       "node_type": "depot",
       "order_id": null,
-      "seq": 7,
+      "seq": 8,
       "x": 329911.498876,
       "y": 3437187.13333
     }
@@ -211,9 +229,16 @@
       "node_id": "STA-TEST-09",
       "node_type": "station",
       "reason": "on_route"
+    },
+    {
+      "detour_cost_road_m": 290.64399708542805,
+      "insert_index": 5,
+      "node_id": "STA-TEST-08",
+      "node_type": "station",
+      "reason": "min_future_fixed_nodes"
     }
   ],
-  "min_future_fixed_nodes": 2,
+  "min_future_fixed_nodes": 3,
   "ordered_truck_orders": [
     {
       "deadline": 2700.0,
@@ -252,6 +277,7 @@
   "visited_fixed_node_ids": [
     "DEP-TEST-01",
     "STA-TEST-02",
+    "STA-TEST-08",
     "STA-TEST-09",
     "DEP-TEST-01"
   ],
@@ -263,6 +289,7 @@
   ],
   "visited_station_ids": [
     "STA-TEST-02",
+    "STA-TEST-08",
     "STA-TEST-09"
   ]
 }
