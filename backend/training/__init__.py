@@ -30,16 +30,16 @@ from .order_source_adapter import (
 )
 from .env_adapter import (
     DecisionContext,
-    DispatchAction,
     EnvStepResult,
-    GlobalWaitAction,
     NodeStateView,
     ReservationStateView,
     RuntimeStateView,
     TrainingDroneState,
     TrainingEnvAdapter,
-    WAIT_ACTION,
 )
+from .actions import DispatchAction, GlobalWaitAction, WAIT_ACTION
+from .candidate_builder import CandidateBuilder
+from .planner_bridge import PlannerBridge
 from .export_sumo_truck_route import (
     Phase4ExportResult,
     TruckExecutionRoute,
@@ -57,6 +57,7 @@ __all__ = [
     "TruckExecutionRoute",
     "build_order_source",
     "build_order_source_preview_summary",
+    "CandidateBuilder",
     "configure_order_manager_for_source",
     "DecisionContext",
     "DispatchAction",
@@ -68,6 +69,7 @@ __all__ = [
     "load_training_scene",
     "NodeStateView",
     "preview_dynamic_order_stream",
+    "PlannerBridge",
     "ReservationStateView",
     "RuntimeStateView",
     "TrainingDroneState",
