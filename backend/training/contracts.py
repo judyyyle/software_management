@@ -21,6 +21,8 @@ from dataclasses import asdict, dataclass, field
 from enum import StrEnum
 from typing import Any, FrozenSet, Mapping, TypeAlias
 
+from .actions import DispatchAction, GlobalWaitAction
+
 
 NodeId: TypeAlias = str
 OrderId: TypeAlias = str
@@ -341,6 +343,172 @@ class CoarsePlanView:
         return self.route_drift_ref[node_id].eta_ref
 
 
+# ── Phase 6 共享契约 ──────────────────────────────────────────────────────────
+
+
+@dataclass(frozen=True)
+class PlannerTriggerContext:
+    """供 planner_bridge 判定是否需要重规划的环境侧触发上下文。"""
+
+    t_now: float
+    backlog_new_orders: int
+    fallback_count_in_window: int
+    hard_failure_count_in_window: int
+    route_drift_ratio: float
+
+
+@dataclass(frozen=True)
+class UavSelfFeatures:
+    drone_id: str
+    x: float
+    y: float
+    z: float
+    battery_current: float
+    battery_max: float
+    battery_ratio: float
+    training_state: str
+    has_reservation: bool
+    reservation_remaining_sec: float
+    plan_version_delta: int
+    is_riding_truck: bool
+    drone_source_type: str
+    cruise_speed: float
+    payload_capacity: float
+
+
+@dataclass(frozen=True)
+class OrderFeatures:
+    order_id: str
+    weight: float
+    deadline: float
+    remaining_time: float
+    delivery_x: float
+    delivery_y: float
+    delivery_z: float
+    distance_to_order: float
+    order_pre_score: float
+    priority_band: int
+    has_mode_b_action: bool
+    best_mode_b_return_score: float
+    best_mode_b_host_type: str
+    best_mode_b_queue_time_est: float
+    is_valid: bool
+
+
+@dataclass(frozen=True)
+class RecoveryFeatures:
+    order_id: str
+    recover_node_id: str
+    recover_node_type: str
+    x: float
+    y: float
+    z: float
+    truck_eta: float
+    rendezvous_margin: float
+    reservation_count: int
+    predicted_queue_time_est: float
+    service_time: float
+    is_valid: bool
+
+
+@dataclass(frozen=True)
+class InfraNodeFeatures:
+    node_id: str
+    node_type: str
+    x: float
+    y: float
+    z: float
+    queue_length: int
+    available_slots: int
+    parking_slots: int
+    swap_time: float
+    truck_eta: float | None
+    node_charge_load_budget: int
+    is_in_backbone: bool
+    is_launch_candidate_station: bool
+
+
+@dataclass(frozen=True)
+class InfraFeatures:
+    truck_x: float
+    truck_y: float
+    truck_z: float
+    plan_version: int
+    future_backbone_node_count: int
+    authorized_order_count: int
+    node_features: tuple[InfraNodeFeatures, ...]
+
+
+@dataclass(frozen=True)
+class CandidateFeatures:
+    uav_self: UavSelfFeatures
+    order_features: tuple[OrderFeatures, ...]
+    recovery_features: tuple[tuple[RecoveryFeatures, ...], ...]
+    infra_features: InfraFeatures
+
+
+@dataclass(frozen=True)
+class FactorizedActionSchema:
+    root_branch_order: tuple[str, str]
+    mode_order: tuple[str, str]
+    max_order_slots: int
+    max_recovery_slots: int
+
+
+ResolvedDispatchKey: TypeAlias = tuple[int, int, int | None]
+
+
+@dataclass(frozen=True)
+class ResolvedActionLookup:
+    wait_action: GlobalWaitAction
+    dispatch_actions: Mapping[ResolvedDispatchKey, DispatchAction]
+
+    def resolve(
+        self,
+        *,
+        root_branch_idx: int,
+        order_idx: int | None = None,
+        mode_idx: int | None = None,
+        recovery_idx: int | None = None,
+    ) -> GlobalWaitAction | DispatchAction:
+        if root_branch_idx == 0:
+            return self.wait_action
+        if root_branch_idx != 1:
+            raise KeyError(f"未知 root_branch_idx: {root_branch_idx}")
+        if order_idx is None or mode_idx is None:
+            raise KeyError("DISPATCH 分支必须同时提供 order_idx 与 mode_idx")
+        key = (order_idx, mode_idx, recovery_idx)
+        if key not in self.dispatch_actions:
+            raise KeyError(f"未找到结构化动作索引: {key}")
+        return self.dispatch_actions[key]
+
+    def as_action_lookup(self) -> tuple[GlobalWaitAction | DispatchAction, ...]:
+        ordered_dispatch = [
+            action
+            for _key, action in sorted(
+                self.dispatch_actions.items(),
+                key=lambda item: (
+                    item[0][0],
+                    item[0][1],
+                    -1 if item[0][2] is None else item[0][2],
+                ),
+            )
+        ]
+        return (self.wait_action, *ordered_dispatch)
+
+
+@dataclass(frozen=True)
+class CandidateOutput:
+    candidate_features: CandidateFeatures
+    root_branch_mask: tuple[bool, bool]
+    has_wait_action: bool
+    order_mask: tuple[bool, ...]
+    mode_mask: tuple[tuple[bool, bool], ...]
+    recovery_mask: tuple[tuple[bool, ...], ...]
+    factorized_action_schema: FactorizedActionSchema
+    resolved_action_lookup: ResolvedActionLookup
+
+
 # ── meta.json 契约 ────────────────────────────────────────────────────────────
 
 
@@ -591,22 +759,32 @@ def build_meta_json_dict(
 __all__ = [
     "ActionSpaceMeta",
     "BenchmarkMeta",
+    "CandidateFeatures",
     "CandidateMeta",
+    "CandidateOutput",
     "CoarsePlanView",
+    "FactorizedActionSchema",
     "DroneRuntimeParamsSnapshot",
     "EnvSemanticContractMeta",
     "EtaSec",
+    "InfraFeatures",
+    "InfraNodeFeatures",
     "MetaJson",
     "NodeChargeLoadBudget",
     "NodeId",
     "OnlineLockParams",
+    "OrderFeatures",
     "OrderId",
     "PlanVersion",
     "PlannerMeta",
     "PlannerMode",
+    "PlannerTriggerContext",
     "PolicyMeta",
     "PolicyMode",
     "PriorityBand",
+    "RecoveryFeatures",
+    "ResolvedActionLookup",
+    "ResolvedDispatchKey",
     "RewardMeta",
     "RouteDriftRef",
     "SharedRuntimeParamsSnapshot",
@@ -614,5 +792,6 @@ __all__ = [
     "SolverEnergyRuntimeSnapshot",
     "TrainingInputMeta",
     "TrainingRunMeta",
+    "UavSelfFeatures",
     "build_meta_json_dict",
 ]
