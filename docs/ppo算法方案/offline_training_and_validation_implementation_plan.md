@@ -2336,6 +2336,42 @@ r_timeout = -lambda_res_timeout * T_timeout_cost
   骨架耗尽后构造空骨架退化对象，`policy_mode_mask` 收缩为 `{B}`，为合法退化状态
 - poisson 模式下，巡站循环的 ETA 单调递增，不出现时序倒退
 
+### 4.5.0 本轮前置代码同步记录（2026-04-25）
+
+为支撑 Phase 5 中"空骨架退化开关"的文档语义，本轮已对
+`backend/training/contracts.py` 做以下同步修改：
+
+1. `CoarsePlanView` 新增 `allow_empty_backbone_route: bool = False`
+   - 默认保持严格契约（poisson 模式），`truck_backbone_route` 不能为空
+   - benchmark / hybrid 模式下由 `env_adapter.reset()` 自动设为 `True`，无需手动配置
+2. `CoarsePlanView.__post_init__()` 增加条件校验分支
+   - 当 `allow_empty_backbone_route = False` 时，沿用原有"空骨架即报错"
+   - 当 `allow_empty_backbone_route = True` 且 `truck_backbone_route` 为空时，要求：
+     - `truck_eta_map = {}`
+     - `route_drift_ref = {}`
+     - `launch_candidate_stations = ()`
+     - `recovery_pool` 对所有订单均为空
+     - `policy_mode_mask` 不允许再包含 `C`，应收缩为 `{B}`
+3. `EnvSemanticContractMeta` 新增 `allow_empty_backbone_route: bool`
+   - 用于把这条环境语义开关纳入 Phase 1 已冻结的 `meta.json` 契约摘要
+
+`allow_empty_backbone_route` 的模式绑定规则（由 `env_adapter.reset()` 负责设置）：
+
+| 订单源模式 | `allow_empty_backbone_route` | 说明 |
+|---|---|---|
+| `poisson` | `False` | 骨架为空视为契约错误，尽早暴露巡站循环问题 |
+| `benchmark` | `True`（自动） | 骨架耗尽为合法退化状态，不追加巡站循环 |
+| `hybrid` | `True`（自动） | 同 benchmark |
+
+`planner.allow_empty_backbone_route` 配置项保留在 `rh_alns_cmrappo.yaml` 中，
+但其值在运行时由 `env_adapter.reset()` 根据 `order_source_mode` 自动覆盖，
+手动配置值仅作为 fallback，不建议依赖。
+
+补充说明：当前仓库中不存在 `backend/training/env_adapter.py` 的可编辑源码文件，
+因此本轮关于 `queueing_at_host`、`_on_arrive_charging_host()`、`T_queue` 统计范围、
+Phase 5 分层（5a/5b/5c）的修复先冻结在 Phase 5 文档语义层；后续新增或恢复
+`env_adapter` 源码时，必须严格按本节口径实现。
+
 ### 4.5.1 Phase 5 实现分层
 
 Phase 5 的实现规格较重，为避免一次性面对过多复杂度导致 bug 难以定位，拆分为三个子层。
@@ -2573,6 +2609,153 @@ if mode == C:
 - `post_delivery_revalidation` 能正确拦截复核失败，fallback 路径可复现
 - mode B 返程宿主选择结果可复现，score 计算不缓存旧队列快照
 
+**本轮代码同步记录（2026-04-26）**
+
+本轮已在 `backend/training/env_adapter.py` 与
+`backend/training/test_env_adapter_phase5b.py` 完成 Phase 5b 的代码同步，
+供后续 Phase 5c / Phase 6 / Phase 7 继续接续。当前实际落地情况如下：
+
+1. **mode C 候选的运行时精细过滤已接入**
+   - `_build_action_lookup()` 不再把 `recovery_pool` 原样平铺成 mode C 动作
+   - 新增 `_iter_feasible_mode_c_recovery_nodes()` /
+     `_is_mode_c_recovery_feasible()`，按以下统一口径过滤：
+     - `t_arrive_truck(node) > t_deliver`
+     - `t_arrive_uav(deliver -> node) + rendezvous_eta_safe_margin_sec <= t_arrive_truck(node)`
+     - `E_need(deliver -> node, payload=0) + drone.safe_margin_j <= E_rem_after_delivery`
+   - 因此，Phase 5a 中“只要 coarse recovery_pool 非空就放行 mode C”的临时口径已移除
+
+2. **mode B 确定性返程宿主选择已接入**
+   - 已新增 `_select_return_host_mode_b()`
+   - 评分规则与文档一致：
+     `score = fly_time + predicted_queue_time + service_time`
+   - `predicted_queue_time` 直接复用 `ChargingHost.estimate_wait_time(current_time)`，
+     每次即时读取宿主当前真值，不缓存旧队列快照
+   - `_has_mode_b_return_host()` 也已切换为复用这套 5b 规则，而不是 5a 的 depot-first 临时口径
+
+3. **送达后执行层复核（post_delivery_revalidation）已接入**
+   - mode C 送达后不再沿用 5a 的“只检查 recover_node 是否还在未来骨架里”的最小兜底
+   - 已新增 `_revalidate_mode_c_recover_node()`，统一复核以下三项：
+     - `energy_feasible`
+     - `rendezvous_time_feasible`
+     - `node_still_valid`
+   - 任一失败即不重新请求 PPO，而是直接进入 `fallback_recovery`
+
+4. **`T_fallback` 的 5b 级 reward 已接入**
+   - 已新增 `_settle_phase5b_per_dt_rewards(t_prev, t_next)`
+   - 当前只结算 `fallback_recovery` 状态下的
+     `-lambda_miss * dt`
+   - 结算时显式截断到 `_fallback_leg[drone_id].arrival_time`，
+     并兼容“中途空中耗尽电量导致飞行提前中断”的情况
+
+5. **回归与新增测试已补齐**
+   - 原 `backend.training.test_env_adapter_phase5a` 继续通过
+   - 新增 `backend.training.test_env_adapter_phase5b`，覆盖：
+     - mode C action mask 的时间/能量过滤
+     - mode B 返程宿主评分选择
+     - post-delivery revalidation 失败后进入 fallback
+     - `T_fallback` 的持续扣罚
+   - 当前本地验证命令：
+     `python -m unittest backend.training.test_env_adapter_phase5a backend.training.test_env_adapter_phase5b`
+
+**与 Phase 1-5 规约的对齐检查**
+
+以下条目表示：从 Phase 1 到 Phase 5 文档中，凡是“应在 Phase 5b 落地”的规约，
+当前代码是否已经对齐，以及还有哪些边界需要后续 phase 接续。
+
+1. **`DispatchAction` / `WAIT_ACTION` / `DecisionContext` / `RuntimeStateView` 接口形状**
+   - **状态**：已对齐
+   - 说明：5a 已冻结接口，本轮未改外部 schema；5b 仅填充实现深度，不改调用方契约
+
+2. **mode C 候选合法性交由运行时 action mask 判定**
+   - **状态**：已对齐
+   - 说明：现在 mode C 只在“送达后仍能赶上卡车且送达后电量可达”的条件下才进入 `action_lookup`
+
+3. **mode B 不在起飞前绑定返程宿主，送达后由执行层确定性规则选择**
+   - **状态**：已对齐
+   - 说明：PPO 仍只输出 `order + mode=B`；返程宿主在送达后由 `_select_return_host_mode_b()` 选择
+
+4. **mode C 送达后不允许二次 PPO 决策，只允许执行层复核与兜底**
+   - **状态**：已对齐
+   - 说明：当前复核失败后直接进入 `fallback_recovery`，没有二次 action mask 或第二次 actor 调用
+
+5. **fallback 退出依赖 `_fallback_leg` 账本，到达后立即清空**
+   - **状态**：已对齐
+   - 说明：`fallback_recovery` 到达后仍统一走 `_on_arrive_charging_host()`，并在到达分支清空 `_fallback_leg`
+
+6. **mode B 的 `predicted_queue_time` 只作用于回收后补能服务阶段，不用于 mode C 等待回收合法性**
+   - **状态**：已对齐
+   - 说明：queue 只参与 mode B 返程宿主评分；mode C 合法性仍只看时序与能量，不把站点容量当作非法条件
+
+7. **Phase 5b 允许 reward 只补 `T_fallback`，其余奖励项延后**
+   - **状态**：已对齐
+   - 说明：当前 reward 由 `delivery_bonus`、`hard_failure`、`fallback` 三部分组成，未越界提前实现 5c 项
+
+8. **“完整 action_mask”当前的对外暴露方式**
+   - **状态**：语义已对齐，表示形式保持 5a 契约
+   - 说明：当前 env 侧已经实现“合法动作集合”的完整语义过滤，但对外仍只通过
+     `DecisionContext.action_lookup` 暴露，不单独输出 dense action_mask 张量。
+     这是刻意保持 5a 冻结接口不变；若后续 Phase 6/7 需要张量化 mask，应在 policy /
+     candidate builder 侧消费 `action_lookup` 构造，而不是回改 env API
+
+**当前 Phase 5b 与全文规约之间仍需明确标注的未实现项**
+
+以下不是本轮遗漏，而是文档本身就要求留到后续 phase 的内容；为了避免后续实现时误判，
+在这里显式标注为“未在 5b 落地”：
+
+1. **reservation 状态机**
+   - `ReservationState`、`_reservations`、`_reservation_count`
+   - `build_runtime_state_view()` 中 `reservation` / `reservation_count` 仍未填真实值
+   - **后续归属**：Phase 5c
+
+2. **reservation timeout 与 `T_timeout_cost`**
+   - 当前 `_advance_to_event()` 仍未扫描 timeout 条件
+   - 当前也未实现 `tau_res = alpha * fly_time + gamma * q_est`
+   - 因此本文档中“飞行途中持续复核 / timeout 后直接 fallback”的完整 CCT 映射，
+     目前只完成了“送达时复核”这一半，飞行途中 timeout 检查仍待补
+   - **后续归属**：Phase 5c
+
+3. **完整 `_settle_per_dt_rewards()`**
+   - 当前只实现了 `T_fallback`
+   - `T_overdue`、`T_wait`、`T_queue` 尚未接入
+   - **后续归属**：Phase 5c
+
+4. **`T_idle` 的 WAIT 即时惩罚**
+   - 当前 `WAIT_ACTION` 仍只作为 `active_wait` 的占位语义，不结算 `delta_wait`
+   - “在 `step(WAIT_action)` 调用点按精确 `delta_wait` 一次性扣罚”尚未实现
+   - **后续归属**：Phase 5c
+
+5. **无订单时不触发 PPO 决策**
+   - 当前 env 仍保留 `WAIT_ACTION` 作为兜底动作，未显式落实
+     “`authorized_orders` 为空时直接推进到下一事件，不产生 `T_idle`”
+   - 由于 `T_idle` 还未接入，这一条暂不影响 5b 正确性，但需要在 5c 一并收口
+   - **后续归属**：Phase 5c
+
+6. **reservation 相关观测拥挤信号**
+   - 文档中规划的 `reservation_count(node)` 作为拥挤信号，目前仍未对外暴露真实值
+   - 当前 mode B 的拥挤感知只来自真实 host queue，而不是 reservation 视角
+   - **后续归属**：Phase 5c
+
+7. **benchmark / stochastic 验证口径**
+   - 5b 仍不允许正式训练，也不允许作为最终 benchmark 指标基线
+   - 因为主目标中的 `T_res_timeout / T_overdue / T_wait / T_queue / T_idle` 仍未齐备
+   - **后续归属**：Phase 5c 完整奖励后，Phase 7 / 8 再正式接入验证
+
+**对后续 phase 的实现提醒**
+
+为避免 Phase 5c / Phase 6 重复返工，基于当前 5b 代码状态，后续实现时请保持以下约束不变：
+
+1. `DispatchAction` / `GlobalWaitAction` / `DecisionContext` / `RuntimeStateView`
+   的字段形状不要再改，只补真实值
+2. mode C 的合法性判定继续沿用“时序 + 能量 + 固定交接节点”三件事，
+   不要把 `station/depot` 的补能容量回灌成“等待被回收动作”的非法条件
+3. reservation timeout 接入时，不要回到“送达后二次 PPO 决策”；必须复用当前
+   `dispatch_commit -> post_delivery_revalidation / timeout -> fallback_recovery`
+   这条执行层链路
+4. 5c 接 `T_wait / T_queue / T_idle / T_overdue` 时，要在当前 `fallback` 结算路径上继续扩展，
+   不要重写 `fallback_recovery` 的账本语义
+5. 若 Phase 6/7 需要 dense action mask，请在 policy/candidate builder 消费
+   `action_lookup` 生成，不要回改 env_adapter 的对外返回格式
+
 ---
 
 #### Phase 5c：完整奖励信号（第一个允许正式训练的子层）
@@ -2610,42 +2793,6 @@ if mode == C:
 - `T_overdue` 在订单超过 deadline 后立即开始累加，送达后立即停止，送达时不叠加额外惩罚
 - reservation timeout 能在 `_advance_to_event()` 中被正确检测并触发 fallback
 - 无订单时不产生 T_idle 惩罚
-
-### 4.5.2 本轮代码同步记录（2026-04-25）
-
-为支撑 Phase 5 中"空骨架退化开关"的文档语义，本轮已对
-`backend/training/contracts.py` 做以下同步修改：
-
-1. `CoarsePlanView` 新增 `allow_empty_backbone_route: bool = False`
-   - 默认保持严格契约（poisson 模式），`truck_backbone_route` 不能为空
-   - benchmark / hybrid 模式下由 `env_adapter.reset()` 自动设为 `True`，无需手动配置
-2. `CoarsePlanView.__post_init__()` 增加条件校验分支
-   - 当 `allow_empty_backbone_route = False` 时，沿用原有"空骨架即报错"
-   - 当 `allow_empty_backbone_route = True` 且 `truck_backbone_route` 为空时，要求：
-     - `truck_eta_map = {}`
-     - `route_drift_ref = {}`
-     - `launch_candidate_stations = ()`
-     - `recovery_pool` 对所有订单均为空
-     - `policy_mode_mask` 不允许再包含 `C`，应收缩为 `{B}`
-3. `EnvSemanticContractMeta` 新增 `allow_empty_backbone_route: bool`
-   - 用于把这条环境语义开关纳入 Phase 1 已冻结的 `meta.json` 契约摘要
-
-`allow_empty_backbone_route` 的模式绑定规则（由 `env_adapter.reset()` 负责设置）：
-
-| 订单源模式 | `allow_empty_backbone_route` | 说明 |
-|---|---|---|
-| `poisson` | `False` | 骨架为空视为契约错误，尽早暴露巡站循环问题 |
-| `benchmark` | `True`（自动） | 骨架耗尽为合法退化状态，不追加巡站循环 |
-| `hybrid` | `True`（自动） | 同 benchmark |
-
-`planner.allow_empty_backbone_route` 配置项保留在 `rh_alns_cmrappo.yaml` 中，
-但其值在运行时由 `env_adapter.reset()` 根据 `order_source_mode` 自动覆盖，
-手动配置值仅作为 fallback，不建议依赖。
-
-补充说明：当前仓库中不存在 `backend/training/env_adapter.py` 的可编辑源码文件，
-因此本轮关于 `queueing_at_host`、`_on_arrive_charging_host()`、`T_queue` 统计范围、
-Phase 5 分层（5a/5b/5c）的修复先冻结在 Phase 5 文档语义层；后续新增或恢复
-`env_adapter` 源码时，必须严格按本节口径实现。
 
 ## 4.6 Phase 6：实现候选动作与上层规划骨架
 
