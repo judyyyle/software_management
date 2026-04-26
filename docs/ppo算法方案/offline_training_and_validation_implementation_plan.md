@@ -2346,6 +2346,144 @@ Phase 5 的实现规格较重，为避免一次性面对过多复杂度导致 bu
 
 #### Phase 5a：状态机骨架 + smoke test 连通性验证
 
+**本轮已完成实现记录（对应当前代码，而非后续目标态）**
+
+当前仓库已新增：
+
+- `backend/training/env_adapter.py`
+- `backend/training/test_env_adapter_phase5a.py`
+- `backend/training/__init__.py` 已补充 `env_adapter` 相关导出
+
+当前代码中已经落地并可直接从实现验证的内容如下：
+
+1. **环境入口与固定接口**
+   - 已实现 `TrainingEnvAdapter.reset()` / `step(action)` / `is_done()`
+   - 已定义固定接口：
+     - `TrainingDroneState`
+     - `RuntimeStateView`
+     - `DroneStateView`
+     - `NodeStateView`
+     - `DecisionContext`
+     - `DispatchAction`
+     - `GlobalWaitAction`
+     - `EnvStepResult`
+   - `DecisionContext` 当前暴露的是 `action_lookup`（候选动作列表），**尚未单独暴露 dense `action_mask` 张量**
+
+2. **Phase 2 / 3 / 4 产物对接**
+   - `reset()` 已对接 `scene_loader.load_default_scene()`、`order_source_adapter.build_order_source()`
+   - 已复用 `configure_order_manager_for_source()` 配置 `OrderManager`
+   - 已读取 Phase 4 的 `truck_execution_route.json`，转成内部 `_planned_route_stops`
+   - 已从 Phase 4 固定节点停靠记录构造 `_full_backbone_cache`
+   - `poisson` 模式下已在 `reset()` 内部按当前文档参数追加巡站循环；
+     `benchmark / hybrid` 不追加巡站循环，并自动允许空骨架退化
+
+3. **状态机骨架**
+   - 已实现 14 个训练态枚举值：
+     - `idle`
+     - `flying_to_deliver`
+     - `delivered`
+     - `return_to_rendezvous`
+     - `waiting_for_truck`
+     - `return_to_station`
+     - `return_to_depot`
+     - `queueing_at_host`
+     - `charging_or_swap`
+     - `active_wait`
+     - `fallback_recovery`
+     - `charging_on_truck`
+     - `riding_with_truck`
+     - `airborne_energy_failure`
+   - 其中 `home_type == TRUCK` 的 UAV 在 `reset()` 后初始化为 `riding_with_truck`
+   - `home_type == DEPOT` 的 UAV 在 `reset()` 后初始化为 `idle`
+
+4. **事件推进**
+   - 已实现 `_advance_to_event(t_next)`，当前会处理：
+     - 真实空中硬失败事件：若当前飞行段总能耗大于 UAV 剩余电量，则按飞行比例计算
+       `airborne_energy_failure` 发生时刻，并在到达事件之前截断该飞行段
+     - UAV 送达事件
+     - mode A 背景订单完成事件（来自 `truck_execution_route` 的 customer stop）
+     - 卡车到站事件
+     - `return_to_rendezvous / return_to_station / return_to_depot / fallback_recovery` 到达事件
+     - 固定节点充换电完成事件（`ChargingHost.tick_update()`）
+     - `charging_on_truck -> riding_with_truck` 的车载充换电完成事件
+     - `OrderManager.tick()` 触发的泊松/回放新订单注入
+
+5. **统一 charging host 入口**
+   - 已实现 `_on_arrive_charging_host(drone_id, host, t_now)`
+   - `station` 与 `depot` 到达均复用该入口
+   - `fallback_recovery` 到达后也直接走该入口
+   - 当前状态流转以 `host.arrive()` 的真实结果为准：
+     - 在 `serving_drones` 中则进入 `charging_or_swap`
+     - 在 `wait_queue` 中则进入 `queueing_at_host`
+
+6. **coarse plan 与 5a 候选动作**
+   - 已实现 `_build_coarse_plan_view(t_now)`
+   - 骨架过滤当前使用 `departure_time > t_now`
+   - 已按代码当前实现填充：
+     - `truck_backbone_route`
+     - `truck_eta_map`
+     - `route_drift_ref`
+     - `authorized_orders`
+     - `planner_mode_cap`
+     - `policy_mode_mask`
+     - `recovery_pool`
+     - `launch_candidate_stations`
+     - `node_charge_load_budget`
+   - 已实现 `_build_action_lookup(...)`
+   - 当前 5a 候选动作过滤包括：
+     - 订单必须仍在 `pending_orders`
+     - 订单重量不能超过当前 UAV `payload_capacity`
+     - 送达腿必须能飞到
+     - mode B 还要求存在至少一个可达返程宿主
+     - mode C 当前仅要求 `recovery_pool` 中存在 coarse 候选节点，不做 5b 的时序/能量精细过滤
+   - `WAIT` 当前始终保留
+
+7. **送达后执行层**
+   - mode B 当前**尚未**实现 5b 文档里的完整 `score = fly_time + predicted_queue_time + service_time`
+   - 当前代码里，mode B 返程宿主选择临时复用 `deterministic_fallback` 规则：
+     - `depot` 优先
+     - 若 `depot` 不可达，则选最近可达 `station`
+   - mode C 已实现 5a 最小兜底：
+     - 若原 `selected_recover_node` 仍在当前 `truck_backbone_route` 中，则进入 `return_to_rendezvous`
+     - 否则直接进入 `fallback_recovery`
+
+8. **fallback 内部账本**
+   - 已实现 `_fallback_leg: dict[drone_id, FallbackLeg]`
+   - 进入 `fallback_recovery` 时写入：
+     - `host_node_id`
+     - `host_node_type`
+     - `arrival_time`
+   - 到达 fallback 宿主后会立即清空对应账本
+
+9. **奖励与终止条件**
+   - 当前代码里只结算：
+     - `+ R_delivery_bonus`
+     - `- hard_failure_penalty_sec`
+   - 当前 `is_done()` 已实现三个终止条件：
+     - `t_now >= upper_horizon_sec`
+     - `pending_orders / assigned_orders / background_mode_a_pending` 全空
+     - 所有 UAV 都处于 `airborne_energy_failure`
+
+10. **当前 smoke test**
+   - 已新增 `backend/training/test_env_adapter_phase5a.py`
+   - 当前测试覆盖：
+     - default scene 下 `reset -> step -> done` 连通性
+     - `_fallback_leg` 在到达宿主后清空
+     - mode C 动作接口形状固定为“必须显式携带 `recover_node_id`”
+     - 真实空中电量耗尽会在飞行到达前触发 `airborne_energy_failure`
+     - `_on_arrive_charging_host()` 对 `station / depot` 统一复用同一套排队逻辑
+     - `_build_coarse_plan_view(t_now)` 在 `arrival_time == t_now` 时仍保留当前站点
+     - `poisson` 默认场景下，`reset()` 会在 Phase 4 原路线后追加巡站循环
+
+**本轮未完成 / 仍与目标态存在差异的部分**
+
+- 当前代码没有单独输出 dense `action_mask` 张量，只有 `action_lookup`
+- 当前代码没有实现 5b 的 mode C 精细过滤
+- 当前代码没有实现 reservation 状态机
+- 当前代码没有实现 `T_overdue / T_wait / T_queue / T_fallback / T_idle`
+- 当前代码没有实现 5b 的 mode B 完整返程评分规则，只保留了 5a 可运行替代口径
+
+
 **用途**：验证环境状态机正确性，确认 `reset → step → done` 能跑通。
 **禁止用途**：**不允许用于正式 PPO 训练**，不允许用于 benchmark 对比。
 原因：5a 的奖励只有送达奖励和硬失败惩罚，缺少 `T_overdue`，策略会对超时订单和准时订单
@@ -2353,7 +2491,7 @@ Phase 5 的实现规格较重，为避免一次性面对过多复杂度导致 bu
 
 **实现范围**：
 
-- 完整的 `TrainingDroneState` 枚举（全部 13 个状态，一次定义，5b/5c 不增删）
+- 完整的 `TrainingDroneState` 枚举（全部 14 个状态，一次定义，5b/5c 不增删）
 - 完整的状态转移图（所有路径，含 mode B/C/WAIT、fallback、charging_on_truck、riding_with_truck）
 - `_on_arrive_charging_host()` 统一入口（station 和 depot 统一走此处，排队判断一次写对）
 - `_fallback_leg` 内部账本（进入 `fallback_recovery` 时写入，到达时清空）——**5a 必须实现**，
