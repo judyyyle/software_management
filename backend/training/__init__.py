@@ -28,6 +28,18 @@ from .order_source_adapter import (
     ensure_mode_allowed,
     preview_dynamic_order_stream,
 )
+from .env_adapter import (
+    DecisionContext,
+    DispatchAction,
+    EnvStepResult,
+    GlobalWaitAction,
+    NodeStateView,
+    ReservationStateView,
+    RuntimeStateView,
+    TrainingDroneState,
+    TrainingEnvAdapter,
+    WAIT_ACTION,
+)
 from .export_sumo_truck_route import (
     Phase4ExportResult,
     TruckExecutionRoute,
@@ -46,9 +58,19 @@ __all__ = [
     "build_order_source",
     "build_order_source_preview_summary",
     "configure_order_manager_for_source",
+    "DecisionContext",
+    "DispatchAction",
+    "EnvStepResult",
     "export_phase4_truck_route",
     "ensure_mode_allowed",
+    "GlobalWaitAction",
     "load_default_scene",
     "load_training_scene",
+    "NodeStateView",
     "preview_dynamic_order_stream",
+    "ReservationStateView",
+    "RuntimeStateView",
+    "TrainingDroneState",
+    "TrainingEnvAdapter",
+    "WAIT_ACTION",
 ]
