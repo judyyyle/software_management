@@ -40,13 +40,16 @@ from core.entities.truck import Truck
 from environment.state.entity_manager import EntityManager
 from environment.state.order_manager import OrderManager
 
-from .contracts import CoarsePlanView, PlannerMode, PolicyMode, RouteDriftRef
+from .actions import DispatchAction, EnvAction, GlobalWaitAction, WAIT_ACTION
+from .candidate_builder import CandidateBuilder
+from .contracts import CoarsePlanView, PlannerMode, PlannerTriggerContext, PolicyMode, RouteDriftRef
 from .order_source_adapter import (
     OrderSourceConfig,
     OrderSourceMode,
     build_order_source,
     configure_order_manager_for_source,
 )
+from .planner_bridge import PlannerBridge
 from .scene_loader import DEFAULT_CONFIG_PATH, TrainingSceneContext, load_default_scene
 
 
@@ -136,44 +139,6 @@ class RuntimeStateView:
     assigned_orders: Mapping[str, Order]
     node_states: Mapping[str, NodeStateView]
     reservation_count: Mapping[str, int]
-
-
-@dataclass(frozen=True)
-class DispatchAction:
-    """一次派送动作。
-
-    当前实现中：
-      - `mode B` 只绑定订单，不绑定返程宿主；
-      - `mode C` 必须显式给出 recover_node_id。
-    """
-    # 与文档约定一致：一次 dispatch 同时绑定 order 和 mode；
-    # mode C 额外携带 recover_node_id，mode B 不携带返程宿主。
-    order_id: str
-    mode: PolicyMode
-    recover_node_id: str | None = None
-
-    def __post_init__(self) -> None:
-        """校验动作形状是否和当前接口约定一致。"""
-        if self.mode not in {PolicyMode.B, PolicyMode.C}:
-            raise ValueError(f"dispatch_action.mode 仅允许 B/C，实际={self.mode}")
-        if self.mode == PolicyMode.B and self.recover_node_id is not None:
-            raise ValueError("mode B 不应携带 recover_node_id")
-        if self.mode == PolicyMode.C and not self.recover_node_id:
-            raise ValueError("mode C 必须携带 recover_node_id")
-
-
-@dataclass(frozen=True)
-class GlobalWaitAction:
-    """全局 WAIT 动作。
-
-    该动作不绑定订单，也不绑定 recover node。
-    """
-    name: str = "WAIT"
-
-
-WAIT_ACTION = GlobalWaitAction()
-
-EnvAction: TypeAlias = DispatchAction | GlobalWaitAction
 
 
 @dataclass(frozen=True)
@@ -285,6 +250,9 @@ class _YamlConfig:
     max_overdue_sec: float
     hard_overdue_penalty_sec: float
     hard_failure_penalty_sec: float
+    support_radius_km: float
+    fallback_burst_window_sec: float
+    coarse_new_order_trigger: int
 
 
 class TrainingEnvAdapter:
@@ -301,6 +269,9 @@ class TrainingEnvAdapter:
         order_source: OrderSourceConfig | None = None,
         config_path: str | Path = DEFAULT_CONFIG_PATH,
         phase4_route_dir: str | Path | None = None,
+        enable_phase6: bool = True,
+        planner_bridge: PlannerBridge | None = None,
+        candidate_builder: CandidateBuilder | None = None,
     ) -> None:
         """构造环境对象并装载静态依赖。
 
@@ -312,6 +283,10 @@ class TrainingEnvAdapter:
         self._scene_ctx = scene_ctx or load_default_scene(config_path=self._config_path)
         self._order_source = order_source or build_order_source(
             self._scene_ctx,
+            config_path=self._config_path,
+        )
+        self._candidate_builder = candidate_builder or CandidateBuilder(
+            scene_ctx=self._scene_ctx,
             config_path=self._config_path,
         )
         self._phase4_route_dir = (
@@ -351,6 +326,24 @@ class TrainingEnvAdapter:
         self._background_mode_a_pending: set[str] = set()
         self._background_mode_a_completed: set[str] = set()
         self._last_reward_breakdown: dict[str, float] = {}
+        self._current_coarse_plan: CoarsePlanView | None = None
+        self._active_launch_stations: set[str] = set()
+        self._fallback_event_times: list[float] = []
+        self._hard_failure_event_times: list[float] = []
+        self._completed_backbone_nodes_since_plan: set[str] = set()
+        self._planner_bridge = (
+            planner_bridge
+            if planner_bridge is not None
+            else (
+                PlannerBridge(
+                    future_backbone_provider=self._future_backbone_visits,
+                    config_path=self._config_path,
+                    heavy_payload_capacity=self._heavy_payload_capacity,
+                )
+                if enable_phase6
+                else None
+            )
+        )
 
     # ---------------------------------------------------------------------
     # Public API
@@ -392,6 +385,11 @@ class TrainingEnvAdapter:
         self._background_mode_a_pending.clear()
         self._background_mode_a_completed.clear()
         self._last_reward_breakdown = {}
+        self._current_coarse_plan = None
+        self._active_launch_stations.clear()
+        self._fallback_event_times.clear()
+        self._hard_failure_event_times.clear()
+        self._completed_backbone_nodes_since_plan.clear()
 
         artifacts = self._load_phase4_artifacts()
         self._planned_route_stops = list(artifacts["planned_stops"])
@@ -571,19 +569,7 @@ class TrainingEnvAdapter:
         """
         order_mgr = self._require_order_manager()
 
-        # 文档要求按 departure_time 过滤，保证“卡车刚到站但尚未离站”的节点仍保留在未来骨架里。
-        filtered = [
-            visit
-            for visit in self._full_backbone_cache
-            if visit.departure_time > t_now
-        ]
-        deduped: list[BackboneVisit] = []
-        seen_nodes: set[str] = set()
-        for visit in filtered:
-            if visit.node_id in seen_nodes:
-                continue
-            seen_nodes.add(visit.node_id)
-            deduped.append(visit)
+        deduped = list(self._dedup_backbone_visits(self._future_backbone_visits(t_now)))
 
         truck_backbone_route = tuple(visit.node_id for visit in deduped)
         if not truck_backbone_route and not self._allow_empty_backbone_route:
@@ -665,48 +651,146 @@ class TrainingEnvAdapter:
             allow_empty_backbone_route=self._allow_empty_backbone_route,
         )
 
+    def _future_backbone_visits(self, t_now: float) -> tuple[BackboneVisit, ...]:
+        """返回当前时刻之后仍在未来骨架中的固定节点访问记录。"""
+        return tuple(
+            visit
+            for visit in self._full_backbone_cache
+            if visit.departure_time > t_now
+        )
+
+    def _dedup_backbone_visits(
+        self,
+        visits: tuple[BackboneVisit, ...],
+    ) -> tuple[BackboneVisit, ...]:
+        deduped: list[BackboneVisit] = []
+        seen_nodes: set[str] = set()
+        for visit in visits:
+            if visit.node_id in seen_nodes:
+                continue
+            seen_nodes.add(visit.node_id)
+            deduped.append(visit)
+        return tuple(deduped)
+
+    def _refresh_coarse_plan_if_needed(
+        self,
+        runtime_state: RuntimeStateView | None = None,
+    ) -> CoarsePlanView:
+        """统一 coarse plan 刷新入口。"""
+        if self._planner_bridge is None:
+            return self._build_coarse_plan_view(self._t_now)
+
+        if runtime_state is None:
+            runtime_state = self.build_runtime_state_view()
+
+        trigger_ctx = self._build_planner_trigger_context(runtime_state)
+        coarse_plan = self._planner_bridge.maybe_replan(runtime_state, trigger_ctx)
+        if (
+            self._current_coarse_plan is None
+            or coarse_plan.plan_version > self._current_coarse_plan.plan_version
+        ):
+            self._current_coarse_plan = coarse_plan
+            self._active_launch_stations = set(coarse_plan.launch_candidate_stations)
+            self._completed_backbone_nodes_since_plan.clear()
+        elif self._current_coarse_plan is None:
+            self._current_coarse_plan = coarse_plan
+
+        self._prune_active_launch_stations(runtime_state)
+        return self._current_coarse_plan
+
+    def _build_planner_trigger_context(
+        self,
+        runtime_state: RuntimeStateView,
+    ) -> PlannerTriggerContext:
+        backlog_new_orders = 0
+        route_drift_ratio = 0.0
+        if self._current_coarse_plan is not None:
+            backlog_new_orders = sum(
+                1
+                for order_id, order in runtime_state.pending_orders.items()
+                if self._is_uav_primary_order(order)
+                and not self._current_coarse_plan.is_order_authorized(order_id)
+            )
+            total_backbone_count = len(self._current_coarse_plan.route_drift_ref)
+            if total_backbone_count > 0:
+                expected_count = sum(
+                    1
+                    for item in self._current_coarse_plan.route_drift_ref.values()
+                    if float(item.eta_ref) <= float(runtime_state.t_now) + _TIME_EPS
+                )
+                completed_count = len(self._completed_backbone_nodes_since_plan)
+                route_drift_ratio = abs(completed_count - expected_count) / total_backbone_count
+
+        self._prune_window_events(self._fallback_event_times, runtime_state.t_now)
+        self._prune_window_events(self._hard_failure_event_times, runtime_state.t_now)
+        return PlannerTriggerContext(
+            t_now=float(runtime_state.t_now),
+            backlog_new_orders=int(backlog_new_orders),
+            fallback_count_in_window=len(self._fallback_event_times),
+            hard_failure_count_in_window=len(self._hard_failure_event_times),
+            route_drift_ratio=float(route_drift_ratio),
+        )
+
+    def _prune_window_events(self, events: list[float], t_now: float) -> None:
+        window_start = t_now - self._cfg.fallback_burst_window_sec
+        while events and events[0] < window_start - _TIME_EPS:
+            events.pop(0)
+
+    def _prune_active_launch_stations(self, runtime_state: RuntimeStateView) -> None:
+        if not self._active_launch_stations:
+            return
+        removable = [
+            node_id
+            for node_id in self._active_launch_stations
+            if not self._station_has_pending_orders(runtime_state, node_id)
+        ]
+        for node_id in removable:
+            self._active_launch_stations.discard(node_id)
+
+    def _station_has_pending_orders(
+        self,
+        runtime_state: RuntimeStateView,
+        station_id: str,
+    ) -> bool:
+        node_state = runtime_state.node_states.get(station_id)
+        if node_state is None:
+            return False
+        radius_m = self._cfg.support_radius_km * 1000.0
+        for order in runtime_state.pending_orders.values():
+            if not self._is_uav_primary_order(order):
+                continue
+            if node_state.position.distance_2d(order.delivery_loc) <= radius_m + _TIME_EPS:
+                return True
+        return False
+
     def _build_action_lookup(
         self,
         *,
         drone_id: str,
         coarse_plan: CoarsePlanView,
+        trigger_type: str | None = None,
+        trigger_station_id: str | None = None,
     ) -> tuple[EnvAction, ...]:
         """为当前决策 UAV 构造可执行动作列表。"""
-        entity_mgr = self._require_entity_manager()
-        order_mgr = self._require_order_manager()
-        drone = entity_mgr.drones[drone_id]
-        actions: list[EnvAction] = []
-
-        for order_id in coarse_plan.authorized_orders:
-            order = order_mgr.pending_orders.get(order_id)
-            if order is None:
-                continue
-            # 至少要过滤掉“当前无人机根本拿不起”的订单，否则会在 assign_order 处直接报错。
-            if float(order.payload_weight) > float(drone.payload_capacity):
-                continue
-            if not self._deliver_leg_feasible(drone, order):
-                continue
-
-            modes = coarse_plan.get_policy_modes(order_id)
-            if PolicyMode.B in modes and self._has_mode_b_return_host(drone, order):
-                actions.append(DispatchAction(order_id=order_id, mode=PolicyMode.B))
-
-            if PolicyMode.C in modes:
-                for recover_node_id in self._iter_feasible_mode_c_recovery_nodes(
-                    drone=drone,
-                    order=order,
-                    coarse_plan=coarse_plan,
-                ):
-                    actions.append(
-                        DispatchAction(
-                            order_id=order_id,
-                            mode=PolicyMode.C,
-                            recover_node_id=recover_node_id,
-                        )
-                    )
-
-        actions.append(WAIT_ACTION)
-        return tuple(actions)
+        runtime_state = self.build_runtime_state_view()
+        effective_trigger_type = (
+            trigger_type
+            if trigger_type is not None
+            else (
+                "truck_station_arrival"
+                if self._drone_state.get(drone_id) == TrainingDroneState.RIDING_WITH_TRUCK
+                else "inline_idle"
+            )
+        )
+        candidate_out = self._candidate_builder.build(
+            runtime_state=runtime_state,
+            coarse_plan=coarse_plan,
+            deciding_drone_id=drone_id,
+            trigger_type=effective_trigger_type,
+            trigger_station_id=trigger_station_id,
+            last_seen_plan_version=coarse_plan.plan_version,
+        )
+        return candidate_out.resolved_action_lookup.as_action_lookup()
 
     # ---------------------------------------------------------------------
     # Step helpers
@@ -772,10 +856,12 @@ class TrainingEnvAdapter:
     def _build_decision_context(self, trigger: DecisionTrigger) -> DecisionContext:
         """把内部 trigger 展开成给调用方可直接消费的决策上下文。"""
         runtime_state = self.build_runtime_state_view()
-        coarse_plan = self._build_coarse_plan_view(self._t_now)
+        coarse_plan = self._refresh_coarse_plan_if_needed(runtime_state)
         action_lookup = self._build_action_lookup(
             drone_id=trigger.drone_id,
             coarse_plan=coarse_plan,
+            trigger_type=trigger.trigger_type,
+            trigger_station_id=trigger.trigger_station_id,
         )
         return DecisionContext(
             deciding_drone_id=trigger.drone_id,
@@ -887,14 +973,14 @@ class TrainingEnvAdapter:
             reward_breakdown["hard_failure"] = hard_failure_reward
 
         # 3a. 卡车到站
-        station_trigger: str | None = None
+        station_arrivals = [stop for stop in truck_stops if stop.node_type == "station"]
         if truck_stops:
             last_stop = truck_stops[-1]
             truck.current_loc = _clone_position(last_stop.position)
-            if last_stop.node_type == "station":
-                coarse_plan = self._build_coarse_plan_view(t_next)
-                if last_stop.node_id in coarse_plan.launch_candidate_stations:
-                    station_trigger = last_stop.node_id
+        if self._current_coarse_plan is not None:
+            for stop in station_arrivals:
+                if stop.node_id in self._current_coarse_plan.route_drift_ref:
+                    self._completed_backbone_nodes_since_plan.add(stop.node_id)
 
         # 3b. UAV 到站 + host charge complete + truck charge complete
         newly_idle_from_host: list[str] = []
@@ -942,6 +1028,13 @@ class TrainingEnvAdapter:
 
         # 6. 生成 decision context / done
         self._t_now = min(float(t_next), float(self._cfg.upper_horizon_sec))
+        station_trigger: str | None = None
+        refreshed_runtime_state = self.build_runtime_state_view()
+        self._refresh_coarse_plan_if_needed(refreshed_runtime_state)
+        for stop in station_arrivals:
+            if stop.node_id in self._active_launch_stations:
+                station_trigger = stop.node_id
+            self._active_launch_stations.discard(stop.node_id)
         if station_trigger is not None:
             # 车到站先恢复 riding_with_truck 的 WAIT 占位，再为当前仍在车上的 UAV 产生触发。
             self._resume_active_wait_for_station_trigger()
@@ -1174,6 +1267,7 @@ class TrainingEnvAdapter:
             arrival_time=float(arrival_time),
         )
         self._drone_state[drone_id] = TrainingDroneState.FALLBACK_RECOVERY
+        self._fallback_event_times.append(float(self._t_now))
         self._schedule_flight_leg(
             drone_id=drone_id,
             kind="fallback_recovery",
@@ -1263,10 +1357,18 @@ class TrainingEnvAdapter:
         t_now: float,
     ) -> float | None:
         """返回 reservation timeout 的违规量；无 timeout 时返回 None。"""
+        if self._drone_state.get(drone_id) not in {
+            TrainingDroneState.DELIVERED,
+            TrainingDroneState.RETURN_TO_RENDEZVOUS,
+            TrainingDroneState.WAITING_FOR_TRUCK,
+        }:
+            return None
+
         drone = self._require_entity_manager().drones[drone_id]
         host = self._resolve_fixed_node(reservation.recover_node)
         host_pos = host.get_location(t_now)
-        t_arrive_truck = self._build_coarse_plan_view(t_now).truck_eta_map.get(reservation.recover_node)
+        coarse_plan = self._build_coarse_plan_view(t_now)
+        t_arrive_truck = coarse_plan.truck_eta_map.get(reservation.recover_node)
         effective_battery = self._effective_battery_current(drone_id, t_now)
         energy_feasible = self._can_reach_from(
             drone=drone,
@@ -1699,12 +1801,17 @@ class TrainingEnvAdapter:
     def _next_global_decision_event_time(self) -> float:
         """返回下一个会触发 PPO 决策的全局事件时刻。"""
         candidates: list[float] = []
-        coarse_plan = self._build_coarse_plan_view(self._t_now)
+        coarse_plan = self._refresh_coarse_plan_if_needed()
+        launch_stations = (
+            self._active_launch_stations
+            if self._planner_bridge is not None
+            else set(coarse_plan.launch_candidate_stations)
+        )
 
         for stop in self._planned_route_stops[self._planned_route_stop_i :]:
             if (
                 stop.node_type == "station"
-                and stop.node_id in coarse_plan.launch_candidate_stations
+                and stop.node_id in launch_stations
                 and stop.arrival_time > self._t_now + _TIME_EPS
             ):
                 candidates.append(stop.arrival_time)
@@ -1937,7 +2044,8 @@ class TrainingEnvAdapter:
         state = self._drone_state.get(drone_id)
         if state not in {TrainingDroneState.IDLE, TrainingDroneState.RIDING_WITH_TRUCK}:
             return
-        if not self._has_authorized_orders_now():
+        runtime_state = self.build_runtime_state_view()
+        if not self._has_authorized_orders_now(runtime_state):
             return
         if any(item.drone_id == drone_id for item in self._decision_queue):
             return
@@ -1970,9 +2078,58 @@ class TrainingEnvAdapter:
             if state == TrainingDroneState.IDLE:
                 self._enqueue_decision(drone_id, "wait_resume", None)
 
-    def _has_authorized_orders_now(self) -> bool:
+    def _has_authorized_orders_now(
+        self,
+        runtime_state: RuntimeStateView | None = None,
+    ) -> bool:
         """当前时刻是否存在 coarse plan 授权订单。"""
-        return bool(self._build_coarse_plan_view(self._t_now).authorized_orders)
+        if runtime_state is None:
+            runtime_state = self.build_runtime_state_view()
+
+        coarse_plan = self._refresh_coarse_plan_if_needed(runtime_state)
+        live_authorized = any(
+            order_id in runtime_state.pending_orders
+            for order_id in coarse_plan.authorized_orders
+        )
+        if live_authorized:
+            return True
+
+        if self._planner_bridge is not None:
+            pending_uav_orders = any(
+                self._is_uav_primary_order(order)
+                for order in runtime_state.pending_orders.values()
+            )
+            if pending_uav_orders:
+                forced_ctx = self._build_planner_trigger_context(runtime_state)
+                forced_ctx = PlannerTriggerContext(
+                    t_now=forced_ctx.t_now,
+                    backlog_new_orders=max(
+                        forced_ctx.backlog_new_orders,
+                        self._cfg.coarse_new_order_trigger,
+                    ),
+                    fallback_count_in_window=forced_ctx.fallback_count_in_window,
+                    hard_failure_count_in_window=forced_ctx.hard_failure_count_in_window,
+                    route_drift_ratio=forced_ctx.route_drift_ratio,
+                )
+                coarse_plan = self._planner_bridge.maybe_replan(runtime_state, forced_ctx)
+                if (
+                    self._current_coarse_plan is None
+                    or coarse_plan.plan_version >= self._current_coarse_plan.plan_version
+                ):
+                    if (
+                        self._current_coarse_plan is None
+                        or coarse_plan.plan_version > self._current_coarse_plan.plan_version
+                    ):
+                        self._completed_backbone_nodes_since_plan.clear()
+                    self._current_coarse_plan = coarse_plan
+                    self._active_launch_stations = set(coarse_plan.launch_candidate_stations)
+                    self._prune_active_launch_stations(runtime_state)
+                return any(
+                    order_id in runtime_state.pending_orders
+                    for order_id in coarse_plan.authorized_orders
+                )
+
+        return False
 
     # ---------------------------------------------------------------------
     # Phase 4 / reset helpers
@@ -2153,6 +2310,7 @@ class TrainingEnvAdapter:
             truck.docked_drones.remove(drone_id)
         drone.battery_current = 0.0
         self._drone_state[drone_id] = TrainingDroneState.AIRBORNE_ENERGY_FAILURE
+        self._hard_failure_event_times.append(float(self._t_now))
         return -self._cfg.hard_failure_penalty_sec
 
     def _compute_airborne_failure_time(
@@ -2311,6 +2469,9 @@ def _load_env_yaml(config_path: Path) -> _YamlConfig:
         patrol_min_remaining_sec=float(planner["patrol_min_remaining_sec"]),
         patrol_stations_per_loop=int(planner["patrol_stations_per_loop"]),
         allow_empty_backbone_route=bool(planner.get("allow_empty_backbone_route", False)),
+        support_radius_km=float(planner["support_radius_km"]),
+        fallback_burst_window_sec=float(planner["fallback_burst_window_sec"]),
+        coarse_new_order_trigger=int(planner["coarse_new_order_trigger"]),
         max_wait_decision_gap_sec=float(planner["max_wait_decision_gap_sec"]),
         max_candidate_recovery_per_order=int(candidate["max_candidate_recovery_per_order"]),
         rendezvous_eta_safe_margin_sec=float(candidate["rendezvous_eta_safe_margin_sec"]),
