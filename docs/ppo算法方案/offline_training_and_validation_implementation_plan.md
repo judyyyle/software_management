@@ -171,8 +171,8 @@ J =
   + lambda_miss * T_fallback
   + lambda_res_timeout * T_res_timeout
   + lambda_overdue * T_overdue
-  + Lambda_hard * N_hard_fail
-  + Lambda_hard_overdue * N_hard_overdue
+  + hard_failure_penalty_sec * N_hard_fail
+  + hard_overdue_penalty_sec * N_hard_overdue
 ```
 
 含义如下：
@@ -193,22 +193,30 @@ J =
    即时惩罚为 `r_wait_step = -wait_idle_penalty_coef * delta_t_wait_k`，
    与 `lambda_wait` 保持同一口径（首轮建议 `wait_idle_penalty_coef = 0.10`，
    与 `lambda_wait` 相同，后续可通过 curriculum 衰减）。
-   注意：排队（`T_queue`）、站点容量导致的被动等待不计入 `T_idle`，
+   注意：排队（`T_queue`）、补能宿主容量导致的被动等待不计入 `T_idle`，
    避免与 `T_wait` / `T_queue` 重复扣罚
-- `T_queue`：无人机在充换电站排队总时间
-- `T_fallback`：错过卡车后飞往下一个站点或仓库的总时间
+- `T_queue`：无人机在充换电宿主（`station / depot`）排队总时间，仅统计已到达
+   宿主后等待服务槽位的时间；不包含 `charging_on_truck` 的车载充换电等待
+- `T_fallback`：错过卡车后飞往下一个安全宿主（充换电站或仓库）的总飞行时间。
+   在事件驱动环境中，它不是一次性入场惩罚，而是 `fallback_recovery`（兜底返程飞行态）
+   的状态占用时间累计：只要 UAV 仍处于 `fallback_recovery`，每次时间推进区间 `[t_prev, t_next)`
+   都累计 `ΔT_fallback = t_next - t_prev`；到达备用宿主后立即停止累计。
 - `T_res_timeout`：reservation timeout 造成的总局部损失
 - `T_overdue`：所有未送达且已超时订单的累计超时时长，定义为
-   `T_overdue = sum_i max(0, t_now - deadline_i)`（对所有未送达订单，每步累加）。
-   **必须在每个仿真步实时累加，不允许等到送达时才结算**，原因是：若仅在送达时结算，
-   模型会学到"不送超时订单"可规避惩罚，导致超时订单被系统性忽略。
-   实时累加后，送达超时订单会停止该订单的累加，模型仍有动力去送。
-   送达时不再叠加额外惩罚，避免双重计入。
+   `T_overdue = sum_i overdue_duration_i`，其中 `overdue_duration_i` 表示订单 `i`
+   在“未送达且已超过 deadline”状态下经历的累计时间。
+   在事件驱动环境中，采用**按时间推进区间类实时累计**，不允许等到送达、强制移除或
+   episode 结束时再统一结算。对任意一次时间推进区间 `[t_prev, t_next)`，订单 `i` 的
+   增量定义为：
+   `ΔT_overdue_i = max(0, t_next - max(t_prev, deadline_i))`
+   （仅当订单在整个结算时刻仍属于未送达订单集合时才参与累计）。
+   这样订单一旦超过 `deadline_i`，就在下一次时间推进时立即开始扣罚；送达后停止累计，
+   且送达时不再叠加额外惩罚，避免双重计入。
    首轮建议 `lambda_overdue = 0.20`（高于 `lambda_wait`，体现超时的更高优先级）
 - `N_hard_overdue`：超时时长超过 `max_overdue_sec` 仍未送达的订单数。
-   超过该阈值后订单从可调度池中强制移除，记一次固定惩罚 `Lambda_hard_overdue`，
+   超过该阈值后订单从可调度池中强制移除，记一次固定惩罚 `hard_overdue_penalty_sec`，
    避免模型长期持有无法挽回的"死单"。
-   首轮建议 `max_overdue_sec = 600`，`Lambda_hard_overdue = 600`
+   首轮建议 `max_overdue_sec = 600`，`hard_overdue_penalty_sec = 600`
 - `N_hard_fail`：半空停电或无合法安全节点可达的事件数
 
 要求：
@@ -217,8 +225,9 @@ J =
 - benchmark 与 stochastic 验证也必须回到这套指标，不允许只看 PPO reward
 - `mode A` 背景订单不进入这套 PPO 主指标；其执行结果只进入单独的系统上下文统计区
 - `T_overdue` 的即时惩罚必须在 `env_adapter` 的 `compute_reward()` 里逐步结算，
-   不能只在 episode 末端累计，否则梯度信号仍然稀释
-- `T_idle` 的即时惩罚同样必须逐步结算（同上）
+   不能只在 episode 末端或强制移除时统一结算，否则梯度信号仍然稀释
+- `T_idle` 的即时惩罚固定为 `step(WAIT_action)` 调用点的一次性 entry cost
+   （入场成本），数值等于本次 WAIT 的精确 `delta_wait`，不进入后续区间持续累计
 
 ### 2.1.5 当前阶段建议采用事件驱动环境
 
@@ -323,25 +332,34 @@ Trigger_ALNS =
 CMRAPPO 是本阶段唯一需要训练的组件，其职责是：
 
 1. 在每次局部事件触发时，基于共享参数策略在 `action_mask` 过滤后的候选集中选择动作
-2. 动作空间采用 `factorized action space`，顺序固定为：
-   - 先选 `order_i`（候选订单）
-   - 再选 `mode_i`（`WAIT` / `B` / `C`）
-   - 再选 `recover_node_j`（回收节点）
+2. 动作空间采用 `factorized action space`：
+   - 对真实派送动作，顺序固定为：先选 `order_i`（候选订单），再选 `mode_i`
+     （`B` / `C`）
+   - 当 `mode_i = C` 时，第三阶段再选 `recover_node_j`（卡车汇合回收节点）
+   - 当 `mode_i = B` 时，不存在第三阶段策略选择；具体返程充换电宿主在订单送达后由
+     执行层确定性规则在 `station / depot` 中选择
+   - 同时保留一个 `global_wait_action`（全局 WAIT 动作）；它在语义上属于 mode 层的
+     `WAIT` 分支，但**不绑定任何具体 `order_i` / `recover_node_j`**
 3. `mode A` 不进入 PPO actor head，由 RH-ALNS / truck-side coarse planner 管理
 4. 模式约束采用双层语义：
    - `planner_mode_cap={A,B,C}`：上层规划器语义边界
-   - `policy_mode_mask={WAIT,B,C}`：真正给 PPO actor 的可选模式掩码
+   - `policy_mode_mask={B,C}`：真正给 PPO actor 的**订单级派送模式掩码**
 5. 训练阶段固定使用 `centralized_train_only critic`
 6. 推理阶段默认使用 `greedy` 动作选择
 
 **PPO 决策触发时机（两类，结构完全统一）**
 
-PPO 在以下两类时机触发，动作空间结构相同：
+PPO 在以下两类时机触发，动作语义相同：
 
 - **`idle` 触发**：无人机在 depot 或 station 完成充换电后进入 idle，触发 PPO 决策
 - **`riding_with_truck` 触发**：卡车到达某个站点，且该站点在 `CoarsePlanView.launch_candidate_stations` 中，触发该卡车上所有 `riding_with_truck` 无人机的 PPO 决策
 
-两类触发的动作空间完全一致：`(order_i, mode, recover_node_j)`。
+两类触发都共享同一套派送动作语义：
+
+- `mode B = autonomous_return_to_charge_host`（自主返程，不依赖卡车；订单送达后由执行层在
+  `station / depot` 中确定性选择返程充换电宿主）
+- `mode C = rendezvous_return`（卡车汇合返程，需要选择 `recover_node_j`）
+- 并始终额外提供一个 `global_wait_action`
 
 `WAIT` 动作在两类触发中的语义：
 - `idle` 状态下：保持当前位置不动，等待下一个环境事件
@@ -357,9 +375,9 @@ PPO 在以下两类时机触发，动作空间结构相同：
     t_deliver = t_now + fly_time(S_k → order_i.location)
     recovery_pool(order_i) = {
       r_j | node_type(r_j) ∈ {station, depot}
-          AND ETA_truck(r_j) > t_deliver
-          AND ETA_uav(order_i.location → r_j) + delta_safe <= ETA_truck(r_j)
-          AND E_need(order_i.location → r_j) + E_safe <= E_rem
+          AND t_arrive_truck(r_j) > t_deliver
+          AND t_deliver + fly_time(order_i.location → r_j) + rendezvous_eta_safe_margin_sec <= t_arrive_truck(r_j)
+          AND E_need(order_i.location → r_j, payload=0) + drone.safe_margin_j <= E_rem
     }
 ```
 
@@ -381,16 +399,17 @@ CoarsePlanView {
   issued_at: float
   valid_until: float
   truck_backbone_route: [node_id]
-  truck_eta_map: {node_id -> eta_sec}
+  truck_eta_map: {node_id -> t_arrive_truck_sec}
   authorized_orders: [order_id]
   order_priority_band: {order_id -> int}
   order_pre_score: {order_id -> float}
    planner_mode_cap: {order_id -> {A,B,C}}
-   policy_mode_mask: {order_id -> {WAIT,B,C}}
+   policy_mode_mask: {order_id -> {B,C}}
   recovery_pool: {order_id -> [node_id]}
   node_charge_load_budget: {node_id -> int}
   route_drift_ref: {node_id -> (eta_ref, route_index_ref)}
   launch_candidate_stations: [node_id]
+  allow_empty_backbone_route: bool
 }
 ```
 
@@ -400,6 +419,16 @@ CoarsePlanView {
 - 仅用于决定"卡车到达哪些站点时触发 `riding_with_truck` 无人机的 PPO 决策点"
 - 不预算具体的回收候选点，回收候选点在 PPO 决策时实时计算（见 CMRAPPO 职责描述）
 - `plan_version` 更新时，`launch_candidate_stations` 同步更新；已在飞行中的无人机不受影响
+- **Phase 5 简化版覆盖规则**：见 Section 4.5。为减少上层启发式对训练分布的干预，
+  `launch_candidate_stations` 在 Phase 5 直接放宽为
+  `future_backbone_station_nodes`（由 `truck_backbone_route` 派生的未来 `station` 节点子集）；
+  注意：这不是 Phase 4 独立导出的字段名，而是消费侧根据 `truck_backbone_route`
+  （卡车未来骨架路线）和当前路线进度动态过滤得到的 `station` 子序列，**不包含**
+  customer 停靠点，也**不包含**场景中卡车未来不会经过的 station；基于订单密度的
+  二次筛选延后到 Phase 6
+- `allow_empty_backbone_route`：骨架退化开关。poisson 模式下默认 `false`，骨架为空视为
+  契约错误；benchmark / hybrid 模式下由 `env_adapter.reset()` 自动设为 `true`，
+  允许构造"卡车未来骨架已耗尽"的空骨架 `CoarsePlanView`，为合法退化状态
 
 `node_charge_load_budget` 说明：
 
@@ -412,12 +441,13 @@ CoarsePlanView {
 
 PPO 的权限严格限定为：
 
-1. 只能在 `authorized_orders` 内选订单
-2. 只能在 `policy_mode_mask[order]` 内选模式（actor 侧）
+1. 只能在 `authorized_orders` 内选订单（仅对 `dispatch_action` 分支）
+2. 只能在 `policy_mode_mask[order]` 内选订单级派送模式（`B` / `C`）
 3. `planner_mode_cap[order]` 仅作为上层语义边界，不直接作为 actor head 掩码
-4. 当 `planner_mode_cap` 仅放行 `A` 时，该订单不进入本轮 PPO 可选订单集（或仅保留 `WAIT`）
-5. `policy_mode_mask` 必须与 actor head 分支严格对齐为 `{WAIT,B,C}`
-6. 只能在 `recovery_pool[order]` 内选回收节点
+4. 当 `planner_mode_cap` 仅放行 `A` 时，该订单不进入本轮 PPO 可选订单集
+5. `global_wait_action` 独立于 `policy_mode_mask`，由 `enable_wait_action=true`
+   全局提供，不绑定订单
+6. 只能在 `recovery_pool[order]` 内选回收节点（仅对 `mode C`）
 7. 不能改写 `truck_backbone_route`
 8. 唯一例外：当所有 coarse-plan 授权动作都非法时，允许进入 `safety fallback action`（飞往 depot 或最近可达 station）
 
@@ -470,11 +500,53 @@ PPO 的权限严格限定为：
 - "返回卡车"只能解释成返回卡车未来将经过的合法交接节点
 - 合法交接节点仅限：`station` 或 `depot`
 
+**时序量统一记号（全文强制）**
+
+- `fly_time(A → B)`（飞行耗时）：duration（持续时间），单位秒
+- `t_arrive_uav(A → B)`（无人机到达 `B` 的绝对仿真时刻）：timestamp（绝对时刻）。
+  若该飞行段从当前时刻起飞，则 `t_arrive_uav(A → B) = t_now + fly_time(A → B)`；
+  若该飞行段从送达时刻起飞，则 `t_arrive_uav(deliver → r_j) = t_deliver + fly_time(deliver → r_j)`
+- `t_arrive_truck(r_j)`（卡车到达回收节点 `r_j` 的绝对仿真时刻）：timestamp（绝对时刻），
+  固定定义为 `truck_eta_map[r_j]`
+
+禁止在公式里继续混用“无人机 ETA / 卡车 ETA”这类历史写法。所有 mode C 时序判断、
+reservation timeout、`T_timeout_cost` 和 WAIT 推进量的计算，都必须只使用
+`fly_time`、`t_arrive_uav`、`t_arrive_truck` 这三类量。
+
 候选回收动作仅在同时满足以下条件时才能保留在 `action_mask` 中：
 
-1. 该节点在卡车未来路径上，且仍未经过（`ETA_truck(r_j) > t_deliver`）
-2. 无人机预计到达时刻早于卡车到达该节点（`ETA_uav(deliver -> r_j) + delta_safe <= ETA_truck(r_j)`）
-3. 无人机剩余电量足以飞到该节点并保留安全余量（`E_need + E_safe <= E_rem`）
+1. 该节点在卡车未来路径上，且仍未经过（`t_arrive_truck(r_j) > t_deliver`）
+2. 无人机预计到达时刻早于卡车到达该节点（`t_arrive_uav(deliver -> r_j) + rendezvous_eta_safe_margin_sec <= t_arrive_truck(r_j)`）
+3. 无人机剩余电量足以飞到该节点并保留安全余量（`E_need(deliver -> r_j, payload=0) + drone.safe_margin_j <= E_rem`）
+
+其中：
+
+- `rendezvous_eta_safe_margin_sec` 是汇合安全时间裕量参数，对应 `backend/config/rh_alns_cmrappo.yaml.candidate.rendezvous_eta_safe_margin_sec`
+- `drone.safe_margin_j` 是运行时绝对安全余量（焦耳），由共享运行时参数 `safe_margin_ratio` 经 loader 换算得到；运行时能量判断以该绝对值为准
+- `CandidateMeta.energy_safe_margin_ratio` 仅作为训练配置 / 契约快照保留，不直接作为 `can_reach()` 的入参
+
+`mode B / mode C` 的动作语义在本阶段进一步冻结为：
+
+- `mode B = autonomous_return_to_charge_host`（自主返程，不依赖卡车）：
+  `dispatch_action` 只输出 `order_i`（目标订单）与 `mode_i=B`；PPO 不在起飞前锁定具体
+  `station / depot`。订单送达后，由执行层按确定性规则选择最优返程充换电宿主
+- `mode C = rendezvous_return`（卡车汇合返程）：
+  `dispatch_action` 在 PPO 决策时一次性输出 `order_i`（目标订单）、`mode_i=C`、
+  `selected_recover_node`（策略原选回收节点）
+
+- `selected_recover_node` 只属于 `mode C`；它必须在起飞前确定，**不允许**在
+  `delivered`（已送达待返程）后
+  再触发一次 `second_ppo_decision_after_delivery`（送达后二次 PPO 决策）
+- 订单送达后，环境必须执行 `post_delivery_revalidation`（送达后执行层复核），对
+  `selected_recover_node` 重新检查：
+  - `energy_feasible`（送达后剩余电量对原定回收点是否仍可达）
+  - `rendezvous_time_feasible`（送达后无人机与卡车在原定回收点的汇合时序是否仍成立）
+  - `node_still_valid`（原定回收点是否仍属于卡车未来合法交接节点）
+- 若复核通过，则 `effective_recover_node`（执行层最终采用的回收节点）=
+  `selected_recover_node`
+- 若复核失败，则环境**不重新向 PPO 请求动作**，而是进入
+  `deterministic_fallback`（确定性兜底返程），按固定规则改飞仓库或最近可达充换电站，
+  并记录对应的 `reservation_timeout`（预留失效）或 `soft_miss`（软失配）惩罚
 
 补充说明：
 
@@ -497,9 +569,14 @@ PPO 的权限严格限定为：
 
 - reservation 是"软预留、非排他、后续服务排队感知"的局部承诺，不是物理工位锁
 - 每个 mode C 动作建立后，启动 timeout 计时器：
+- reservation 的建立时机固定为 `dispatch_action`（起飞前一次性派送动作）被选中时；
+  其绑定对象是 `selected_recover_node`（策略原选回收节点），不是送达后的二次 PPO 结果
+- `reservation timeout`（预留失效）与 `post_delivery_revalidation`（送达后执行层复核）
+  属于执行层逻辑，不引入新的 actor 决策点；送达后若原定回收点失效，只允许进入
+  `deterministic_fallback`（确定性兜底返程），不允许重新构造 `action_mask` 让 PPO 再选一次
 
 ```text
-tau_res = alpha * ETA_uav(deliver -> r_j)
+tau_res = alpha * fly_time(deliver -> r_j)
         + beta  * t_hist(node_type_j, mode C)
         + gamma * q_est(r_j)
 ```
@@ -508,8 +585,8 @@ tau_res = alpha * ETA_uav(deliver -> r_j)
 
 ```text
 timeout(res) =
-    (t_now >= t_res_expire)
- OR (ETA_uav + delta_safe > ETA_truck)
+    (t_now >= expires_at)
+ OR (t_arrive_uav(current_loc -> r_j) + rendezvous_eta_safe_margin_sec > t_arrive_truck(r_j))
  OR (energy_feasible == false)
  OR (route_drift_invalid == true)
  OR (node_available == false)
@@ -547,23 +624,26 @@ r_timeout = - lambda_res_timeout * T_timeout_cost
 
 **（6）超时订单惩罚机制**
 
-超时订单的惩罚必须采用实时累加方式，不允许仅在送达时结算：
+超时订单的惩罚必须采用类实时累加方式，不允许仅在送达时结算，也不允许拖到
+episode 结束或强制移除时再统一结算：
 
-- 每个仿真步，对所有未送达且已超时的订单，实时累加超时惩罚：
+- 在事件驱动环境中，对每次时间推进区间 `[t_prev, t_next)`，对所有未送达订单结算：
   ```text
-  r_overdue_step = -lambda_overdue * sum_i max(0, t_now - deadline_i) * dt
+  overdue_dt_i = max(0, t_next - max(t_prev, deadline_i))
+  r_overdue_interval = -lambda_overdue * sum_i overdue_dt_i
   ```
 - 送达超时订单时，停止该订单的累加，不再叠加额外惩罚（避免双重计入）
-- 若订单超时时长超过 `max_overdue_sec` 仍未送达，强制从可调度池移除，记一次 `Lambda_hard_overdue` 惩罚
+- 若订单超时时长超过 `max_overdue_sec` 仍未送达，强制从可调度池移除，记一次 `hard_overdue_penalty_sec` 惩罚
 
-**为什么必须实时累加**：若仅在送达时结算，模型会学到"不送超时订单"可规避惩罚，
-导致超时订单被系统性忽略。实时累加后，不送的代价持续增大，送达则停止累加，
+**为什么必须类实时累加**：若仅在送达时结算，或拖到 episode 末端 / 强制移除时统一结算，
+模型会学到"不送超时订单"可规避惩罚，导致超时订单被系统性忽略。类实时累加后，
+不送的代价持续增大，送达则停止累加，
 模型始终有动力去送超时订单。
 
 参数：
 - `lambda_overdue = 0.20`（首轮建议值，高于 `lambda_wait`，体现超时的更高优先级）
 - `max_overdue_sec = 600`（超过此阈值强制移除）
-- `Lambda_hard_overdue = 600`（强制移除时的固定惩罚，秒级等价）
+- `hard_overdue_penalty_sec = 600`（强制移除时的固定惩罚，秒级等价）
 
 **（7）`riding_with_truck` 状态语义**
 
@@ -597,13 +677,29 @@ r_timeout = - lambda_res_timeout * T_timeout_cost
 1. **ALNS 重规划时**（主要路径）：重新计算 `launch_candidate_stations`，与 `CoarsePlanView` 其他字段同步刷新，`plan_version` 递增
 2. **卡车经过某站点后**：该站点自动从 `launch_candidate_stations` 中移除，无需等待 ALNS 重规划（轻量实时维护）
 3. **某站点周边订单全部被分配后**：该站点从 `launch_candidate_stations` 中移除，避免无人机在此起飞后无订单可选只能 WAIT
+
+**Phase 5 简化版覆盖规则**：
+
+- Phase 5 不再按订单密度筛选 `launch_candidate_stations`
+- 直接取 `future_backbone_station_nodes`（由 `truck_backbone_route` 派生的未来 `station`
+  节点子集）：即 `truck_backbone_route` 中当前时刻之后仍会经过的全部 `station` 节点
+- **不包含** customer 订单停靠点，也**不包含**场景中卡车未来不会经过的 station
+- 这样做只放宽"哪些站点触发 `riding_with_truck` 决策"的启发式，不放宽
+  `mode C` 的时序、电量与回收节点合法性约束
+- 基于 `support_radius_km` / `min_orders_to_trigger` 的订单密度筛选，延后到 Phase 6 恢复
+
 2. **候选集实时构建**：对每个候选订单 `order_i`，实时计算：
    ```text
    t_deliver = t_now + fly_time(S_k → order_i.location)
    recovery_pool(order_i) = {r_j | 满足时序 + 电量约束，基于 t_deliver}
    ```
-3. **动作空间与 idle 完全统一**：`(order_i, mode ∈ {WAIT/B/C}, recover_node_j)`
-4. **WAIT 语义**：在 `riding_with_truck` 状态下，选择 WAIT = 继续搭车到下一站，不起飞
+3. **动作空间与 idle 完全统一**：
+   - `mode B` 分支：`dispatch_action=(order_i, mode=B)`，具体返程宿主不暴露给 PPO，
+     由送达后的确定性规则在 `station / depot` 中选择
+   - `mode C` 分支：`dispatch_action=(order_i, mode=C, recover_node_j)`
+   - 并额外保留一个 `global_wait_action`
+4. **WAIT 语义**：在 `riding_with_truck` 状态下，选择 `global_wait_action` =
+   继续搭车到下一站，不起飞
 5. **不触发决策的站点**：若卡车到达的站点不在 `launch_candidate_stations` 中，无人机继续搭车，不触发 PPO 决策
 6. **卡车上充换电**：无人机在卡车上充换电不占用站点 FIFO 队列，由 `truck_drone_recover_time_s` 决定服务时长；充换电完成后重新进入 `riding_with_truck` 状态
 7. **取货**：起飞时直接从卡车取货，无需返回仓库
@@ -625,8 +721,8 @@ J =
   + lambda_miss * T_fallback
   + lambda_res_timeout * T_res_timeout
   + lambda_overdue * T_overdue
-  + Lambda_hard * N_hard_fail
-  + Lambda_hard_overdue * N_hard_overdue
+  + hard_failure_penalty_sec * N_hard_fail
+  + hard_overdue_penalty_sec * N_hard_overdue
 ```
 
 含义：
@@ -646,31 +742,39 @@ J =
    即时惩罚 `r_wait_step = -wait_idle_penalty_coef * delta_t_wait_k` 在每步立即结算，
    不在 episode 末端累计，以保证梯度信号清晰。
    首轮建议 `wait_idle_penalty_coef = 0.10`，与 `lambda_wait` 同口径。
-   排队（`T_queue`）、站点容量导致的被动等待不计入 `T_idle`
-- `T_queue`：无人机在充换电站排队总时间
+   排队（`T_queue`）、补能宿主容量导致的被动等待不计入 `T_idle`
+- `T_queue`：无人机在充换电宿主（`station / depot`）排队总时间，仅统计已到达
+   宿主后等待服务槽位的时间；不包含 `charging_on_truck` 的车载充换电等待
 - `T_fallback`：错过卡车后飞往下一个站点或仓库的总时间
 - `T_res_timeout`：reservation timeout 造成的总局部损失
 - `T_overdue`：所有未送达且已超时订单的累计超时时长，定义为
-   `T_overdue = sum_i max(0, t_now - deadline_i)`（对所有未送达订单，每步累加）。
-   **必须在每个仿真步实时累加，不允许等到送达时才结算**，原因是：若仅在送达时结算，
-   模型会学到"不送超时订单"可规避惩罚，导致超时订单被系统性忽略。
-   实时累加后，送达超时订单会停止该订单的累加，模型仍有动力去送。
-   送达时不再叠加额外惩罚，避免双重计入。
+   `T_overdue = sum_i overdue_duration_i`，其中 `overdue_duration_i` 表示订单 `i`
+   在“未送达且已超过 deadline”状态下经历的累计时间。
+   在事件驱动环境中，采用**按时间推进区间类实时累计**，不允许等到送达、强制移除或
+   episode 结束时再统一结算。对任意一次时间推进区间 `[t_prev, t_next)`，订单 `i` 的
+   增量定义为：
+   `ΔT_overdue_i = max(0, t_next - max(t_prev, deadline_i))`
+   （仅当订单在整个结算时刻仍属于未送达订单集合时才参与累计）。
+   这样订单一旦超过 `deadline_i`，就在下一次时间推进时立即开始扣罚；送达后停止累计，
+   且送达时不再叠加额外惩罚，避免双重计入。
    首轮建议 `lambda_overdue = 0.20`（高于 `lambda_wait`，体现超时的更高优先级）
 - `N_hard_overdue`：超时时长超过 `max_overdue_sec` 仍未送达的订单数。
-   超过该阈值后订单从可调度池中强制移除，记一次固定惩罚 `Lambda_hard_overdue`，
+   超过该阈值后订单从可调度池中强制移除，记一次固定惩罚 `hard_overdue_penalty_sec`，
    避免模型长期持有无法挽回的"死单"。
-   首轮建议 `max_overdue_sec = 600`，`Lambda_hard_overdue = 600`
+   首轮建议 `max_overdue_sec = 600`，`hard_overdue_penalty_sec = 600`
 - `N_hard_fail`：硬失败次数
 
 要求：
 
 - `J` 仅作为评估指标，不直接用于 PPO 梯度更新
 - benchmark 与 stochastic 验证必须回到这套 UAV-scope 指标，不允许只看 PPO reward
-- `Lambda_hard` 首轮建议值为 `1200`（秒级等价损失），必须显著大于一次最坏可恢复扰动
+- `hard_failure_penalty_sec` 首轮建议值为 `1200`（秒级等价损失），必须显著大于一次最坏可恢复扰动
 - `T_complete` 仅用于评估，不计入训练 reward（见 4.1.4.1 节）
-- `T_overdue` 的即时惩罚必须在 `env_adapter` 的 `compute_reward()` 里逐步结算，不能只在 episode 末端累计
-- `T_idle` 的即时惩罚必须在 `env_adapter` 的 `compute_reward()` 里逐步结算
+- `T_overdue` 的即时惩罚必须在 `env_adapter` 的 `compute_reward()` 里按时间推进区间逐步结算，不能只在 episode 末端或强制移除时统一结算
+- `T_idle` 的即时惩罚固定在 `step(WAIT_action)` 调用点按精确 `delta_wait`
+  一次性结算，不进入 `_settle_per_dt_rewards(dt)` 的持续累计路径
+- `T_fallback` 的即时惩罚必须在 `env_adapter` 的 `compute_reward()` 里按
+  `fallback_recovery` 状态的实际持续时间逐步结算，不允许只在进入 fallback 时扣一次
 - `mode A` 背景订单不进入 `J` 与 PPO-vs-baseline 核心比较指标，仅进入单独的系统上下文统计区
 
 ### 4.1.4.1 PPO 训练用每步奖励 r_t
@@ -685,17 +789,17 @@ J =
 r_t =
 
   [每步累加项，每个仿真步 dt 结算一次]
-  - lambda_overdue * sum_i max(0, t_now - deadline_i) * dt   // 超时订单实时惩罚（仅无人机订单）
+  - lambda_overdue * sum_i overdue_dt_i                       // 超时订单按时间推进区间类实时惩罚（仅无人机订单）
   - lambda_wait    * delta_wait_t                             // UAV 被动等待卡车
-  - wait_idle_coef * delta_idle_t                             // UAV 主动选 WAIT 动作
-  - lambda_queue   * delta_queue_t                            // 充换电站排队
-  - lambda_miss    * delta_fallback_t                         // 错过卡车后飞往备用点
+  - wait_idle_penalty_coef * delta_idle_t                     // UAV 主动选 WAIT 动作
+  - lambda_queue   * delta_queue_t                            // 充换电宿主排队（station / depot）
+  - lambda_miss    * delta_fallback_t                         // UAV 处于 fallback_recovery 时的兜底返程飞行时间
 
   [事件触发项，事件发生时一次性结算]
   + R_delivery_bonus                                          // 无人机成功送达一单（正奖励）
   - lambda_res_timeout * T_timeout_cost                       // reservation timeout
-  - Lambda_hard                                               // 硬失败（半空停电等）
-  - Lambda_hard_overdue                                       // 订单超时被强制移除
+  - hard_failure_penalty_sec                                  // 硬失败（半空停电等）
+  - hard_overdue_penalty_sec                                  // 订单超时被强制移除
 ```
 
 说明：
@@ -730,6 +834,9 @@ r_t =
 - `meta.json` schema 初版
 - 离线阶段参数清单
 - 一份环境语义契约说明（可内嵌于 yaml 注释或单独文档）
+- `CoarsePlanView` 字段保留说明：`launch_candidate_stations`、`order_priority_band`、
+  `order_pre_score` 在 Phase 1 仍作为正式契约字段保留；Phase 5 对它们的“放宽 /
+  降级”仅属于消费侧实现覆盖，不改变 Phase 1 产物结构
 
 ### 4.1.7 验收标准
 
@@ -737,6 +844,9 @@ r_t =
 - 不再混用旧共享配置与新算法专属权重/惩罚参数
 - RH-ALNS 与 CMRAPPO 的职责边界已明确写入文档，`env_adapter` 的后续实现不会再对模式 C / miss / queue / reservation timeout 语义各自理解
 - `CoarsePlanView` 接口契约已定义，后续实现可直接对照
+- Phase 5 的简化覆盖规则已与 Phase 1 契约边界对齐：允许保留
+  `launch_candidate_stations` / `order_priority_band` / `order_pre_score` 字段，
+  但在 Phase 5 中按简化语义消费，不要求回头修改契约结构
 - 主目标函数已包含 `lambda_res_timeout * T_res_timeout` 项，与算法方案文档一致
 
 ### 4.1.8 Phase 1 当前已完成内容（截至本轮）
@@ -754,6 +864,9 @@ r_t =
    - 已定义 `RouteDriftRef`
    - 已定义相关基础类型与模式枚举：`NodeId`、`OrderId`、`PlannerMode`、`PolicyMode` 等
    - 已在契约层加入基础一致性校验，避免后续 `planner_bridge` 产出不完整或自相矛盾的 coarse plan
+   - 说明：`launch_candidate_stations`、`order_priority_band`、`order_pre_score`
+     仍保留在 Phase 1 契约中；Phase 5 对这三个字段的“全未来骨架站点触发 /
+     仅日志排序用途”属于消费侧简化，不要求删除或重命名字段
 
 3. 已创建训练子包入口：
    - `backend/training/__init__.py`
@@ -767,7 +880,7 @@ r_t =
      - `PlannerMeta`：上层规划触发参数（`coarse_replan_interval_sec`、`support_radius_km` 等）
      - `RewardMeta`：奖惩权重（`lambda_*`、`R_delivery_bonus`、`hard_failure_penalty_sec` 等）
      - `SharedRuntimeParamsSnapshot`：共享运行时参数快照（对应 `backend/config/drone_params.yaml` 的物理参数、能耗参数、服务时长参数）
-     - `EnvSemanticContractMeta`：环境语义契约摘要（mode C 回收节点类型、reservation timeout 开关、overdue 惩罚模式等）
+    - `EnvSemanticContractMeta`：环境语义契约摘要（mode C 回收节点类型、reservation timeout 开关、overdue 惩罚模式、`allow_empty_backbone_route` 等）
      - `OnlineLockParams`：在线锁参数策略骨架（`locked_fields` / `tunable_fields`）
    - 新增 `TrainingRunMeta`：训练完成后才能填充的运行时字段（`model_version`、`trained_at`、`scene_id`、`scene_bundle_dir`、`training_input`）
    - 新增 `BenchmarkMeta`：benchmark 身份快照（`orders.json` 路径、整体摘要、`static_orders` / `dynamic_orders` 数量、`benchmark_use_dynamic_orders`）
@@ -1041,15 +1154,16 @@ r_t =
 
 目标：
 
-- 在实现 env_adapter 之前，先用 SUMO 验证卡车路径规划的正确性
-- 确认 ETA、经过节点、mode C 合法回收节点集合在物理上是可信的
+- 在实现 `env_adapter` 之前，先把卡车物理执行路线、固定节点骨架和 ETA 口径固定下来
+- 用同源的 OSM 路网与 SUMO `net.xml` 对卡车路径进行离线导出和 GUI 复核
+- 为后续 `CoarsePlanView.truck_backbone_route`、`truck_eta_map`、`route_drift_ref` 提供可直接复用的前置产物
 
 **为什么必须在 env_adapter 之前做**
 
 卡车路径决定了 env_adapter 里三件核心事：
 
 1. mode C 的合法回收节点集合（`recovery_pool`）
-2. 各 station/depot 的 `ETA_truck`（直接影响 `action_mask`）
+2. 各 station/depot 的 `t_arrive_truck`（卡车绝对到达时刻，直接影响 `action_mask`）
 3. `CoarsePlanView.truck_backbone_route` 的内容
 
 如果路径有问题，训练时 `action_mask` 会基于错误的 ETA 构建，模型学到错误的 mode C 行为，且无法区分是模型问题还是路径问题。
@@ -1061,254 +1175,190 @@ r_t =
 - `backend/environment/geo/exporters/sumo_net_osm.py`
 - `backend/scripts/run_phase4_sumo_gui.py`
 
-职责：
+从当前代码看，Phase 4 已经不是“准备开始做”的状态，而是已经形成了一条可执行的导出与复核链路，职责可以概括为：
 
-1. 读取 `static_orders` 和 `osm_network.xml`，生成卡车骨架路线
-2. 把卡车路线、depot/station 坐标导出为 SUMO 可加载文件（`poi.add.xml`、路线文件）
-3. 在 `sumo-gui` 中验证：
-   - 卡车路线是否连通
-   - 是否经过预期的 station/depot 节点
-   - 各节点的 ETA 是否符合物理约束（`truck.speed = 15 m/s`）
-   - 路线覆盖的地理范围是否与 `scene_config.json.bounds` 一致
+1. 从默认训练场景加载 `depot / truck / static_orders / stations / osm_network.xml`
+2. 在严格遵守 OSM 单行线方向的前提下生成卡车完整执行路线 `truck_execution_route`
+3. 从完整执行路线投影出后续训练使用的 `truck_backbone_route`、`truck_eta_map`、`route_drift_ref`
+4. 生成与 OSM 路径同源的 SUMO `net.xml / rou.xml / poi.add.xml / sumocfg`
+5. 输出 JSON 报告、调试轨迹，并可直接启动 `sumo-gui` 做人工复核
 
-产物：
+### 4.4.1 当前已经落地的路线语义
 
-- `poi.add.xml`（depot/station 坐标）
-- 卡车路线导出文件
-- 各节点 ETA 列表（供 env_adapter 直接使用，作为 `CoarsePlanView` 的初始输入）
-
-验收标准：
-
-- `sumo-gui` 能正确加载路线和设施
-- 卡车路线经过所有预期 station/depot
-- ETA 与手工估算（距离 / 速度）误差在合理范围内
-- 确认至少有 2 个以上合法 mode C 回收节点存在于路线中
-
-### 4.4.1 本阶段已明确的路线语义
-
-为避免把“卡车真实送货路线”和“PPO 可见的固定节点骨架”混成一个对象，本阶段将两条路线正式分开：
+本阶段已明确把“物理执行路线”和“PPO 可见固定节点骨架”分成两个对象：
 
 1. **`truck_execution_route`**：卡车真实执行路线
-   - 节点类型允许为：`depot / customer / station`
-   - 必须从 `depot` 出发，最后回到 `depot`
-   - 用于 SUMO 导出、几何连通性检查、客户点是否被实际经过的验证
-2. **`truck_backbone_route`**：`CoarsePlanView` 使用的固定节点骨架
+   - 节点类型允许为 `depot / customer / station`
+   - 路线形态固定为“仓库出发 -> 客户/站点访问 -> 回仓”
+   - 每一段 stop-to-stop 都会物化出：
+     - OSM 最短路径节点序列
+     - SUMO edge 序列
+     - 距离、行驶时间、到达时间
+   - 该对象只服务于路径验证、导出和 GUI 回放
+2. **`truck_backbone_route`**：供 `CoarsePlanView` 使用的未来固定节点骨架
    - 仅允许包含 `station / depot`
-   - 不包含 `customer`
-   - 表示卡车从“当前时刻起未来还会经过的合法固定交接节点序列”
-   - 起点仓库不计入 future node；终点回仓库可保留，因为它仍是 future recovery 节点
+   - 不包含任何 `customer`
+   - 从 `truck_execution_route.stops[1:]` 中投影得到，因此起始 `depot` 会被排除，回程 `depot` 会保留
+   - 不允许重复固定节点，且不能为空
 
-这两个对象的职责必须保持分离：
+因此，Phase 4 之后应继续坚持：
 
-- `truck_execution_route` 服务于物理验证与 SUMO 回放
-- `truck_backbone_route` 服务于 `recovery_pool`、`truck_eta_map`、`route_drift_ref`、`launch_candidate_stations`
+- `truck_execution_route` 只作为验证和回放产物
+- `truck_backbone_route / truck_eta_map / route_drift_ref` 才是后续训练链路消费的粗规划输入
 
-### 4.4.2 路线构建规则（已实现口径）
+### 4.4.2 `export_sumo_truck_route.py` 当前主流程
 
-`backend/training/export_sumo_truck_route.py` 当前按以下固定规则构建路线：
+`backend/training/export_sumo_truck_route.py` 已经落地了完整的 Phase 4 主流程，当前实现口径如下：
 
-1. 从 `static_orders` 中筛选卡车相关订单
-   - 当前筛选口径：`fulfillment_mode` 含 `TRUCK`
-2. 先生成卡车完整执行路线 `truck_execution_route`
-   - 起点：唯一 `depot`
-   - 中间节点：卡车相关订单的客户送达地
-   - 如有需要，插入 `station`
-   - 终点：回到同一 `depot`
-3. 客户访问顺序规则：
-   - 先按订单 `deadline` 分组
-   - 同一 `deadline` 组内，按“从当前位置到候选订单的 OSM 路网最短距离”做贪心选点
-   - 若路网距离相同，再按 `order_id` 稳定排序
-4. 为保证 mode C 至少存在足够的 future fixed nodes，允许在完整执行路线中插入 `station`
-   - 插站目标不是替代客户点，而是补充未来合法 recovery 节点
-   - 插站代价口径已改为“路网绕路代价”，不再使用曼哈顿距离
-   - 具体分两阶段：
-     - 先把绕路代价 `< 100m` 的顺路站点全部加入
-     - 若 future fixed nodes 数量仍不足 `min_future_fixed_nodes`，再按绕路代价从小到大补齐
-5. 完整执行路线生成后，再从中投影出 `truck_backbone_route`
-   - 只保留 `station / depot`
-   - 去掉起点 `depot`
-   - 保留终点 `depot`
-   - 不允许重复固定节点
-
-### 4.4.3 ETA 与可达性计算规则
-
-本阶段明确区分：
-
-- 曼哈顿距离：只用于排序与插站启发式
-- 实际 ETA：必须基于 OSM 路网最短可达路径长度计算
-
-具体口径如下：
-
-1. 使用 `osm_network.xml` 构建道路图
-2. 将执行路线中相邻停靠点吸附到 OSM 最近节点
-3. 对每一段相邻停靠点计算 OSM 最短路径
-4. 用该段实际路径长度除以 `truck.speed = 15 m/s` 得到 `travel_time`
-5. 累加得到：
-   - `truck_execution_route` 各 stop 的 `arrival_time`
-   - `truck_backbone_route` 各固定节点的 `truck_eta_map`
+1. 只支持单 `depot`、单 `truck` 的默认训练场景
+2. 订单筛选口径不是 `fulfillment_mode`，而是：
+   - 从 `static_orders` 中筛出 `payload_weight > heavy_drone.payload_capacity` 的重货订单
+   - 这些订单视为必须由卡车直送的订单
+3. 客户访问顺序按以下规则确定：
+   - 先按 `deadline` 分组
+   - 同一 `deadline` 组内，从当前位置出发，按 OSM 路网最短距离做贪心选点
+   - 若距离相同，再按 `order_id` 稳定排序
+4. 初始执行计划固定为：
+   - `depot -> customers -> depot`
+5. 为补足未来固定节点，会在执行计划中插入 `station`
+   - 第一阶段：反复插入绕路代价 `< 100m` 的顺路站点
+   - 第二阶段：若 `station` 数量仍不足 `planner.phase4_min_future_fixed_nodes`，继续按绕路代价从小到大补足
+   - 注意：`min_future_fixed_nodes` 统计的是 `station` 数量，不把终点 `depot` 算入补齐目标
+6. 路线物化时，所有停靠点会先吸附到最近 OSM 节点，再对每一段 stop-to-stop 计算 OSM 最短路
+   - 路段距离会把起终点的 snap 偏移一起计入
+   - ETA 由 `segment_distance / truck.speed` 累加得到
+   - 当前 `CUSTOMER_SERVICE_TIME_SEC = 0.0`
+7. 完整执行路线生成后，再投影得到：
+   - `truck_backbone_route`
+   - `truck_eta_map`
    - `route_drift_ref`
 
-因此，本阶段 `truck_eta_map` 的口径是：
+这里需要特别固定两个口径：
 
-- 来自完整执行路线中对应 future fixed node 的首次到达时刻
-- 不是曼哈顿距离估算值
-- 不是客户点 ETA
+- 排序、插站、ETA 的主距离口径都是 OSM 路网距离
+- 曼哈顿距离只作为“路网不可达时”的 fallback，不再是默认启发式
 
-### 4.4.4 “至少两个合法 recovery 节点”的实现口径
+### 4.4.3 `osm_service.py` 与 `sumo_net_osm.py` 当前补齐的底层能力
 
-这里必须说清楚，本阶段能保证的是**路线级合法 recovery 节点**，不是“对任意订单都可回收”。
+这两个文件已经把“OSM 求路”和“SUMO 导出”对齐到同一套边语义上：
 
-本阶段的硬约束是：
+1. `backend/environment/geo/osm_service.py`
+   - `build_road_graph()` 新增 `respect_osm_oneway`
+   - Phase 4 导出链路显式使用 `respect_osm_oneway=True`
+   - 新增 `shortest_path_length()`，供订单排序、插站绕路代价和 ETA 计算统一复用
+   - 默认兼容模式仍保留，避免影响仓库内其他历史求解器
+2. `backend/environment/geo/exporters/sumo_net_osm.py`
+   - 新增 `SumoNetEdge`、`SumoNetArtifacts`
+   - 先构建 artifacts，再写出 `net.xml`
+   - 同时导出 `directed_step_to_edge`，把 OSM 有向 step 映射到 SUMO edge
+   - 对双向道路生成正反两个 directed edge
+   - 在 junction connection 上允许必要的反向切换，降低 SUMO 载入 `no valid route` 的概率
 
-- `truck_backbone_route` 中至少保留 `2` 个 future fixed nodes
-- 这些节点必须属于 `station / depot`
-- 每个节点都必须在实际 OSM 路网上可达
-- 每个节点都必须有严格递增的 ETA
+这意味着当前 Phase 4 的 OSM 最短路和 SUMO 回放使用的是同一套有向道路语义，不再是“两套近似上看起来差不多”的实现。
 
-而“某个订单在某个时刻能否把该节点作为 `mode C` recovery 节点”，仍然要在后续 `candidate_builder / env_adapter` 中继续叠加：
+### 4.4.4 当前已完成的导出产物与验证项
 
-- `ETA_truck(r_j) > t_deliver`
-- `ETA_uav + safe_margin <= ETA_truck(r_j)`
-- 电量可行
-
-### 4.4.5 Phase 4 当前导出产物（已实现）
-
-`backend/training/export_sumo_truck_route.py` 当前会在场景目录下导出以下文件：
+`export_phase4_truck_route()` 默认会把产物写到 `scene_bundle_dir/sumo/phase4_truck_route`，当前已稳定导出：
 
 - `truck_execution_route.json`
-  - 卡车完整执行路线
-  - 包含 `depot / customer / station` 停靠点顺序、每段距离、每段 OSM 路径、SUMO edge 序列
 - `truck_backbone_route.json`
-  - 仅包含 `station / depot` 的 future fixed node 序列
 - `truck_eta_map.json`
-  - `truck_backbone_route` 各固定节点 ETA
 - `route_drift_ref.json`
-  - 供 `CoarsePlanView.route_drift_ref` 直接复用
 - `validation_report.json`
-  - 记录客户点是否全部被经过、骨架节点数、ETA 单调性、路网连通性、边界检查、snap 误差等
 - `phase4_debug_trace.json`
-  - 记录订单排序结果、初始/最终执行计划、插站原因、stop trace，便于人工审计
 - `phase4_gui.view.xml`
-  - GUI 视图配置，默认把车辆名、POI 文本、路线覆盖层直接打开
 - `poi.add.xml`
-  - depot / station / customer 的 SUMO POI 与 marker 叠加层，并额外绘制卡车完整路线折线
 - `truck_route.net.xml`
-  - 由 `osm_network.xml` 生成的 SUMO `net.xml`
 - `truck_route.rou.xml`
-  - 基于完整执行路线生成的卡车 SUMO 路由文件
 - `truck_route.sumocfg`
-  - 用于 `sumo-gui` 直接加载的配置文件
 
-其中：
+其中几个关键文件的职责已经比较明确：
 
-- `truck_execution_route` 用于物理回放与路径审计
-- `truck_backbone_route / truck_eta_map / route_drift_ref` 用于 Phase 5/6 直接消费
+- `truck_execution_route.json`
+  - 保存完整 stop trace、segment 距离、OSM node path、SUMO edge 序列
+- `truck_backbone_route.json`
+  - 保存 `station / depot` 组成的 future fixed node 序列
+- `truck_eta_map.json`
+  - 保存固定节点首次到达 ETA
+- `route_drift_ref.json`
+  - 保存 `eta_ref + route_index_ref`
+- `phase4_debug_trace.json`
+  - 保存重货订单排序结果、初始执行计划、最终执行计划、插站原因、最终 stop trace，
+    以及 `visited_station_ids`（访问过的站点汇总）/ `inserted_fixed_nodes`
+    （插入固定站点记录）等调试摘要
 
-另外，仓库中已补充启动脚本：
+说明：
 
-- `backend/scripts/run_phase4_sumo_gui.py`
+- Phase 4 当前**没有**独立导出名为 `all_future_backbone_stations` 的 JSON 字段或文件
+- 训练侧若需要“未来会经过的 `station` 汇总”，应从 `truck_backbone_route.json` 的
+  `truck_backbone_route`（未来固定节点骨架序列）中过滤出 `station` 节点得到
+- `phase4_debug_trace.json.visited_station_ids` 仅用于调试与 GUI 摘要，不应作为
+  `env_adapter`（训练环境适配器）的正式输入契约
 
-本机安装 SUMO 后，可直接运行：
+`validation_report.json` 当前已经自动检查：
 
-```bash
-python backend/scripts/run_phase4_sumo_gui.py
-```
+- `all_segments_connected`
+- `all_expected_customers_visited`
+- `all_expected_fixed_nodes_visited`
+- `eta_monotonic`
+- `max_snap_distance_m`
+- `snap_within_warn_threshold`
+- `bounds_ok`
+- `min_future_fixed_nodes_ok`
+- `sumo_edge_sequence_non_empty`
 
-当前脚本会在启动前直接调用 `export_phase4_truck_route()`，因此默认就会重新生成最新 Phase 4 产物，不再需要单独的 `--regenerate` 参数。
+因此，Phase 4 当前已经能自动回答以下问题：
 
-若 `sumo-gui` 不在系统 `PATH` 中，可显式指定：
+- 预期重货客户是否都被卡车实际访问
+- 生成的骨架节点是否都真实出现在执行路线中
+- 固定节点 ETA 是否严格递增
+- 路线吸附误差是否超过告警阈值
+- 路线是否仍位于场景边界内
+- SUMO 回放所需 edge 序列是否为空
 
-```bash
-python backend/scripts/run_phase4_sumo_gui.py \
-  --sumo-gui-bin /path/to/sumo-gui
-```
+### 4.4.5 `run_phase4_sumo_gui.py` 当前提供的 GUI 复核链路
 
-若只想载入后停在 GUI 中人工检查，不自动播放，可运行：
+`backend/scripts/run_phase4_sumo_gui.py` 已经把 Phase 4 的人工复核链路串起来了：
 
-```bash
-python backend/scripts/run_phase4_sumo_gui.py --no-start
-```
+1. 启动前直接调用 `export_phase4_truck_route()`，重新生成最新默认场景产物
+2. 自动查找 `sumo-gui`
+3. 若同目录存在 `netconvert`，会先对 `net.xml` 做一次规范化
+4. 启动前打印 `phase4_debug_trace.json` 摘要与 `truck_execution_route`
+5. 默认加载：
+   - `backend/test_data/default_scene/sumo/phase4_truck_route/truck_route.sumocfg`
 
-### 4.4.6 为 Phase 4 新增的底层支持
+当前已支持的参数包括：
 
-为保证 SUMO 导出与 OSM 路径映射使用完全一致的边语义，本阶段对地理工具层做了两处补充：
+- `--sumocfg`
+- `--sumo-gui-bin`
+- `--no-start`
+- `--delay-ms`
+- `--no-debug-print`
 
-1. `backend/environment/geo/exporters/sumo_net_osm.py`
-   - 保留原有 `osm_to_sumo_net(osm_xml, orig_bounds, path)` 对外接口不变
-   - 新增 `SumoNetEdge`、`SumoNetArtifacts` 两个中间结构
-   - 新增 `build_sumo_net_artifacts()` / `write_sumo_net_artifacts()`，用于同时生成：
-     - SUMO `net.xml`
-     - `directed_step_to_edge` 映射表
-     - junction / connection 元数据
-   - 双向道路现在会同时生成正反两个 directed edge
-   - 在 junction 连接上显式允许必要的掉头/反向切换，避免 Phase 4 route 在 SUMO 载入时报 `no valid route`
-2. `backend/environment/geo/osm_service.py`
-   - `build_road_graph()` 新增可选参数 `respect_osm_oneway`
-   - 默认值保持兼容旧行为，不影响仓库内既有求解器调用
-   - 只有 `Phase 4` 导出链路显式使用 `respect_osm_oneway=True`
-   - 这样可以保证：
-     - Phase 4 的 OSM 最短路与 SUMO 单行线方向一致
-     - 旧求解器路径逻辑不会被这次改动悄悄改变
-   - 同时补齐 `shortest_path_length()`，供订单排序、插站绕路代价、ETA 估算统一复用
+因此，Phase 4 现在已经具备“代码生成产物 -> 本地拉起 SUMO GUI -> 人工看路径”的最小闭环。
 
-### 4.4.7 本次实际修改记录（对应四个文件）
+### 4.4.6 当前 Phase 4 已完成边界与未覆盖边界
 
-1. `backend/training/export_sumo_truck_route.py`
-   - 已落地完整的 Phase 4 主流程：
-     - 加载默认训练场景
-     - 用 `respect_osm_oneway=True` 构建 OSM `DiGraph`
-     - 生成 SUMO net 中间结果
-     - 过滤卡车订单
-     - 生成 `truck_execution_route`
-     - 投影出 `truck_backbone_route`
-     - 计算 `truck_eta_map` 与 `route_drift_ref`
-     - 导出 SUMO / JSON / debug 产物
-   - 客户顺序已经不是“deadline + 曼哈顿距离”，而是“deadline 分组 + 组内路网最短距离贪心”
-   - `station` 插入已经不是一次性最短绕路，而是“顺路站点全加 + 不足时继续补齐”的两阶段策略
-   - ETA 已按 stop-to-stop 的 OSM 实际路径长度 / `truck.speed` 计算，并把 snap 偏移计入距离
-   - 新增 `validation_report`、`phase4_debug_trace`、GUI 视图文件导出
-2. `backend/environment/geo/osm_service.py`
-   - `build_road_graph()` 现在可按 OSM `oneway` 严格建图
-   - 新增 `shortest_path_length()`，供路线排序与插站代价计算
-   - 旧调用方仍可继续走兼容模式，不会被 Phase 4 改动破坏
-3. `backend/environment/geo/exporters/sumo_net_osm.py`
-   - 从“直接写 net.xml”扩展成“先构建 artifacts，再落盘”
-   - 导出了 OSM step 到 SUMO edge 的映射，保证 `truck_route.rou.xml` 与 `truck_route.net.xml` 完全同源
-   - 连接规则已放宽到支持 Phase 4 路由需要的反向切换场景，减少 SUMO 载入失败
-4. `backend/scripts/run_phase4_sumo_gui.py`
-   - 脚本启动前会直接重新导出最新 Phase 4 产物
-   - 会自动查找 `sumo-gui`，并在可用时用 `netconvert` 先规范化 net
-   - 启动前会打印 `phase4_debug_trace.json` 摘要和 `truck_execution_route`
-   - 已支持 `--sumocfg`、`--sumo-gui-bin`、`--no-start`、`--delay-ms`、`--no-debug-print`
+当前可以认为已经完成的内容：
 
-### 4.4.8 当前 Phase 4 的代码边界
+1. 基于默认场景重货订单生成单车卡车执行路线
+2. 从执行路线稳定投影出 `truck_backbone_route / truck_eta_map / route_drift_ref`
+3. 保证 OSM 求路与 SUMO 回放共用同源有向道路语义
+4. 自动导出 JSON、SUMO 和调试产物
+5. 提供可直接启动的 GUI 复核脚本
 
-本阶段已经明确：
+当前仍未由 Phase 4 覆盖的部分：
 
-- `CoarsePlanView` 只继续保留：
-  - `truck_backbone_route`
-  - `truck_eta_map`
-  - `route_drift_ref`
-- `truck_execution_route` 不进入 `CoarsePlanView`
-  - 它属于 Phase 4 的验证与导出产物
-  - 不属于 PPO 粗规划边界对象
-
-因此，后续实现不得把 customer 节点重新塞回 `truck_backbone_route`，也不得把 `truck_execution_route` 与 `truck_backbone_route` 重新混成一个变量。
-
-### 4.4.9 当前仍未完成或仍需人工验收的部分
-
-1. `sumo-gui` 的最终验收仍是人工步骤
-   - 当前代码已能导出并启动 GUI
-   - 但“路线视觉上是否经过预期 station/depot”“GUI 中是否无异常跳边”仍需人工打开 `sumo-gui` 确认
-2. “ETA 与手工估算误差”尚未自动化成报告项
-   - 当前 `validation_report.json` 只校验 ETA 单调性、路网连通性、边界、snap 距离等
-   - 还没有单独输出“手工估算距离 / 速度”对比误差表
-3. `mode C` 的订单时刻级合法性还没有在 Phase 4 闭环
-   - 当前只能保证路线级 future fixed nodes 存在，且 ETA 递增、物理可达
-   - 订单在具体投递时刻能否把某节点作为 recovery node，仍要在后续 `candidate_builder / env_adapter` 里叠加 `ETA_truck > t_deliver`、安全裕量、电量约束
-4. `run_phase4_sumo_gui.py` 对自定义 `--sumocfg` 的再生成功能还不完全对齐
-   - 当前脚本会先按默认场景调用 `export_phase4_truck_route()`
-   - 若传入的是其他目录下的自定义 `sumocfg`，脚本会加载该文件，但不会按该路径同步重导对应产物
+1. `mode C` 的订单时刻级合法性尚未闭环
+   - Phase 4 只能保证“路线级存在 future fixed nodes，且 ETA 单调、物理可达”
+   - 但 `t_arrive_truck > t_deliver`、安全裕量、电量约束仍需后续 `candidate_builder / env_adapter` 叠加
+2. 多车、多仓、多场景泛化尚未覆盖
+   - 当前代码明确只支持单 `truck`、单 `depot`
+3. GUI 最终验收仍是人工步骤
+   - 是否存在视觉跳边、站点经过是否符合预期，仍需人工打开 `sumo-gui` 确认
+4. `run_phase4_sumo_gui.py` 对自定义 `--sumocfg` 的“按该路径同步重导”尚未实现
+   - 当前导出动作仍固定针对默认场景
+5. 还没有自动输出“手工距离/速度估算 vs ETA”误差对照表
 
 ## 4.5 Phase 5：实现训练环境适配器
 
@@ -1339,7 +1389,643 @@ python backend/scripts/run_phase4_sumo_gui.py --no-start
   3. policy 或 baseline 在该上下文上选动作
   4. `env_adapter.step(action)` 执行真实状态转移并结算 reward
 
-第一版环境建议：
+**Phase 5 阶段的接口边界明晰**
+
+Phase 5 要求先实现 `env_adapter`，而 `planner_bridge` 和 `candidate_builder` 是 Phase 6 的产物。
+为避免 Phase 5 阻塞在 Phase 6 依赖上，采用以下策略：
+Phase 5 的实现与验收以 4.5.1 的分层定义为准；4.5 主体仅提供统一语义总则。
+
+**（1）inline planner：Phase 5 内置最小 CoarsePlanView 构建逻辑**
+
+`env_adapter` 内部实现私有方法 `_build_coarse_plan_view(t_now: float) -> CoarsePlanView`，
+在每次 `advance_to_decision_event()` 触发决策点时调用，替代 Phase 6 的
+`planner_bridge.maybe_replan()`。Phase 6 接入时只需把对该私有方法的调用替换成
+`planner_bridge.maybe_replan(runtime_state)`，`env_adapter` 本身不需要任何改动。
+
+`_build_coarse_plan_view(t_now)` 构建一个完整合法的 `CoarsePlanView` 对象，所有字段
+必须满足 `contracts.py` 的 `__post_init__` 校验。各字段的 Phase 5 临时填充规则如下：
+
+**元数据字段**：
+
+```text
+plan_version  = 0（整局固定，Phase 5 不实现重规划）
+issued_at     = t_now
+valid_until   = upper_horizon_sec（整局有效，不触发重规划）
+```
+
+**卡车骨架部分（动态过滤，不整局固定）**：
+
+`reset()` 时从 Phase 4 产出的 `truck_backbone_route.json`、`truck_eta_map.json`、
+`route_drift_ref.json` 以及巡站循环追加的节点，合并构造内部缓存 `_full_backbone_cache`。
+
+`_full_backbone_cache` 是一个**有序列表**，每个条目为：
+
+```python
+(node_id: str, arrival_time: float, departure_time: float)
+```
+
+同一个 `node_id` 可以出现多次，对应卡车多圈经过同一站点的不同访问记录，顺序严格按
+`arrival_time` 升序排列。这是与字典结构的关键区别——字典只能存一条记录，无法表达
+"S2 在 t=800 和 t=2400 各经过一次"的信息。
+
+每次 `_build_coarse_plan_view(t_now)` 调用时，按以下两步构造骨架字段：
+
+**第一步：时间过滤**
+
+```text
+保留条目的条件：departure_time > t_now
+```
+
+过滤后得到一个有序子列表，包含所有卡车尚未离开的未来访问记录。
+
+**第二步：去重（保留每个 node_id 的最近一次未来访问）**
+
+遍历过滤后的子列表，每个 `node_id` 只保留首次出现的条目，后续重复丢弃。
+由于列表按 `arrival_time` 升序排列，首次出现即为该节点**下一次到站**的记录。
+
+这样当第一圈 S2 的 `departure_time <= t_now` 时，它被过滤掉，第二圈 S2 的条目
+（`departure_time > t_now`）成为首次出现，PPO 看到的 S2 的 ETA 自动更新为第二圈
+的到站时间。卡车每经过一个站点，该站点的 ETA 在下次 `_build_coarse_plan_view()`
+调用时自动切换到下一圈，无需任何额外触发逻辑。
+
+去重后的有序列表直接映射为：
+
+```text
+truck_backbone_route = [node_id for (node_id, _, _) in deduped]
+truck_eta_map        = {node_id: arrival_time for (node_id, arrival_time, _) in deduped}
+route_drift_ref      = {node_id: RouteDriftRef(eta_ref=arrival_time, route_index_ref=i)
+                        for i, (node_id, arrival_time, _) in enumerate(deduped)}
+```
+
+使用 `departure_time` 而非 `arrival_time` 做过滤的原因：`advance_to_decision_event()` 可能
+恰好在卡车到站时刻触发（`arrival_time == t_now`），此时卡车仍停在站点，该节点对
+`launch_candidate_stations` 和 `recovery_pool` 仍然有效。若用 `arrival_time > t_now`
+（严格大于），会把当前刚到达的站点错误地踢出候选集，导致 `riding_with_truck` 决策点
+丢失和 mode C 回收候选丢失。`departure_time > t_now` 语义上等价于"卡车尚未离开该节点"，
+是正确的"未来节点"判定条件。
+
+`truck_eta_map` 对外暴露的 `arrival_time` 固定解释为
+`t_arrive_truck(node)`（卡车到达该节点的绝对仿真时刻）；它不是 duration（持续时间），
+不能与 `fly_time(...)` 直接比较。过滤逻辑内部使用 `departure_time`，
+两者分工固定，不混用。
+
+**空骨架退化开关（`allow_empty_backbone_route`）**：
+
+`_build_coarse_plan_view(t_now)` 在过滤后 `deduped` 为空时的行为由该开关控制：
+
+- **poisson 模式**：开关保持 `False`（默认），骨架为空视为契约错误，尽早暴露巡站循环问题
+- **benchmark / hybrid 模式**：`env_adapter.reset()` 自动将开关设为 `True`，
+  骨架耗尽为合法退化状态，构造以下退化对象：
+
+```text
+truck_backbone_route      = ()
+truck_eta_map             = {}
+route_drift_ref           = {}
+launch_candidate_stations = ()
+```
+
+同时：
+
+- 所有订单的 `recovery_pool` 置空（`mode C` 不再有 coarse 候选边界）
+- 所有 UAV 可配送订单的 `policy_mode_mask` 收缩为 `{B}`，使 PPO 只能选 `mode B` 或全局
+  `WAIT`
+- `planner_mode_cap` 可继续保留 `{B, C}` 作为 planner 语义边界，但真正暴露给 actor 的
+  `policy_mode_mask` 在该退化状态下不再包含 `C`
+
+**巡站循环节点的重复问题**：`CoarsePlanView.truck_backbone_route` 契约要求节点不重复
+（`contracts.py:151`）。巡站循环会重复经过同一 station/depot，因此 `_build_coarse_plan_view(t_now)`
+在过滤后，对 `truck_backbone_route` 做去重处理：**保留每个节点在过滤后序列中的首次出现**，
+后续重复访问丢弃。`truck_eta_map` 和 `route_drift_ref` 同步只保留首次出现的 ETA 和参考位置。
+这样 `CoarsePlanView` 始终满足无重复节点的契约，同时巡站循环的物理执行（停靠事件队列）
+不受影响，两者独立维护。
+
+**订单相关切片（每次调用时扫描当前订单池）**：
+
+- `weight > heavy_drone.payload_capacity` 的 static_orders → `planner_mode_cap = {A}`，
+  不进入 `authorized_orders`
+- 其余订单（含 poisson 新单）→ `planner_mode_cap = {B, C}`，`policy_mode_mask = {B, C}`，
+  进入 `authorized_orders`
+- 若 `allow_empty_backbone_route = true` 且当前 `truck_backbone_route` 为空，
+  则上述 UAV 可配送订单的 `policy_mode_mask` 收缩为 `{B}`；`recovery_pool` 保持全空
+- `recovery_pool` 填入当前时刻过滤后（去重后）的 `truck_backbone_route` 全部节点，
+  作为 `mode C` 的 coarse 候选边界；最终 `action_mask` 仍需在 Phase 5 执行硬合法性过滤
+- `launch_candidate_stations` 在 Phase 5 直接放宽为
+  `future_backbone_station_nodes`（由过滤后的 `truck_backbone_route` 派生的未来
+  `station` 节点子集）
+- **不包含** customer 停靠点，也**不包含**场景中卡车未来不会经过的 station
+- 不再使用 `support_radius_km` / `min_orders_to_trigger` 做二次筛选；这部分启发式延后到
+  Phase 6
+- `node_charge_load_budget` 对所有 station/depot 填 `0`（Phase 5 不建模充换电负载预算）
+
+**order_priority_band / order_pre_score 打分规则**：
+
+```text
+score(order_i) = max(0, deadline_i - t_now)   // 剩余时间窗，单位秒
+```
+
+剩余时间窗越小，分数越低，优先级越高（越紧迫越先处理）。`order_priority_band` 按
+剩余时间窗三等分切分为 `0`（紧急，≤ 1/3 窗口）、`1`（正常）、`2`（宽松，> 2/3 窗口）。
+
+Phase 5 对这两个字段采用降级用法：
+
+- `order_priority_band`（优先级分桶）与 `order_pre_score`（预排序分数）**仅用于日志、
+  调试输出与稳定排序**
+- 它们**不参与强裁剪**，不作为 `authorized_orders`（被上层放行给 PPO 的订单集合）的
+  再次截断条件
+- 若 Phase 5 里需要做稳定排序，方向固定为：先按 `order_pre_score` **升序**
+  （剩余时间窗越小越靠前），再按 `order_id` 做稳定 tie-break
+- Phase 6 若需要控制张量预算或做更强的候选集压缩，可再恢复基于分数的硬截断逻辑
+  ；若恢复硬截断，也必须优先保留 `order_pre_score` 更小（更紧急）的订单
+
+**重量阈值来源**：`reset()` 时从 `drone_params.yaml` 读取 `heavy_drone.payload_capacity`，
+同时断言：
+
+```python
+assert cfg.poisson_weight_max_kg <= heavy_drone.payload_capacity
+```
+
+不允许硬编码字面量 `10.0`，避免两个配置独立漂移后 mode A 筛选逻辑悄悄失效。
+
+**（1b）inline candidate builder：Phase 5 内置最小 action_mask 构建逻辑**
+
+Phase 5 同样内置私有方法 `_build_action_mask(drone_id, coarse_plan, t_now)`，替代
+Phase 6 的 `candidate_builder.build()`。Phase 6 接入时只需替换调用点，`env_adapter`
+本身不需要改动。
+
+Phase 5 inline candidate builder 的最小职责：
+
+1. **候选订单**：从 `coarse_plan.authorized_orders` 中取当前 pending 订单，
+   Phase 5 不再按 `order_pre_score` 做强截断；`order_priority_band` /
+   `order_pre_score` 仅用于日志、调试和稳定排序，不改变可见订单集合
+2. **候选模式**：对每个候选订单，从 `coarse_plan.policy_mode_mask[order_id]` 读取，
+   只保留订单级派送模式 `B/C`；`WAIT` 不出现在 `policy_mode_mask` 中
+3. **候选动作合法性**：
+   - 对 `mode B`：仅当 `deliver_leg_feasible`（执行 `drone → order_i` 可达）且
+     `exists_mode_b_return_host_feasible`（订单送达后至少存在一个能安全到达的
+     `station / depot`）时保留；`mode B` 不读取 `recovery_pool`，也不在 action space
+     中暴露具体返程宿主选择
+   - 对 `mode C`：从 `coarse_plan.recovery_pool[order_id]` 中过滤，并且**必须同时满足**
+     - `truck_eta_map[node] > t_deliver`（该节点仍在卡车未来路径上；即 `t_arrive_truck(node) > t_deliver`）
+     - `t_arrive_uav(deliver -> node) + rendezvous_eta_safe_margin_sec <= t_arrive_truck(node)`（汇合安全时间裕量成立）
+     - `E_need(deliver -> node, payload=0) + drone.safe_margin_j <= E_rem_after_delivery`（送达后对该节点能量可达）
+     - 再截断到 `max_candidate_recovery_per_order`
+4. **全局 WAIT 动作**：无论当前是否存在合法派送动作，始终额外保留一个
+   `pure WAIT action`（纯 WAIT 动作）；其语义是“本次决策窗口不绑定任何订单，不起飞 /
+   不派送”，从而保证 `WAIT` 是真正的全局动作，而不是 `WAIT(order_i)` 的多份等价副本
+
+Phase 6 的 `candidate_builder` 在此基础上增加：`predicted_queue_time` 软截断、
+`best_mode_b_return_score`（某订单若选 mode B 时的最优返程总代价估计）、
+`best_mode_b_host_type`（该最优返程宿主类型：`station` 或 `depot`）、
+更丰富的 runtime feature、`riding_with_truck` 触发的实时 recovery_pool 计算、
+observation tensor 生成。
+
+**（1c）`recover_node` 单次承诺 + 送达后执行层复核**
+
+为保持 Phase 5 的训练接口稳定，`env_adapter.step(action)` 的输入仍然是一次性
+`dispatch_action`（起飞前一次性派送动作），不拆成"派送阶段动作"与"返程阶段动作"两次 PPO
+决策。实现口径固定如下：
+
+- 当 `mode = B` 时，不写入 `selected_recover_node`；订单送达后由环境内部执行
+  `_select_return_host_mode_b(...)`，在所有能量可达的 `station / depot` 中按确定性规则选择
+  实际返程宿主 `effective_return_host`
+- 当 `mode = C` 时，`selected_recover_node`（策略原选回收节点）在 dispatch 时写入
+  环境内部 sidecar state，作为该架 UAV 当前订单的返程承诺
+- `delivery_event`（订单送达事件）**不触发新的 PPO 决策点**；它只触发执行层的
+  `post_delivery_revalidation`（送达后执行层复核）
+- `mode B` 的确定性返程宿主选择规则固定为：
+
+  ```text
+  score_mode_b(node_j)
+    = fly_time(deliver_i -> node_j)
+    + predicted_queue_time(node_j, t_arrive_j)
+    + service_time(node_j)
+  ```
+
+  其中：
+  - `t_arrive_uav(deliver_i -> node_j) = t_deliver + fly_time(deliver_i -> node_j)`
+  - `predicted_queue_time(node_j, t_arrive_uav(deliver_i -> node_j))` 在 `env_adapter`
+    中直接复用
+    `ChargingHost.estimate_wait_time(t_arrive_uav(deliver_i -> node_j))`（运行时真实宿主队列估计）
+  - `service_time(node_j)` 取该宿主的 `swap_time`
+  - 只在 `energy_feasible(deliver_i -> node_j)` 为真的候选宿主中取 `score_mode_b` 最小者
+
+  若最优宿主类型为 `station`，则转入 `return_to_station`；若为 `depot`，则转入
+  `return_to_depot`
+- `post_delivery_revalidation` 至少复核三个条件：
+  - `energy_feasible`（送达后剩余电量对原定回收点是否仍可达）
+  - `rendezvous_time_feasible`（送达后对原定回收点的汇合时序是否仍成立）
+  - `node_still_valid`（原定回收点是否仍在当前卡车未来合法交接节点集合中）
+- 若复核通过，则
+  `effective_recover_node`（执行层最终采用的回收节点）继续取 `selected_recover_node`，
+  并进入 `return_to_rendezvous`
+- 若复核失败，则不做 `second_ppo_decision_after_delivery`（送达后二次 PPO 决策），
+  而是直接触发 `reservation_timeout`（预留失效）或 `soft_miss`（软失配），进入
+  `fallback_recovery`（兜底返程），并由环境按 `deterministic_fallback`
+  （确定性兜底返程规则）选择仓库或最近可达充换电站
+
+这样设计的目的有两点：
+
+- 保持 `recover_node` head（回收节点决策头）的责任归属清晰，避免环境在送达后"偷偷改写"
+  策略原决策而稀释训练信号
+- 避免把一单任务拆成两个 actor 决策窗口，导致 `reservation` 建立时机、
+  `step(action)` 接口和 rollout 采样结构全部改变
+
+**（2）mode A 背景订单的执行主体**
+
+mode A 的职责分两层，不允许混淆：
+
+- **派发标记（inline planner 职责）**：`_build_coarse_plan_view()` 在构建订单切片时，
+  把 `weight > heavy_drone.payload_capacity` 的 static_orders 标记为 `planner_mode_cap = {A}`，
+  排除出 `authorized_orders`。这是 mode A 的全部"派发决策"，在 `reset()` 时一次性确定，
+  整局固定，不需要运行时动态决策。poisson 订单重量上限 ≤ `heavy_drone.payload_capacity`，
+  所以 poisson 新单永远不会是 mode A。
+
+- **物理执行（env_adapter 职责）**：`reset()` 时从 Phase 4 的 `truck_execution_route.json`
+  读取完整停靠序列，按 `_planned_route_stops` 的数据格式（`node_type`、`node_id`、
+  `position`、`arrival_time`、`departure_time`、`order_id`）写入 `env_adapter` 内部事件队列。
+  `_advance_to_event(t_next)` 推进时，扫描队列中 `arrival_time <= t_next` 的 customer
+  停靠点，触发"mode A 订单完成"事件，更新系统上下文统计，不触发 PPO 决策。
+
+  注意：Phase 4 导出的客户停靠服务时长固定为 `0.0`（`CUSTOMER_SERVICE_TIME_SEC = 0.0`），
+  Phase 5 沿用这个简化，不建模额外服务时长。
+
+- **卡车位置同步（env_adapter 职责）**：`reset()` 时调用 `truck.set_route()` 写入
+  Phase 4 路线的几何数据，设置 `_departure_time = 0.0`。之后每次 `_advance_to_event(t_next)`
+  时，调用 `truck.get_location(t_next)` 更新 `truck.current_loc`。`Truck.get_location()`
+  已实现基于 `_route_data` 和 `_departure_time` 的线性插值，不依赖 `tick_all()`，直接按
+  仿真时间查询即可。这样 `candidate_builder` 读取 `truck.current_loc` 时始终是正确的物理
+  真值，`t_arrive_truck` 计算不会因位置停滞而失真。
+
+**（4）卡车循环巡站机制（poisson 训练模式专用）**
+
+**问题背景**：poisson 训练模式下，卡车路线基于 static_orders 的重货订单一次性规划，
+episode 时长 3600s，但卡车可能在 1000s 左右就走完路线回仓库。此后 `truck_backbone_route`
+为空，`recovery_pool` 全空，`launch_candidate_stations` 全空，PPO 只能选 mode B 或 WAIT，
+训练分布严重偏斜，mode C 的学习信号消失。
+
+**触发条件**：`reset()` 时，在完成 Phase 4 路线读入后，检查以下条件是否同时成立：
+
+```text
+触发循环巡站的条件（全部满足）：
+  1. order_source_mode == poisson
+  2. truck_execution_route 最后一个停靠点是 depot（卡车会回仓）
+  3. 最后一个停靠点的 arrival_time < upper_horizon_sec - patrol_min_remaining_sec
+     （卡车回仓时刻距 episode 结束仍有足够时间，默认 patrol_min_remaining_sec = 600s）
+```
+
+条件 3 的参数 `patrol_min_remaining_sec = 600` 从 `rh_alns_cmrappo.yaml` 的 `planner`
+段读取（新增配置项），表示"剩余时间不足此值时不再追加巡站，避免生成极短的无意义路段"。
+
+**执行方案**：
+
+`reset()` 时，若触发条件成立，在 Phase 4 路线末尾追加一段或多段"巡站循环"，直到
+填满 `upper_horizon_sec`。具体步骤如下：
+
+1. **起点**：上一段路线的终点 depot，`t_start = 上一段路线最后一个停靠点的 arrival_time`
+
+2. **站点选取**：采用贪心最近邻算法，每选一个站点后更新当前位置，再从剩余站点中
+   选距离最近的下一个，构成一次巡站循环：`depot → S_1 → S_2 → ... → S_k → depot`。
+   具体步骤：
+   - 初始当前位置 = depot 坐标
+   - 重复 `min(len(stations), patrol_stations_per_loop)` 次：
+     从未选站点中选直线距离当前位置最近的站点，加入序列，更新当前位置
+   - **最后一站必须是终点 depot**：在所有 station 停靠点之后、追加下一圈起点之前，
+     插入一个 depot 停靠点作为本圈终点；depot 停靠点不写入 `_full_backbone_cache`
+     骨架缓存，仅用于维持卡车物理路线的几何连续性与 ETA 单调性
+   站点数量 `k` 取 `min(len(stations), patrol_stations_per_loop)`，
+   `patrol_stations_per_loop` 默认值为 `planner.phase4_min_future_fixed_nodes`（即 3），
+   从配置读取，不硬编码。
+
+3. **ETA 估算**：巡站循环使用站点间直线距离 / `truck.speed` 估算 ETA，不做 OSM 精确规划。
+   原因：巡站路段不承载 mode A 订单，只需保证 `truck_backbone_route` 有未来节点，
+   ETA 精度要求低于 Phase 4 的执行路线。
+
+4. **循环追加**：每追加一次巡站循环后，检查当前最后一个停靠点的 `arrival_time` 是否
+   仍满足条件 3，若满足则继续追加下一次循环，直到不满足为止。
+
+5. **停靠点格式**：追加的巡站停靠点使用与 Phase 4 相同的 `_planned_route_stops` 格式，
+   `node_type = "station"`，`order_id = None`，`departure_time = arrival_time`（不停留）。
+   这些停靠点不触发 mode A 订单完成事件，只用于维护 `truck_backbone_route` 的未来节点。
+
+6. **骨架路线同步**：追加的巡站停靠点中，`node_type == "station"` 的节点同步写入
+   全量骨架缓存（`_full_backbone_cache`），供 `_build_coarse_plan_view(t_now)` 的
+   `departure_time > t_now` 过滤逻辑使用。每圈终点的 depot 停靠点**不写入**
+   `_full_backbone_cache`，原因是：depot 已经作为 Phase 4 原始路线的终点节点存在于
+   骨架缓存中；巡站循环的 depot 停靠点只是物理路线的几何连接点，重复写入会导致
+   `_build_coarse_plan_view()` 去重后 depot 的 ETA 被错误地更新为巡站循环的时刻，
+   而不是 Phase 4 原始路线的终点时刻。
+
+**与 Phase 4 路线的边界**：
+
+- Phase 4 的 `truck_execution_route.json` 只包含基于 static_orders 的原始路线，不包含巡站循环
+- 巡站循环完全在 `env_adapter.reset()` 内部生成，不写回 Phase 4 产物文件
+- `truck.set_route()` 调用时传入的是原始路线 + 巡站循环的完整几何序列
+- `truck_execution_route` 的语义（物理验证与路径审计）不受影响
+
+**benchmark / hybrid 模式下的行为**：
+
+巡站循环仅在 `order_source_mode == poisson` 时触发。benchmark 和 hybrid 模式下，
+卡车路线严格按 Phase 4 产物执行，不追加巡站循环，以保证 benchmark 验证的可复现性。
+
+benchmark / hybrid 模式下，`allow_empty_backbone_route` **自动开启**（无需显式配置），
+原因是：这两种模式不追加巡站循环，卡车提前回仓后骨架自然耗尽是预期的合法业务状态，
+不应视为契约错误。自动开启后，`_build_coarse_plan_view()` 在骨架耗尽时构造空骨架退化对象：
+`truck_backbone_route = ()`、`recovery_pool` 全空、`launch_candidate_stations = ()`、
+`policy_mode_mask` 收缩为 `{B}`，PPO 只能选 mode B 或全局 WAIT。
+
+poisson 模式下，`allow_empty_backbone_route` 保持 `false`（默认值）；若骨架为空，
+仍视为契约错误，用于尽早暴露巡站循环生成逻辑的问题。
+
+**（3）reservation 状态的存储位置**
+
+reservation 状态存在 `env_adapter` 内部，不挂在 `Drone` 对象上（原因同 `TrainingDroneState`：
+不污染在线仿真引擎的实体层）。
+
+`env_adapter` 内部维护两个字典：
+
+```python
+_reservations: dict[str, ReservationState]  # drone_id → 当前 reservation
+_reservation_count: dict[str, int]          # node_id → 当前预留该节点的无人机数量
+```
+
+`ReservationState` 是训练侧专属 dataclass：
+
+```python
+@dataclass
+class ReservationState:
+    recover_node: str   # 预留的回收节点 ID
+    issued_at: float    # reservation 建立时刻（仿真秒）
+    expires_at: float   # reservation 过期时刻（仿真秒）
+```
+
+**命名必须与在线 solver 的 `RendezvousContract` 严格区分**：`RendezvousContract` 是
+`B_WAIT` 模式下卡车锚点锁定的时空约束，绑定的是卡车必须在 `latest_departure` 前到达锚点，
+生命周期是 `active/fulfilled/expired/released`。`ReservationState` 是 mode C 返程的局部
+承诺，timeout 条件是
+`t_arrive_uav(current_loc -> r_j) + rendezvous_eta_safe_margin_sec > t_arrive_truck(r_j)` 等时序约束，两者语义完全不同，
+不能混名，也不能复用。
+
+`_reservation_count` 通过 `build_runtime_state_view()` 暴露给外部，作为 `candidate_builder`
+构建候选集时的节点拥挤信号，不直接让外部访问 `env_adapter` 内部字典。
+
+生命周期：`reset()` 时两个字典清空；`step()` 时随状态转移更新；reservation timeout 检查
+在每次 `_advance_to_event()` 时顺带扫描。timeout 参数（`alpha`、`beta`、`gamma`）从
+`rh_alns_cmrappo.yaml` 的 `reservation` 段读取，已在配置文件中预留。
+
+**（5）build_runtime_state_view() 接口 schema**
+
+`build_runtime_state_view()` 返回全局运行时真值快照，供 `candidate_builder` 和外部
+观测构建使用。**当前决策上下文（deciding_drone_id、trigger_type、trigger_station_id）
+不放入此接口**，而是作为 `candidate_builder.build()` 的独立参数传入，原因是：
+它们不是全局真值，而是"本次 build 面向哪架 UAV"的局部上下文；同一时刻可能有多个
+决策 UAV，共用同一个 `runtime_state` 更干净。
+
+`build_runtime_state_view()` 返回的 schema 定义如下：
+
+```python
+@dataclass(frozen=True)
+class RuntimeStateView:
+    t_now: float                              # 当前仿真时间（秒）
+
+    # 卡车侧
+    truck_current_loc: Position3D             # 当前物理位置（每次 _advance_to_event 后同步）
+
+    # 无人机侧（每架无人机一条记录）
+    drone_states: Mapping[str, DroneStateView]
+
+    # 订单池（只读引用，Phase 5 可用 Order 对象；长期建议只读 snapshot）
+    pending_orders: Mapping[str, Order]
+    assigned_orders: Mapping[str, Order]
+
+    # 站点侧（station + depot 均包含）
+    node_states: Mapping[str, NodeStateView]
+
+    # reservation 拥挤信号（node_id → 当前预留该节点的无人机数量）
+    reservation_count: Mapping[str, int]
+
+@dataclass(frozen=True)
+class DroneStateView:
+    drone_id: str
+    training_state: str                       # TrainingDroneState 枚举值
+    current_loc: Position3D
+    battery_current: float                    # 当前电量（焦耳）
+    battery_max: float                        # 满电容量（焦耳）
+    battery_ratio: float                      # 当前电量比例
+    carrying_order_id: Optional[str]
+    home_type: str                            # "DEPOT" 或 "TRUCK"（drone_source_type）
+    # 静态能力字段（供 candidate_builder 计算 fly_time / t_arrive_uav / E_need）
+    cruise_speed: float                       # m/s
+    payload_capacity: float                   # kg
+    empty_weight: float                       # kg
+    k1: float                                 # 诱导功率系数
+    k2: float                                 # 废阻功率系数
+    reservation: Optional[ReservationStateView]  # 当前 reservation，无则 None
+
+@dataclass(frozen=True)
+class ReservationStateView:
+    recover_node: str
+    issued_at: float
+    expires_at: float
+
+@dataclass(frozen=True)
+class NodeStateView:
+    node_id: str
+    node_type: str                            # "station" 或 "depot"
+    position: Position3D
+    parking_slots: int                        # 充换电并行槽位数
+    swap_time: float                          # 单次充换电服务时长（秒）
+    queue_length: int                         # 当前排队数
+    available_slots: int                      # 当前空闲服务槽位数
+```
+
+说明：
+- `truck_eta_map` 和 `truck_backbone_route` 不放入 `RuntimeStateView`，它们属于
+  `CoarsePlanView` 语义边界，重复放会形成双真相源
+- `DroneStateView` 中的静态能力字段（`k1`、`k2`、`cruise_speed` 等）在 `reset()` 时
+  从 `Drone` 实体对象一次性读取并缓存，运行期不变
+- `NodeStateView` 中的 `queue_length` 和 `available_slots` 在每次 `_advance_to_event()`
+  后从 `ChargingHost` 实体对象实时读取
+- 任何依赖节点拥挤度的 runtime feature（如 `best_mode_b_return_score` 的队列项、
+  `predicted_queue_time` 软信号）都必须在每次 `candidate_builder.build()` 时基于
+  **当前** `RuntimeStateView.node_states` 重新计算，禁止跨 build 缓存旧快照
+
+**（6）WAIT 动作的 delta_wait 唯一化**
+
+`idle` 状态下 WAIT 的 `delta_wait` 定义为：
+
+```text
+delta_wait = min(
+    t_next_global_decision_event,
+    t_now + max_wait_decision_gap_sec,
+    upper_horizon_sec
+) - t_now
+```
+
+其中：
+- `t_next_global_decision_event`：下一个会触发 PPO 决策的全局事件时刻，包括：
+  任意无人机完成充换电进入 idle、卡车到达 `launch_candidate_stations` 中的某个站点。
+  不包括：mode A 订单完成、poisson 新订单注入、reservation timeout 等不触发 PPO 的事件。
+- `max_wait_decision_gap_sec`：WAIT 推进量上限，防止极长空窗把一次 WAIT 惩罚拉得过大。
+  从 `rh_alns_cmrappo.yaml` 的 `planner` 段读取，首轮建议 `60s`。
+
+`riding_with_truck` 状态下 WAIT 的 `delta_wait` 定义为：
+
+```text
+delta_wait = t_arrive_truck(next_station_on_route) - t_now
+```
+
+即继续搭车到下一站，不起飞。
+
+**`active_wait` 状态的语义边界**：
+
+WAIT 动作会把无人机切到 `active_wait`，但该状态只表示"本次 WAIT 已经选定、该 UAV 在
+下一次全局决策事件前不再派送"这一执行层占位语义；`T_idle` 的数值本身不按状态持续累计。
+`T_idle` 固定在 `step(WAIT_action)` 调用点按
+
+```text
+delta_wait = t_next_global_decision_event - t_now
+```
+
+一次性结算。只要 `delta_wait` 的定义是精确的，这与"推进过程中累计到同一个
+delta_wait"在数值上等价，但实现更简单，也不需要引入"被其他 UAV 决策事件打断"的额外语义。
+
+`max_wait_decision_gap_sec` 新增到配置文件 `rh_alns_cmrappo.yaml` 的 `planner` 段。
+
+**（7）同一时刻多事件的处理顺序**
+
+事件驱动环境中，同一仿真时刻 `t_event` 可能同时发生多个事件。处理顺序分两层：
+
+**第一层：先结算区间成本（连续时间项）**
+
+在处理任何点事件之前，先对区间 `(t_prev, t_event)` 结算所有连续时间成本：
+
+```text
+_settle_per_dt_rewards(dt = t_event - t_prev)
+```
+
+包含：`T_overdue`、`T_wait`、`T_queue`、`T_fallback`
+（fallback_recovery 状态）。
+
+其中 `T_overdue` 的结算口径固定为：按区间 `[t_prev, t_event)` 与每个订单超时区间
+`[deadline_i, +∞)` 的重叠长度累计，而不是使用 `max(0, t_now - deadline_i) * dt`
+这类近似写法。这样"deadline 恰好到点且同刻送达"不会被误算一次 overdue：区间成本
+先精确结算到 `t_event` 之前，送达事件再在 `t_event` 时刻处理，订单从 `_active_uav_orders()`
+移除，后续不再累加。
+
+**第二层：按以下顺序处理点事件**
+
+```text
+1. 硬失败（airborne_energy_failure）
+   → 先处理，避免后续事件基于已失效无人机计算
+
+2. 订单送达 / mode A 完成，结算 R_delivery_bonus
+   → 先结算正奖励，再做超时判定，避免"刚送达就被算超时"
+
+3. 到达类事件（合并处理，再做交互）
+   3a. 卡车到站
+   3b. UAV 到站（含 `return_to_rendezvous`、`return_to_station`、`return_to_depot`、
+       `fallback_recovery` 四类飞行段的到达，以及充换电完成、回收完成）
+   3c. 由到达触发的交互：rendezvous 成功、FIFO 入队/出队、
+       launch_candidate_stations 决策触发
+
+4. reservation timeout 检查
+   → 在到达类事件之后，确保"UAV 与 truck 同刻到达 rendezvous 点"先成功配对，
+     再决定是否 timeout
+
+5. poisson 新订单注入
+   → 新注入的订单不进入当前时刻的 authorized_orders，
+     在下一次 _build_coarse_plan_view() 调用时才被纳入，
+     避免"刚出现就要立刻决策"的不合理场景
+
+6. 生成下一个 decision context / 检查 is_done()
+```
+
+**（8）reservation timeout 落地规则（Phase 5 简化版）**
+
+`tau_res` 公式在 Phase 5 简化为：
+
+```text
+tau_res = alpha * fly_time(deliver -> r_j) + gamma * q_est(r_j)
+```
+
+其中：`reservation_beta` 配置字段继续保留在契约 / yaml 中，但 Phase 5 不维护历史统计，
+因此 `beta * t_hist(...)` 项在数值上固定为 `0`；Phase 6+ 恢复历史统计后可直接启用，
+无需修改接口结构。
+
+各项的 Phase 5 落地规则：
+
+```text
+t_hist(node_type_j, mode C) = 0
+    → Phase 5 不维护历史统计，固定为 0
+
+q_est(r_j) = host.estimate_wait_time(t_now)
+    → 复用 ChargingHost.estimate_wait_time()，已考虑"服务中但队列未排起来"的情况，
+      比 queue_length * swap_time 更准确
+
+route_drift_invalid = false
+    → Phase 5 不实现 route drift 检测，固定为 false
+
+node_available = true
+    → Phase 5 不建模节点不可用，固定为 true
+```
+
+timeout 判定保留三个条件（任一成立即失效）：
+
+```text
+timeout(res) =
+    (t_now >= expires_at)
+ OR (t_arrive_uav(current_loc -> r_j) + rendezvous_eta_safe_margin_sec > t_arrive_truck(r_j))
+ OR (energy_feasible == false)
+```
+
+这里的实现语义进一步固定为：
+
+- 上述 timeout 检查是 `post_delivery_revalidation`（送达后执行层复核）与飞行途中持续复核
+  的一部分，不是新的 PPO 决策触发条件
+- 一旦 timeout 成立，环境直接放弃 `selected_recover_node`（策略原选回收节点），转入
+  `deterministic_fallback`（确定性兜底返程）；**不重新构造 `action_mask` 让 PPO 二次选点**
+
+`energy_feasible` 的判定时机：**在每次 `_advance_to_event()` 时重新计算**，不只在
+reservation 建立时算一次。原因：无人机在飞往客户点途中电量持续消耗，建立时可行的
+reservation 在送达后可能已经不可行。
+
+```text
+energy_feasible = drone.can_reach(
+    target = node_position(r_j),
+    payload = 0.0,          # 送达后空载返程
+    safe_margin = drone.safe_margin_j
+)
+```
+
+`T_timeout_cost` 定义为"违规量"，不是 fallback 飞行时间（避免与 `T_fallback` 重复计量）：
+
+```text
+若因 t_now >= expires_at 触发：
+    T_timeout_cost = t_now - expires_at
+
+若因 t_arrive_uav(current_loc -> r_j) + rendezvous_eta_safe_margin_sec > t_arrive_truck(r_j) 触发：
+    T_timeout_cost = t_arrive_uav(current_loc -> r_j) + rendezvous_eta_safe_margin_sec - t_arrive_truck(r_j)
+
+若因 energy_feasible == false 触发：
+    T_timeout_cost = 0（电量不足本身不产生时间违规量，惩罚由 hard_failure_penalty_sec 覆盖）
+```
+
+timeout 后进入 `fallback_recovery`，施加软惩罚：
+
+```text
+r_timeout = -lambda_res_timeout * T_timeout_cost
+```
+
+`T_fallback` 继续表示"后续兜底飞行的物理代价"，两者不混用。其落地结算路径固定为：
+
+- UAV 进入 `fallback_recovery`（兜底返程飞行态）后，在每次 `_advance_to_event()` 的
+  区间结算里，只要该 UAV 仍处于 `fallback_recovery`，就累计
+  `delta_fallback_t = t_next - t_prev`
+- 到达备用宿主（`station` 或 `depot`）的事件发生时，先结算到到达时刻之前的
+  `T_fallback`，再把状态切到对应的到达后状态，后续不再继续累计 `T_fallback`
+- "到达备用宿主"事件的触发依据不是模糊的当前位置比较，而是
+  `_fallback_leg[drone_id].arrival_time`（兜底返程预计到达时刻）被 `_advance_to_event()`
+  跨过；触发后必须立刻清空 `_fallback_leg[drone_id]`，避免到达后继续累计 `T_fallback`
 
 - 场景固定为 `default_scene`
 - 运行时订单源通过 `order_source_adapter` 注入
@@ -1353,7 +2039,8 @@ python backend/scripts/run_phase4_sumo_gui.py --no-start
 需要先定清楚：
 
 1. 观测包含什么
-2. 动作代表什么（factorized：order → mode → recover_node）
+2. 动作代表什么（派送分支 factorized：`order → mode(B/C) → recover_node`，
+   另有独立全局 `WAIT` 动作）
 3. 奖励在什么时刻结算
 4. 终止条件是什么
 
@@ -1370,43 +2057,195 @@ python backend/scripts/run_phase4_sumo_gui.py --no-start
 这一阶段必须明确实现以下状态和事件：
 
 1. 无人机状态
-   - `idle`
-   - `flying_to_deliver`
-   - `delivered`
-   - `return_to_rendezvous`
-   - `return_to_station`
-   - `return_to_depot`
-   - `queueing_at_station`
-   - `charging_or_swap`
-   - `fallback_recovery`
-   - `recovered`
-   - `airborne_energy_failure`
-   - `riding_with_truck`（新增：无人机在卡车上，含初始搭车出发和 mode C 回收后）
+
+   `env_adapter` 内部维护一个 `_drone_state: dict[str, TrainingDroneState]` 覆盖层，
+   使用训练侧自己的枚举，**不修改** `core/entities/primitives.py` 的 `DroneStatus`。
+   原因：`DroneStatus` 是在线仿真引擎的物理状态机，`RIDING_WITH_TRUCK` 等训练侧概念
+   不应反向污染基础层，否则前端 WebSocket 帧、`is_flying`、`is_dispatchable` 等属性
+   都需要感知一个它们不需要处理的状态。
+
+	   `TrainingDroneState` 枚举定义如下（仅在 `env_adapter.py` 内部使用）：
+
+	   - `idle`：在 depot 或 station 完成充换电后空闲，可被 PPO 调度
+	   - `flying_to_deliver`：飞往客户投递点
+	   - `delivered`：已完成投递，等待按既定返程承诺执行后续转移：
+	     `mode B` 在执行层确定性选择 `station / depot` 返程宿主，`mode C` 对
+	     `selected_recover_node`（策略原选回收节点）做返程执行层复核；
+	     **不是第二次 PPO 决策点**
+	   - `return_to_rendezvous`：返程飞往 mode C 预定回收节点（飞行中）
+	   - `waiting_for_truck`：已到达 rendezvous 节点，被动等待卡车到来（**T_wait 累计区间**）
+	   - `return_to_station`：返程飞往充换电站（`mode B` 执行层已选择 `station`；
+	     **不属于** `T_fallback` 的累计状态）
+	   - `return_to_depot`：返程飞往仓库（`mode B` 执行层已选择 `depot`）
+	   - `queueing_at_host`：已到达充换电宿主（`station / depot`），等待服务槽位
+	     （**T_queue 累计区间**）
+	   - `charging_or_swap`：正在充换电服务中
+	   - `active_wait`：主动选择 WAIT 动作后的占位等待状态；`T_idle` 在
+	     `step(WAIT_action)` 中按精确 `delta_wait` 一次性结算，不在该状态下持续累计
+	   - `fallback_recovery`：错过卡车后飞往备用宿主（`station` 或 `depot`）的整个兜底飞行阶段
+	     （**T_fallback 累计区间**）
+	   - `charging_on_truck`：mode C 成功回收，正在卡车上充换电（等待 `truck_drone_recover_time_s`）
+	   - `riding_with_truck`：卡车上充换电完成，搭车等待下一个决策点
+	   - `airborne_energy_failure`：半空中电量耗尽，硬失败终态
+
+   状态转移中涉及的完整路径：
+
+	   ```text
+		   idle / riding_with_truck
+		     → [PPO 选 dispatch_action] → flying_to_deliver
+		     → [到达客户点] → delivered
+	         mode C → [post_delivery_revalidation 通过]
+	                  → return_to_rendezvous → [到达节点] → waiting_for_truck
+	                                         → [卡车到达] → charging_on_truck
+	                                                       → [充换电完成] → riding_with_truck
+	               → [post_delivery_revalidation 失败 / timeout]
+	                  → fallback_recovery
+	                     → [到达备用 station/depot] → _on_arrive_charging_host
+	                     → queueing_at_host / charging_or_swap → idle
+	         mode B → [执行层选择 station] → return_to_station
+	                  → [到达宿主] → _on_arrive_charging_host
+	                  → queueing_at_host / charging_or_swap → idle
+	               → [执行层选择 depot]   → return_to_depot
+	                  → [到达宿主] → _on_arrive_charging_host
+	                  → queueing_at_host / charging_or_swap → idle
+	     → [选 WAIT] → active_wait → [下一个环境事件] → idle / riding_with_truck
+	   ```
+
+   说明：`charging_on_truck` 与 `riding_with_truck` 是两个独立状态，不是别名。
+   前者表示"已被回收、正在车载充换电服务中"，后者表示"充换电完成、搭车等待决策"。
+   `recovered` 不作为正式枚举值，其语义由 `charging_on_truck` 覆盖。
+
+   **`riding_with_truck` 初始化来源**：`reset()` 时读取 `drone.home_type`（存储在
+   `Drone` 实例上，由 `EntityManager.load_from_config()` 按 `entities.json` 的
+   `home_type` 字段写入）。`home_type == SourceType.TRUCK` 的无人机初始状态设为
+   `riding_with_truck`；`home_type == SourceType.DEPOT` 的无人机初始状态设为 `idle`。
+   不需要任何额外配置层，`entities.json` 的 `home_type` 字段即为唯一来源。
+
+   - `waiting_for_truck` 与 `active_wait` 的区分：两者在状态机层面是不同的状态，
+   触发来源不同，`compute_reward()` 只需检查当前状态即可确定 `dt` 计入哪个桶，
+   不需要额外的 `_wait_cause` 标志：
+   - `return_to_rendezvous → [到达节点] → waiting_for_truck`（被动，T_wait）
+   - `idle / riding_with_truck → [选 WAIT 动作] → active_wait`（主动，T_idle）
+
+   - `fallback_recovery` 的退出规则必须显式依赖一段内部飞行账本，而不能只靠文字描述。
+   `env_adapter` 在 UAV 进入 `fallback_recovery` 时，必须同步写入一组内部执行字段：
+
+   ```python
+   _fallback_leg[drone_id] = FallbackLeg(
+       host_node_id=str,          # 备用宿主节点 ID
+       host_node_type=str,        # "station" | "depot"
+       arrival_time=float,        # 预计到达时刻（绝对仿真秒）
+   )
+   ```
+
+   这些字段仅用于执行层状态转移，不需要暴露到 `RuntimeStateView`。状态退出口径固定为：
+
+   - 若一次 `_advance_to_event(t_next)` 结束后仍满足
+     `t_next < _fallback_leg[drone_id].arrival_time`，
+     则 UAV 保持 `fallback_recovery`，本次区间全部计入
+     `delta_fallback_t = t_next - t_prev`
+   - `env_adapter` 必须统一复用一个宿主到达处理入口，不允许在 fallback 或 mode B
+     路径上手写第二套 `available_slots` 判断，也不允许 depot 路径绕过排队判断：
+
+   ```python
+   def _on_arrive_charging_host(self, drone_id: str, host: ChargingHost, t_now: float) -> None:
+       host.arrive(drone_id, t_now)
+       if drone_id in host.serving_drones:
+           self._drone_state[drone_id] = TrainingDroneState.CHARGING_OR_SWAP
+       elif drone_id in host.wait_queue:
+           self._drone_state[drone_id] = TrainingDroneState.QUEUEING_AT_HOST
+       else:
+           raise RuntimeError("charging host arrival state inconsistent")
+   ```
+
+   - 若本次推进满足
+     `t_next >= _fallback_leg[drone_id].arrival_time`，
+     则先只把区间 `[t_prev, arrival_time)` 计入 `T_fallback`，随后立刻触发
+     "到达备用宿主"点事件，并统一调用
+     `_on_arrive_charging_host(drone_id, host, arrival_time)`；此处的 `host` 可以是
+     `station` 或 `depot`，两者都必须经过同一套入队/入服判断
+   - `mode B` 在 `return_to_station` / `return_to_depot` 到达终点后也必须复用
+     同一个 `_on_arrive_charging_host(...)` 入口，不允许存在
+     `return_to_depot -> charging_or_swap` 这类绕过排队判断的捷径
+   - `fallback_recovery` 到达宿主后必须**直接**结束，不允许再转成
+     `return_to_station` / `return_to_depot` 二次飞行；否则会把 `T_fallback`
+     与普通返程飞行重复计时
+   - 一旦完成上述到达事件，必须立即清空 `_fallback_leg[drone_id]`；
+     后续同一时刻及之后的奖励结算不再把该 UAV 计入 `T_fallback`
 
 2. 关键事件
+
    - 订单送达
    - truck-side `mode A` 背景订单完成
-   - 返程回收点选择（factorized action）
+   - `mode C` 的返程汇合点在 `dispatch_action` 中一次性确定（第三阶段）；
+     `mode B` 的具体返程宿主由 `delivery_event` 后的确定性逻辑选出
    - reservation 建立与 timeout 检查
    - 卡车到站
-   - 无人机到站
+   - 无人机到站（含 `return_to_rendezvous`、`return_to_station`、`return_to_depot`、
+     `fallback_recovery` 四类飞行段的到达事件）
    - 错过卡车（触发 fallback_recovery）
    - FIFO 入队 / 出队
    - 半空中能源硬失败
-   - 卡车到达 `launch_candidate_station`（新增：触发 `riding_with_truck` 无人机的 PPO 决策点）
-   - 无人机在卡车上完成充换电（新增：`charging_on_truck` → `riding_with_truck`）
-   - 无人机从卡车起飞（新增：`riding_with_truck` → `flying_to_deliver`）
+- 卡车到达 `launch_candidate_stations` 中的某个站点（触发 `riding_with_truck` 无人机的 PPO 决策点）
+   - 无人机在卡车上完成充换电（`charging_on_truck` → `riding_with_truck`）
+   - 无人机从卡车起飞（`riding_with_truck` → `flying_to_deliver`）
 
 3. 奖励与惩罚来源（必须与主目标逐项对应）
    - `T_complete`（仅无人机订单）
    - `T_wait`（UAV 被动等待卡车的物理等待时间，episode 级累计）
-   - `T_idle`（UAV 显式选择 WAIT 动作的 idle 时间，**每步即时结算**，不在 episode 末端累计）
-   - `T_queue`
+   - `T_idle`（UAV 显式选择 WAIT 动作的 idle 时间，**在 `step(WAIT_action)` 按精确
+     `delta_wait` 一次性即时结算**）
+   - `T_queue`（UAV 在 `station / depot` 补能宿主等待服务槽位的累计排队时间）
    - `T_fallback`
    - `T_res_timeout`（reservation timeout 造成的局部损失）
-   - `T_overdue`（未送达超时订单的累计超时时长，**每步即时结算**，不在 episode 末端累计）
+   - `T_overdue`（未送达超时订单的累计超时时长，**每次时间推进时按实际 dt 即时结算**）
    - `N_hard_overdue`（超时超过 `max_overdue_sec` 被强制移除的订单数，一次性固定惩罚）
    - `N_hard_fail`
+
+   **事件驱动环境下的奖励结算统一口径**：
+
+   文档中"每个仿真步结算"在事件驱动环境里的正确映射是"每次时间推进时按实际推进量
+   `dt` 结算"，而不是固定步长。`env_adapter` 内部实现一个 `_settle_per_dt_rewards(dt)`
+   函数，在以下两个时机调用：
+
+   - `_advance_to_event(t_next)`：推进到下一个事件，`dt = t_next - t_now`
+   - `step(WAIT_action)`：执行 WAIT 动作，`dt = delta_wait`
+
+   `_settle_per_dt_rewards(dt)` 统一结算所有"按时间流逝累加"的惩罚项（不含 `T_idle`）：
+
+   ```python
+   def _settle_per_dt_rewards(self, dt: float) -> float:
+       reward = 0.0
+       t_prev = self._t_now
+       t_next = self._t_now + dt
+       # T_overdue：按时间推进区间类实时累加，不等送达事件，不允许拖到 episode 末端统一结算
+       for order in self._active_uav_orders():
+           overdue_dt = max(0.0, t_next - max(t_prev, order.deadline))
+           reward -= self._cfg.lambda_overdue * overdue_dt
+       # T_wait / T_queue / T_fallback：按当前训练状态分桶，不需要额外标志
+       for drone_id, state in self._drone_state.items():
+           if state == TrainingDroneState.WAITING_FOR_TRUCK:
+               reward -= self._cfg.lambda_wait * dt
+           elif state == TrainingDroneState.QUEUEING_AT_HOST:
+               reward -= self._cfg.lambda_queue * dt
+           elif state == TrainingDroneState.FALLBACK_RECOVERY:
+               reward -= self._cfg.lambda_miss * dt
+       return reward
+   ```
+
+   `T_idle` 的结算**仅在** `step(WAIT_action)` 调用点额外叠加，不进入
+   `_settle_per_dt_rewards`，确保与 `T_wait` 的结算路径完全分开：
+
+   ```python
+   # step(WAIT_action) 内部
+   reward += self._settle_per_dt_rewards(delta_wait)
+   reward -= self._cfg.wait_idle_penalty_coef * delta_wait  # T_idle 专属
+   ```
+
+   `T_overdue` 的送达处理：订单被送达时，从 `_active_uav_orders()` 中移除，
+   后续推进不再对该订单累加，送达时不叠加额外惩罚（避免双重计入）。
+   这里采用的是"按时间推进区间类实时累计"，不是"episode 结束或强制移除时统一结算"；
+   因此模型始终有动力去送超时订单——不送则惩罚持续增大，送达则立刻止损。
 
 4. 局部承诺状态（reservation）
    - 当前预留的 `recover_node`
@@ -1422,8 +2261,12 @@ python backend/scripts/run_phase4_sumo_gui.py --no-start
 
 动作建议：
 
-- 采用 factorized action space：先选订单，再选模式（`WAIT`/`B`/`C`），再选回收节点
-- `WAIT` 为必备动作，不允许被 mask 掉
+- 采用 factorized action space：
+  `mode B` 分支为 `dispatch_action=(order_i, mode=B)`，
+  `mode C` 分支为 `dispatch_action=(order_i, mode=C, recover_node_j)`；
+  其中 `mode B` 不暴露 `station / depot` 选择，具体返程宿主由执行层在送达后确定；
+  同时保留一个全局 `WAIT` 动作
+- 全局 `WAIT` 为必备动作，不允许被 mask 掉
 - `mode A` 不进入 PPO 动作空间
 - 全程配合 `action_mask`
 
@@ -1436,11 +2279,235 @@ python backend/scripts/run_phase4_sumo_gui.py --no-start
 验收标准：
 
 - `reset -> step -> ... -> done` 能完整跑通
-- 不出现非法动作、空 mask、订单状态错乱
+- 不出现非法动作、空 mask、订单状态错乱（由 inline candidate builder 保证：
+  WAIT 始终存在，mask 永远非空；Phase 6 接入后此条继续成立）
 - 错过卡车时订单不会被错误回滚
 - 硬失败时无人机会被正确移出后续可用集合
-- 站点排队和工位释放逻辑可复现
+- 补能宿主排队和工位释放逻辑可复现（`station / depot` 统一复用同一套入队 / 入服规则）
 - reservation timeout 能正确触发 fallback 并记录 `T_res_timeout`
+- `delivery_event`（订单送达事件）不会触发 `second_ppo_decision_after_delivery`
+  （送达后二次 PPO 决策）；原定 `selected_recover_node`（策略原选回收节点）只允许被
+  `post_delivery_revalidation`（送达后执行层复核）接受或拒绝
+- `mode C` 在 Phase 5 中仍保持三阶段派送语义，但最终 `action_mask` 不能只停留在
+  `recovery_pool` 的粗候选边界；必须对每个 `recover_node_j` 同时执行
+  `rendezvous_eta_safe_margin_sec`（汇合安全时间裕量）与 `energy_feasible`（能量可达性）过滤，
+  不允许退化成仅按 `truck_eta_map` 做粗时序筛选
+- `mode B` 在 Phase 5 中表示“送达后自主返回某个可达充换电宿主”，不依赖卡车；
+  `action_mask` 只负责检查“送达后至少存在一个可达 `station / depot`”，
+  但不向 PPO 暴露具体宿主选择
+- `return_to_station` 与 `return_to_depot` 都是 `mode B` 的合法返程飞行状态；
+  一旦到达 `station / depot`，必须统一进入 `_on_arrive_charging_host()`，
+  后续状态只能是 `queueing_at_host` 或 `charging_or_swap`；
+  `fallback_recovery` 只允许由 `mode C` 的复核失败 / timeout 触发，不与 `mode B` 重叠
+- `queueing_at_host` 覆盖 `station + depot` 两类补能宿主；
+  `T_queue` 统计范围与 `ChargingHost.arrive()` 的实体语义一致，不再只统计 station
+- `home_type == TRUCK` 的无人机在 `reset()` 后初始状态为 `riding_with_truck`，
+  `home_type == DEPOT` 的无人机初始状态为 `idle`，两类无人机不混淆
+- `T_wait` 与 `T_idle` 在同一 episode 内累计值互不重叠：
+  `waiting_for_truck` 状态产生的时间只进 `T_wait`，
+  `active_wait` 状态产生的时间只进 `T_idle`
+- `T_overdue` 在订单超过 deadline 后的每次时间推进中立刻开始累加，
+  不等送达事件；订单送达后停止累加，送达时不叠加额外惩罚
+- `_build_coarse_plan_view(t_now)` 在卡车恰好到站时刻（`arrival_time == t_now`）
+  仍能正确保留该站点在 `launch_candidate_stations` 和 `recovery_pool` 中，
+  不因严格 `>` 过滤而丢失当前站点
+- `_build_coarse_plan_view(t_now)` 返回的 `CoarsePlanView` 能通过 `contracts.py`
+  的 `__post_init__` 校验（含 `plan_version`、`issued_at`、`valid_until`、
+  `truck_backbone_route` 无重复节点等所有字段约束）
+- mode A 订单完成事件由 `env_adapter` 内部事件队列驱动，`truck.current_loc`
+  在每次 `_advance_to_event()` 后与仿真时间同步，`candidate_builder` 读取的
+  卡车位置与订单完成事件时序一致
+- `_reservations` 与 `_reservation_count` 在 `reset()` 后均为空，
+  reservation timeout 能在 `_advance_to_event()` 中被正确检测并触发 fallback
+- `build_runtime_state_view()` 返回的 `RuntimeStateView` 包含 `t_now`、
+  `truck_current_loc`、每架无人机的 `DroneStateView`（含静态能力字段和 `home_type`）、
+  每个节点的 `NodeStateView`（含 `position`、`parking_slots`、`swap_time`）、
+  `reservation_count`；不包含 `truck_eta_map` 和 `truck_backbone_route`（属于 CoarsePlanView）
+- `idle` 状态下 WAIT 的 `delta_wait` 不超过 `max_wait_decision_gap_sec`（60s），
+  且 `T_idle` 在 `step(WAIT_action)` 中按精确 `delta_wait` 一次性扣罚，不走持续累计路径
+- 同一时刻多事件按"先区间成本、后点事件；到达类先合并再做 timeout；
+  poisson 新订单在下一次 _build_coarse_plan_view() 才纳入 authorized_orders"的顺序处理
+- reservation timeout 的 `energy_feasible` 在每次 `_advance_to_event()` 时重新计算，
+  不只在建立时算一次；`T_timeout_cost` 为违规量，不与 `T_fallback` 重复计量
+- poisson 模式下，`reset()` 后 `truck_backbone_route` 在整个 `upper_horizon_sec`
+  内始终有未来节点（巡站循环已追加），不出现卡车提前回仓后骨架为空的情况
+- benchmark / hybrid 模式下，`reset()` 后卡车路线严格等于 Phase 4 产物，
+  不追加巡站循环，多次运行结果完全一致；`allow_empty_backbone_route` 自动开启，
+  骨架耗尽后构造空骨架退化对象，`policy_mode_mask` 收缩为 `{B}`，为合法退化状态
+- poisson 模式下，巡站循环的 ETA 单调递增，不出现时序倒退
+
+### 4.5.1 Phase 5 实现分层
+
+Phase 5 的实现规格较重，为避免一次性面对过多复杂度导致 bug 难以定位，拆分为三个子层。
+**三层共用同一套接口定义**（`TrainingDroneState` 枚举、`RuntimeStateView` schema、
+`step(action)` 输入格式），接口在 5a 一次定义完毕，5b/5c 只填充实现深度，不改接口。
+
+---
+
+#### Phase 5a：状态机骨架 + smoke test 连通性验证
+
+**用途**：验证环境状态机正确性，确认 `reset → step → done` 能跑通。
+**禁止用途**：**不允许用于正式 PPO 训练**，不允许用于 benchmark 对比。
+原因：5a 的奖励只有送达奖励和硬失败惩罚，缺少 `T_overdue`，策略会对超时订单和准时订单
+一视同仁，学出错误的优先级偏好，该偏好在 5c 加入完整奖励后需要被覆盖，代价很高。
+
+**实现范围**：
+
+- 完整的 `TrainingDroneState` 枚举（全部 13 个状态，一次定义，5b/5c 不增删）
+- 完整的状态转移图（所有路径，含 mode B/C/WAIT、fallback、charging_on_truck、riding_with_truck）
+- `_on_arrive_charging_host()` 统一入口（station 和 depot 统一走此处，排队判断一次写对）
+- `_fallback_leg` 内部账本（进入 `fallback_recovery` 时写入，到达时清空）——**5a 必须实现**，
+  因为 `fallback_recovery` 的退出依赖它，缺失会导致状态机卡死
+- 事件队列推进（`_advance_to_event`），含卡车到站、UAV 到站、mode A 完成
+- `reset()` 读取 Phase 4 产物 + 巡站循环（poisson 模式触发）
+- `is_done()` 三个终止条件
+- `build_runtime_state_view()` 完整 schema（一次定义，5b/5c 不改）
+- 同一时刻多事件处理顺序（第 7 节定义的 6 步顺序）
+
+**奖励（仅两项）**：
+```python
++R_delivery_bonus         # 送达时
+- hard_failure_penalty_sec  # 硬失败时
+```
+
+**action_mask（最粗过滤）**：
+- mode B：`deliver_leg_feasible`（送达可达）且至少一个宿主可达
+- mode C：`recovery_pool` 非空（不做时序/电量精细过滤）
+- WAIT：始终保留
+
+**最小送达后失败兜底（5a 必须实现，不可省略）**：
+
+5a 不实现完整的 `post_delivery_revalidation`，但必须保留以下最小兜底逻辑，
+否则策略可能选出一个送达后根本无法执行的 mode C，导致状态机卡死：
+
+```python
+# delivered 状态下的最小兜底（在 delivery_event 处理时执行）
+if mode == C:
+    if recover_node_j not in current_truck_backbone_route:
+        # 卡车已过该节点，直接进 fallback_recovery
+        → 写入 _fallback_leg，选最近可达宿主，进入 fallback_recovery
+    else:
+        → return_to_rendezvous（不做完整三条件复核）
+```
+
+此处 `current_truck_backbone_route` 取 `_build_coarse_plan_view(t_now)` 的当前过滤结果，
+不需要额外维护。
+
+**不实现**：reservation 状态机、T_overdue、T_wait、T_queue、T_fallback、T_idle、
+完整 `post_delivery_revalidation` 三条件复核。
+
+**验收**：
+- episode 能跑完，状态不乱
+- `_on_arrive_charging_host` 覆盖所有到达路径，无 depot 绕过排队的捷径
+- `fallback_recovery` 能正确触发并退出，`_fallback_leg` 账本在到达后清空
+- 最小兜底逻辑能拦截"卡车已过的 recover_node"，不出现状态机卡死
+
+---
+
+#### Phase 5b：完整 action_mask + 送达后执行层复核
+
+**用途**：action_mask 语义正确，mode C 候选合法，mode B 返程宿主确定性选择。
+**禁止用途**：**不允许用于正式 PPO 训练**，奖励信号仍不完整。
+
+**在 5a 基础上增加**：
+
+- mode C 精细过滤（注意量纲：两边均为 timestamp）：
+  - `t_arrive_uav(deliver → node) + rendezvous_eta_safe_margin_sec <= t_arrive_truck(node)`
+  - `E_need(deliver → node, payload=0) + drone.safe_margin_j <= E_rem_after_delivery`
+- 完整 `post_delivery_revalidation` 三条件复核（替换 5a 的最小兜底）：
+  - `energy_feasible`
+  - `rendezvous_time_feasible`
+  - `node_still_valid`
+  - 复核失败 → `fallback_recovery`（复用 `_fallback_leg` 账本）
+- mode B 确定性返程宿主选择：
+  `score = fly_time + predicted_queue_time + service_time`，选最小者
+- `_select_return_host_mode_b()` 实现
+
+**奖励（在 5a 基础上增加）**：
+```python
+-lambda_miss * dt   # fallback_recovery 状态下持续扣（T_fallback）
+```
+
+**不实现**：reservation 状态机、T_overdue、T_wait、T_queue、T_idle。
+
+**验收**：
+- mode C 候选集合法，精细过滤后不出现量纲混用
+- `post_delivery_revalidation` 能正确拦截复核失败，fallback 路径可复现
+- mode B 返程宿主选择结果可复现，score 计算不缓存旧队列快照
+
+---
+
+#### Phase 5c：完整奖励信号（第一个允许正式训练的子层）
+
+**用途**：所有奖励项接入，训练信号完整。**5c 是第一个允许正式 PPO 训练和 benchmark 对比的子层。**
+更准确地说，5c 的职责是为 Phase 7 / Phase 8 提供完整环境前置条件；正式训练与 benchmark 对比仍分别属于后续阶段。
+
+**在 5b 基础上增加**：
+
+- reservation 状态机（`_reservations`、`_reservation_count`、`ReservationState`）
+- reservation timeout 检查（在 `_advance_to_event` 中扫描，三个条件任一触发）：
+  ```text
+  timeout(res) =
+      (t_now >= expires_at)
+   OR (t_arrive_uav(current_loc -> r_j) + rendezvous_eta_safe_margin_sec > t_arrive_truck(r_j))
+   OR (energy_feasible == false)
+  ```
+  `energy_feasible` 在每次 `_advance_to_event()` 时重新计算，不只在建立时算一次
+- `tau_res = alpha * fly_time(deliver → r_j) + gamma * q_est(r_j)`
+- `T_timeout_cost` 计算（违规量，不与 `T_fallback` 重复）
+- `_settle_per_dt_rewards` 完整版：T_overdue、T_wait、T_queue、T_fallback
+  - `T_overdue` 按区间 `[t_prev, t_event)` 与 `[deadline_i, +∞)` 重叠长度累计
+  - `T_wait`：`waiting_for_truck` 状态下按 dt 累计
+  - `T_queue`：`queueing_at_host` 状态下按 dt 累计（station 和 depot 均计入）
+  - `T_fallback`：`fallback_recovery` 状态下按 dt 累计
+- T_idle：在 `step(WAIT_action)` 一次性结算 `delta_wait`，不进 `_settle_per_dt_rewards`
+- `N_hard_overdue`：超时超过 `max_overdue_sec` 强制移除，记 `hard_overdue_penalty_sec` 惩罚
+- 无订单时不触发 PPO 决策：`authorized_orders` 为空时直接推进到下一事件，不产生 T_idle
+
+**验收**：
+- 所有奖励项可独立观测，各项之间不重叠：
+  - `T_wait` 与 `T_idle` 不重叠（`waiting_for_truck` vs `active_wait` 状态分桶）
+  - `T_fallback` 与 `T_timeout_cost` 不重叠（飞行代价 vs 违规量）
+  - `T_queue` 覆盖 station 和 depot 两类宿主
+- `T_overdue` 在订单超过 deadline 后立即开始累加，送达后立即停止，送达时不叠加额外惩罚
+- reservation timeout 能在 `_advance_to_event()` 中被正确检测并触发 fallback
+- 无订单时不产生 T_idle 惩罚
+
+### 4.5.2 本轮代码同步记录（2026-04-25）
+
+为支撑 Phase 5 中"空骨架退化开关"的文档语义，本轮已对
+`backend/training/contracts.py` 做以下同步修改：
+
+1. `CoarsePlanView` 新增 `allow_empty_backbone_route: bool = False`
+   - 默认保持严格契约（poisson 模式），`truck_backbone_route` 不能为空
+   - benchmark / hybrid 模式下由 `env_adapter.reset()` 自动设为 `True`，无需手动配置
+2. `CoarsePlanView.__post_init__()` 增加条件校验分支
+   - 当 `allow_empty_backbone_route = False` 时，沿用原有"空骨架即报错"
+   - 当 `allow_empty_backbone_route = True` 且 `truck_backbone_route` 为空时，要求：
+     - `truck_eta_map = {}`
+     - `route_drift_ref = {}`
+     - `launch_candidate_stations = ()`
+     - `recovery_pool` 对所有订单均为空
+     - `policy_mode_mask` 不允许再包含 `C`，应收缩为 `{B}`
+3. `EnvSemanticContractMeta` 新增 `allow_empty_backbone_route: bool`
+   - 用于把这条环境语义开关纳入 Phase 1 已冻结的 `meta.json` 契约摘要
+
+`allow_empty_backbone_route` 的模式绑定规则（由 `env_adapter.reset()` 负责设置）：
+
+| 订单源模式 | `allow_empty_backbone_route` | 说明 |
+|---|---|---|
+| `poisson` | `False` | 骨架为空视为契约错误，尽早暴露巡站循环问题 |
+| `benchmark` | `True`（自动） | 骨架耗尽为合法退化状态，不追加巡站循环 |
+| `hybrid` | `True`（自动） | 同 benchmark |
+
+`planner.allow_empty_backbone_route` 配置项保留在 `rh_alns_cmrappo.yaml` 中，
+但其值在运行时由 `env_adapter.reset()` 根据 `order_source_mode` 自动覆盖，
+手动配置值仅作为 fallback，不建议依赖。
+
+补充说明：当前仓库中不存在 `backend/training/env_adapter.py` 的可编辑源码文件，
+因此本轮关于 `queueing_at_host`、`_on_arrive_charging_host()`、`T_queue` 统计范围、
+Phase 5 分层（5a/5b/5c）的修复先冻结在 Phase 5 文档语义层；后续新增或恢复
+`env_adapter` 源码时，必须严格按本节口径实现。
 
 ## 4.6 Phase 6：实现候选动作与上层规划骨架
 
@@ -1461,8 +2528,8 @@ python backend/scripts/run_phase4_sumo_gui.py --no-start
    - 输出 policy/baseline 直接消费的 `observation + action_mask + action_lookup`
    - 构建候选订单（在 `authorized_orders` 范围内）
    - 构建候选回收点（在 `recovery_pool[order]` 范围内）
-   - 构建 factorized action mask（order → mode → recover_node 三阶段）
-   - 实现 `max_candidate_actions` 截断逻辑（先按 `order_pre_score` 截断低优先级订单，再截断较差 recovery 候选，不允许截掉 `WAIT`）
+	   - 构建派送分支的 factorized action mask（`order → mode(B/C) → recover_node` 三阶段）
+	   - 同时保留一个全局 `WAIT` 动作，不允许在 `max_candidate_actions` 截断时被裁掉
    - **新增**：支持 `riding_with_truck` 触发的候选集构建：
      - 输入：当前站点 `S_k`、当前时刻 `t_now`、卡车剩余路线与 ETA
      - 对每个候选订单实时计算 `t_deliver = t_now + fly_time(S_k → order_i.location)`
@@ -1509,11 +2576,12 @@ python backend/scripts/run_phase4_sumo_gui.py --no-start
 同时必须把以下语义写进候选动作生成器：
 
 1. 模式 C 候选回收点只能来自卡车未来合法交接节点或保底合法节点
-2. 若 `ETA_uav + delta_safe > ETA_truck`，该回收动作必须直接裁掉
+2. 若 `t_arrive_uav(deliver -> r_j) + rendezvous_eta_safe_margin_sec > t_arrive_truck(r_j)`，该回收动作必须直接裁掉
 3. 若电量不足以到达候选回收点并保留安全余量，该动作必须直接裁掉
 4. `predicted_queue_time(node)` 可作为排序或软截断信号，但不应单独作为 mode C 等待回收动作的硬性非法判据
 5. 若模式 C 原候选失效，fallback 只能指向最近可达充换电站或仓库
-6. `WAIT` 必须始终存在于模式阶段动作域中，不允许被 mask 掉
+6. 全局 `WAIT` 动作必须始终存在，不允许被 mask 掉，也不应复制成多个
+   `WAIT(order_i)` 等价动作
 
 产物：
 
@@ -1572,6 +2640,32 @@ python backend/scripts/run_phase4_sumo_gui.py --no-start
    - `is_riding_truck: bool`：是否处于 `riding_with_truck` 状态，用于区分两类决策触发
    - `drone_source_type: {depot, truck}`：当前无人机的取货来源类型（从仓库出发 or 从卡车起飞）
 2. `order_tokens`：最多 `max_candidate_orders=32` 个候选订单 token
+   - 每个 `order_token` 除基础订单特征外，增加两个 `mode B` 摘要特征：
+     - `best_mode_b_return_score`：若当前订单选择 `mode B`，基于**本次 build 的决策前状态**
+       估算的最优返程总代价
+     - `best_mode_b_host_type`：该最优返程宿主类型（`station` / `depot`）
+   - 这两个特征按订单分别计算，因为不同 `order_i` 的送达位置、送达时刻不同，
+     对应的 `mode B` 后续代价也不同
+   - 估算公式固定为：先基于当前决策 UAV 的起飞前状态估计 `t_deliver_i` 与订单送达位置，
+     再对每个可达 `station / depot` 计算
+
+     ```text
+     score_mode_b_est(order_i, node_j)
+       = fly_time_est(deliver_i -> node_j)
+       + predicted_queue_time_est(node_j, t_arrive_ij)
+       + service_time(node_j)
+     ```
+
+     其中 `t_arrive_ij = t_deliver_i + fly_time_est(deliver_i -> node_j)`；
+     `predicted_queue_time_est(node_j, t_arrive_ij)` 是 `candidate_builder.build()` 基于
+     **当前** `NodeStateView.queue_length`、`available_slots`、`swap_time` 推导的本轮近似量，
+     不要求与执行层在送达时调用 `ChargingHost.estimate_wait_time(...)` 的结果完全一致；
+     `best_mode_b_return_score_i` 取所有可达宿主上的最小值，
+     `best_mode_b_host_type_i` 取对应最优宿主的类型
+   - 它们属于 `candidate_builder.build()` 时的**起飞前估计量**，用于给 PPO 提供相对量级；
+     不要求与送达后执行层实际选择的宿主完全一致
+   - 计算时必须基于当前 `RuntimeStateView.node_states` 的最新快照重新估算，
+     不允许复用上一次 build 的缓存结果
 3. `recovery_tokens`：对当前所选订单的回收节点候选（最多 `max_candidate_recovery_per_order=4` 个）
 4. `infra_tokens`：truck 骨架摘要 + station/depot 摘要（queue、ETA、parking_slots、node_charge_load_budget）
    - 其中 `queue` / `parking_slots` 描述充换电服务阶段负载
@@ -1589,7 +2683,7 @@ Padding/Masking 规则：
 - reward 与第 4.1.4 节主目标逐项对应（含 `T_res_timeout`）
 - 软失败通过 `T_fallback` 进入小惩罚项
 - reservation timeout 通过 `T_res_timeout` 进入小惩罚项
-- 硬失败通过 `N_hard_fail` 进入大惩罚项（`Lambda_hard=1200`）
+- 硬失败通过 `N_hard_fail` 进入大惩罚项（`hard_failure_penalty_sec=1200`）
 - 不允许继续使用与主目标脱节的混杂代理奖励作为默认训练目标
 
 训练建议分两阶段：
@@ -1659,14 +2753,15 @@ baseline 设计（本阶段正式采用）：
 3. 候选订单选择规则采用加权贪心分数：
    ```text
    score(order_i) =
-       w_priority * order_pre_score_i
+     - w_priority * order_pre_score_i
      - w_eta      * eta_to_deliver_i
-     - w_queue    * predicted_queue_time(best_recovery_i)
+     - w_b_return * best_mode_b_return_score_i
      - w_risk     * miss_risk_i
      - w_overdue  * projected_overdue_cost_i
    ```
 4. 模式选择规则：
-   - 若存在满足安全时序与电量约束的 `mode C`，且其后续服务拥挤代价可接受、`ETA_margin >= greedy_c_margin_min_sec`，优先选 `C`
+   - 若存在满足安全时序与电量约束的 `mode C`，且其综合后续代价优于
+     `best_mode_b_return_score_i`、同时 `ETA_margin >= greedy_c_margin_min_sec`，优先选 `C`
    - 否则选 `B`
    - 若无合法配送动作，才选 `WAIT`
 5. 回收点选择规则：
@@ -1686,7 +2781,7 @@ baseline 设计（本阶段正式采用）：
 - 模式分布（mode B / C 采用比例）
 - 每单平均响应时延（仅无人机订单）
 - 无人机等待卡车时间（`T_wait`）
-- 站点排队总时间（`T_queue`）
+- 补能宿主排队总时间（`T_queue`，含 `station / depot`）
 - miss 次数
 - fallback 总时间（`T_fallback`）
 - reservation timeout 次数（`T_res_timeout`）
