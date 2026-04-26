@@ -2763,36 +2763,98 @@ if mode == C:
 **用途**：所有奖励项接入，训练信号完整。**5c 是第一个允许正式 PPO 训练和 benchmark 对比的子层。**
 更准确地说，5c 的职责是为 Phase 7 / Phase 8 提供完整环境前置条件；正式训练与 benchmark 对比仍分别属于后续阶段。
 
-**在 5b 基础上增加**：
+**本轮代码同步记录（2026-04-26）**
 
-- reservation 状态机（`_reservations`、`_reservation_count`、`ReservationState`）
-- reservation timeout 检查（在 `_advance_to_event` 中扫描，三个条件任一触发）：
-  ```text
-  timeout(res) =
-      (t_now >= expires_at)
-   OR (t_arrive_uav(current_loc -> r_j) + rendezvous_eta_safe_margin_sec > t_arrive_truck(r_j))
-   OR (energy_feasible == false)
-  ```
-  `energy_feasible` 在每次 `_advance_to_event()` 时重新计算，不只在建立时算一次
-- `tau_res = alpha * fly_time(deliver → r_j) + gamma * q_est(r_j)`
-- `T_timeout_cost` 计算（违规量，不与 `T_fallback` 重复）
-- `_settle_per_dt_rewards` 完整版：T_overdue、T_wait、T_queue、T_fallback
-  - `T_overdue` 按区间 `[t_prev, t_event)` 与 `[deadline_i, +∞)` 重叠长度累计
-  - `T_wait`：`waiting_for_truck` 状态下按 dt 累计
-  - `T_queue`：`queueing_at_host` 状态下按 dt 累计（station 和 depot 均计入）
-  - `T_fallback`：`fallback_recovery` 状态下按 dt 累计
-- T_idle：在 `step(WAIT_action)` 一次性结算 `delta_wait`，不进 `_settle_per_dt_rewards`
-- `N_hard_overdue`：超时超过 `max_overdue_sec` 强制移除，记 `hard_overdue_penalty_sec` 惩罚
-- 无订单时不触发 PPO 决策：`authorized_orders` 为空时直接推进到下一事件，不产生 T_idle
+当前 `backend/training/env_adapter.py` 文件头已明确标注“本文件当前实现到 Phase 5c”，
+且对应测试 `backend/training/test_env_adapter_phase5c.py` 已补齐。结合当前代码，5c
+实际已完成的内容如下：
 
-**验收**：
-- 所有奖励项可独立观测，各项之间不重叠：
-  - `T_wait` 与 `T_idle` 不重叠（`waiting_for_truck` vs `active_wait` 状态分桶）
-  - `T_fallback` 与 `T_timeout_cost` 不重叠（飞行代价 vs 违规量）
-  - `T_queue` 覆盖 station 和 depot 两类宿主
-- `T_overdue` 在订单超过 deadline 后立即开始累加，送达后立即停止，送达时不叠加额外惩罚
-- reservation timeout 能在 `_advance_to_event()` 中被正确检测并触发 fallback
-- 无订单时不产生 T_idle 惩罚
+1. **reservation 状态机与观测暴露已落地**
+   - 已实现 `ReservationState` / `ReservationStateView`
+   - `TrainingEnvAdapter` 内部已维护：
+     - `_reservations`
+     - `_reservation_count`
+   - `build_runtime_state_view()` 已把每架 UAV 的 `reservation` 与全局
+     `reservation_count` 回填到 `RuntimeStateView`
+   - mode C 派送动作在 `_apply_dispatch_action()` 中已通过 `_acquire_reservation()`
+     创建 reservation，而不是只保留 5b 的 dispatch 承诺
+
+2. **reservation timeout 检测与执行层 fallback 已落地**
+   - `_advance_to_event()` 已接入 `_process_reservation_timeouts(t_next)`
+   - timeout 判定由 `_reservation_timeout_cost()` 统一计算，当前覆盖三类触发：
+     - `t_now >= expires_at`
+     - `t_arrive_uav(current_loc -> r_j) + rendezvous_eta_safe_margin_sec > t_arrive_truck(r_j)`
+     - 原 reservation 目标不再满足当前时刻的时序约束时产生违规量
+   - `tau_res` 已按代码落地为：
+     `alpha * fly_time(deliver -> r_j) + gamma * estimate_wait_time(r_j)`
+   - timeout 后会立即：
+     - 释放 reservation 与节点计数
+     - 清空 `dispatch_commit.selected_recover_node`
+     - 对 `delivered / return_to_rendezvous / waiting_for_truck` 状态 UAV 直接切入
+       `fallback_recovery`
+     - 若连 fallback 都不可达，则立即记硬失败
+
+3. **5c 完整持续型奖励结算已落地**
+   - `_settle_per_dt_rewards(t_prev, t_next)` 已取代 5b 只结算 `fallback` 的临时版本
+   - 当前已按状态分桶结算：
+     - `T_overdue` -> `-lambda_overdue * overdue_dt_total`
+     - `T_wait` -> `-lambda_wait * wait_dt_total`
+     - `T_queue` -> `-lambda_queue * queue_dt_total`
+     - `T_fallback` -> `-lambda_miss * fallback_dt_total`
+   - 其中 `T_overdue` 已按区间重叠长度即时累计；订单一旦送达或移出活动集合即停止累计，
+     不在送达时追加额外一次性惩罚
+   - 当前 reward breakdown 也会通过 `EnvStepResult.info["reward_breakdown"]` 对外暴露
+
+4. **WAIT 精确 idle 惩罚与“无订单不触发决策”已落地**
+   - `step(WAIT_ACTION)` 已先调用 `_compute_wait_delta()` 计算本次精确推进量，再即时扣除：
+     `-wait_idle_penalty_coef * delta_wait`
+   - `T_idle` 没有混入 `_settle_per_dt_rewards()`，而是在 WAIT 调用点一次性结算，
+     与 `waiting_for_truck` / `queueing_at_host` 的持续惩罚分离
+   - `_enqueue_decision()` 已显式检查 `_has_authorized_orders_now()`；
+     没有可派送订单时不会入队 PPO 决策，也不会凭空产生 `T_idle`
+
+5. **hard overdue 强制移除与 assigned 订单清场已落地**
+   - `_advance_to_event()` 已接入 `_apply_hard_overdue_penalty(t_next)`
+   - `pending_orders` 中超出 `max_overdue_sec` 的 UAV 主订单会被强制转为 `TaskStatus.TIMEOUT`
+   - `assigned_orders` 中达到 hard overdue 的订单会：
+     - 从订单池移除
+     - 释放 UAV 当前携带订单
+     - 清理飞行段 / reservation / dispatch_commit
+     - UAV 切到 `delivered` 后复用现有 fallback 清场链路
+
+6. **Phase 5c 回归测试已补齐并通过**
+   - 已新增 `backend/training/test_env_adapter_phase5c.py`
+   - 当前测试覆盖：
+     - runtime_state 正确暴露 `reservation` 与 `reservation_count`
+     - reservation timeout 后进入 `fallback_recovery`
+     - hard overdue 订单被移除并记罚
+     - WAIT 动作按精确 `delta_wait` 结算 `T_idle`
+     - 无 authorized orders 时不创建决策点
+     - `T_wait` 与 `T_queue` 分桶结算互不混淆
+   - 当前本地验证结果：
+     `python -m unittest backend.training.test_env_adapter_phase5a backend.training.test_env_adapter_phase5b backend.training.test_env_adapter_phase5c`
+     已通过，共 `17` 个测试
+
+**Phase 5 完成总结（结合当前 `env_adapter.py`）**
+
+1. **Phase 5a 完成了“能跑”的训练环境骨架**
+   - 打通了 `reset -> step -> done`
+   - 接上了 Phase 2/3/4 的场景、订单与卡车骨架产物
+   - 冻结了 `RuntimeStateView / DecisionContext / DispatchAction / WAIT_ACTION` 等对外接口
+   - 把训练态状态机、事件推进、充换电宿主统一入口、fallback 账本这些底层骨架先搭起来
+
+2. **Phase 5b 完成了“动作语义正确”的执行层闭环**
+   - mode C 不再只看 coarse 候选，而是接入送达后时序/能量合法性过滤
+   - mode B 改为按 `fly_time + predicted_queue_time + service_time` 确定性选择返程宿主
+   - mode C 送达后增加三条件复核，失败直接走 fallback，不回退到二次 PPO 决策
+   - `T_fallback` 开始进入 reward，使“错过卡车”的代价第一次具备持续型训练信号
+
+3. **Phase 5c 完成了“可正式训练”的奖励与约束收口**
+   - reservation / timeout / fallback / hard overdue / WAIT idle penalty 已全部接入
+   - `T_overdue / T_wait / T_queue / T_fallback / T_idle` 的主要 reward 语义已闭环
+   - 无订单不触发决策、reward 分桶不重叠、runtime_state 暴露拥挤相关观测这几项也已收口
+   - 结合当前代码状态，Phase 5 的核心目标已经完成；后续 Phase 6 更适合围绕
+     `candidate_builder` / `planner_bridge` 做职责拆分，而不是继续回补 env 语义缺口
 
 ## 4.6 Phase 6：实现候选动作与上层规划骨架
 
