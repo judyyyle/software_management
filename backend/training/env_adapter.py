@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-HiveLogix — Phase 5a 训练环境适配器。
+HiveLogix — Phase 5b 训练环境适配器。
 
 职责边界：
   - 读取 Phase 2/3/4 产物，提供事件驱动的最小可运行训练环境；
@@ -9,10 +9,12 @@ HiveLogix — Phase 5a 训练环境适配器。
   - 在 Phase 5 内部内联实现最小 coarse plan / action mask；
   - 保证 reset -> step -> done 连通，且为 Phase 5b/5c 保留稳定接口。
 
-本文件仅实现 Phase 5a：
-  - 奖励只包含 R_delivery_bonus / hard_failure_penalty_sec
-  - 不实现 reservation / T_overdue / T_wait / T_queue / T_fallback / T_idle
-  - mode C 仅实现“卡车已过 recover_node 时直接 fallback”的最小兜底
+本文件当前实现到 Phase 5b：
+  - 完整 action_mask：mode C 候选按时序/能量精细过滤
+  - 完整 post_delivery_revalidation：送达后对 mode C 原选回收点做三条件复核
+  - mode B 返程宿主使用确定性 score 规则选择
+  - 奖励补齐 T_fallback 的逐区间累计
+  - 仍不实现 reservation / T_overdue / T_wait / T_queue / T_idle
 """
 
 from __future__ import annotations
@@ -77,7 +79,7 @@ class TrainingDroneState(StrEnum):
 class ReservationStateView:
     """reservation 只读视图。
 
-    Phase 5a 当前始终返回 `None`，这里先把对外字段形状固定下来。
+    Phase 5b 当前仍始终返回 `None`，这里先把对外字段形状固定下来。
     """
     recover_node: str
     issued_at: float
@@ -118,7 +120,7 @@ class NodeStateView:
 @dataclass(frozen=True)
 class RuntimeStateView:
     """当前时刻暴露给训练侧的运行时状态快照。"""
-    # Phase 5a 已固定对外 schema；后续阶段只能填充实现，不能改字段形状。
+    # Phase 5 已固定对外 schema；后续阶段只能填充实现，不能改字段形状。
     t_now: float
     truck_current_loc: Position3D
     drone_states: Mapping[str, DroneStateView]
@@ -253,20 +255,22 @@ class DecisionTrigger:
 
 @dataclass(frozen=True)
 class _YamlConfig:
-    """从训练 YAML 中提取出的 5a 运行参数子集。"""
+    """从训练 YAML 中提取出的 5b 运行参数子集。"""
     upper_horizon_sec: float
     patrol_min_remaining_sec: float
     patrol_stations_per_loop: int
     allow_empty_backbone_route: bool
     max_wait_decision_gap_sec: float
     max_candidate_recovery_per_order: int
+    rendezvous_eta_safe_margin_sec: float
+    lambda_miss: float
     R_delivery_bonus: float
     hard_failure_penalty_sec: float
 
 
 class TrainingEnvAdapter:
     """
-    Phase 5a 训练环境。
+    Phase 5b 训练环境。
 
     当前只支持单 truck / 单 depot 场景，与 Phase 4 路线导出约束保持一致。
     """
@@ -512,7 +516,7 @@ class TrainingEnvAdapter:
         )
 
     def _build_coarse_plan_view(self, t_now: float) -> CoarsePlanView:
-        """在给定时刻构造 5a 内联 coarse plan。
+        """在给定时刻构造 Phase 5 内联 coarse plan。
 
         当前版本不做重规划，`plan_version` 固定为 0。
         """
@@ -586,7 +590,7 @@ class TrainingEnvAdapter:
                 recovery_pool[order_id] = ()
             else:
                 policy_mode_mask[order_id] = frozenset({PolicyMode.B, PolicyMode.C})
-                # 5a 只暴露 coarse recovery pool，不做 5b 的时序/能量精滤。
+                # coarse plan 只暴露 recovery pool；最终动作合法性由 5b 运行时过滤负责。
                 recovery_pool[order_id] = truck_backbone_route[: self._cfg.max_candidate_recovery_per_order]
 
         node_charge_load_budget = {
@@ -628,7 +632,7 @@ class TrainingEnvAdapter:
             order = order_mgr.pending_orders.get(order_id)
             if order is None:
                 continue
-            # 5a 必须至少过滤掉“当前无人机根本拿不起”的订单，否则会在 assign_order 处直接报错。
+            # 至少要过滤掉“当前无人机根本拿不起”的订单，否则会在 assign_order 处直接报错。
             if float(order.payload_weight) > float(drone.payload_capacity):
                 continue
             if not self._deliver_leg_feasible(drone, order):
@@ -639,8 +643,11 @@ class TrainingEnvAdapter:
                 actions.append(DispatchAction(order_id=order_id, mode=PolicyMode.B))
 
             if PolicyMode.C in modes:
-                for recover_node_id in coarse_plan.get_recovery_candidates(order_id):
-                    # 当前实现对 mode C 只要求 recovery_pool 非空；细粒度合法性留给 5b。
+                for recover_node_id in self._iter_feasible_mode_c_recovery_nodes(
+                    drone=drone,
+                    order=order,
+                    coarse_plan=coarse_plan,
+                ):
                     actions.append(
                         DispatchAction(
                             order_id=order_id,
@@ -665,7 +672,7 @@ class TrainingEnvAdapter:
             self._active_wait_resume[drone_id] = TrainingDroneState.RIDING_WITH_TRUCK
         else:
             raise RuntimeError(f"状态 {current_state.value} 不允许执行 WAIT")
-        # 5a 不在 WAIT 上单独推进 delta_wait；只用 active_wait 占位到下一次会恢复决策的事件。
+        # Phase 5c 前不在 WAIT 上单独推进 delta_wait；这里仅用 active_wait 占位到下一次事件。
         self._drone_state[drone_id] = TrainingDroneState.ACTIVE_WAIT
 
     def _apply_dispatch_action(
@@ -697,7 +704,7 @@ class TrainingEnvAdapter:
             selected_recover_node=action.recover_node_id,
             trigger_station_id=trigger.trigger_station_id,
         )
-        # 5a 直接从当前物理位置起飞送货，不建模单独的 pickup / launch service 段。
+        # Phase 5 当前仍直接从当前物理位置起飞送货，不建模单独的 pickup / launch service 段。
         self._schedule_flight_leg(
             drone_id=drone.drone_id,
             kind="deliver",
@@ -771,8 +778,10 @@ class TrainingEnvAdapter:
 
         self._sync_in_transit_positions(t_next)
 
-        reward = 0.0
-        reward_breakdown: dict[str, float] = {}
+        reward, reward_breakdown = self._settle_phase5b_per_dt_rewards(
+            t_prev=self._t_now,
+            t_next=t_next,
+        )
         hard_failure_ready = self._collect_airborne_failure_events(t_next)
         failed_drones = {drone_id for drone_id, _, _ in hard_failure_ready}
         # delivery 先处理，保持“送达奖励优先于后续到达交互”的顺序。
@@ -862,7 +871,7 @@ class TrainingEnvAdapter:
             for stop in truck_stops:
                 self._process_rendezvous_recovery(stop.node_id, t_next)
 
-        # 4. reservation timeout：5a 不实现
+        # 4. reservation timeout：Phase 5c 再接入
 
         # 5. poisson / benchmark 动态订单注入
         order_mgr.tick(t_next, entity_mgr)
@@ -918,19 +927,26 @@ class TrainingEnvAdapter:
         self._drone_state[drone_id] = TrainingDroneState.DELIVERED
 
         if commit.mode == PolicyMode.B:
-            # 当前 5a 实现还没接 5b 的 queue/service score；
-            # 这里临时复用 deterministic fallback 规则。
-            target = self._select_mode_b_return_host_phase5a(drone_id)
+            target = self._select_return_host_mode_b(
+                drone_id,
+                current_time=leg.arrival_time,
+            )
             if target is None:
                 return self._mark_hard_failure(drone_id)
             self._schedule_return_to_host(drone_id, target)
         else:
-            coarse_plan = self._build_coarse_plan_view(leg.arrival_time)
             selected_node = commit.selected_recover_node
-            if selected_node and selected_node in coarse_plan.truck_backbone_route:
+            if selected_node:
+                is_valid, _checks = self._revalidate_mode_c_recover_node(
+                    drone_id=drone_id,
+                    node_id=selected_node,
+                    t_now=leg.arrival_time,
+                )
+            else:
+                is_valid = False
+            if is_valid:
                 self._schedule_return_to_rendezvous(drone_id, selected_node)
             else:
-                # 5a 的最小 mode C 兜底：只检查原 recover_node 是否还在当前未来骨架中。
                 if not self._enter_fallback_recovery(drone_id):
                     return self._mark_hard_failure(drone_id)
 
@@ -1102,6 +1118,40 @@ class TrainingEnvAdapter:
         )
         return True
 
+    def _settle_phase5b_per_dt_rewards(
+        self,
+        *,
+        t_prev: float,
+        t_next: float,
+    ) -> tuple[float, dict[str, float]]:
+        """结算 Phase 5b 已落地的持续型奖励项。"""
+        if t_next <= t_prev + _TIME_EPS:
+            return 0.0, {}
+
+        fallback_dt_total = 0.0
+        for drone_id, state in self._drone_state.items():
+            if state != TrainingDroneState.FALLBACK_RECOVERY:
+                continue
+            leg = self._fallback_leg.get(drone_id)
+            if leg is None:
+                continue
+
+            interval_end = min(t_next, leg.arrival_time)
+            flight_leg = self._flight_legs.get(drone_id)
+            if flight_leg is not None:
+                failure_time = self._compute_airborne_failure_time(drone_id, flight_leg)
+                if failure_time is not None:
+                    interval_end = min(interval_end, failure_time)
+
+            if interval_end > t_prev + _TIME_EPS:
+                fallback_dt_total += interval_end - t_prev
+
+        if fallback_dt_total <= _TIME_EPS:
+            return 0.0, {}
+
+        penalty = -self._cfg.lambda_miss * fallback_dt_total
+        return penalty, {"fallback": penalty}
+
     # ---------------------------------------------------------------------
     # Selection helpers
     # ---------------------------------------------------------------------
@@ -1116,34 +1166,211 @@ class TrainingEnvAdapter:
         )
         return energy_need <= drone.battery_current + _TIME_EPS
 
-    def _has_mode_b_return_host(self, drone: Drone, order: Order) -> bool:
-        """检查送达后是否至少存在一个可达的 mode B 返程宿主。"""
-        energy_after_delivery = drone.battery_current - self._estimate_energy_needed(
+    def _estimate_delivery_arrival_time(self, drone: Drone, order: Order) -> float:
+        """估算当前时刻派送该订单的送达绝对时刻。"""
+        return self._t_now + self._estimate_flight_time(
+            drone=drone,
+            from_pos=drone.current_loc,
+            to_pos=order.delivery_loc,
+        )
+
+    def _estimate_energy_after_delivery(self, drone: Drone, order: Order) -> float:
+        """估算无人机送达订单后的剩余电量。"""
+        return drone.battery_current - self._estimate_energy_needed(
             drone=drone,
             from_pos=drone.current_loc,
             to_pos=order.delivery_loc,
             payload=float(order.payload_weight),
         )
+
+    def _iter_feasible_mode_c_recovery_nodes(
+        self,
+        *,
+        drone: Drone,
+        order: Order,
+        coarse_plan: CoarsePlanView,
+    ) -> tuple[str, ...]:
+        """返回当前订单在 5b 语义下合法的 mode C 回收节点。"""
+        t_deliver = self._estimate_delivery_arrival_time(drone, order)
+        energy_after_delivery = self._estimate_energy_after_delivery(drone, order)
+        if energy_after_delivery <= 0.0:
+            return ()
+
+        feasible_nodes: list[str] = []
+        for recover_node_id in coarse_plan.get_recovery_candidates(order.order_id):
+            if self._is_mode_c_recovery_feasible(
+                drone=drone,
+                deliver_pos=order.delivery_loc,
+                recover_node_id=recover_node_id,
+                t_deliver=t_deliver,
+                energy_after_delivery=energy_after_delivery,
+                coarse_plan=coarse_plan,
+            ):
+                feasible_nodes.append(recover_node_id)
+        return tuple(feasible_nodes)
+
+    def _is_mode_c_recovery_feasible(
+        self,
+        *,
+        drone: Drone,
+        deliver_pos: Position3D,
+        recover_node_id: str,
+        t_deliver: float,
+        energy_after_delivery: float,
+        coarse_plan: CoarsePlanView,
+    ) -> bool:
+        """按 5b 的时序与能量口径判定单个 mode C 回收点是否合法。"""
+        t_arrive_truck = coarse_plan.truck_eta_map.get(recover_node_id)
+        if t_arrive_truck is None or t_arrive_truck <= t_deliver + _TIME_EPS:
+            return False
+
+        host = self._resolve_fixed_node(recover_node_id)
+        recover_pos = host.get_location(t_deliver)
+        t_arrive_uav = t_deliver + self._estimate_flight_time(
+            drone=drone,
+            from_pos=deliver_pos,
+            to_pos=recover_pos,
+        )
+        if (
+            t_arrive_uav + self._cfg.rendezvous_eta_safe_margin_sec
+            > t_arrive_truck + _TIME_EPS
+        ):
+            return False
+
+        return self._can_reach_from(
+            drone=drone,
+            from_pos=deliver_pos,
+            to_pos=recover_pos,
+            payload=0.0,
+            safe_margin=drone.safe_margin_j,
+            battery_current=energy_after_delivery,
+        )
+
+    def _has_mode_b_return_host(self, drone: Drone, order: Order) -> bool:
+        """检查送达后是否至少存在一个可达的 mode B 返程宿主。"""
+        energy_after_delivery = self._estimate_energy_after_delivery(drone, order)
         if energy_after_delivery <= 0:
             return False
 
-        for host in self._all_return_hosts():
-            if self._can_reach_from(
-                drone=drone,
+        return (
+            self._select_return_host_mode_b(
+                drone.drone_id,
                 from_pos=order.delivery_loc,
-                to_pos=host.get_location(self._t_now),
+                battery_current=energy_after_delivery,
+                current_time=self._estimate_delivery_arrival_time(drone, order),
+            )
+            is not None
+        )
+
+    def _select_return_host_mode_b(
+        self,
+        drone_id: str,
+        *,
+        from_pos: Position3D | None = None,
+        battery_current: float | None = None,
+        current_time: float | None = None,
+    ) -> ChargingHost | None:
+        """按 5b 规则选择 mode B 的确定性返程宿主。"""
+        entity_mgr = self._require_entity_manager()
+        drone = entity_mgr.drones[drone_id]
+        eval_pos = _clone_position(from_pos) if from_pos is not None else _clone_position(drone.current_loc)
+        eval_battery = float(drone.battery_current if battery_current is None else battery_current)
+        eval_time = float(self._t_now if current_time is None else current_time)
+
+        scored_hosts: list[tuple[float, float, float, float, str, ChargingHost]] = []
+        for host in self._all_return_hosts():
+            host_pos = host.get_location(eval_time)
+            if not self._can_reach_from(
+                drone=drone,
+                from_pos=eval_pos,
+                to_pos=host_pos,
                 payload=0.0,
                 safe_margin=drone.safe_margin_j,
-                battery_current=energy_after_delivery,
+                battery_current=eval_battery,
             ):
-                return True
-        return False
+                continue
 
-    def _select_mode_b_return_host_phase5a(self, drone_id: str) -> ChargingHost | None:
-        """返回 5a 临时口径下的 mode B 返程宿主。"""
-        # Phase 5a 仅保证最小可运行，不引入 5b 的完整 score。
-        # 为避免和 fallback 两套返程规则分叉，这里统一采用“depot 优先，否则最近可达 station”。
-        return self._select_deterministic_fallback_host(drone_id)
+            fly_time = self._estimate_flight_time(
+                drone=drone,
+                from_pos=eval_pos,
+                to_pos=host_pos,
+            )
+            predicted_queue_time = float(host.estimate_wait_time(eval_time))
+            service_time = float(host.swap_time)
+            score = fly_time + predicted_queue_time + service_time
+            scored_hosts.append(
+                (
+                    score,
+                    fly_time,
+                    predicted_queue_time,
+                    service_time,
+                    _host_id(host),
+                    host,
+                )
+            )
+
+        if not scored_hosts:
+            return None
+
+        scored_hosts.sort(
+            key=lambda item: (
+                item[0],
+                item[1],
+                item[2],
+                item[3],
+                item[4],
+            )
+        )
+        return scored_hosts[0][5]
+
+    def _revalidate_mode_c_recover_node(
+        self,
+        *,
+        drone_id: str,
+        node_id: str,
+        t_now: float,
+    ) -> tuple[bool, dict[str, bool]]:
+        """对 mode C 原选回收点执行 5b 的送达后复核。"""
+        drone = self._require_entity_manager().drones[drone_id]
+        coarse_plan = self._build_coarse_plan_view(t_now)
+
+        node_still_valid = (
+            node_id in coarse_plan.truck_backbone_route
+            and node_id in coarse_plan.truck_eta_map
+        )
+        if not node_still_valid:
+            checks = {
+                "energy_feasible": False,
+                "rendezvous_time_feasible": False,
+                "node_still_valid": False,
+            }
+            return False, checks
+
+        host = self._resolve_fixed_node(node_id)
+        host_pos = host.get_location(t_now)
+        energy_feasible = self._can_reach_from(
+            drone=drone,
+            from_pos=drone.current_loc,
+            to_pos=host_pos,
+            payload=0.0,
+            safe_margin=drone.safe_margin_j,
+            battery_current=drone.battery_current,
+        )
+        t_arrive_uav = t_now + self._estimate_flight_time(
+            drone=drone,
+            from_pos=drone.current_loc,
+            to_pos=host_pos,
+        )
+        rendezvous_time_feasible = (
+            t_arrive_uav + self._cfg.rendezvous_eta_safe_margin_sec
+            <= coarse_plan.truck_eta_map[node_id] + _TIME_EPS
+        )
+        checks = {
+            "energy_feasible": energy_feasible,
+            "rendezvous_time_feasible": rendezvous_time_feasible,
+            "node_still_valid": node_still_valid,
+        }
+        return all(checks.values()), checks
 
     def _select_deterministic_fallback_host(self, drone_id: str) -> ChargingHost | None:
         """按当前实现的 deterministic fallback 规则选宿主。"""
@@ -1733,6 +1960,8 @@ def _load_env_yaml(config_path: Path) -> _YamlConfig:
         allow_empty_backbone_route=bool(planner.get("allow_empty_backbone_route", False)),
         max_wait_decision_gap_sec=float(planner["max_wait_decision_gap_sec"]),
         max_candidate_recovery_per_order=int(candidate["max_candidate_recovery_per_order"]),
+        rendezvous_eta_safe_margin_sec=float(candidate["rendezvous_eta_safe_margin_sec"]),
+        lambda_miss=float(reward["lambda_miss"]),
         R_delivery_bonus=float(reward["R_delivery_bonus"]),
         hard_failure_penalty_sec=float(reward["hard_failure_penalty_sec"]),
     )
