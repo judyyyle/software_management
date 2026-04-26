@@ -40,7 +40,7 @@ class PlannerMode(StrEnum):
 
 
 class PolicyMode(StrEnum):
-    """真正暴露给 PPO actor 的模式。"""
+    """真正暴露给 PPO actor 的模式词表。"""
 
     WAIT = "WAIT"
     B = "B"
@@ -117,7 +117,8 @@ class CoarsePlanView:
 
     # 上层粗规划语义边界：某订单允许的配送模式集合，取值来自 {A, B, C}。
     planner_mode_cap: Mapping[OrderId, FrozenSet[PlannerMode]]
-    # 真正暴露给 PPO actor 的模式边界，取值来自 {WAIT, B, C}。
+    # 真正暴露给 PPO actor 的订单级派送模式边界，取值来自 {B, C}。
+    # 注意：WAIT 是全局动作，不挂在某个订单上，因此不出现在该字段中。
     policy_mode_mask: Mapping[OrderId, FrozenSet[PolicyMode]]
 
     # 每个订单在 coarse 层面允许考虑的回收节点池；最终合法性仍需运行时过滤。
@@ -129,6 +130,9 @@ class CoarsePlanView:
     route_drift_ref: Mapping[NodeId, RouteDriftRef]
     # 卡车到达这些站点时，允许触发 riding_with_truck 无人机的 PPO 决策点。
     launch_candidate_stations: tuple[NodeId, ...]
+    # 可选退化开关：当为 True 时，允许 truck_backbone_route 为空，表示“卡车未来骨架已耗尽”。
+    # 仅建议在 benchmark / hybrid 等不追加巡站循环的验证场景中显式开启；默认保持严格契约。
+    allow_empty_backbone_route: bool = False
 
     # 缓存集合，便于高频 membership 查询。
     _authorized_order_set: FrozenSet[OrderId] = field(init=False, repr=False)
@@ -144,28 +148,45 @@ class CoarsePlanView:
                 "valid_until 必须大于等于 issued_at: "
                 f"{self.valid_until} < {self.issued_at}"
             )
-        if not self.truck_backbone_route:
-            raise ValueError("truck_backbone_route 不能为空")
-
         route_nodes = set(self.truck_backbone_route)
-        if len(route_nodes) != len(self.truck_backbone_route):
-            raise ValueError("truck_backbone_route 不允许重复节点")
+        if not route_nodes:
+            if not self.allow_empty_backbone_route:
+                raise ValueError(
+                    "truck_backbone_route 不能为空；若需允许空骨架，"
+                    "需显式开启 allow_empty_backbone_route"
+                )
+            if self.truck_eta_map:
+                raise ValueError(
+                    "allow_empty_backbone_route=True 时，truck_eta_map 必须为空"
+                )
+            if self.route_drift_ref:
+                raise ValueError(
+                    "allow_empty_backbone_route=True 时，route_drift_ref 必须为空"
+                )
+            if self.launch_candidate_stations:
+                raise ValueError(
+                    "allow_empty_backbone_route=True 且 truck_backbone_route 为空时，"
+                    "launch_candidate_stations 必须为空"
+                )
+        else:
+            if len(route_nodes) != len(self.truck_backbone_route):
+                raise ValueError("truck_backbone_route 不允许重复节点")
 
-        if missing_eta := route_nodes - set(self.truck_eta_map):
-            raise ValueError(
-                "truck_eta_map 缺少骨架节点 ETA: "
-                f"{sorted(missing_eta)}"
-            )
-        if missing_drift := route_nodes - set(self.route_drift_ref):
-            raise ValueError(
-                "route_drift_ref 缺少骨架节点参考项: "
-                f"{sorted(missing_drift)}"
-            )
-        if invalid_launch := set(self.launch_candidate_stations) - route_nodes:
-            raise ValueError(
-                "launch_candidate_stations 必须来自 truck_backbone_route: "
-                f"{sorted(invalid_launch)}"
-            )
+            if missing_eta := route_nodes - set(self.truck_eta_map):
+                raise ValueError(
+                    "truck_eta_map 缺少骨架节点 ETA: "
+                    f"{sorted(missing_eta)}"
+                )
+            if missing_drift := route_nodes - set(self.route_drift_ref):
+                raise ValueError(
+                    "route_drift_ref 缺少骨架节点参考项: "
+                    f"{sorted(missing_drift)}"
+                )
+            if invalid_launch := set(self.launch_candidate_stations) - route_nodes:
+                raise ValueError(
+                    "launch_candidate_stations 必须来自 truck_backbone_route: "
+                    f"{sorted(invalid_launch)}"
+                )
 
         authorized_set = frozenset(self.authorized_orders)
         if len(authorized_set) != len(self.authorized_orders):
@@ -200,21 +221,22 @@ class CoarsePlanView:
                 )
 
         for order_id, modes in self.policy_mode_mask.items():
-            if PolicyMode.WAIT not in modes:
+            if not modes:
                 raise ValueError(
-                    f"policy_mode_mask[{order_id}] 必须包含 WAIT"
+                    f"policy_mode_mask[{order_id}] 不能为空"
                 )
-            invalid = set(modes) - set(PolicyMode)
+            invalid = set(modes) - set(_POLICY_TO_PLANNER_MODE)
             if invalid:
                 raise ValueError(
-                    f"policy_mode_mask[{order_id}] 含非法模式: {invalid}"
+                    f"policy_mode_mask[{order_id}] 只允许包含订单级派送模式 "
+                    f"{{B, C}}，不应包含 WAIT: {invalid}"
                 )
 
         for order_id in self.authorized_orders:
             planner_modes = self.planner_mode_cap[order_id]
             policy_modes = self.policy_mode_mask[order_id]
 
-            allowed_policy_modes = {PolicyMode.WAIT}
+            allowed_policy_modes = set()
             for policy_mode, planner_mode in _POLICY_TO_PLANNER_MODE.items():
                 if planner_mode in planner_modes:
                     allowed_policy_modes.add(policy_mode)
@@ -224,6 +246,28 @@ class CoarsePlanView:
                     f"policy_mode_mask[{order_id}] 越过 planner_mode_cap "
                     f"{sorted(mode.value for mode in planner_modes)}: "
                     f"{sorted(mode.value for mode in invalid_policy_modes)}"
+                )
+
+        if not route_nodes and self.allow_empty_backbone_route:
+            nonempty_recovery_orders = [
+                order_id for order_id, nodes in self.recovery_pool.items() if nodes
+            ]
+            if nonempty_recovery_orders:
+                raise ValueError(
+                    "allow_empty_backbone_route=True 且 truck_backbone_route 为空时，"
+                    "recovery_pool 必须对所有订单为空: "
+                    f"{sorted(nonempty_recovery_orders)}"
+                )
+            invalid_mode_c_orders = [
+                order_id
+                for order_id, modes in self.policy_mode_mask.items()
+                if PolicyMode.C in modes
+            ]
+            if invalid_mode_c_orders:
+                raise ValueError(
+                    "allow_empty_backbone_route=True 且 truck_backbone_route 为空时，"
+                    "policy_mode_mask 必须收缩为 {B}: "
+                    f"{sorted(invalid_mode_c_orders)}"
                 )
 
         for order_id, node_ids in self.recovery_pool.items():
@@ -276,7 +320,7 @@ class CoarsePlanView:
         return self.planner_mode_cap.get(order_id, frozenset())
 
     def get_policy_modes(self, order_id: OrderId) -> FrozenSet[PolicyMode]:
-        """返回真正暴露给 actor 的模式集合。"""
+        """返回某订单可选的订单级派送模式集合（B/C，不含全局 WAIT）。"""
 
         return self.policy_mode_mask.get(order_id, frozenset())
 
@@ -380,6 +424,7 @@ class EnvSemanticContractMeta:
     overdue_penalty_mode: str
     fifo_queue_enabled: bool
     riding_with_truck_enabled: bool
+    allow_empty_backbone_route: bool
     hard_failure_type: str
 
 

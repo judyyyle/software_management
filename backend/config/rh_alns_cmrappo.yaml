@@ -104,6 +104,28 @@ planner:
   # 同时给返程、排队、fallback 留足尾部时间。
   upper_horizon_sec: 3600
 
+  # 卡车循环巡站参数（仅 poisson 训练模式生效）。
+  # patrol_min_remaining_sec：卡车回仓后距 episode 结束的剩余时间低于此值时，
+  #   不再追加巡站循环，避免生成极短的无意义路段。
+  # patrol_stations_per_loop：每次巡站循环选取的充换电站数量上限，
+  #   默认复用 phase4_min_future_fixed_nodes，保证每次循环后骨架节点数不低于该值。
+  patrol_min_remaining_sec: 600
+  patrol_stations_per_loop: 3
+
+  # 可选退化开关：仅建议在 benchmark / hybrid 等不追加巡站循环的验证路径中显式开启。
+  # 开启后，若卡车未来骨架自然耗尽，允许 `_build_coarse_plan_view()` 继续构造空骨架退化对象：
+  #   truck_backbone_route=()
+  #   recovery_pool={}
+  #   launch_candidate_stations=()
+  #   policy_mode_mask 收缩为 {B}
+  # 默认保持严格契约，空骨架仍视为错误。
+  allow_empty_backbone_route: false
+
+  # WAIT 动作推进量上限（idle 状态下）。
+  # 防止极长空窗把一次 WAIT 的 T_idle 惩罚拉得过大，影响训练稳定性。
+  # 首轮建议 60s，与 coarse_replan_interval_sec=420s 相比不会太碎，也不会太粗。
+  max_wait_decision_gap_sec: 60
+
   # 增量派单节流参数，为后续 planner_bridge 实现预留。
   incremental_dispatch_min_interval_s: 2.0
   incremental_dispatch_debounce_s: 0.0
