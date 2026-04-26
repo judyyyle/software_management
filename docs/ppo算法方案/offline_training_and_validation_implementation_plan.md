@@ -3458,6 +3458,158 @@ def _refresh_coarse_plan_if_needed(self) -> CoarsePlanView:
 - mask 与候选动作一一对应
 - `CoarsePlanView` 输出满足接口契约，PPO 可直接消费
 
+**本轮代码同步记录（2026-04-26）**
+
+本轮已在 `backend/training/` 下完成 Phase 6 的首版落地，当前仓库中的真实实现情况如下。
+
+1. **已新增 Phase 6 共享动作与契约层**
+   - 新增 `backend/training/actions.py`
+     - 将 `DispatchAction` / `GlobalWaitAction` / `WAIT_ACTION` 从
+       `env_adapter.py` 中拆出，供 `candidate_builder` 与 `env_adapter` 共同消费，
+       避免循环依赖
+   - 扩展 `backend/training/contracts.py`
+     - 已新增 `PlannerTriggerContext`
+     - 已新增 `UavSelfFeatures` / `OrderFeatures` / `RecoveryFeatures` /
+       `InfraFeatures` / `InfraNodeFeatures`
+     - 已新增 `CandidateFeatures` / `FactorizedActionSchema` /
+       `ResolvedActionLookup` / `CandidateOutput`
+   - 当前实现中：
+     - `ResolvedActionLookup.resolve(...)` 已支持
+       `root_branch_idx -> EnvAction` 的结构化反查
+     - `ResolvedActionLookup.as_action_lookup()` 已提供到旧
+       `DecisionContext.action_lookup` 的兼容映射
+
+2. **已新增 `planner_bridge.py`，但当前仍为“规则化 coarse planner”而非完整 RH-ALNS**
+   - 新增 `backend/training/planner_bridge.py`
+   - 已实现：
+     - `maybe_replan(runtime_state, trigger_ctx) -> CoarsePlanView`
+     - 基于以下触发量做重规划判断：
+       - `coarse_replan_interval_sec`
+       - `backlog_new_orders`
+       - `route_drift_ratio`
+       - `fallback_count_in_window`
+       - `hard_failure_count_in_window`
+     - `plan_version` 递增
+     - `launch_candidate_stations` 的订单密度筛选：
+       - 仅从未来 backbone 的 `station` 节点中选
+       - 以 `support_radius_km` 与 `min_orders_to_trigger` 判断是否放行
+   - 当前仍是简化实现：
+     - `authorized_orders` 仍直接基于当前 `pending_orders`、重量阈值与
+       Phase 5 既有 `order_pre_score` / `priority_band` 规则生成
+     - `recovery_pool` 仍按未来 backbone 前缀裁剪，不含更强的 ALNS 优化逻辑
+     - 因此它已经满足 `CoarsePlanView` 契约，但**还不是**文档语义里的完整
+       RH-ALNS 上层求解器
+
+3. **已新增 `candidate_builder.py`，并切到 factorized 输出**
+   - 新增 `backend/training/candidate_builder.py`
+   - 已实现：
+     - `build(runtime_state, coarse_plan, deciding_drone_id, trigger_type,
+       trigger_station_id, last_seen_plan_version) -> CandidateOutput`
+     - 固定 shape 的：
+       - `root_branch_mask`
+       - `order_mask`
+       - `mode_mask`
+       - `recovery_mask`
+     - `CandidateFeatures` 生成
+     - `ResolvedActionLookup` 生成
+   - 当前候选动作语义已对齐到 Phase 6 约束：
+     - `WAIT` 始终存在，且不进入订单/模式/回收点头
+     - `mode B` 只暴露订单，不暴露返程宿主
+     - `mode C` 只保留同时满足时序与能量约束的回收点
+     - `riding_with_truck` 触发时，不直接使用
+       `coarse_plan.recovery_pool[order]`，而是按 `trigger_station_id`
+       动态生成 runtime recovery pool
+     - `best_mode_b_return_score` /
+       `best_mode_b_host_type` /
+       `predicted_queue_time_est`
+       已在 build 时按当前 `RuntimeStateView.node_states` 即时计算
+   - 当前实现中的一个明确边界：
+     - `station_wait_threshold_sec` 当前只作为 recovery 候选排序中的软信号，
+       **不作为** mode C 的硬性非法判据；这与文档约束一致
+
+4. **`env_adapter.py` 已切到“统一 coarse plan 刷新入口 + Phase 6 候选构建器接线”**
+   - `TrainingEnvAdapter` 新增：
+     - `_current_coarse_plan`
+     - `_active_launch_stations`
+     - `_fallback_event_times`
+     - `_hard_failure_event_times`
+     - `_completed_backbone_nodes_since_plan`
+   - 已新增统一入口：
+     - `_refresh_coarse_plan_if_needed(...)`
+   - 当前行为：
+     - `enable_phase6=True` 时默认注入 `PlannerBridge` 与 `CandidateBuilder`
+     - `enable_phase6=False` 时仍可回退到 Phase 5 的 inline coarse plan 语义
+   - 已完成的 Phase 6 接线点：
+     - `DecisionContext` 构造时不再直接依赖旧的 inline action builder，
+       而是通过 `candidate_builder.build(...)` 生成兼容的
+       `action_lookup`
+     - `WAIT` 的下一次全局决策时刻计算改为读取 `_active_launch_stations`
+     - 卡车经过站点后，会从 `_active_launch_stations` 中实时移除
+     - 若某触发站点周边已无 pending UAV 订单，也会从 `_active_launch_stations`
+       中实时移除
+
+5. **已显式修复“stale coarse plan 卡死新单”的闭环风险**
+   - 文档中提到的风险已在 `env_adapter._has_authorized_orders_now(...)` 中做了保护
+   - 当前实现口径为：
+     - 先检查当前缓存 coarse plan 中是否还存在“仍在 `pending_orders` 中的 live authorized orders”
+     - 若没有，但当前 `pending_orders` 中已有 UAV 可配送新单，则构造一个
+       `backlog_new_orders >= coarse_new_order_trigger` 的强制触发上下文，
+       再次调用 `planner_bridge.maybe_replan(...)`
+   - 这样可以避免出现：
+     - 旧 coarse plan 已经过时
+     - 新订单已进入 `pending_orders`
+     - 但由于旧 coarse plan 未授权任何新单，导致不入队、不重规划、永远看不到新单
+
+6. **当前仍保留的一些 Phase 5 真值口径，没有被 Phase 6 错误改写**
+   - `post_delivery_revalidation`
+   - `reservation timeout`
+   - `fallback_recovery`
+   - `mode B` 执行层真实返程宿主选择
+   - 上述逻辑仍以 `env_adapter` 的运行时真值为准；Phase 6 只是把
+     coarse planning 与 candidate building 从 env 内部职责中拆了出来，
+     没有改坏 Phase 5 的状态转移与 reward 结算边界
+
+7. **已补充并修正 Phase 6 集成测试**
+   - 新增 `backend/training/test_phase6_integration.py`
+   - 当前已覆盖：
+     - `planner_bridge` 重规划后整体重置 `_active_launch_stations`
+     - `candidate_builder` 的 mask / feature / resolved lookup 对齐关系
+     - stale cached coarse plan 不会压制新 idle 决策：
+       - 该测试最初版本只验证“有新单时能入队”，不是真正的 stale-plan 场景
+       - 本轮已修正为：
+         1. 先显式生成旧 `_current_coarse_plan`
+         2. 再注入旧 plan 不包含的新订单
+         3. 验证会触发 replan、`plan_version` 递增、新订单被授权并成功入队
+
+8. **当前本地回归结果**
+   - 已通过的验证命令：
+
+     ```bash
+     python -m unittest \
+       backend.training.test_phase6_integration \
+       backend.training.test_env_adapter_phase5a \
+       backend.training.test_env_adapter_phase5b \
+       backend.training.test_env_adapter_phase5c
+     ```
+
+   - 当前结果：
+     - `20` 个测试全部通过
+
+9. **本轮未完成、仍应保持清晰认知的边界**
+   - `planner_bridge.py` 当前是**规则化骨架实现**，不是完整 RH-ALNS
+   - `CandidateOutput` 当前仍主要通过 `DecisionContext.action_lookup`
+     向旧接口兼容；Phase 7 训练主路径仍需显式消费
+     `CandidateOutput` 本体
+   - `last_seen_plan_version` 的跨 step / 按 UAV 持久化维护，当前仍应由
+     Phase 7 rollout collector 或后续 baseline / validation 脚本承担；
+     `env_adapter` 本身不持有这份外部消费态
+   - `ObservationTensorizer` / `model.py` / `rollout_buffer.py`
+     尚未实现，这部分仍属于 Phase 7
+   - 因此，本轮 Phase 6 的准确定位是：
+     - **候选动作与 coarse-plan 接口已经落地**
+     - **训练前的环境侧编排已打通**
+     - **但完整 PPO 主循环尚未接入**
+
 ## 4.7 Phase 7：实现 PPO 训练主循环
 
 目标：
