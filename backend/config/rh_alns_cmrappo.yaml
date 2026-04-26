@@ -146,7 +146,8 @@ candidate:
   #   1 个最近安全 station
   max_candidate_recovery_per_order: 4
 
-  # factorized 组合动作预算上限，不是 flat logits 维度。
+  # `resolved_action_lookup` 展开规模的保护性预算，不是 PPO 主训练路径的 flat logits 维度；
+  # 主训练路径张量 shape 由 max_candidate_orders / max_candidate_recovery_per_order 冻结。
   max_candidate_actions: 128
 
   # 240s 相比 4×4km 场景下 station 最近邻切换时间（47~99s）已经明显过长，
