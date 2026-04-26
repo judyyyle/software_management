@@ -1,0 +1,1785 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+HiveLogix — Phase 5a 训练环境适配器。
+
+职责边界：
+  - 读取 Phase 2/3/4 产物，提供事件驱动的最小可运行训练环境；
+  - 维护训练侧无人机状态机覆盖层，不污染 core 层物理枚举；
+  - 在 Phase 5 内部内联实现最小 coarse plan / action mask；
+  - 保证 reset -> step -> done 连通，且为 Phase 5b/5c 保留稳定接口。
+
+本文件仅实现 Phase 5a：
+  - 奖励只包含 R_delivery_bonus / hard_failure_penalty_sec
+  - 不实现 reservation / T_overdue / T_wait / T_queue / T_fallback / T_idle
+  - mode C 仅实现“卡车已过 recover_node 时直接 fallback”的最小兜底
+"""
+
+from __future__ import annotations
+
+import copy
+import json
+import math
+import random
+from dataclasses import dataclass
+from enum import StrEnum
+from pathlib import Path
+from typing import Any, Mapping, TypeAlias
+
+from core.entities.charging_host import ChargingHost
+from core.entities.depot import Depot
+from core.entities.drone import Drone
+from core.entities.order import Order
+from core.entities.primitives import Position3D, SourceType, TaskStatus
+from core.entities.swap_station import SwapStation
+from core.entities.truck import Truck
+from environment.state.entity_manager import EntityManager
+from environment.state.order_manager import OrderManager
+
+from .contracts import CoarsePlanView, PlannerMode, PolicyMode, RouteDriftRef
+from .order_source_adapter import (
+    OrderSourceConfig,
+    OrderSourceMode,
+    build_order_source,
+    configure_order_manager_for_source,
+)
+from .scene_loader import DEFAULT_CONFIG_PATH, TrainingSceneContext, load_default_scene
+
+
+NodeId: TypeAlias = str
+OrderId: TypeAlias = str
+DroneId: TypeAlias = str
+
+_TIME_EPS = 1e-6
+_BACKBONE_DEPARTURE_EPS = 1e-6
+
+
+class TrainingDroneState(StrEnum):
+    """训练环境内部使用的无人机状态枚举。"""
+    # 训练侧状态覆盖层；不修改 core 层 DroneStatus。
+    IDLE = "idle"
+    FLYING_TO_DELIVER = "flying_to_deliver"
+    DELIVERED = "delivered"
+    RETURN_TO_RENDEZVOUS = "return_to_rendezvous"
+    WAITING_FOR_TRUCK = "waiting_for_truck"
+    RETURN_TO_STATION = "return_to_station"
+    RETURN_TO_DEPOT = "return_to_depot"
+    QUEUEING_AT_HOST = "queueing_at_host"
+    CHARGING_OR_SWAP = "charging_or_swap"
+    ACTIVE_WAIT = "active_wait"
+    FALLBACK_RECOVERY = "fallback_recovery"
+    CHARGING_ON_TRUCK = "charging_on_truck"
+    RIDING_WITH_TRUCK = "riding_with_truck"
+    AIRBORNE_ENERGY_FAILURE = "airborne_energy_failure"
+
+
+@dataclass(frozen=True)
+class ReservationStateView:
+    """reservation 只读视图。
+
+    Phase 5a 当前始终返回 `None`，这里先把对外字段形状固定下来。
+    """
+    recover_node: str
+    issued_at: float
+    expires_at: float
+
+
+@dataclass(frozen=True)
+class DroneStateView:
+    """单架无人机在 runtime_state 中的只读快照。"""
+    drone_id: str
+    training_state: str
+    current_loc: Position3D
+    battery_current: float
+    battery_max: float
+    battery_ratio: float
+    carrying_order_id: str | None
+    home_type: str
+    cruise_speed: float
+    payload_capacity: float
+    empty_weight: float
+    k1: float
+    k2: float
+    reservation: ReservationStateView | None
+
+
+@dataclass(frozen=True)
+class NodeStateView:
+    """固定充换电节点在 runtime_state 中的只读快照。"""
+    node_id: str
+    node_type: str
+    position: Position3D
+    parking_slots: int
+    swap_time: float
+    queue_length: int
+    available_slots: int
+
+
+@dataclass(frozen=True)
+class RuntimeStateView:
+    """当前时刻暴露给训练侧的运行时状态快照。"""
+    # Phase 5a 已固定对外 schema；后续阶段只能填充实现，不能改字段形状。
+    t_now: float
+    truck_current_loc: Position3D
+    drone_states: Mapping[str, DroneStateView]
+    pending_orders: Mapping[str, Order]
+    assigned_orders: Mapping[str, Order]
+    node_states: Mapping[str, NodeStateView]
+    reservation_count: Mapping[str, int]
+
+
+@dataclass(frozen=True)
+class DispatchAction:
+    """一次派送动作。
+
+    当前实现中：
+      - `mode B` 只绑定订单，不绑定返程宿主；
+      - `mode C` 必须显式给出 recover_node_id。
+    """
+    # 与文档约定一致：一次 dispatch 同时绑定 order 和 mode；
+    # mode C 额外携带 recover_node_id，mode B 不携带返程宿主。
+    order_id: str
+    mode: PolicyMode
+    recover_node_id: str | None = None
+
+    def __post_init__(self) -> None:
+        """校验动作形状是否和当前接口约定一致。"""
+        if self.mode not in {PolicyMode.B, PolicyMode.C}:
+            raise ValueError(f"dispatch_action.mode 仅允许 B/C，实际={self.mode}")
+        if self.mode == PolicyMode.B and self.recover_node_id is not None:
+            raise ValueError("mode B 不应携带 recover_node_id")
+        if self.mode == PolicyMode.C and not self.recover_node_id:
+            raise ValueError("mode C 必须携带 recover_node_id")
+
+
+@dataclass(frozen=True)
+class GlobalWaitAction:
+    """全局 WAIT 动作。
+
+    该动作不绑定订单，也不绑定 recover node。
+    """
+    name: str = "WAIT"
+
+
+WAIT_ACTION = GlobalWaitAction()
+
+EnvAction: TypeAlias = DispatchAction | GlobalWaitAction
+
+
+@dataclass(frozen=True)
+class DecisionContext:
+    """一次 PPO 决策点对应的上下文。"""
+    # 当前实现只返回 action_lookup；还没有单独暴露 dense action_mask 张量。
+    deciding_drone_id: str
+    trigger_type: str
+    trigger_station_id: str | None
+    runtime_state: RuntimeStateView
+    coarse_plan: CoarsePlanView
+    action_lookup: tuple[EnvAction, ...]
+
+
+@dataclass(frozen=True)
+class EnvStepResult:
+    """一次 `reset()` 或 `step()` 调用返回的统一结果对象。"""
+    reward: float
+    done: bool
+    runtime_state: RuntimeStateView
+    decision_context: DecisionContext | None
+    info: Mapping[str, Any]
+
+
+@dataclass(frozen=True)
+class FallbackLeg:
+    """fallback_recovery 执行段的内部账本。"""
+    # fallback_recovery 的退出完全依赖这份账本；到达宿主后必须清空。
+    host_node_id: str
+    host_node_type: str
+    arrival_time: float
+
+
+@dataclass(frozen=True)
+class BackboneVisit:
+    """卡车对固定节点的一次未来访问记录。"""
+    # _full_backbone_cache 的单条访问记录；允许同一 node_id 多次出现。
+    node_id: str
+    arrival_time: float
+    departure_time: float
+
+
+@dataclass(frozen=True)
+class PlannedStop:
+    """卡车事件队列中的一个停靠点。"""
+    # 统一承接 Phase 4 stops 和 poisson 巡站追加停靠点。
+    seq: int
+    node_type: str
+    node_id: str
+    position: Position3D
+    order_id: str | None
+    arrival_time: float
+    departure_time: float
+
+
+@dataclass(frozen=True)
+class FlightLeg:
+    """无人机当前正在执行的一段飞行。"""
+    # 当前实现把所有空中过程统一收敛为绝对时刻的飞行段，事件推进只看 arrival_time。
+    kind: str
+    start_time: float
+    arrival_time: float
+    start_pos: Position3D
+    target_pos: Position3D
+    order_id: str | None = None
+    target_node_id: str | None = None
+    target_node_type: str | None = None
+    energy_cost_j: float = 0.0
+
+
+@dataclass(frozen=True)
+class DispatchCommit:
+    """记录某架无人机当前订单的 dispatch 承诺。"""
+    order_id: str
+    mode: PolicyMode
+    selected_recover_node: str | None
+    trigger_station_id: str | None
+
+
+@dataclass(frozen=True)
+class DecisionTrigger:
+    """内部决策队列中的一个待处理触发点。"""
+    drone_id: str
+    trigger_type: str
+    trigger_station_id: str | None = None
+
+
+@dataclass(frozen=True)
+class _YamlConfig:
+    """从训练 YAML 中提取出的 5a 运行参数子集。"""
+    upper_horizon_sec: float
+    patrol_min_remaining_sec: float
+    patrol_stations_per_loop: int
+    allow_empty_backbone_route: bool
+    max_wait_decision_gap_sec: float
+    max_candidate_recovery_per_order: int
+    R_delivery_bonus: float
+    hard_failure_penalty_sec: float
+
+
+class TrainingEnvAdapter:
+    """
+    Phase 5a 训练环境。
+
+    当前只支持单 truck / 单 depot 场景，与 Phase 4 路线导出约束保持一致。
+    """
+
+    def __init__(
+        self,
+        *,
+        scene_ctx: TrainingSceneContext | None = None,
+        order_source: OrderSourceConfig | None = None,
+        config_path: str | Path = DEFAULT_CONFIG_PATH,
+        phase4_route_dir: str | Path | None = None,
+    ) -> None:
+        """构造环境对象并装载静态依赖。
+
+        这里只准备配置、scene 和订单源；真正的 episode 运行态在 `reset()` 里创建。
+        """
+        self._config_path = Path(config_path)
+        self._cfg = _load_env_yaml(self._config_path)
+
+        self._scene_ctx = scene_ctx or load_default_scene(config_path=self._config_path)
+        self._order_source = order_source or build_order_source(
+            self._scene_ctx,
+            config_path=self._config_path,
+        )
+        self._phase4_route_dir = (
+            Path(phase4_route_dir)
+            if phase4_route_dir is not None
+            else Path(self._scene_ctx.scene_bundle_dir) / "sumo" / "phase4_truck_route"
+        )
+
+        self._entity_manager: EntityManager | None = None
+        self._order_manager: OrderManager | None = None
+        self._truck: Truck | None = None
+        self._truck_id: str | None = None
+        self._depot: Depot | None = None
+        self._depot_id: str | None = None
+        self._heavy_payload_capacity = self._resolve_heavy_payload_capacity()
+
+        self._t_now = 0.0
+        self._planned_route_stops: list[PlannedStop] = []
+        self._planned_route_stop_i = 1
+        self._full_backbone_cache: list[BackboneVisit] = []
+        self._allow_empty_backbone_route = False
+
+        self._drone_state: dict[DroneId, TrainingDroneState] = {}
+        # 仅用于 WAIT 动作后的“恢复到哪个基础状态”；不承载 reward 语义。
+        self._active_wait_resume: dict[DroneId, TrainingDroneState] = {}
+        self._flight_legs: dict[DroneId, FlightLeg] = {}
+        self._fallback_leg: dict[DroneId, FallbackLeg] = {}
+        # 记录当前订单对应的 dispatch 承诺，供 delivered 后执行层继续转移。
+        self._dispatch_commit: dict[DroneId, DispatchCommit] = {}
+        # 车载充换电完成时刻；到点后 charging_on_truck -> riding_with_truck。
+        self._truck_charge_until: dict[DroneId, float] = {}
+        self._decision_queue: list[DecisionTrigger] = []
+
+        # 只跟踪 truck_execution_route 中的 mode A 背景订单完成情况。
+        self._background_mode_a_pending: set[str] = set()
+        self._background_mode_a_completed: set[str] = set()
+        self._last_reward_breakdown: dict[str, float] = {}
+
+    # ---------------------------------------------------------------------
+    # Public API
+    # ---------------------------------------------------------------------
+
+    def reset(self) -> EnvStepResult:
+        """重建一个全新的 episode，并返回首个可见状态。
+
+        当前实现会：
+          1. 重建实体与订单管理器；
+          2. 读取 Phase 4 产物并按需追加 poisson 巡站循环；
+          3. 初始化训练侧状态机；
+          4. 注入 t=0 的订单并生成初始决策点。
+        """
+        random.seed(self._order_source.seed)
+
+        self._entity_manager = EntityManager()
+        self._entity_manager.load_from_config({"entities": self._scene_ctx.entities_raw})
+        self._order_manager = OrderManager()
+        configure_order_manager_for_source(
+            self._order_manager,
+            self._scene_ctx,
+            self._order_source,
+        )
+
+        self._truck_id, self._truck = _require_singleton(self._entity_manager.trucks, "truck")
+        self._depot_id, self._depot = _require_singleton(self._entity_manager.depots, "depot")
+
+        self._t_now = 0.0
+        self._planned_route_stop_i = 1
+        self._flight_legs.clear()
+        self._fallback_leg.clear()
+        self._dispatch_commit.clear()
+        self._truck_charge_until.clear()
+        self._decision_queue.clear()
+        self._active_wait_resume.clear()
+        self._background_mode_a_pending.clear()
+        self._background_mode_a_completed.clear()
+        self._last_reward_breakdown = {}
+
+        artifacts = self._load_phase4_artifacts()
+        self._planned_route_stops = list(artifacts["planned_stops"])
+        self._full_backbone_cache = list(artifacts["backbone_cache"])
+        self._background_mode_a_pending = set(artifacts["mode_a_order_ids"])
+
+        if self._order_source.mode == OrderSourceMode.POISSON:
+            # 仅 poisson 训练模式追加巡站循环，benchmark/hybrid 保持 Phase 4 原路线。
+            self._append_patrol_loop_if_needed()
+            self._allow_empty_backbone_route = False
+        else:
+            self._allow_empty_backbone_route = True
+
+        self._bind_truck_route()
+        self._initialize_drone_states()
+
+        # 允许 poisson 在 t=0 生成首单，使 reset 后的初始决策上下文可见新单。
+        self._order_manager.tick(0.0, self._entity_manager)
+        self._enqueue_initial_idle_decisions()
+        if not self._decision_queue:
+            self._advance_until_decision_or_done()
+
+        return self._build_step_result(reward=0.0, info={"event": "reset"})
+
+    def step(self, action: EnvAction) -> EnvStepResult:
+        """消费当前决策点的一个动作，并推进到下一个决策点或 episode 结束。"""
+        if self.is_done():
+            raise RuntimeError("episode 已结束，不能继续 step()")
+        if not self._decision_queue:
+            raise RuntimeError("当前没有可执行的 decision context")
+
+        trigger = self._decision_queue.pop(0)
+        decision = self._build_decision_context(trigger)
+        if not self._is_action_allowed(action, decision.action_lookup):
+            raise ValueError(f"非法动作: {action}")
+
+        reward = 0.0
+        info: dict[str, Any] = {
+            "drone_id": trigger.drone_id,
+            "trigger_type": trigger.trigger_type,
+            "trigger_station_id": trigger.trigger_station_id,
+        }
+
+        if isinstance(action, GlobalWaitAction):
+            self._apply_wait_action(trigger.drone_id)
+            info["applied_action"] = "WAIT"
+        else:
+            self._apply_dispatch_action(trigger, action)
+            info["applied_action"] = {
+                "order_id": action.order_id,
+                "mode": action.mode.value,
+                "recover_node_id": action.recover_node_id,
+            }
+
+        if not self._decision_queue:
+            reward += self._advance_until_decision_or_done()
+
+        return self._build_step_result(reward=reward, info=info)
+
+    def is_done(self) -> bool:
+        """检查 episode 是否满足当前实现中的任一终止条件。"""
+        if self._t_now >= self._cfg.upper_horizon_sec - _TIME_EPS:
+            return True
+        if (
+            self._order_manager is not None
+            and not self._order_manager.pending_orders
+            and not self._order_manager.assigned_orders
+            and not self._background_mode_a_pending
+        ):
+            return True
+        if self._drone_state and all(
+            state == TrainingDroneState.AIRBORNE_ENERGY_FAILURE
+            for state in self._drone_state.values()
+        ):
+            return True
+        return False
+
+    @property
+    def current_decision_context(self) -> DecisionContext | None:
+        """返回队首决策点对应的上下文；若当前无需决策则返回 `None`。"""
+        if not self._decision_queue or self.is_done():
+            return None
+        return self._build_decision_context(self._decision_queue[0])
+
+    # ---------------------------------------------------------------------
+    # Core builders
+    # ---------------------------------------------------------------------
+
+    def build_runtime_state_view(self) -> RuntimeStateView:
+        """基于当前内部真值构造一次 runtime_state 快照。"""
+        entity_mgr = self._require_entity_manager()
+        order_mgr = self._require_order_manager()
+        truck = self._require_truck()
+
+        drone_states = {
+            drone_id: DroneStateView(
+                drone_id=drone_id,
+                training_state=self._drone_state[drone_id].value,
+                current_loc=_clone_position(drone.current_loc),
+                battery_current=float(drone.battery_current),
+                battery_max=float(drone.battery_max),
+                battery_ratio=float(drone.battery_ratio),
+                carrying_order_id=drone.carrying_order_id,
+                home_type=drone.home_type.value,
+                cruise_speed=float(drone.cruise_speed),
+                payload_capacity=float(drone.payload_capacity),
+                empty_weight=float(drone.empty_weight),
+                k1=float(drone.k1),
+                k2=float(drone.k2),
+                reservation=None,
+            )
+            for drone_id, drone in entity_mgr.drones.items()
+        }
+
+        node_states: dict[str, NodeStateView] = {}
+        for node_id, station in entity_mgr.stations.items():
+            node_states[node_id] = NodeStateView(
+                node_id=node_id,
+                node_type="station",
+                position=_clone_position(station.location),
+                parking_slots=int(station.parking_slots),
+                swap_time=float(station.swap_time),
+                queue_length=int(station.queue_length),
+                available_slots=int(station.available_slots),
+            )
+        for node_id, depot in entity_mgr.depots.items():
+            node_states[node_id] = NodeStateView(
+                node_id=node_id,
+                node_type="depot",
+                position=_clone_position(depot.location),
+                parking_slots=int(depot.parking_slots),
+                swap_time=float(depot.swap_time),
+                queue_length=int(depot.queue_length),
+                available_slots=int(depot.available_slots),
+            )
+
+        return RuntimeStateView(
+            t_now=float(self._t_now),
+            truck_current_loc=_clone_position(truck.current_loc),
+            drone_states=drone_states,
+            pending_orders=copy.copy(order_mgr.pending_orders),
+            assigned_orders=copy.copy(order_mgr.assigned_orders),
+            node_states=node_states,
+            reservation_count={},
+        )
+
+    def _build_coarse_plan_view(self, t_now: float) -> CoarsePlanView:
+        """在给定时刻构造 5a 内联 coarse plan。
+
+        当前版本不做重规划，`plan_version` 固定为 0。
+        """
+        order_mgr = self._require_order_manager()
+
+        # 文档要求按 departure_time 过滤，保证“卡车刚到站但尚未离站”的节点仍保留在未来骨架里。
+        filtered = [
+            visit
+            for visit in self._full_backbone_cache
+            if visit.departure_time > t_now
+        ]
+        deduped: list[BackboneVisit] = []
+        seen_nodes: set[str] = set()
+        for visit in filtered:
+            if visit.node_id in seen_nodes:
+                continue
+            seen_nodes.add(visit.node_id)
+            deduped.append(visit)
+
+        truck_backbone_route = tuple(visit.node_id for visit in deduped)
+        if not truck_backbone_route and not self._allow_empty_backbone_route:
+            raise RuntimeError("poisson 模式下不允许空骨架，请检查 patrol loop 生成逻辑")
+
+        truck_eta_map = {visit.node_id: float(visit.arrival_time) for visit in deduped}
+        route_drift_ref = {
+            visit.node_id: RouteDriftRef(
+                eta_ref=float(visit.arrival_time),
+                route_index_ref=idx,
+            )
+            for idx, visit in enumerate(deduped)
+        }
+        launch_candidate_stations = tuple(
+            node_id
+            for node_id in truck_backbone_route
+            if node_id in self._require_entity_manager().stations
+        )
+
+        authorized_orders: list[str] = []
+        order_priority_band: dict[str, int] = {}
+        order_pre_score: dict[str, float] = {}
+        planner_mode_cap: dict[str, frozenset[PlannerMode]] = {}
+        policy_mode_mask: dict[str, frozenset[PolicyMode]] = {}
+        recovery_pool: dict[str, tuple[str, ...]] = {}
+
+        for order_id, order in sorted(
+            order_mgr.pending_orders.items(),
+            key=lambda item: (item[1].deadline, item[0]),
+        ):
+            # 超过 heavy payload 上限的订单只保留 planner 语义边界，不进入 UAV 授权集合。
+            if float(order.payload_weight) > self._heavy_payload_capacity:
+                planner_mode_cap[order_id] = frozenset({PlannerMode.A})
+                continue
+
+            remaining = max(0.0, float(order.deadline) - t_now)
+            time_window = max(_TIME_EPS, float(order.time_window_seconds))
+            ratio = remaining / time_window
+            if ratio <= 1.0 / 3.0:
+                band = 0
+            elif ratio <= 2.0 / 3.0:
+                band = 1
+            else:
+                band = 2
+
+            authorized_orders.append(order_id)
+            order_priority_band[order_id] = band
+            order_pre_score[order_id] = remaining
+            planner_mode_cap[order_id] = frozenset({PlannerMode.B, PlannerMode.C})
+
+            if not truck_backbone_route and self._allow_empty_backbone_route:
+                policy_mode_mask[order_id] = frozenset({PolicyMode.B})
+                recovery_pool[order_id] = ()
+            else:
+                policy_mode_mask[order_id] = frozenset({PolicyMode.B, PolicyMode.C})
+                # 5a 只暴露 coarse recovery pool，不做 5b 的时序/能量精滤。
+                recovery_pool[order_id] = truck_backbone_route[: self._cfg.max_candidate_recovery_per_order]
+
+        node_charge_load_budget = {
+            **{node_id: 0 for node_id in self._require_entity_manager().stations},
+            **{node_id: 0 for node_id in self._require_entity_manager().depots},
+        }
+
+        return CoarsePlanView(
+            plan_version=0,
+            issued_at=float(t_now),
+            valid_until=float(self._cfg.upper_horizon_sec),
+            truck_backbone_route=truck_backbone_route,
+            truck_eta_map=truck_eta_map,
+            authorized_orders=tuple(authorized_orders),
+            order_priority_band=order_priority_band,
+            order_pre_score=order_pre_score,
+            planner_mode_cap=planner_mode_cap,
+            policy_mode_mask=policy_mode_mask,
+            recovery_pool=recovery_pool,
+            node_charge_load_budget=node_charge_load_budget,
+            route_drift_ref=route_drift_ref,
+            launch_candidate_stations=launch_candidate_stations,
+            allow_empty_backbone_route=self._allow_empty_backbone_route,
+        )
+
+    def _build_action_lookup(
+        self,
+        *,
+        drone_id: str,
+        coarse_plan: CoarsePlanView,
+    ) -> tuple[EnvAction, ...]:
+        """为当前决策 UAV 构造可执行动作列表。"""
+        entity_mgr = self._require_entity_manager()
+        order_mgr = self._require_order_manager()
+        drone = entity_mgr.drones[drone_id]
+        actions: list[EnvAction] = []
+
+        for order_id in coarse_plan.authorized_orders:
+            order = order_mgr.pending_orders.get(order_id)
+            if order is None:
+                continue
+            # 5a 必须至少过滤掉“当前无人机根本拿不起”的订单，否则会在 assign_order 处直接报错。
+            if float(order.payload_weight) > float(drone.payload_capacity):
+                continue
+            if not self._deliver_leg_feasible(drone, order):
+                continue
+
+            modes = coarse_plan.get_policy_modes(order_id)
+            if PolicyMode.B in modes and self._has_mode_b_return_host(drone, order):
+                actions.append(DispatchAction(order_id=order_id, mode=PolicyMode.B))
+
+            if PolicyMode.C in modes:
+                for recover_node_id in coarse_plan.get_recovery_candidates(order_id):
+                    # 当前实现对 mode C 只要求 recovery_pool 非空；细粒度合法性留给 5b。
+                    actions.append(
+                        DispatchAction(
+                            order_id=order_id,
+                            mode=PolicyMode.C,
+                            recover_node_id=recover_node_id,
+                        )
+                    )
+
+        actions.append(WAIT_ACTION)
+        return tuple(actions)
+
+    # ---------------------------------------------------------------------
+    # Step helpers
+    # ---------------------------------------------------------------------
+
+    def _apply_wait_action(self, drone_id: str) -> None:
+        """把当前 UAV 切入 `active_wait` 占位状态。"""
+        current_state = self._drone_state[drone_id]
+        if current_state == TrainingDroneState.IDLE:
+            self._active_wait_resume[drone_id] = TrainingDroneState.IDLE
+        elif current_state == TrainingDroneState.RIDING_WITH_TRUCK:
+            self._active_wait_resume[drone_id] = TrainingDroneState.RIDING_WITH_TRUCK
+        else:
+            raise RuntimeError(f"状态 {current_state.value} 不允许执行 WAIT")
+        # 5a 不在 WAIT 上单独推进 delta_wait；只用 active_wait 占位到下一次会恢复决策的事件。
+        self._drone_state[drone_id] = TrainingDroneState.ACTIVE_WAIT
+
+    def _apply_dispatch_action(
+        self,
+        trigger: DecisionTrigger,
+        action: DispatchAction,
+    ) -> None:
+        """把 dispatch 动作落到订单池、无人机绑定和飞行账本上。"""
+        entity_mgr = self._require_entity_manager()
+        order_mgr = self._require_order_manager()
+        drone = entity_mgr.drones[trigger.drone_id]
+        order = order_mgr.pending_orders.pop(action.order_id)
+
+        order.assigned_vehicle_id = drone.drone_id
+        order.assigned_mode = action.mode.value
+        order.update_status(TaskStatus.ASSIGNED)
+        order.update_status(TaskStatus.PICKED_UP)
+        order.update_status(TaskStatus.DELIVERING)
+        order_mgr.assigned_orders[order.order_id] = order
+
+        drone.assign_order(order.order_id, float(order.payload_weight))
+        if self._drone_state[drone.drone_id] == TrainingDroneState.RIDING_WITH_TRUCK:
+            if drone.drone_id in self._require_truck().docked_drones:
+                self._require_truck().docked_drones.remove(drone.drone_id)
+
+        self._dispatch_commit[drone.drone_id] = DispatchCommit(
+            order_id=order.order_id,
+            mode=action.mode,
+            selected_recover_node=action.recover_node_id,
+            trigger_station_id=trigger.trigger_station_id,
+        )
+        # 5a 直接从当前物理位置起飞送货，不建模单独的 pickup / launch service 段。
+        self._schedule_flight_leg(
+            drone_id=drone.drone_id,
+            kind="deliver",
+            target_pos=_clone_position(order.delivery_loc),
+            payload=float(order.payload_weight),
+            target_order_id=order.order_id,
+        )
+        self._drone_state[drone.drone_id] = TrainingDroneState.FLYING_TO_DELIVER
+
+    def _build_decision_context(self, trigger: DecisionTrigger) -> DecisionContext:
+        """把内部 trigger 展开成给调用方可直接消费的决策上下文。"""
+        runtime_state = self.build_runtime_state_view()
+        coarse_plan = self._build_coarse_plan_view(self._t_now)
+        action_lookup = self._build_action_lookup(
+            drone_id=trigger.drone_id,
+            coarse_plan=coarse_plan,
+        )
+        return DecisionContext(
+            deciding_drone_id=trigger.drone_id,
+            trigger_type=trigger.trigger_type,
+            trigger_station_id=trigger.trigger_station_id,
+            runtime_state=runtime_state,
+            coarse_plan=coarse_plan,
+            action_lookup=action_lookup,
+        )
+
+    def _build_step_result(
+        self,
+        *,
+        reward: float,
+        info: Mapping[str, Any],
+    ) -> EnvStepResult:
+        """把当前内部状态封装成一次统一返回结果。"""
+        decision_context = self.current_decision_context
+        runtime_state = self.build_runtime_state_view()
+        merged_info = dict(info)
+        if self._last_reward_breakdown:
+            merged_info["reward_breakdown"] = dict(self._last_reward_breakdown)
+        return EnvStepResult(
+            reward=float(reward),
+            done=self.is_done(),
+            runtime_state=runtime_state,
+            decision_context=decision_context,
+            info=merged_info,
+        )
+
+    # ---------------------------------------------------------------------
+    # Event loop
+    # ---------------------------------------------------------------------
+
+    def _advance_until_decision_or_done(self) -> float:
+        """持续推进事件，直到出现新的决策点或 episode 结束。"""
+        reward = 0.0
+        while not self.is_done() and not self._decision_queue:
+            next_time = self._next_event_time()
+            if math.isinf(next_time):
+                next_time = self._cfg.upper_horizon_sec
+            if next_time <= self._t_now + _TIME_EPS:
+                next_time = min(self._cfg.upper_horizon_sec, self._t_now + 1.0)
+            reward += self._advance_to_event(next_time)
+        return reward
+
+    def _advance_to_event(self, t_next: float) -> float:
+        """推进到给定绝对时刻，并结算该区间内跨过的事件。"""
+        if t_next < self._t_now - _TIME_EPS:
+            raise ValueError(f"不能回退时间: t_next={t_next}, t_now={self._t_now}")
+
+        entity_mgr = self._require_entity_manager()
+        truck = self._require_truck()
+        order_mgr = self._require_order_manager()
+
+        self._sync_in_transit_positions(t_next)
+
+        reward = 0.0
+        reward_breakdown: dict[str, float] = {}
+        hard_failure_ready = self._collect_airborne_failure_events(t_next)
+        failed_drones = {drone_id for drone_id, _, _ in hard_failure_ready}
+        # delivery 先处理，保持“送达奖励优先于后续到达交互”的顺序。
+        delivery_ready = [
+            (drone_id, leg)
+            for drone_id, leg in self._collect_flight_events(t_next, kind="deliver")
+            if drone_id not in failed_drones
+        ]
+        non_delivery_ready = [
+            (drone_id, leg)
+            for drone_id, leg in self._collect_flight_events(
+                t_next,
+                kind=None,
+                exclude={"deliver"},
+            )
+            if drone_id not in failed_drones
+        ]
+        truck_charge_ready = [
+            drone_id
+            for drone_id, done_time in list(self._truck_charge_until.items())
+            if done_time <= t_next + _TIME_EPS
+        ]
+        truck_stops = self._collect_truck_stops(t_next)
+
+        delivery_reward = 0.0
+        hard_failure_reward = 0.0
+
+        # 1. 硬失败事件：半空停电会在到达事件之前截断当前飞行段。
+        for drone_id, _leg, _failure_time in hard_failure_ready:
+            hard_failure_reward += self._process_airborne_failure_event(drone_id)
+
+        # 2. 订单送达 / mode A 完成
+        for drone_id, leg in delivery_ready:
+            delivery_reward += self._process_delivery_event(drone_id, leg)
+        for stop in truck_stops:
+            if stop.node_type == "customer" and stop.order_id:
+                if stop.order_id in self._background_mode_a_pending:
+                    self._background_mode_a_pending.remove(stop.order_id)
+                    self._background_mode_a_completed.add(stop.order_id)
+                    delivery_reward += self._cfg.R_delivery_bonus
+
+        reward += delivery_reward + hard_failure_reward
+        if delivery_reward:
+            reward_breakdown["delivery_bonus"] = delivery_reward
+        if hard_failure_reward:
+            reward_breakdown["hard_failure"] = hard_failure_reward
+
+        # 3a. 卡车到站
+        station_trigger: str | None = None
+        if truck_stops:
+            last_stop = truck_stops[-1]
+            truck.current_loc = _clone_position(last_stop.position)
+            if last_stop.node_type == "station":
+                coarse_plan = self._build_coarse_plan_view(t_next)
+                if last_stop.node_id in coarse_plan.launch_candidate_stations:
+                    station_trigger = last_stop.node_id
+
+        # 3b. UAV 到站 + host charge complete + truck charge complete
+        newly_idle_from_host: list[str] = []
+        for drone_id, leg in non_delivery_ready:
+            self._process_non_delivery_arrival(drone_id, leg)
+
+        for drone_id in truck_charge_ready:
+            self._truck_charge_until.pop(drone_id, None)
+            drone = entity_mgr.drones[drone_id]
+            drone.recharge_to_full()
+            drone.current_loc = _clone_position(truck.current_loc)
+            if drone_id not in truck.docked_drones:
+                truck.docked_drones.append(drone_id)
+            self._drone_state[drone_id] = TrainingDroneState.RIDING_WITH_TRUCK
+
+        for host in list(entity_mgr.stations.values()) + list(entity_mgr.depots.values()):
+            completed = host.tick_update(t_next)
+            if completed:
+                newly_idle_from_host.extend(completed)
+            self._sync_host_service_states(host)
+
+        for drone_id in newly_idle_from_host:
+            drone = entity_mgr.drones[drone_id]
+            drone.recharge_to_full()
+            if drone_id in self._dispatch_commit:
+                self._dispatch_commit.pop(drone_id, None)
+            self._drone_state[drone_id] = TrainingDroneState.IDLE
+
+        # 3c. 由到达触发的交互
+        if truck_stops:
+            for stop in truck_stops:
+                self._process_rendezvous_recovery(stop.node_id, t_next)
+
+        # 4. reservation timeout：5a 不实现
+
+        # 5. poisson / benchmark 动态订单注入
+        order_mgr.tick(t_next, entity_mgr)
+
+        # 6. 生成 decision context / done
+        self._t_now = min(float(t_next), float(self._cfg.upper_horizon_sec))
+        if station_trigger is not None:
+            # 车到站先恢复 riding_with_truck 的 WAIT 占位，再为当前仍在车上的 UAV 产生触发。
+            self._resume_active_wait_for_station_trigger()
+            for drone_id, state in self._drone_state.items():
+                if state == TrainingDroneState.RIDING_WITH_TRUCK:
+                    self._enqueue_decision(
+                        drone_id,
+                        trigger_type="truck_station_arrival",
+                        trigger_station_id=station_trigger,
+                    )
+        if newly_idle_from_host:
+            # 固定节点充换电完成会恢复 idle 上的 WAIT 占位，并为真正空闲的 UAV 重新建决策点。
+            self._resume_active_wait_for_idle_trigger()
+            for drone_id in newly_idle_from_host:
+                if self._drone_state.get(drone_id) == TrainingDroneState.IDLE:
+                    self._enqueue_decision(
+                        drone_id,
+                        trigger_type="idle_ready",
+                        trigger_station_id=None,
+                    )
+
+        self._last_reward_breakdown = reward_breakdown
+        return reward
+
+    # ---------------------------------------------------------------------
+    # Event processing
+    # ---------------------------------------------------------------------
+
+    def _process_delivery_event(self, drone_id: str, leg: FlightLeg) -> float:
+        """处理一次送达事件，并立即衔接送达后的执行层转移。"""
+        entity_mgr = self._require_entity_manager()
+        order_mgr = self._require_order_manager()
+        drone = entity_mgr.drones[drone_id]
+        commit = self._dispatch_commit[drone_id]
+
+        drone.current_loc = _clone_position(leg.target_pos)
+        drone.battery_current = max(0.0, drone.battery_current - leg.energy_cost_j)
+        released_order_id = drone.release_order()
+        if released_order_id != commit.order_id:
+            raise RuntimeError("delivery_event 订单绑定不一致")
+
+        order = order_mgr.assigned_orders.pop(commit.order_id)
+        order.actual_deliver_time = float(leg.arrival_time)
+        order.update_status(TaskStatus.COMPLETED)
+        order_mgr.completed_orders.append(order)
+        self._flight_legs.pop(drone_id, None)
+        self._drone_state[drone_id] = TrainingDroneState.DELIVERED
+
+        if commit.mode == PolicyMode.B:
+            # 当前 5a 实现还没接 5b 的 queue/service score；
+            # 这里临时复用 deterministic fallback 规则。
+            target = self._select_mode_b_return_host_phase5a(drone_id)
+            if target is None:
+                return self._mark_hard_failure(drone_id)
+            self._schedule_return_to_host(drone_id, target)
+        else:
+            coarse_plan = self._build_coarse_plan_view(leg.arrival_time)
+            selected_node = commit.selected_recover_node
+            if selected_node and selected_node in coarse_plan.truck_backbone_route:
+                self._schedule_return_to_rendezvous(drone_id, selected_node)
+            else:
+                # 5a 的最小 mode C 兜底：只检查原 recover_node 是否还在当前未来骨架中。
+                if not self._enter_fallback_recovery(drone_id):
+                    return self._mark_hard_failure(drone_id)
+
+        return self._cfg.R_delivery_bonus
+
+    def _process_non_delivery_arrival(self, drone_id: str, leg: FlightLeg) -> None:
+        """处理除送达以外的飞行到达事件。"""
+        entity_mgr = self._require_entity_manager()
+        drone = entity_mgr.drones[drone_id]
+        drone.current_loc = _clone_position(leg.target_pos)
+        drone.battery_current = max(0.0, drone.battery_current - leg.energy_cost_j)
+        self._flight_legs.pop(drone_id, None)
+
+        if leg.kind == "return_to_rendezvous":
+            self._drone_state[drone_id] = TrainingDroneState.WAITING_FOR_TRUCK
+            return
+
+        host = self._resolve_host(leg.target_node_id, leg.target_node_type)
+        if leg.kind == "fallback_recovery":
+            # fallback 到达后直接进入统一 charging host 入口，不再转成 return_to_station/depot 二次飞行。
+            self._fallback_leg.pop(drone_id, None)
+            self._on_arrive_charging_host(drone_id, host, leg.arrival_time)
+            return
+
+        if leg.kind in {"return_to_station", "return_to_depot"}:
+            self._on_arrive_charging_host(drone_id, host, leg.arrival_time)
+            return
+
+        raise RuntimeError(f"未知飞行段类型: {leg.kind}")
+
+    def _process_rendezvous_recovery(self, node_id: str, t_now: float) -> None:
+        """处理“卡车到达某个 rendezvous 节点”时的回收配对。"""
+        truck = self._require_truck()
+        recovered: list[str] = []
+        for drone_id, state in self._drone_state.items():
+            if state != TrainingDroneState.WAITING_FOR_TRUCK:
+                continue
+            commit = self._dispatch_commit.get(drone_id)
+            if commit is None or commit.selected_recover_node != node_id:
+                continue
+            recovered.append(drone_id)
+
+        for drone_id in recovered:
+            self._drone_state[drone_id] = TrainingDroneState.CHARGING_ON_TRUCK
+            self._truck_charge_until[drone_id] = (
+                t_now + self._scene_solver_params().truck_drone_recover_time_s
+            )
+            if drone_id not in truck.docked_drones:
+                truck.docked_drones.append(drone_id)
+
+    def _process_airborne_failure_event(
+        self,
+        drone_id: str,
+    ) -> float:
+        """处理一次真实的空中电量耗尽事件。"""
+        drone = self._require_entity_manager().drones[drone_id]
+        drone.battery_current = 0.0
+        return self._mark_hard_failure(drone_id)
+
+    # ---------------------------------------------------------------------
+    # Scheduling helpers
+    # ---------------------------------------------------------------------
+
+    def _schedule_flight_leg(
+        self,
+        *,
+        drone_id: str,
+        kind: str,
+        target_pos: Position3D,
+        payload: float,
+        target_order_id: str | None = None,
+        target_node_id: str | None = None,
+        target_node_type: str | None = None,
+    ) -> None:
+        """为 UAV 写入一段新的飞行账本。"""
+        entity_mgr = self._require_entity_manager()
+        drone = entity_mgr.drones[drone_id]
+        start_pos = _clone_position(drone.current_loc)
+        energy_cost = self._estimate_energy_needed(
+            drone=drone,
+            from_pos=start_pos,
+            to_pos=target_pos,
+            payload=payload,
+        )
+        flight_time = self._estimate_flight_time(
+            drone=drone,
+            from_pos=start_pos,
+            to_pos=target_pos,
+        )
+        self._flight_legs[drone_id] = FlightLeg(
+            kind=kind,
+            start_time=float(self._t_now),
+            arrival_time=float(self._t_now + flight_time),
+            start_pos=start_pos,
+            target_pos=_clone_position(target_pos),
+            order_id=target_order_id,
+            target_node_id=target_node_id,
+            target_node_type=target_node_type,
+            energy_cost_j=energy_cost,
+        )
+
+    def _schedule_return_to_host(self, drone_id: str, host: ChargingHost) -> None:
+        """为 mode B 或其他固定宿主返程写入飞行段。"""
+        drone = self._require_entity_manager().drones[drone_id]
+        if isinstance(host, Depot):
+            kind = "return_to_depot"
+            self._drone_state[drone_id] = TrainingDroneState.RETURN_TO_DEPOT
+            node_type = "depot"
+            node_id = host.depot_id
+        elif isinstance(host, SwapStation):
+            kind = "return_to_station"
+            self._drone_state[drone_id] = TrainingDroneState.RETURN_TO_STATION
+            node_type = "station"
+            node_id = host.station_id
+        else:
+            raise TypeError(f"不支持的 host 类型: {type(host)!r}")
+
+        self._schedule_flight_leg(
+            drone_id=drone_id,
+            kind=kind,
+            target_pos=_clone_position(host.get_location(self._t_now)),
+            payload=0.0,
+            target_node_id=node_id,
+            target_node_type=node_type,
+        )
+
+    def _schedule_return_to_rendezvous(self, drone_id: str, node_id: str) -> None:
+        """为 mode C 的 rendezvous 返程写入飞行段。"""
+        host = self._resolve_fixed_node(node_id)
+        self._drone_state[drone_id] = TrainingDroneState.RETURN_TO_RENDEZVOUS
+        self._schedule_flight_leg(
+            drone_id=drone_id,
+            kind="return_to_rendezvous",
+            target_pos=_clone_position(host.get_location(self._t_now)),
+            payload=0.0,
+            target_node_id=node_id,
+            target_node_type=_node_type_of_host(host),
+        )
+
+    def _enter_fallback_recovery(self, drone_id: str) -> bool:
+        """让 UAV 进入 fallback_recovery，并建立对应账本。
+
+        返回值表示是否找到了可落地的兜底宿主。
+        """
+        host = self._select_deterministic_fallback_host(drone_id)
+        if host is None:
+            return False
+
+        drone = self._require_entity_manager().drones[drone_id]
+        target_pos = _clone_position(host.get_location(self._t_now))
+        arrival_time = self._t_now + self._estimate_flight_time(
+            drone=drone,
+            from_pos=drone.current_loc,
+            to_pos=target_pos,
+        )
+        self._fallback_leg[drone_id] = FallbackLeg(
+            host_node_id=_host_id(host),
+            host_node_type=_node_type_of_host(host),
+            arrival_time=float(arrival_time),
+        )
+        self._drone_state[drone_id] = TrainingDroneState.FALLBACK_RECOVERY
+        self._schedule_flight_leg(
+            drone_id=drone_id,
+            kind="fallback_recovery",
+            target_pos=target_pos,
+            payload=0.0,
+            target_node_id=_host_id(host),
+            target_node_type=_node_type_of_host(host),
+        )
+        return True
+
+    # ---------------------------------------------------------------------
+    # Selection helpers
+    # ---------------------------------------------------------------------
+
+    def _deliver_leg_feasible(self, drone: Drone, order: Order) -> bool:
+        """检查当前电量是否足以把订单送到客户点。"""
+        energy_need = self._estimate_energy_needed(
+            drone=drone,
+            from_pos=drone.current_loc,
+            to_pos=order.delivery_loc,
+            payload=float(order.payload_weight),
+        )
+        return energy_need <= drone.battery_current + _TIME_EPS
+
+    def _has_mode_b_return_host(self, drone: Drone, order: Order) -> bool:
+        """检查送达后是否至少存在一个可达的 mode B 返程宿主。"""
+        energy_after_delivery = drone.battery_current - self._estimate_energy_needed(
+            drone=drone,
+            from_pos=drone.current_loc,
+            to_pos=order.delivery_loc,
+            payload=float(order.payload_weight),
+        )
+        if energy_after_delivery <= 0:
+            return False
+
+        for host in self._all_return_hosts():
+            if self._can_reach_from(
+                drone=drone,
+                from_pos=order.delivery_loc,
+                to_pos=host.get_location(self._t_now),
+                payload=0.0,
+                safe_margin=drone.safe_margin_j,
+                battery_current=energy_after_delivery,
+            ):
+                return True
+        return False
+
+    def _select_mode_b_return_host_phase5a(self, drone_id: str) -> ChargingHost | None:
+        """返回 5a 临时口径下的 mode B 返程宿主。"""
+        # Phase 5a 仅保证最小可运行，不引入 5b 的完整 score。
+        # 为避免和 fallback 两套返程规则分叉，这里统一采用“depot 优先，否则最近可达 station”。
+        return self._select_deterministic_fallback_host(drone_id)
+
+    def _select_deterministic_fallback_host(self, drone_id: str) -> ChargingHost | None:
+        """按当前实现的 deterministic fallback 规则选宿主。"""
+        entity_mgr = self._require_entity_manager()
+        drone = entity_mgr.drones[drone_id]
+
+        depot = self._require_depot()
+        depot_pos = depot.get_location(self._t_now)
+        if self._can_reach_from(
+            drone=drone,
+            from_pos=drone.current_loc,
+            to_pos=depot_pos,
+            payload=0.0,
+            safe_margin=drone.safe_margin_j,
+            battery_current=drone.battery_current,
+        ):
+            return depot
+
+        reachable_stations: list[tuple[float, SwapStation]] = []
+        for station in entity_mgr.stations.values():
+            station_pos = station.get_location(self._t_now)
+            if self._can_reach_from(
+                drone=drone,
+                from_pos=drone.current_loc,
+                to_pos=station_pos,
+                payload=0.0,
+                safe_margin=drone.safe_margin_j,
+                battery_current=drone.battery_current,
+            ):
+                reachable_stations.append(
+                    (drone.current_loc.distance_2d(station_pos), station)
+                )
+        if not reachable_stations:
+            return None
+        reachable_stations.sort(key=lambda item: (item[0], item[1].station_id))
+        return reachable_stations[0][1]
+
+    # ---------------------------------------------------------------------
+    # Position / time helpers
+    # ---------------------------------------------------------------------
+
+    def _sync_in_transit_positions(self, t_now: float) -> None:
+        """把 truck / UAV 的物理位置同步到给定时刻。"""
+        entity_mgr = self._require_entity_manager()
+        truck = self._require_truck()
+        truck.current_loc = _clone_position(truck.get_location(t_now))
+
+        for drone_id, state in self._drone_state.items():
+            drone = entity_mgr.drones[drone_id]
+            if state in {
+                TrainingDroneState.RIDING_WITH_TRUCK,
+                TrainingDroneState.CHARGING_ON_TRUCK,
+            }:
+                # 这两个状态下无人机位置直接跟随卡车当前位置。
+                drone.current_loc = _clone_position(truck.current_loc)
+            elif state == TrainingDroneState.ACTIVE_WAIT:
+                resume_state = self._active_wait_resume.get(drone_id)
+                if resume_state == TrainingDroneState.RIDING_WITH_TRUCK:
+                    drone.current_loc = _clone_position(truck.current_loc)
+
+        for drone_id, leg in self._flight_legs.items():
+            drone = entity_mgr.drones[drone_id]
+            if t_now <= leg.start_time + _TIME_EPS:
+                drone.current_loc = _clone_position(leg.start_pos)
+                continue
+            if t_now >= leg.arrival_time - _TIME_EPS:
+                drone.current_loc = _clone_position(leg.target_pos)
+                continue
+            # 对仍在飞行中的 UAV 做线性插值，只用于当前实现的运行时位置可视化。
+            ratio = (t_now - leg.start_time) / max(_TIME_EPS, leg.arrival_time - leg.start_time)
+            drone.current_loc = leg.start_pos.interpolate(leg.target_pos, ratio)
+
+    def _next_event_time(self) -> float:
+        """从当前所有已知事件源里取下一个未来事件时刻。"""
+        candidates = [self._cfg.upper_horizon_sec]
+
+        if self._planned_route_stop_i < len(self._planned_route_stops):
+            candidates.append(self._planned_route_stops[self._planned_route_stop_i].arrival_time)
+
+        for leg in self._flight_legs.values():
+            candidates.append(leg.arrival_time)
+
+        failure_time = self._next_airborne_failure_time()
+        if math.isfinite(failure_time):
+            candidates.append(failure_time)
+
+        for done_time in self._truck_charge_until.values():
+            candidates.append(done_time)
+
+        for host in list(self._require_entity_manager().stations.values()) + list(self._require_entity_manager().depots.values()):
+            for finish_time in host.serving_drones.values():
+                candidates.append(float(finish_time))
+
+        order_mgr = self._require_order_manager()
+        next_poisson = float(getattr(order_mgr, "_next_order_time", math.inf))
+        if math.isfinite(next_poisson):
+            candidates.append(next_poisson)
+
+        scheduled_dynamic = list(getattr(order_mgr, "_scheduled_dynamic", []))
+        idx = int(getattr(order_mgr, "_scheduled_dynamic_i", 0))
+        if idx < len(scheduled_dynamic):
+            candidates.append(float(scheduled_dynamic[idx]["spawn_sim_s"]))
+
+        future = [value for value in candidates if value > self._t_now + _TIME_EPS]
+        if not future:
+            return math.inf
+        return min(future)
+
+    def _next_airborne_failure_time(self) -> float:
+        """返回当前最早的真实空中电量耗尽时刻。"""
+        failure_times = [
+            failure_time
+            for drone_id, leg in self._flight_legs.items()
+            if (failure_time := self._compute_airborne_failure_time(drone_id, leg)) is not None
+        ]
+        if not failure_times:
+            return math.inf
+        return min(failure_times)
+
+    def _collect_flight_events(
+        self,
+        t_now: float,
+        *,
+        kind: str | None,
+        exclude: set[str] | None = None,
+    ) -> list[tuple[str, FlightLeg]]:
+        """收集在 `t_now` 之前已经到达的飞行段事件。"""
+        events: list[tuple[str, FlightLeg]] = []
+        for drone_id, leg in list(self._flight_legs.items()):
+            if leg.arrival_time > t_now + _TIME_EPS:
+                continue
+            if kind is not None and leg.kind != kind:
+                continue
+            if exclude is not None and leg.kind in exclude:
+                continue
+            events.append((drone_id, leg))
+        events.sort(key=lambda item: (item[1].arrival_time, item[0]))
+        return events
+
+    def _collect_airborne_failure_events(
+        self,
+        t_now: float,
+    ) -> list[tuple[str, FlightLeg, float]]:
+        """收集在 `t_now` 前已经发生的空中电量耗尽事件。"""
+        events: list[tuple[str, FlightLeg, float]] = []
+        for drone_id, leg in list(self._flight_legs.items()):
+            failure_time = self._compute_airborne_failure_time(drone_id, leg)
+            if failure_time is None or failure_time > t_now + _TIME_EPS:
+                continue
+            events.append((drone_id, leg, failure_time))
+        events.sort(key=lambda item: (item[2], item[0]))
+        return events
+
+    def _collect_truck_stops(self, t_now: float) -> list[PlannedStop]:
+        """收集卡车在 `t_now` 之前已经到站的停靠点事件。"""
+        stops: list[PlannedStop] = []
+        while self._planned_route_stop_i < len(self._planned_route_stops):
+            stop = self._planned_route_stops[self._planned_route_stop_i]
+            if stop.arrival_time > t_now + _TIME_EPS:
+                break
+            stops.append(stop)
+            self._planned_route_stop_i += 1
+        return stops
+
+    # ---------------------------------------------------------------------
+    # Charging / queue helpers
+    # ---------------------------------------------------------------------
+
+    def _on_arrive_charging_host(
+        self,
+        drone_id: str,
+        host: ChargingHost,
+        t_now: float,
+    ) -> None:
+        """统一处理 UAV 到达 depot/station 后的入队或入服。"""
+        drone = self._require_entity_manager().drones[drone_id]
+        drone.current_loc = _clone_position(host.get_location(t_now))
+        host.arrive(drone_id, t_now)
+        # 状态分流完全以 host.arrive() 的真实队列结果为准，不手写第二套判定。
+        if drone_id in host.serving_drones:
+            self._drone_state[drone_id] = TrainingDroneState.CHARGING_OR_SWAP
+        elif drone_id in host.wait_queue:
+            self._drone_state[drone_id] = TrainingDroneState.QUEUEING_AT_HOST
+        else:
+            raise RuntimeError("charging host arrival state inconsistent")
+
+    def _sync_host_service_states(self, host: ChargingHost) -> None:
+        """把 host 内部队列真值回写到训练状态层。"""
+        for drone_id in list(host.serving_drones):
+            if self._drone_state.get(drone_id) in {
+                TrainingDroneState.QUEUEING_AT_HOST,
+                TrainingDroneState.CHARGING_OR_SWAP,
+            }:
+                self._drone_state[drone_id] = TrainingDroneState.CHARGING_OR_SWAP
+        for drone_id in list(host.wait_queue):
+            if self._drone_state.get(drone_id) in {
+                TrainingDroneState.QUEUEING_AT_HOST,
+                TrainingDroneState.CHARGING_OR_SWAP,
+            }:
+                self._drone_state[drone_id] = TrainingDroneState.QUEUEING_AT_HOST
+
+    # ---------------------------------------------------------------------
+    # Decision queue helpers
+    # ---------------------------------------------------------------------
+
+    def _enqueue_initial_idle_decisions(self) -> None:
+        """为 reset 后处于 idle 的 UAV 批量创建初始决策点。"""
+        for drone_id, state in sorted(self._drone_state.items()):
+            if state == TrainingDroneState.IDLE:
+                self._enqueue_decision(drone_id, "initial_idle", None)
+
+    def _enqueue_decision(
+        self,
+        drone_id: str,
+        trigger_type: str,
+        trigger_station_id: str | None,
+    ) -> None:
+        """向内部决策队列追加一个触发点。"""
+        state = self._drone_state.get(drone_id)
+        if state not in {TrainingDroneState.IDLE, TrainingDroneState.RIDING_WITH_TRUCK}:
+            return
+        if any(item.drone_id == drone_id for item in self._decision_queue):
+            return
+        self._decision_queue.append(
+            DecisionTrigger(
+                drone_id=drone_id,
+                trigger_type=trigger_type,
+                trigger_station_id=trigger_station_id,
+            )
+        )
+
+    def _resume_active_wait_for_idle_trigger(self) -> None:
+        """在“固定节点空闲触发”发生时恢复 idle 上的 WAIT 占位。"""
+        resumable = [
+            drone_id
+            for drone_id, state in self._active_wait_resume.items()
+            if state == TrainingDroneState.IDLE
+        ]
+        for drone_id in resumable:
+            self._active_wait_resume.pop(drone_id, None)
+            self._drone_state[drone_id] = TrainingDroneState.IDLE
+            self._enqueue_decision(drone_id, "wait_resume", None)
+
+    def _resume_active_wait_for_station_trigger(self) -> None:
+        """在“卡车到站触发”发生时恢复 WAIT 占位。"""
+        resumable = list(self._active_wait_resume.items())
+        for drone_id, state in resumable:
+            self._active_wait_resume.pop(drone_id, None)
+            self._drone_state[drone_id] = state
+            if state == TrainingDroneState.IDLE:
+                self._enqueue_decision(drone_id, "wait_resume", None)
+
+    # ---------------------------------------------------------------------
+    # Phase 4 / reset helpers
+    # ---------------------------------------------------------------------
+
+    def _load_phase4_artifacts(self) -> dict[str, Any]:
+        """读取 Phase 4 路线产物，并转成当前环境内部结构。"""
+        route_dir = self._phase4_route_dir
+        execution_payload = _load_json(route_dir / "truck_execution_route.json")
+        planned_stops: list[PlannedStop] = []
+        backbone_cache: list[BackboneVisit] = []
+        mode_a_order_ids: list[str] = []
+
+        for raw_stop in execution_payload["stops"]:
+            stop = PlannedStop(
+                seq=int(raw_stop["seq"]),
+                node_type=str(raw_stop["node_type"]),
+                node_id=str(raw_stop["node_id"]),
+                position=Position3D(
+                    x=float(raw_stop["x"]),
+                    y=float(raw_stop["y"]),
+                    z=float(raw_stop.get("z", 0.0)),
+                ),
+                order_id=None if raw_stop.get("order_id") is None else str(raw_stop["order_id"]),
+                arrival_time=float(raw_stop["arrival_time_sec"]),
+                departure_time=float(raw_stop["departure_time_sec"]),
+            )
+            planned_stops.append(stop)
+
+            if stop.node_type in {"station", "depot"} and stop.seq > 0:
+                backbone_cache.append(
+                    BackboneVisit(
+                        node_id=stop.node_id,
+                        arrival_time=stop.arrival_time,
+                        departure_time=stop.departure_time + _BACKBONE_DEPARTURE_EPS,
+                    )
+                )
+            if stop.node_type == "customer" and stop.order_id:
+                # truck_execution_route 里的 customer stop 对应 mode A 背景完成事件。
+                mode_a_order_ids.append(stop.order_id)
+
+        return {
+            "planned_stops": planned_stops,
+            "backbone_cache": backbone_cache,
+            "mode_a_order_ids": tuple(mode_a_order_ids),
+        }
+
+    def _append_patrol_loop_if_needed(self) -> None:
+        """在 poisson 模式下按当前实现追加巡站循环。"""
+        if not self._planned_route_stops:
+            return
+        if self._order_source.mode != OrderSourceMode.POISSON:
+            return
+
+        last_stop = self._planned_route_stops[-1]
+        if last_stop.node_type != "depot":
+            return
+        if last_stop.arrival_time >= (
+            self._cfg.upper_horizon_sec - self._cfg.patrol_min_remaining_sec
+        ):
+            return
+
+        entity_mgr = self._require_entity_manager()
+        truck = self._require_truck()
+        depot = self._require_depot()
+        stations = sorted(entity_mgr.stations.values(), key=lambda item: item.station_id)
+        if not stations:
+            return
+
+        seq = self._planned_route_stops[-1].seq
+        t_cursor = last_stop.arrival_time
+        patrol_k = min(len(stations), self._cfg.patrol_stations_per_loop)
+
+        while t_cursor < (self._cfg.upper_horizon_sec - self._cfg.patrol_min_remaining_sec):
+            current_pos = _clone_position(depot.location)
+            available = list(stations)
+            chosen: list[SwapStation] = []
+
+            for _ in range(patrol_k):
+                # 当前实现按文档要求使用最近邻直线距离拼接巡站，不做 OSM 精确规划。
+                next_station = min(
+                    available,
+                    key=lambda station: (
+                        current_pos.distance_2d(station.location),
+                        station.station_id,
+                    ),
+                )
+                available.remove(next_station)
+                chosen.append(next_station)
+                current_pos = next_station.location
+
+            current_pos = _clone_position(depot.location)
+            for station in chosen:
+                travel_time = current_pos.distance_2d(station.location) / max(_TIME_EPS, truck.speed)
+                t_cursor += travel_time
+                seq += 1
+                planned_stop = PlannedStop(
+                    seq=seq,
+                    node_type="station",
+                    node_id=station.station_id,
+                    position=_clone_position(station.location),
+                    order_id=None,
+                    arrival_time=t_cursor,
+                    departure_time=t_cursor,
+                )
+                self._planned_route_stops.append(planned_stop)
+                self._full_backbone_cache.append(
+                    BackboneVisit(
+                        node_id=station.station_id,
+                        arrival_time=t_cursor,
+                        departure_time=t_cursor + _BACKBONE_DEPARTURE_EPS,
+                    )
+                )
+                current_pos = station.location
+
+            travel_time_back = current_pos.distance_2d(depot.location) / max(_TIME_EPS, truck.speed)
+            t_cursor += travel_time_back
+            seq += 1
+            # 巡站循环的 depot stop 只进入物理路线，不写入骨架缓存。
+            self._planned_route_stops.append(
+                PlannedStop(
+                    seq=seq,
+                    node_type="depot",
+                    node_id=depot.depot_id,
+                    position=_clone_position(depot.location),
+                    order_id=None,
+                    arrival_time=t_cursor,
+                    departure_time=t_cursor,
+                )
+            )
+
+        self._full_backbone_cache.sort(key=lambda item: (item.arrival_time, item.node_id))
+
+    def _bind_truck_route(self) -> None:
+        """把当前 `_planned_route_stops` 绑定到 Truck 实体的路线模型上。"""
+        truck = self._require_truck()
+        route_nodes = [stop.node_id for stop in self._planned_route_stops]
+        route_positions = [_clone_position(stop.position) for stop in self._planned_route_stops]
+        truck.set_route(
+            route_nodes=route_nodes,
+            route_positions=route_positions,
+            departure_time=0.0,
+        )
+
+    def _initialize_drone_states(self) -> None:
+        """根据 drone.home_type 建立训练侧初始状态。"""
+        entity_mgr = self._require_entity_manager()
+        truck = self._require_truck()
+        for drone_id, drone in entity_mgr.drones.items():
+            if drone.home_type == SourceType.TRUCK:
+                self._drone_state[drone_id] = TrainingDroneState.RIDING_WITH_TRUCK
+                drone.current_loc = _clone_position(truck.current_loc)
+            else:
+                self._drone_state[drone_id] = TrainingDroneState.IDLE
+                drone.current_loc = _clone_position(self._require_depot().location)
+
+    # ---------------------------------------------------------------------
+    # Utilities
+    # ---------------------------------------------------------------------
+
+    def _mark_hard_failure(
+        self,
+        drone_id: str,
+    ) -> float:
+        """把 UAV 标记为硬失败，并返回一次性惩罚。"""
+        drone = self._require_entity_manager().drones[drone_id]
+        truck = self._require_truck()
+
+        self._flight_legs.pop(drone_id, None)
+        self._fallback_leg.pop(drone_id, None)
+        self._truck_charge_until.pop(drone_id, None)
+        self._active_wait_resume.pop(drone_id, None)
+        self._decision_queue = [
+            item for item in self._decision_queue if item.drone_id != drone_id
+        ]
+        if drone_id in truck.docked_drones:
+            truck.docked_drones.remove(drone_id)
+        drone.battery_current = 0.0
+        self._drone_state[drone_id] = TrainingDroneState.AIRBORNE_ENERGY_FAILURE
+        return -self._cfg.hard_failure_penalty_sec
+
+    def _compute_airborne_failure_time(
+        self,
+        drone_id: str,
+        leg: FlightLeg,
+    ) -> float | None:
+        """按当前飞行账本估算“在到达前耗尽电量”的最早时刻。"""
+        drone = self._require_entity_manager().drones[drone_id]
+        if leg.energy_cost_j <= drone.battery_current + _TIME_EPS:
+            return None
+        if leg.arrival_time <= leg.start_time + _TIME_EPS:
+            return self._t_now + _TIME_EPS
+
+        failure_ratio = max(0.0, min(1.0, drone.battery_current / leg.energy_cost_j))
+        failure_time = leg.start_time + (leg.arrival_time - leg.start_time) * failure_ratio
+        # 若外部测试/调试在飞行中途手动改了电量，failure_time 可能已经落在当前时刻之前；
+        # 此时把失败事件钳到“当前推进区间的下一个瞬间”。
+        return max(self._t_now + _TIME_EPS, failure_time)
+
+    def _estimate_flight_time(
+        self,
+        *,
+        drone: Drone,
+        from_pos: Position3D,
+        to_pos: Position3D,
+    ) -> float:
+        """按三维直线距离和巡航速度估算飞行时长。"""
+        return from_pos.distance_3d(to_pos) / max(_TIME_EPS, drone.cruise_speed)
+
+    def _estimate_energy_needed(
+        self,
+        *,
+        drone: Drone,
+        from_pos: Position3D,
+        to_pos: Position3D,
+        payload: float,
+    ) -> float:
+        """按当前 Drone 功耗模型估算一段飞行能耗。"""
+        distance = from_pos.distance_3d(to_pos)
+        if distance <= _TIME_EPS:
+            return 0.0
+        power = drone.calculate_power(payload, drone.cruise_speed)
+        return power * (distance / max(_TIME_EPS, drone.cruise_speed))
+
+    def _can_reach_from(
+        self,
+        *,
+        drone: Drone,
+        from_pos: Position3D,
+        to_pos: Position3D,
+        payload: float,
+        safe_margin: float,
+        battery_current: float,
+    ) -> bool:
+        """在给定起点和剩余电量假设下判断 UAV 是否可达。"""
+        return battery_current + _TIME_EPS >= (
+            self._estimate_energy_needed(
+                drone=drone,
+                from_pos=from_pos,
+                to_pos=to_pos,
+                payload=payload,
+            )
+            + safe_margin
+        )
+
+    def _all_return_hosts(self) -> tuple[ChargingHost, ...]:
+        """返回当前实现里所有可能的固定返程宿主。"""
+        entity_mgr = self._require_entity_manager()
+        return tuple(entity_mgr.depots.values()) + tuple(entity_mgr.stations.values())
+
+    def _resolve_host(self, node_id: str | None, node_type: str | None) -> ChargingHost:
+        """按 `(node_id, node_type)` 解析固定宿主对象。"""
+        if not node_id or not node_type:
+            raise ValueError("host 节点信息不完整")
+        entity_mgr = self._require_entity_manager()
+        if node_type == "depot":
+            return entity_mgr.depots[node_id]
+        if node_type == "station":
+            return entity_mgr.stations[node_id]
+        raise ValueError(f"不支持的 host node_type: {node_type}")
+
+    def _resolve_fixed_node(self, node_id: str) -> ChargingHost:
+        """按固定节点 ID 解析 station/depot。"""
+        entity_mgr = self._require_entity_manager()
+        if node_id in entity_mgr.stations:
+            return entity_mgr.stations[node_id]
+        if node_id in entity_mgr.depots:
+            return entity_mgr.depots[node_id]
+        raise KeyError(f"未知固定节点: {node_id}")
+
+    def _scene_solver_params(self):
+        """按需读取共享 solver 参数。"""
+        from config.loader import load_solver_energy_params
+
+        return load_solver_energy_params()
+
+    def _resolve_heavy_payload_capacity(self) -> float:
+        """读取 heavy drone 的载重上限，供 coarse plan 做 mode A 边界判断。"""
+        from config.loader import load_drone_params
+
+        return float(load_drone_params().heavy.payload_capacity)
+
+    def _is_action_allowed(
+        self,
+        action: EnvAction,
+        action_lookup: tuple[EnvAction, ...],
+    ) -> bool:
+        """检查给定动作是否出现在当前候选动作列表中。"""
+        return action in action_lookup
+
+    def _require_entity_manager(self) -> EntityManager:
+        """确保 entity_manager 已在 reset() 后初始化。"""
+        if self._entity_manager is None:
+            raise RuntimeError("reset() 前不能访问 entity_manager")
+        return self._entity_manager
+
+    def _require_order_manager(self) -> OrderManager:
+        """确保 order_manager 已在 reset() 后初始化。"""
+        if self._order_manager is None:
+            raise RuntimeError("reset() 前不能访问 order_manager")
+        return self._order_manager
+
+    def _require_truck(self) -> Truck:
+        """确保 truck 已在 reset() 后解析完成。"""
+        if self._truck is None:
+            raise RuntimeError("reset() 前不能访问 truck")
+        return self._truck
+
+    def _require_depot(self) -> Depot:
+        """确保 depot 已在 reset() 后解析完成。"""
+        if self._depot is None:
+            raise RuntimeError("reset() 前不能访问 depot")
+        return self._depot
+
+
+def _load_env_yaml(config_path: Path) -> _YamlConfig:
+    """读取训练 YAML，并抽取 env_adapter 当前实际使用的字段。"""
+    try:
+        import yaml  # type: ignore[import]
+    except ImportError as exc:
+        raise ImportError("缺少 PyYAML，无法读取训练配置") from exc
+
+    with config_path.open("r", encoding="utf-8") as fh:
+        raw = yaml.safe_load(fh)
+    if not isinstance(raw, Mapping):
+        raise ValueError(f"YAML 顶层必须为 mapping: {config_path}")
+
+    planner = _require_mapping(raw, "planner")
+    reward = _require_mapping(raw, "reward")
+    candidate = _require_mapping(raw, "candidate")
+
+    return _YamlConfig(
+        upper_horizon_sec=float(planner["upper_horizon_sec"]),
+        patrol_min_remaining_sec=float(planner["patrol_min_remaining_sec"]),
+        patrol_stations_per_loop=int(planner["patrol_stations_per_loop"]),
+        allow_empty_backbone_route=bool(planner.get("allow_empty_backbone_route", False)),
+        max_wait_decision_gap_sec=float(planner["max_wait_decision_gap_sec"]),
+        max_candidate_recovery_per_order=int(candidate["max_candidate_recovery_per_order"]),
+        R_delivery_bonus=float(reward["R_delivery_bonus"]),
+        hard_failure_penalty_sec=float(reward["hard_failure_penalty_sec"]),
+    )
+
+
+def _load_json(path: Path) -> dict[str, Any]:
+    """读取 JSON 文件，并断言顶层对象类型。"""
+    with path.open("r", encoding="utf-8") as fh:
+        payload = json.load(fh)
+    if not isinstance(payload, dict):
+        raise ValueError(f"JSON 顶层必须为对象: {path}")
+    return payload
+
+
+def _require_mapping(payload: Mapping[str, Any], key: str) -> Mapping[str, Any]:
+    """从字典中取出指定 mapping 字段，否则抛错。"""
+    value = payload.get(key)
+    if not isinstance(value, Mapping):
+        raise ValueError(f"配置缺少 mapping 段: {key}")
+    return value
+
+
+def _require_singleton(mapping: Mapping[str, Any], label: str) -> tuple[str, Any]:
+    """断言某类实体当前只有一个，并返回该唯一元素。"""
+    if len(mapping) != 1:
+        raise ValueError(f"当前仅支持单 {label} 场景，实际数量={len(mapping)}")
+    return next(iter(mapping.items()))
+
+
+def _clone_position(pos: Position3D) -> Position3D:
+    """复制 Position3D，避免直接复用实体上的同一对象引用。"""
+    return Position3D(x=float(pos.x), y=float(pos.y), z=float(pos.z))
+
+
+def _host_id(host: ChargingHost) -> str:
+    """把 depot/station 宿主对象映射回其节点 ID。"""
+    if isinstance(host, Depot):
+        return host.depot_id
+    if isinstance(host, SwapStation):
+        return host.station_id
+    raise TypeError(f"未知 host 类型: {type(host)!r}")
+
+
+def _node_type_of_host(host: ChargingHost) -> str:
+    """把 depot/station 宿主对象映射回当前环境使用的节点类型字符串。"""
+    if isinstance(host, Depot):
+        return "depot"
+    if isinstance(host, SwapStation):
+        return "station"
+    raise TypeError(f"未知 host 类型: {type(host)!r}")
