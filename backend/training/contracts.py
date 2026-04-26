@@ -128,7 +128,8 @@ class CoarsePlanView:
     node_charge_load_budget: Mapping[NodeId, NodeChargeLoadBudget]
     # 供 route drift 检查使用的参考基线：每个骨架节点的参考 ETA 与参考顺序位置。
     route_drift_ref: Mapping[NodeId, RouteDriftRef]
-    # 卡车到达这些站点时，允许触发 riding_with_truck 无人机的 PPO 决策点。
+    # planner 层签发的 riding_with_truck 决策触发站点上界；
+    # 运行时是否真正触发，仍需由 env_adapter 基于执行侧实时集合判定。
     launch_candidate_stations: tuple[NodeId, ...]
     # 可选退化开关：当为 True 时，允许 truck_backbone_route 为空，表示“卡车未来骨架已耗尽”。
     # 仅建议在 benchmark / hybrid 等不追加巡站循环的验证场景中显式开启；默认保持严格契约。
@@ -310,7 +311,7 @@ class CoarsePlanView:
         return order_id in self._authorized_order_set
 
     def is_launch_candidate_station(self, node_id: NodeId) -> bool:
-        """该站点是否应触发 riding_with_truck 决策点。"""
+        """该站点是否被当前 coarse plan 放入触发站点上界。"""
 
         return node_id in self._launch_station_set
 
@@ -393,6 +394,9 @@ class PlannerMeta:
     coarse_replan_interval_sec: float
     coarse_new_order_trigger: int
     route_drift_trigger_ratio: float
+    fallback_burst_trigger_count: int
+    fallback_burst_window_sec: float
+    hard_failure_trigger_count: int
     upper_horizon_sec: float
     support_radius_km: float
     min_orders_to_trigger: int
