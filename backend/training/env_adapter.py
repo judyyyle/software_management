@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-HiveLogix — Phase 5b 训练环境适配器。
+HiveLogix — Phase 5c 训练环境适配器。
 
 职责边界：
   - 读取 Phase 2/3/4 产物，提供事件驱动的最小可运行训练环境；
@@ -9,12 +9,14 @@ HiveLogix — Phase 5b 训练环境适配器。
   - 在 Phase 5 内部内联实现最小 coarse plan / action mask；
   - 保证 reset -> step -> done 连通，且为 Phase 5b/5c 保留稳定接口。
 
-本文件当前实现到 Phase 5b：
+本文件当前实现到 Phase 5c：
   - 完整 action_mask：mode C 候选按时序/能量精细过滤
   - 完整 post_delivery_revalidation：送达后对 mode C 原选回收点做三条件复核
   - mode B 返程宿主使用确定性 score 规则选择
-  - 奖励补齐 T_fallback 的逐区间累计
-  - 仍不实现 reservation / T_overdue / T_wait / T_queue / T_idle
+  - reservation 状态机与 timeout 触发 fallback
+  - 完整 per-dt reward：T_overdue / T_wait / T_queue / T_fallback
+  - WAIT 动作的 T_idle 一次性精确结算
+  - hard overdue 强制移除
 """
 
 from __future__ import annotations
@@ -78,9 +80,15 @@ class TrainingDroneState(StrEnum):
 @dataclass(frozen=True)
 class ReservationStateView:
     """reservation 只读视图。
-
-    Phase 5b 当前仍始终返回 `None`，这里先把对外字段形状固定下来。
     """
+    recover_node: str
+    issued_at: float
+    expires_at: float
+
+
+@dataclass(frozen=True)
+class ReservationState:
+    """训练环境内部维护的 mode C reservation 真值。"""
     recover_node: str
     issued_at: float
     expires_at: float
@@ -263,8 +271,19 @@ class _YamlConfig:
     max_wait_decision_gap_sec: float
     max_candidate_recovery_per_order: int
     rendezvous_eta_safe_margin_sec: float
+    reservation_enabled: bool
+    reservation_alpha: float
+    reservation_beta: float
+    reservation_gamma: float
+    lambda_wait: float
+    wait_idle_penalty_coef: float
+    lambda_queue: float
     lambda_miss: float
+    lambda_res_timeout: float
+    lambda_overdue: float
     R_delivery_bonus: float
+    max_overdue_sec: float
+    hard_overdue_penalty_sec: float
     hard_failure_penalty_sec: float
 
 
@@ -322,6 +341,8 @@ class TrainingEnvAdapter:
         self._fallback_leg: dict[DroneId, FallbackLeg] = {}
         # 记录当前订单对应的 dispatch 承诺，供 delivered 后执行层继续转移。
         self._dispatch_commit: dict[DroneId, DispatchCommit] = {}
+        self._reservations: dict[DroneId, ReservationState] = {}
+        self._reservation_count: dict[NodeId, int] = {}
         # 车载充换电完成时刻；到点后 charging_on_truck -> riding_with_truck。
         self._truck_charge_until: dict[DroneId, float] = {}
         self._decision_queue: list[DecisionTrigger] = []
@@ -363,6 +384,8 @@ class TrainingEnvAdapter:
         self._flight_legs.clear()
         self._fallback_leg.clear()
         self._dispatch_commit.clear()
+        self._reservations.clear()
+        self._reservation_count.clear()
         self._truck_charge_until.clear()
         self._decision_queue.clear()
         self._active_wait_resume.clear()
@@ -406,6 +429,8 @@ class TrainingEnvAdapter:
             raise ValueError(f"非法动作: {action}")
 
         reward = 0.0
+        reward_breakdown: dict[str, float] = {}
+        self._last_reward_breakdown = {}
         info: dict[str, Any] = {
             "drone_id": trigger.drone_id,
             "trigger_type": trigger.trigger_type,
@@ -413,8 +438,19 @@ class TrainingEnvAdapter:
         }
 
         if isinstance(action, GlobalWaitAction):
+            delta_wait = self._compute_wait_delta(trigger.drone_id)
             self._apply_wait_action(trigger.drone_id)
             info["applied_action"] = "WAIT"
+            info["wait_delta"] = delta_wait
+            idle_penalty = -self._cfg.wait_idle_penalty_coef * delta_wait
+            reward += idle_penalty
+            reward_breakdown["idle"] = idle_penalty
+            reward += self._advance_to_event(self._t_now + delta_wait)
+            _merge_reward_breakdown(reward_breakdown, self._last_reward_breakdown)
+            self._resume_capped_wait_if_needed(trigger.drone_id)
+            if not self._decision_queue and not self.is_done():
+                reward += self._advance_until_decision_or_done()
+                _merge_reward_breakdown(reward_breakdown, self._last_reward_breakdown)
         else:
             self._apply_dispatch_action(trigger, action)
             info["applied_action"] = {
@@ -422,9 +458,11 @@ class TrainingEnvAdapter:
                 "mode": action.mode.value,
                 "recover_node_id": action.recover_node_id,
             }
+            if not self._decision_queue:
+                reward += self._advance_until_decision_or_done()
+                _merge_reward_breakdown(reward_breakdown, self._last_reward_breakdown)
 
-        if not self._decision_queue:
-            reward += self._advance_until_decision_or_done()
+        self._last_reward_breakdown = reward_breakdown
 
         return self._build_step_result(reward=reward, info=info)
 
@@ -468,9 +506,12 @@ class TrainingEnvAdapter:
                 drone_id=drone_id,
                 training_state=self._drone_state[drone_id].value,
                 current_loc=_clone_position(drone.current_loc),
-                battery_current=float(drone.battery_current),
+                battery_current=self._effective_battery_current(drone_id, self._t_now),
                 battery_max=float(drone.battery_max),
-                battery_ratio=float(drone.battery_ratio),
+                battery_ratio=(
+                    self._effective_battery_current(drone_id, self._t_now)
+                    / max(_TIME_EPS, float(drone.battery_max))
+                ),
                 carrying_order_id=drone.carrying_order_id,
                 home_type=drone.home_type.value,
                 cruise_speed=float(drone.cruise_speed),
@@ -478,7 +519,15 @@ class TrainingEnvAdapter:
                 empty_weight=float(drone.empty_weight),
                 k1=float(drone.k1),
                 k2=float(drone.k2),
-                reservation=None,
+                reservation=(
+                    ReservationStateView(
+                        recover_node=reservation.recover_node,
+                        issued_at=float(reservation.issued_at),
+                        expires_at=float(reservation.expires_at),
+                    )
+                    if (reservation := self._reservations.get(drone_id)) is not None
+                    else None
+                ),
             )
             for drone_id, drone in entity_mgr.drones.items()
         }
@@ -512,7 +561,7 @@ class TrainingEnvAdapter:
             pending_orders=copy.copy(order_mgr.pending_orders),
             assigned_orders=copy.copy(order_mgr.assigned_orders),
             node_states=node_states,
-            reservation_count={},
+            reservation_count=copy.copy(self._reservation_count),
         )
 
     def _build_coarse_plan_view(self, t_now: float) -> CoarsePlanView:
@@ -704,6 +753,12 @@ class TrainingEnvAdapter:
             selected_recover_node=action.recover_node_id,
             trigger_station_id=trigger.trigger_station_id,
         )
+        if action.mode == PolicyMode.C and action.recover_node_id is not None:
+            self._acquire_reservation(
+                drone_id=drone.drone_id,
+                order=order,
+                recover_node_id=action.recover_node_id,
+            )
         # Phase 5 当前仍直接从当前物理位置起飞送货，不建模单独的 pickup / launch service 段。
         self._schedule_flight_leg(
             drone_id=drone.drone_id,
@@ -778,7 +833,7 @@ class TrainingEnvAdapter:
 
         self._sync_in_transit_positions(t_next)
 
-        reward, reward_breakdown = self._settle_phase5b_per_dt_rewards(
+        reward, reward_breakdown = self._settle_per_dt_rewards(
             t_prev=self._t_now,
             t_next=t_next,
         )
@@ -808,6 +863,8 @@ class TrainingEnvAdapter:
 
         delivery_reward = 0.0
         hard_failure_reward = 0.0
+        hard_overdue_reward = 0.0
+        reservation_timeout_reward = 0.0
 
         # 1. 硬失败事件：半空停电会在到达事件之前截断当前飞行段。
         for drone_id, _leg, _failure_time in hard_failure_ready:
@@ -871,7 +928,14 @@ class TrainingEnvAdapter:
             for stop in truck_stops:
                 self._process_rendezvous_recovery(stop.node_id, t_next)
 
-        # 4. reservation timeout：Phase 5c 再接入
+        # 4. hard overdue + reservation timeout
+        hard_overdue_reward += self._apply_hard_overdue_penalty(t_next)
+        reservation_timeout_reward += self._process_reservation_timeouts(t_next)
+        reward += hard_overdue_reward + reservation_timeout_reward
+        if hard_overdue_reward:
+            reward_breakdown["hard_overdue"] = hard_overdue_reward
+        if reservation_timeout_reward:
+            reward_breakdown["reservation_timeout"] = reservation_timeout_reward
 
         # 5. poisson / benchmark 动态订单注入
         order_mgr.tick(t_next, entity_mgr)
@@ -947,6 +1011,7 @@ class TrainingEnvAdapter:
             if is_valid:
                 self._schedule_return_to_rendezvous(drone_id, selected_node)
             else:
+                self._release_reservation(drone_id)
                 if not self._enter_fallback_recovery(drone_id):
                     return self._mark_hard_failure(drone_id)
 
@@ -990,6 +1055,7 @@ class TrainingEnvAdapter:
             recovered.append(drone_id)
 
         for drone_id in recovered:
+            self._release_reservation(drone_id)
             self._drone_state[drone_id] = TrainingDroneState.CHARGING_ON_TRUCK
             self._truck_charge_until[drone_id] = (
                 t_now + self._scene_solver_params().truck_drone_recover_time_s
@@ -1118,39 +1184,222 @@ class TrainingEnvAdapter:
         )
         return True
 
-    def _settle_phase5b_per_dt_rewards(
+    def _acquire_reservation(
+        self,
+        *,
+        drone_id: str,
+        order: Order,
+        recover_node_id: str,
+    ) -> None:
+        """为一次 mode C dispatch 建立 reservation。"""
+        if not self._cfg.reservation_enabled:
+            return
+
+        self._release_reservation(drone_id)
+        drone = self._require_entity_manager().drones[drone_id]
+        host = self._resolve_fixed_node(recover_node_id)
+        deliver_fly_time = self._estimate_flight_time(
+            drone=drone,
+            from_pos=order.delivery_loc,
+            to_pos=host.get_location(self._t_now),
+        )
+        tau_res = (
+            self._cfg.reservation_alpha * deliver_fly_time
+            + self._cfg.reservation_gamma * float(host.estimate_wait_time(self._t_now))
+        )
+        reservation = ReservationState(
+            recover_node=recover_node_id,
+            issued_at=float(self._t_now),
+            expires_at=float(self._t_now + tau_res),
+        )
+        self._reservations[drone_id] = reservation
+        self._reservation_count[recover_node_id] = self._reservation_count.get(recover_node_id, 0) + 1
+
+    def _release_reservation(self, drone_id: str) -> None:
+        """释放某架 UAV 当前 reservation，并回写节点计数。"""
+        reservation = self._reservations.pop(drone_id, None)
+        if reservation is None:
+            return
+        node_id = reservation.recover_node
+        current = self._reservation_count.get(node_id, 0)
+        if current <= 1:
+            self._reservation_count.pop(node_id, None)
+        else:
+            self._reservation_count[node_id] = current - 1
+
+    def _process_reservation_timeouts(self, t_now: float) -> float:
+        """扫描所有 reservation timeout，并执行 5c 兜底转移。"""
+        reward = 0.0
+        for drone_id, reservation in list(self._reservations.items()):
+            timeout_cost = self._reservation_timeout_cost(drone_id, reservation, t_now)
+            if timeout_cost is None:
+                continue
+
+            self._release_reservation(drone_id)
+            commit = self._dispatch_commit.get(drone_id)
+            if commit is not None:
+                self._dispatch_commit[drone_id] = DispatchCommit(
+                    order_id=commit.order_id,
+                    mode=commit.mode,
+                    selected_recover_node=None,
+                    trigger_station_id=commit.trigger_station_id,
+                )
+
+            timeout_penalty = -self._cfg.lambda_res_timeout * timeout_cost
+            reward += timeout_penalty
+            if self._drone_state.get(drone_id) in {
+                TrainingDroneState.RETURN_TO_RENDEZVOUS,
+                TrainingDroneState.WAITING_FOR_TRUCK,
+                TrainingDroneState.DELIVERED,
+            }:
+                if not self._enter_fallback_recovery(drone_id):
+                    reward += self._mark_hard_failure(drone_id)
+        return reward
+
+    def _reservation_timeout_cost(
+        self,
+        drone_id: str,
+        reservation: ReservationState,
+        t_now: float,
+    ) -> float | None:
+        """返回 reservation timeout 的违规量；无 timeout 时返回 None。"""
+        drone = self._require_entity_manager().drones[drone_id]
+        host = self._resolve_fixed_node(reservation.recover_node)
+        host_pos = host.get_location(t_now)
+        t_arrive_truck = self._build_coarse_plan_view(t_now).truck_eta_map.get(reservation.recover_node)
+        effective_battery = self._effective_battery_current(drone_id, t_now)
+        energy_feasible = self._can_reach_from(
+            drone=drone,
+            from_pos=drone.current_loc,
+            to_pos=host_pos,
+            payload=0.0,
+            safe_margin=drone.safe_margin_j,
+            battery_current=effective_battery,
+        )
+        t_arrive_uav = t_now + self._estimate_flight_time(
+            drone=drone,
+            from_pos=drone.current_loc,
+            to_pos=host_pos,
+        )
+
+        if t_now >= reservation.expires_at - _TIME_EPS:
+            return max(0.0, t_now - reservation.expires_at)
+        if t_arrive_truck is None:
+            return 0.0
+        if (
+            t_arrive_uav + self._cfg.rendezvous_eta_safe_margin_sec
+            > t_arrive_truck + _TIME_EPS
+        ):
+            return (
+                t_arrive_uav
+                + self._cfg.rendezvous_eta_safe_margin_sec
+                - t_arrive_truck
+            )
+        if not energy_feasible:
+            return 0.0
+        return None
+
+    def _apply_hard_overdue_penalty(self, t_now: float) -> float:
+        """强制移除超时过久仍未送达的订单。"""
+        reward = 0.0
+        order_mgr = self._require_order_manager()
+
+        pending_remove = [
+            order_id
+            for order_id, order in list(order_mgr.pending_orders.items())
+            if self._is_hard_overdue_candidate(order, t_now)
+        ]
+        for order_id in pending_remove:
+            order = order_mgr.pending_orders.pop(order_id)
+            order.update_status(TaskStatus.TIMEOUT)
+            order_mgr.completed_orders.append(order)
+            reward -= self._cfg.hard_overdue_penalty_sec
+
+        assigned_remove = [
+            order_id
+            for order_id, order in list(order_mgr.assigned_orders.items())
+            if self._is_hard_overdue_candidate(order, t_now)
+        ]
+        for order_id in assigned_remove:
+            reward += self._force_remove_assigned_order(order_id, t_now)
+
+        return reward
+
+    def _is_hard_overdue_candidate(self, order: Order, t_now: float) -> bool:
+        """检查订单是否达到 hard overdue 强制移除阈值。"""
+        if not self._is_uav_primary_order(order):
+            return False
+        return (t_now - float(order.deadline)) > self._cfg.max_overdue_sec + _TIME_EPS
+
+    def _force_remove_assigned_order(self, order_id: str, t_now: float) -> float:
+        """强制移除已指派但已 hard overdue 的订单。"""
+        order_mgr = self._require_order_manager()
+        order = order_mgr.assigned_orders.pop(order_id)
+        order.update_status(TaskStatus.TIMEOUT)
+        order_mgr.completed_orders.append(order)
+
+        drone_id = order.assigned_vehicle_id
+        if drone_id and drone_id in self._require_entity_manager().drones:
+            drone = self._require_entity_manager().drones[drone_id]
+            if drone.carrying_order_id == order_id:
+                drone.release_order()
+            self._flight_legs.pop(drone_id, None)
+            self._release_reservation(drone_id)
+            self._dispatch_commit.pop(drone_id, None)
+            if self._drone_state.get(drone_id) != TrainingDroneState.AIRBORNE_ENERGY_FAILURE:
+                self._drone_state[drone_id] = TrainingDroneState.DELIVERED
+                if not self._enter_fallback_recovery(drone_id):
+                    return -self._cfg.hard_overdue_penalty_sec + self._mark_hard_failure(drone_id)
+
+        return -self._cfg.hard_overdue_penalty_sec
+
+    def _settle_per_dt_rewards(
         self,
         *,
         t_prev: float,
         t_next: float,
     ) -> tuple[float, dict[str, float]]:
-        """结算 Phase 5b 已落地的持续型奖励项。"""
+        """结算 Phase 5c 的持续型奖励项。"""
         if t_next <= t_prev + _TIME_EPS:
             return 0.0, {}
 
+        reward = 0.0
+        breakdown: dict[str, float] = {}
+        dt = t_next - t_prev
+
+        overdue_dt_total = 0.0
+        for order in self._active_uav_orders():
+            overdue_dt_total += max(0.0, t_next - max(t_prev, float(order.deadline)))
+        if overdue_dt_total > _TIME_EPS:
+            penalty = -self._cfg.lambda_overdue * overdue_dt_total
+            reward += penalty
+            breakdown["overdue"] = penalty
+
+        wait_dt_total = 0.0
+        queue_dt_total = 0.0
         fallback_dt_total = 0.0
         for drone_id, state in self._drone_state.items():
-            if state != TrainingDroneState.FALLBACK_RECOVERY:
-                continue
-            leg = self._fallback_leg.get(drone_id)
-            if leg is None:
-                continue
+            if state == TrainingDroneState.WAITING_FOR_TRUCK:
+                wait_dt_total += dt
+            elif state == TrainingDroneState.QUEUEING_AT_HOST:
+                queue_dt_total += dt
+            elif state == TrainingDroneState.FALLBACK_RECOVERY:
+                fallback_dt_total += dt
 
-            interval_end = min(t_next, leg.arrival_time)
-            flight_leg = self._flight_legs.get(drone_id)
-            if flight_leg is not None:
-                failure_time = self._compute_airborne_failure_time(drone_id, flight_leg)
-                if failure_time is not None:
-                    interval_end = min(interval_end, failure_time)
+        if wait_dt_total > _TIME_EPS:
+            penalty = -self._cfg.lambda_wait * wait_dt_total
+            reward += penalty
+            breakdown["wait"] = penalty
+        if queue_dt_total > _TIME_EPS:
+            penalty = -self._cfg.lambda_queue * queue_dt_total
+            reward += penalty
+            breakdown["queue"] = penalty
+        if fallback_dt_total > _TIME_EPS:
+            penalty = -self._cfg.lambda_miss * fallback_dt_total
+            reward += penalty
+            breakdown["fallback"] = penalty
 
-            if interval_end > t_prev + _TIME_EPS:
-                fallback_dt_total += interval_end - t_prev
-
-        if fallback_dt_total <= _TIME_EPS:
-            return 0.0, {}
-
-        penalty = -self._cfg.lambda_miss * fallback_dt_total
-        return penalty, {"fallback": penalty}
+        return reward, breakdown
 
     # ---------------------------------------------------------------------
     # Selection helpers
@@ -1408,9 +1657,101 @@ class TrainingEnvAdapter:
         reachable_stations.sort(key=lambda item: (item[0], item[1].station_id))
         return reachable_stations[0][1]
 
+    def _active_uav_orders(self) -> tuple[Order, ...]:
+        """返回进入 PPO 主指标口径的所有未送达订单。"""
+        order_mgr = self._require_order_manager()
+        active = [
+            order
+            for order in list(order_mgr.pending_orders.values()) + list(order_mgr.assigned_orders.values())
+            if self._is_uav_primary_order(order)
+        ]
+        active.sort(key=lambda item: item.order_id)
+        return tuple(active)
+
+    def _is_uav_primary_order(self, order: Order) -> bool:
+        """判断订单是否属于 UAV 主指标统计范围。"""
+        return float(order.payload_weight) <= self._heavy_payload_capacity + _TIME_EPS
+
     # ---------------------------------------------------------------------
     # Position / time helpers
     # ---------------------------------------------------------------------
+
+    def _compute_wait_delta(self, drone_id: str) -> float:
+        """按文档定义计算本次 WAIT 的精确推进量。"""
+        state = self._drone_state[drone_id]
+        if state == TrainingDroneState.IDLE:
+            next_decision_t = self._next_global_decision_event_time()
+            target_time = min(
+                next_decision_t,
+                self._t_now + self._cfg.max_wait_decision_gap_sec,
+                self._cfg.upper_horizon_sec,
+            )
+            return max(_TIME_EPS, target_time - self._t_now)
+
+        if state == TrainingDroneState.RIDING_WITH_TRUCK:
+            next_station_t = self._next_station_arrival_time_on_route()
+            if not math.isfinite(next_station_t):
+                return max(_TIME_EPS, self._cfg.upper_horizon_sec - self._t_now)
+            return max(_TIME_EPS, min(next_station_t, self._cfg.upper_horizon_sec) - self._t_now)
+
+        raise RuntimeError(f"状态 {state.value} 不允许执行 WAIT")
+
+    def _next_global_decision_event_time(self) -> float:
+        """返回下一个会触发 PPO 决策的全局事件时刻。"""
+        candidates: list[float] = []
+        coarse_plan = self._build_coarse_plan_view(self._t_now)
+
+        for stop in self._planned_route_stops[self._planned_route_stop_i :]:
+            if (
+                stop.node_type == "station"
+                and stop.node_id in coarse_plan.launch_candidate_stations
+                and stop.arrival_time > self._t_now + _TIME_EPS
+            ):
+                candidates.append(stop.arrival_time)
+
+        for host in list(self._require_entity_manager().stations.values()) + list(self._require_entity_manager().depots.values()):
+            candidates.extend(
+                finish_time
+                for finish_time in host.serving_drones.values()
+                if finish_time > self._t_now + _TIME_EPS
+            )
+
+        if not candidates:
+            return math.inf
+        return min(candidates)
+
+    def _next_station_arrival_time_on_route(self) -> float:
+        """返回卡车未来下一个 station 停靠时刻。"""
+        for stop in self._planned_route_stops[self._planned_route_stop_i :]:
+            if stop.node_type == "station" and stop.arrival_time > self._t_now + _TIME_EPS:
+                return stop.arrival_time
+        return math.inf
+
+    def _resume_capped_wait_if_needed(self, drone_id: str) -> None:
+        """idle WAIT 被 gap 上限截断且未被事件恢复时，手动恢复到新决策点。"""
+        if self._drone_state.get(drone_id) != TrainingDroneState.ACTIVE_WAIT:
+            return
+        resume_state = self._active_wait_resume.get(drone_id)
+        if resume_state != TrainingDroneState.IDLE:
+            return
+
+        self._active_wait_resume.pop(drone_id, None)
+        self._drone_state[drone_id] = TrainingDroneState.IDLE
+        self._enqueue_decision(drone_id, "wait_resume", None)
+
+    def _effective_battery_current(self, drone_id: str, t_now: float) -> float:
+        """返回给定时刻的有效剩余电量（含飞行中线性耗电近似）。"""
+        drone = self._require_entity_manager().drones[drone_id]
+        leg = self._flight_legs.get(drone_id)
+        if leg is None:
+            return float(drone.battery_current)
+        if t_now <= leg.start_time + _TIME_EPS:
+            return float(drone.battery_current)
+        if t_now >= leg.arrival_time - _TIME_EPS:
+            return max(0.0, float(drone.battery_current) - float(leg.energy_cost_j))
+
+        ratio = (t_now - leg.start_time) / max(_TIME_EPS, leg.arrival_time - leg.start_time)
+        return max(0.0, float(drone.battery_current) - float(leg.energy_cost_j) * ratio)
 
     def _sync_in_transit_positions(self, t_now: float) -> None:
         """把 truck / UAV 的物理位置同步到给定时刻。"""
@@ -1459,6 +1800,10 @@ class TrainingEnvAdapter:
 
         for done_time in self._truck_charge_until.values():
             candidates.append(done_time)
+
+        for reservation in self._reservations.values():
+            if reservation.expires_at > self._t_now + _TIME_EPS:
+                candidates.append(reservation.expires_at)
 
         for host in list(self._require_entity_manager().stations.values()) + list(self._require_entity_manager().depots.values()):
             for finish_time in host.serving_drones.values():
@@ -1592,6 +1937,8 @@ class TrainingEnvAdapter:
         state = self._drone_state.get(drone_id)
         if state not in {TrainingDroneState.IDLE, TrainingDroneState.RIDING_WITH_TRUCK}:
             return
+        if not self._has_authorized_orders_now():
+            return
         if any(item.drone_id == drone_id for item in self._decision_queue):
             return
         self._decision_queue.append(
@@ -1622,6 +1969,10 @@ class TrainingEnvAdapter:
             self._drone_state[drone_id] = state
             if state == TrainingDroneState.IDLE:
                 self._enqueue_decision(drone_id, "wait_resume", None)
+
+    def _has_authorized_orders_now(self) -> bool:
+        """当前时刻是否存在 coarse plan 授权订单。"""
+        return bool(self._build_coarse_plan_view(self._t_now).authorized_orders)
 
     # ---------------------------------------------------------------------
     # Phase 4 / reset helpers
@@ -1794,6 +2145,7 @@ class TrainingEnvAdapter:
         self._fallback_leg.pop(drone_id, None)
         self._truck_charge_until.pop(drone_id, None)
         self._active_wait_resume.pop(drone_id, None)
+        self._release_reservation(drone_id)
         self._decision_queue = [
             item for item in self._decision_queue if item.drone_id != drone_id
         ]
@@ -1952,6 +2304,7 @@ def _load_env_yaml(config_path: Path) -> _YamlConfig:
     planner = _require_mapping(raw, "planner")
     reward = _require_mapping(raw, "reward")
     candidate = _require_mapping(raw, "candidate")
+    reservation = _require_mapping(raw, "reservation")
 
     return _YamlConfig(
         upper_horizon_sec=float(planner["upper_horizon_sec"]),
@@ -1961,8 +2314,19 @@ def _load_env_yaml(config_path: Path) -> _YamlConfig:
         max_wait_decision_gap_sec=float(planner["max_wait_decision_gap_sec"]),
         max_candidate_recovery_per_order=int(candidate["max_candidate_recovery_per_order"]),
         rendezvous_eta_safe_margin_sec=float(candidate["rendezvous_eta_safe_margin_sec"]),
+        reservation_enabled=bool(reservation.get("enable", True)),
+        reservation_alpha=float(reservation["alpha"]),
+        reservation_beta=float(reservation["beta"]),
+        reservation_gamma=float(reservation["gamma"]),
+        lambda_wait=float(reward["lambda_wait"]),
+        wait_idle_penalty_coef=float(reward["wait_idle_penalty_coef"]),
+        lambda_queue=float(reward["lambda_queue"]),
         lambda_miss=float(reward["lambda_miss"]),
+        lambda_res_timeout=float(reward["lambda_res_timeout"]),
+        lambda_overdue=float(reward["lambda_overdue"]),
         R_delivery_bonus=float(reward["R_delivery_bonus"]),
+        max_overdue_sec=float(reward["max_overdue_sec"]),
+        hard_overdue_penalty_sec=float(reward["hard_overdue_penalty_sec"]),
         hard_failure_penalty_sec=float(reward["hard_failure_penalty_sec"]),
     )
 
@@ -2012,3 +2376,9 @@ def _node_type_of_host(host: ChargingHost) -> str:
     if isinstance(host, SwapStation):
         return "station"
     raise TypeError(f"未知 host 类型: {type(host)!r}")
+
+
+def _merge_reward_breakdown(target: dict[str, float], source: Mapping[str, float]) -> None:
+    """把一段 reward breakdown 累加合并到目标字典。"""
+    for key, value in source.items():
+        target[key] = target.get(key, 0.0) + float(value)

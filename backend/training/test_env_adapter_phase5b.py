@@ -143,6 +143,7 @@ class TestTrainingEnvAdapterPhase5b(unittest.TestCase):
                 departure_time=t_deliver + 600.0 + 1e-6,
             )
         ]
+        env._enqueue_decision(drone_id, "test_idle", None)
 
         trigger = env._decision_queue.pop(0)
         decision = env._build_decision_context(trigger)
