@@ -79,6 +79,11 @@ class CandidateBuilder:
         trigger_station_id: str | None,
         last_seen_plan_version: int,
     ) -> CandidateOutput:
+        _validate_trigger_context(
+            runtime_state=runtime_state,
+            trigger_type=trigger_type,
+            trigger_station_id=trigger_station_id,
+        )
         drone_view = runtime_state.drone_states[deciding_drone_id]
         launch_pos = self._resolve_launch_position(
             runtime_state=runtime_state,
@@ -91,6 +96,9 @@ class CandidateBuilder:
         for order_id in coarse_plan.authorized_orders:
             order = runtime_state.pending_orders.get(order_id)
             if order is None:
+                continue
+            allowed_policy_modes = coarse_plan.get_policy_modes(order_id)
+            if not allowed_policy_modes:
                 continue
             if float(order.payload_weight) > float(drone_view.payload_capacity):
                 continue
@@ -110,23 +118,28 @@ class CandidateBuilder:
                 continue
 
             energy_after_delivery = float(drone_view.battery_current) - energy_to_deliver
-            mode_b_summary = self._select_best_mode_b_host(
-                runtime_state=runtime_state,
-                drone_view=drone_view,
-                deliver_pos=order.delivery_loc,
-                battery_after_delivery=energy_after_delivery,
-            )
-            recovery_candidates = self._build_mode_c_candidates(
-                runtime_state=runtime_state,
-                coarse_plan=coarse_plan,
-                drone_view=drone_view,
-                order=order,
-                deliver_pos=order.delivery_loc,
-                t_deliver=t_deliver,
-                energy_after_delivery=energy_after_delivery,
-                trigger_type=trigger_type,
-                trigger_station_id=trigger_station_id,
-            )
+            mode_b_summary = None
+            if PolicyMode.B in allowed_policy_modes:
+                mode_b_summary = self._select_best_mode_b_host(
+                    runtime_state=runtime_state,
+                    drone_view=drone_view,
+                    deliver_pos=order.delivery_loc,
+                    battery_after_delivery=energy_after_delivery,
+                )
+
+            recovery_candidates: tuple[RecoveryFeatures, ...] = ()
+            if PolicyMode.C in allowed_policy_modes:
+                recovery_candidates = self._build_mode_c_candidates(
+                    runtime_state=runtime_state,
+                    coarse_plan=coarse_plan,
+                    drone_view=drone_view,
+                    order=order,
+                    deliver_pos=order.delivery_loc,
+                    t_deliver=t_deliver,
+                    energy_after_delivery=energy_after_delivery,
+                    trigger_type=trigger_type,
+                    trigger_station_id=trigger_station_id,
+                )
 
             if mode_b_summary is None and not recovery_candidates:
                 continue
@@ -264,6 +277,39 @@ class CandidateBuilder:
             ),
         )
 
+    def build_from_decision_context(
+        self,
+        decision_context: Any,
+        *,
+        last_seen_plan_version: int,
+    ) -> CandidateOutput:
+        """基于一次既有决策快照重建 `CandidateOutput`。
+
+        该入口保持 `CandidateOutput` 仍由 env 外部调用方持有，不挂在
+        `DecisionContext` / `EnvStepResult` 上；同时避免外部重新手拼
+        `runtime_state` / `coarse_plan` / trigger 字段。
+        """
+        try:
+            runtime_state = decision_context.runtime_state
+            coarse_plan = decision_context.coarse_plan
+            deciding_drone_id = decision_context.deciding_drone_id
+            trigger_type = decision_context.trigger_type
+            trigger_station_id = decision_context.trigger_station_id
+        except AttributeError as exc:
+            raise TypeError(
+                "decision_context 必须暴露 runtime_state / coarse_plan / "
+                "deciding_drone_id / trigger_type / trigger_station_id"
+            ) from exc
+
+        return self.build(
+            runtime_state=runtime_state,
+            coarse_plan=coarse_plan,
+            deciding_drone_id=deciding_drone_id,
+            trigger_type=trigger_type,
+            trigger_station_id=trigger_station_id,
+            last_seen_plan_version=last_seen_plan_version,
+        )
+
     def _resolve_launch_position(
         self,
         *,
@@ -273,7 +319,7 @@ class CandidateBuilder:
         trigger_station_id: str | None,
     ) -> Position3D:
         if (
-            trigger_type == "truck_station_arrival"
+            _is_riding_with_truck_trigger(trigger_type)
             and trigger_station_id
             and trigger_station_id in runtime_state.node_states
         ):
@@ -293,7 +339,7 @@ class CandidateBuilder:
         trigger_type: str,
         trigger_station_id: str | None,
     ) -> tuple[RecoveryFeatures, ...]:
-        if trigger_type == "truck_station_arrival" and trigger_station_id:
+        if _is_riding_with_truck_trigger(trigger_type) and trigger_station_id:
             recovery_pool = self._runtime_recovery_pool(
                 coarse_plan=coarse_plan,
                 trigger_station_id=trigger_station_id,
@@ -548,6 +594,30 @@ def _predicted_queue_time_est(node_state: Any) -> float:
     if int(node_state.available_slots) > 0:
         return 0.0
     return (int(node_state.queue_length) + 1) * float(node_state.swap_time)
+
+
+def _is_riding_with_truck_trigger(trigger_type: str) -> bool:
+    """兼容文档对外语义名与 env 内部事件名。"""
+    return trigger_type in {"riding_with_truck", "truck_station_arrival"}
+
+
+def _validate_trigger_context(
+    *,
+    runtime_state: Any,
+    trigger_type: str,
+    trigger_station_id: str | None,
+) -> None:
+    if not _is_riding_with_truck_trigger(trigger_type):
+        return
+    if not trigger_station_id:
+        raise ValueError(
+            "riding_with_truck / truck_station_arrival 触发必须提供 trigger_station_id"
+        )
+    if trigger_station_id not in runtime_state.node_states:
+        raise ValueError(
+            "trigger_station_id 不存在于 runtime_state.node_states: "
+            f"{trigger_station_id}"
+        )
 
 
 def _padding_order_feature() -> OrderFeatures:

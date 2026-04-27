@@ -54,11 +54,26 @@ class PlannerBridge:
             if heavy_payload_capacity is not None
             else _load_heavy_payload_capacity()
         )
+        self._runtime_allow_empty_backbone_route = bool(
+            self._cfg.allow_empty_backbone_route
+        )
         self._current_plan: CoarsePlanView | None = None
 
     @property
     def current_plan(self) -> CoarsePlanView | None:
         return self._current_plan
+
+    def reset_episode(
+        self,
+        *,
+        allow_empty_backbone_route: bool | None = None,
+    ) -> None:
+        """清空跨 episode coarse-plan 缓存，并同步运行时语义开关。"""
+        self._current_plan = None
+        if allow_empty_backbone_route is not None:
+            self._runtime_allow_empty_backbone_route = bool(
+                allow_empty_backbone_route
+            )
 
     def maybe_replan(
         self,
@@ -114,9 +129,7 @@ class PlannerBridge:
             self._future_backbone_provider(t_now)
         )
         truck_backbone_route = tuple(visit.node_id for visit in future_visits)
-        allow_empty_backbone_route = (
-            self._cfg.allow_empty_backbone_route or not truck_backbone_route
-        )
+        allow_empty_backbone_route = self._runtime_allow_empty_backbone_route
         truck_eta_map = {
             visit.node_id: float(visit.arrival_time) for visit in future_visits
         }
