@@ -11,12 +11,21 @@ from __future__ import annotations
 
 import math
 import unittest
+from dataclasses import replace
 
 from core.entities.order import Order
 from core.entities.primitives import Position3D
 
-from .contracts import PolicyMode
-from .env_adapter import BackboneVisit, TrainingDroneState, TrainingEnvAdapter, WAIT_ACTION
+from .contracts import PlannerTriggerContext, PolicyMode, RouteDriftRef
+from .env_adapter import (
+    BackboneVisit,
+    PlannedStop,
+    TrainingDroneState,
+    TrainingEnvAdapter,
+    WAIT_ACTION,
+)
+from .order_source_adapter import OrderSourceMode, build_order_source
+from .scene_loader import load_default_scene
 
 
 class TestPhase6Integration(unittest.TestCase):
@@ -28,6 +37,12 @@ class TestPhase6Integration(unittest.TestCase):
             if state == TrainingDroneState.IDLE:
                 return drone_id
         self.fail("默认场景中至少应有一架 idle 无人机")
+
+    def _first_riding_drone_id(self, env: TrainingEnvAdapter) -> str:
+        for drone_id, state in env._drone_state.items():
+            if state == TrainingDroneState.RIDING_WITH_TRUCK:
+                return drone_id
+        self.fail("默认场景中至少应有一架 riding_with_truck 无人机")
 
     def _reset_controlled_env(self) -> tuple[TrainingEnvAdapter, str]:
         env = self._make_env()
@@ -161,6 +176,52 @@ class TestPhase6Integration(unittest.TestCase):
         self.assertIn(station_2.station_id, env._active_launch_stations)
         self.assertNotIn(station_1.station_id, env._active_launch_stations)
 
+    def test_poisson_planner_bridge_rejects_empty_backbone(self) -> None:
+        env, _drone_id = self._reset_controlled_env()
+        env._full_backbone_cache = []
+        runtime_state = env.build_runtime_state_view()
+        env._planner_bridge.reset_episode()
+
+        with self.assertRaises(ValueError):
+            env._planner_bridge.maybe_replan(
+                runtime_state,
+                PlannerTriggerContext(
+                    t_now=env._t_now,
+                    backlog_new_orders=0,
+                    fallback_count_in_window=0,
+                    hard_failure_count_in_window=0,
+                    route_drift_ratio=0.0,
+                ),
+            )
+
+    def test_benchmark_planner_bridge_allows_empty_backbone(self) -> None:
+        scene_ctx = load_default_scene()
+        benchmark_source = build_order_source(
+            scene_ctx,
+            mode=OrderSourceMode.BENCHMARK,
+        )
+        env = TrainingEnvAdapter(
+            scene_ctx=scene_ctx,
+            order_source=benchmark_source,
+        )
+        env.reset()
+        env._full_backbone_cache = []
+        runtime_state = env.build_runtime_state_view()
+        env._planner_bridge.reset_episode()
+
+        coarse_plan = env._planner_bridge.maybe_replan(
+            runtime_state,
+            PlannerTriggerContext(
+                t_now=env._t_now,
+                backlog_new_orders=0,
+                fallback_count_in_window=0,
+                hard_failure_count_in_window=0,
+                route_drift_ratio=0.0,
+            ),
+        )
+        self.assertTrue(coarse_plan.allow_empty_backbone_route)
+        self.assertEqual(coarse_plan.truck_backbone_route, ())
+
     def test_candidate_builder_keeps_masks_and_lookup_aligned(self) -> None:
         env, drone_id = self._reset_controlled_env()
         entity_mgr = env._require_entity_manager()
@@ -223,6 +284,364 @@ class TestPhase6Integration(unittest.TestCase):
         self.assertEqual(resolved_mode_c.order_id, order.order_id)
         self.assertEqual(resolved_mode_c.mode, PolicyMode.C)
         self.assertEqual(resolved_mode_c.recover_node_id, station_safe.station_id)
+
+    def test_public_candidate_output_entry_rebuilds_from_decision_context(self) -> None:
+        env, drone_id = self._reset_controlled_env()
+        entity_mgr = env._require_entity_manager()
+        drone = entity_mgr.drones[drone_id]
+        station_ids = sorted(entity_mgr.stations)
+        station_fast = entity_mgr.stations[station_ids[0]]
+        station_safe = entity_mgr.stations[station_ids[1]]
+
+        order = self._inject_order_at(
+            env,
+            order_id="ORDER-P6-PUBLIC-01",
+            position=Position3D(
+                x=drone.current_loc.x + 10.0,
+                y=drone.current_loc.y,
+                z=drone.current_loc.z,
+            ),
+        )
+        t_deliver = env._estimate_delivery_arrival_time(drone, order)
+        env._full_backbone_cache = [
+            BackboneVisit(
+                node_id=station_fast.station_id,
+                arrival_time=t_deliver + 1.0,
+                departure_time=t_deliver + 1.0 + 1e-6,
+            ),
+            BackboneVisit(
+                node_id=station_safe.station_id,
+                arrival_time=t_deliver + 600.0,
+                departure_time=t_deliver + 600.0 + 1e-6,
+            ),
+        ]
+
+        env._enqueue_initial_idle_decisions()
+        decision_context = env.current_decision_context
+        self.assertIsNotNone(decision_context)
+
+        candidate_out = env.build_candidate_output(
+            decision_context,
+            last_seen_plan_version=-1,
+        )
+
+        self.assertEqual(
+            candidate_out.resolved_action_lookup.as_action_lookup(),
+            decision_context.action_lookup,
+        )
+        self.assertEqual(
+            candidate_out.candidate_features.order_features[0].order_id,
+            order.order_id,
+        )
+        self.assertEqual(
+            candidate_out.candidate_features.uav_self.plan_version_delta,
+            decision_context.coarse_plan.plan_version + 1,
+        )
+
+    def test_riding_with_truck_alias_uses_runtime_recovery_pool(self) -> None:
+        env, drone_id = self._reset_controlled_env()
+        entity_mgr = env._require_entity_manager()
+        drone = entity_mgr.drones[drone_id]
+        station_ids = sorted(entity_mgr.stations)
+        station_1 = entity_mgr.stations[station_ids[0]]
+        station_2 = entity_mgr.stations[station_ids[1]]
+
+        order = self._inject_order_at(
+            env,
+            order_id="ORDER-P6-RIDE-ALIAS-01",
+            position=Position3D(
+                x=station_2.location.x + 10.0,
+                y=station_2.location.y,
+                z=station_2.location.z,
+            ),
+        )
+
+        runtime_state = env.build_runtime_state_view()
+        coarse_plan = env._build_coarse_plan_view(env._t_now)
+        custom_plan = replace(
+            coarse_plan,
+            truck_backbone_route=(station_1.station_id, station_2.station_id),
+            truck_eta_map={
+                station_1.station_id: runtime_state.t_now + 1800.0,
+                station_2.station_id: runtime_state.t_now + 2400.0,
+            },
+            route_drift_ref={
+                station_1.station_id: RouteDriftRef(
+                    eta_ref=runtime_state.t_now + 1800.0,
+                    route_index_ref=0,
+                ),
+                station_2.station_id: RouteDriftRef(
+                    eta_ref=runtime_state.t_now + 2400.0,
+                    route_index_ref=1,
+                ),
+            },
+            recovery_pool={
+                **coarse_plan.recovery_pool,
+                order.order_id: (station_1.station_id, station_2.station_id),
+            },
+            launch_candidate_stations=(station_1.station_id, station_2.station_id),
+        )
+
+        candidate_out_alias = env._candidate_builder.build(
+            runtime_state=runtime_state,
+            coarse_plan=custom_plan,
+            deciding_drone_id=drone_id,
+            trigger_type="riding_with_truck",
+            trigger_station_id=station_2.station_id,
+            last_seen_plan_version=custom_plan.plan_version,
+        )
+        candidate_out_internal = env._candidate_builder.build(
+            runtime_state=runtime_state,
+            coarse_plan=custom_plan,
+            deciding_drone_id=drone_id,
+            trigger_type="truck_station_arrival",
+            trigger_station_id=station_2.station_id,
+            last_seen_plan_version=custom_plan.plan_version,
+        )
+        candidate_out_idle = env._candidate_builder.build(
+            runtime_state=runtime_state,
+            coarse_plan=custom_plan,
+            deciding_drone_id=drone_id,
+            trigger_type="test_idle",
+            trigger_station_id=None,
+            last_seen_plan_version=custom_plan.plan_version,
+        )
+
+        alias_recovery_nodes = [
+            feature.recover_node_id
+            for feature in candidate_out_alias.candidate_features.recovery_features[0]
+            if feature.is_valid
+        ]
+        internal_recovery_nodes = [
+            feature.recover_node_id
+            for feature in candidate_out_internal.candidate_features.recovery_features[0]
+            if feature.is_valid
+        ]
+        idle_recovery_nodes = [
+            feature.recover_node_id
+            for feature in candidate_out_idle.candidate_features.recovery_features[0]
+            if feature.is_valid
+        ]
+
+        self.assertEqual(alias_recovery_nodes, [station_2.station_id])
+        self.assertEqual(internal_recovery_nodes, [station_2.station_id])
+        self.assertEqual(
+            set(idle_recovery_nodes),
+            {station_1.station_id, station_2.station_id},
+        )
+
+    def test_riding_with_truck_trigger_requires_station_id(self) -> None:
+        env, drone_id = self._reset_controlled_env()
+        drone = env._require_entity_manager().drones[drone_id]
+        self._inject_order_at(
+            env,
+            order_id="ORDER-P6-RIDE-REQ-01",
+            position=Position3D(
+                x=drone.current_loc.x + 10.0,
+                y=drone.current_loc.y,
+                z=drone.current_loc.z,
+            ),
+        )
+        runtime_state = env.build_runtime_state_view()
+        coarse_plan = env._build_coarse_plan_view(env._t_now)
+
+        with self.assertRaises(ValueError):
+            env._candidate_builder.build(
+                runtime_state=runtime_state,
+                coarse_plan=coarse_plan,
+                deciding_drone_id=drone_id,
+                trigger_type="riding_with_truck",
+                trigger_station_id=None,
+                last_seen_plan_version=coarse_plan.plan_version,
+            )
+
+    def test_candidate_builder_respects_policy_mode_mask(self) -> None:
+        env, drone_id = self._reset_controlled_env()
+        entity_mgr = env._require_entity_manager()
+        drone = entity_mgr.drones[drone_id]
+        station_ids = sorted(entity_mgr.stations)
+        station_1 = entity_mgr.stations[station_ids[0]]
+        station_2 = entity_mgr.stations[station_ids[1]]
+
+        order = self._inject_order_at(
+            env,
+            order_id="ORDER-P6-POLICY-01",
+            position=Position3D(
+                x=drone.current_loc.x + 10.0,
+                y=drone.current_loc.y,
+                z=drone.current_loc.z,
+            ),
+        )
+        t_deliver = env._estimate_delivery_arrival_time(drone, order)
+        env._full_backbone_cache = [
+            BackboneVisit(
+                node_id=station_1.station_id,
+                arrival_time=t_deliver + 300.0,
+                departure_time=t_deliver + 300.0 + 1e-6,
+            ),
+            BackboneVisit(
+                node_id=station_2.station_id,
+                arrival_time=t_deliver + 600.0,
+                departure_time=t_deliver + 600.0 + 1e-6,
+            ),
+        ]
+
+        runtime_state = env.build_runtime_state_view()
+        coarse_plan = env._build_coarse_plan_view(env._t_now)
+        restricted_plan = replace(
+            coarse_plan,
+            policy_mode_mask={
+                **coarse_plan.policy_mode_mask,
+                order.order_id: frozenset({PolicyMode.B}),
+            },
+        )
+        candidate_out = env._candidate_builder.build(
+            runtime_state=runtime_state,
+            coarse_plan=restricted_plan,
+            deciding_drone_id=drone_id,
+            trigger_type="test_idle",
+            trigger_station_id=None,
+            last_seen_plan_version=restricted_plan.plan_version,
+        )
+
+        self.assertTrue(candidate_out.order_mask[0])
+        self.assertEqual(candidate_out.mode_mask[0], (True, False))
+        self.assertFalse(any(candidate_out.recovery_mask[0]))
+        self.assertEqual(
+            candidate_out.candidate_features.order_features[0].order_id,
+            order.order_id,
+        )
+        self.assertTrue(
+            candidate_out.candidate_features.order_features[0].has_mode_b_action
+        )
+        with self.assertRaises(KeyError):
+            candidate_out.resolved_action_lookup.resolve(
+                root_branch_idx=1,
+                order_idx=0,
+                mode_idx=1,
+                recovery_idx=0,
+            )
+
+    def test_riding_wait_tracks_actual_elapsed_until_trigger_station(self) -> None:
+        env = self._make_env()
+        env.reset()
+
+        order_mgr = env._require_order_manager()
+        order_mgr.pending_orders.clear()
+        order_mgr.assigned_orders.clear()
+        order_mgr.completed_orders.clear()
+        order_mgr._next_order_time = math.inf
+        order_mgr._scheduled_dynamic = []
+        order_mgr._scheduled_dynamic_i = 0
+
+        env._decision_queue.clear()
+        env._background_mode_a_pending.clear()
+        env._planner_bridge = None
+        env._current_coarse_plan = None
+
+        drone_id = self._first_riding_drone_id(env)
+        entity_mgr = env._require_entity_manager()
+        truck = env._require_truck()
+        depot = env._require_depot()
+        station_ids = sorted(entity_mgr.stations)
+        self.assertGreaterEqual(len(station_ids), 2)
+        station_1 = entity_mgr.stations[station_ids[0]]
+        station_2 = entity_mgr.stations[station_ids[1]]
+
+        env._planned_route_stops = [
+            PlannedStop(
+                seq=0,
+                node_type="depot",
+                node_id=depot.depot_id,
+                position=Position3D(
+                    x=truck.current_loc.x,
+                    y=truck.current_loc.y,
+                    z=truck.current_loc.z,
+                ),
+                order_id=None,
+                arrival_time=0.0,
+                departure_time=1e-6,
+            ),
+            PlannedStop(
+                seq=1,
+                node_type="station",
+                node_id=station_1.station_id,
+                position=station_1.location,
+                order_id=None,
+                arrival_time=60.0,
+                departure_time=60.0 + 1e-6,
+            ),
+            PlannedStop(
+                seq=2,
+                node_type="station",
+                node_id=station_2.station_id,
+                position=station_2.location,
+                order_id=None,
+                arrival_time=120.0,
+                departure_time=120.0 + 1e-6,
+            ),
+        ]
+        env._planned_route_stop_i = 1
+        env._full_backbone_cache = [
+            BackboneVisit(
+                node_id=station_1.station_id,
+                arrival_time=60.0,
+                departure_time=60.0 + 1e-6,
+            ),
+            BackboneVisit(
+                node_id=station_2.station_id,
+                arrival_time=120.0,
+                departure_time=120.0 + 1e-6,
+            ),
+        ]
+
+        self._inject_order_at(
+            env,
+            order_id="ORDER-P6-RIDE-WAIT-01",
+            position=Position3D(
+                x=truck.current_loc.x + 20.0,
+                y=truck.current_loc.y,
+                z=truck.current_loc.z,
+            ),
+            deadline_offset=7200.0,
+        )
+
+        env._active_launch_stations = {station_2.station_id}
+        env._enqueue_decision(
+            drone_id,
+            trigger_type="truck_station_arrival",
+            trigger_station_id=station_1.station_id,
+        )
+        self.assertTrue(env._decision_queue)
+
+        t_start = env._t_now
+        result = env.step(WAIT_ACTION)
+        elapsed = env._t_now - t_start
+        expected_elapsed = 120.0 - t_start
+
+        self.assertAlmostEqual(elapsed, expected_elapsed, places=6)
+        self.assertEqual(
+            result.info["wait_mode"],
+            "deferred_riding_with_truck",
+        )
+        self.assertNotIn("wait_delta", result.info)
+        self.assertAlmostEqual(
+            result.reward,
+            -env._cfg.wait_idle_penalty_coef * expected_elapsed,
+            places=6,
+        )
+        self.assertIn(
+            env._drone_state[drone_id],
+            {TrainingDroneState.RIDING_WITH_TRUCK, TrainingDroneState.ACTIVE_WAIT},
+        )
+        self.assertTrue(
+            any(
+                trigger.drone_id == drone_id
+                and trigger.trigger_type == "truck_station_arrival"
+                and trigger.trigger_station_id == station_2.station_id
+                for trigger in env._decision_queue
+            )
+        )
 
 
 if __name__ == "__main__":

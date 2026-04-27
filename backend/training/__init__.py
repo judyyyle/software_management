@@ -39,6 +39,7 @@ from .env_adapter import (
 )
 from .actions import DispatchAction, GlobalWaitAction, WAIT_ACTION
 from .candidate_builder import CandidateBuilder
+from .contracts import CandidateOutput
 from .planner_bridge import PlannerBridge
 from .export_sumo_truck_route import (
     Phase4ExportResult,
@@ -58,6 +59,7 @@ __all__ = [
     "build_order_source",
     "build_order_source_preview_summary",
     "CandidateBuilder",
+    "CandidateOutput",
     "configure_order_manager_for_source",
     "DecisionContext",
     "DispatchAction",
