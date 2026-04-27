@@ -226,8 +226,12 @@ J =
 - `mode A` 背景订单不进入这套 PPO 主指标；其执行结果只进入单独的系统上下文统计区
 - `T_overdue` 的即时惩罚必须在 `env_adapter` 的 `compute_reward()` 里逐步结算，
    不能只在 episode 末端或强制移除时统一结算，否则梯度信号仍然稀释
-- `T_idle` 的即时惩罚固定为 `step(WAIT_action)` 调用点的一次性 entry cost
-   （入场成本），数值等于本次 WAIT 的精确 `delta_wait`，不进入后续区间持续累计
+- `T_idle` 的即时惩罚对两类 WAIT 分开定义：
+   - `idle` 状态下：固定为 `step(WAIT_action)` 调用点的一次性 entry cost（入场成本），
+     数值等于本次 WAIT 的精确 `delta_wait`
+   - `riding_with_truck` 状态下：不在 `step(WAIT_action)` 入口预付整段未来时长，而是在
+     `active_wait` 占位期间按每次真实时间推进区间 `[t_prev, t_next)` 的实际 `dt`
+     累计到 `T_idle`
 
 ### 2.1.5 当前阶段建议采用事件驱动环境
 
@@ -840,8 +844,11 @@ J =
 - `hard_failure_penalty_sec` 首轮建议值为 `1200`（秒级等价损失），必须显著大于一次最坏可恢复扰动
 - `T_complete` 仅用于评估，不计入训练 reward（见 4.1.4.1 节）
 - `T_overdue` 的即时惩罚必须在 `env_adapter` 的 `compute_reward()` 里按时间推进区间逐步结算，不能只在 episode 末端或强制移除时统一结算
-- `T_idle` 的即时惩罚固定在 `step(WAIT_action)` 调用点按精确 `delta_wait`
-  一次性结算，不进入 `_settle_per_dt_rewards(dt)` 的持续累计路径
+- `T_idle` 的即时惩罚按 WAIT 触发来源分两条路径：
+  - `idle` 状态下：仍固定在 `step(WAIT_action)` 调用点按精确 `delta_wait`
+    一次性结算，不进入 `_settle_per_dt_rewards(dt)` 的持续累计路径
+  - `riding_with_truck` 状态下：改为在 `active_wait` 持续期间按每次真实事件推进的
+    实际 `dt` 逐段累计，不在 `step(WAIT_action)` 入口预付整段未来等待时长
 - `T_fallback` 的即时惩罚必须在 `env_adapter` 的 `compute_reward()` 里按
   `fallback_recovery` 状态的实际持续时间逐步结算，不允许只在进入 fallback 时扣一次
 - `mode A` 背景订单不进入 `J` 与 PPO-vs-baseline 核心比较指标，仅进入单独的系统上下文统计区
@@ -1907,6 +1914,8 @@ candidate_builder.build(
 - `deciding_drone_id`（当前决策无人机）用于确定"本次候选集是为哪架 UAV 构建"
 - `trigger_type`（触发类型）用于区分 `idle`（地面空闲触发）与 `riding_with_truck`（随车搭载触发）
 - `trigger_station_id`（触发站点）在 `idle` 触发时为 `None`，在 `riding_with_truck` 触发时为卡车当前到达站点 `S_k`
+- 若 `trigger_type` 表示 `riding_with_truck` 路径，则 `trigger_station_id`
+  为**必填**；缺失时实现应直接报错，而不是静默退化到 `idle`/静态 recovery pool 路径
 - `last_seen_plan_version`（上次看到的规划版本号）由 **env 外部消费侧调用方** 维护，
   表示该 `deciding_drone_id`（当前决策无人机）在本 episode（回合）上一次**正式消费的**
   `CoarsePlanView.plan_version`（规划版本号）。训练主路径下通常由 rollout collector
@@ -2122,26 +2131,37 @@ delta_wait = min(
 - `max_wait_decision_gap_sec`：WAIT 推进量上限，防止极长空窗把一次 WAIT 惩罚拉得过大。
   从 `rh_alns_cmrappo.yaml` 的 `planner` 段读取，首轮建议 `60s`。
 
-`riding_with_truck` 状态下 WAIT 的 `delta_wait` 定义为：
+`riding_with_truck` 状态下 WAIT 的执行语义改为：
 
 ```text
-delta_wait = t_arrive_truck(next_station_on_route) - t_now
+进入 active_wait（resume_state = riding_with_truck）
+继续随车，不起飞
+直到卡车到达下一个真正会触发车上 UAV PPO 决策的站点
 ```
 
-即继续搭车到下一站，不起飞。
+其中：
+- “真正会触发车上 UAV 决策的站点”指卡车到达时刻仍属于
+  `_active_launch_stations`（执行侧实时触发站点集合）的站点
+- 若下一次环境返回是由其他 UAV 的决策事件触发，而当前 UAV 仍未等到该触发站，
+  则当前 UAV 保持 `active_wait`，其 WAIT 承诺不被取消
+- 因此 `riding_with_truck` 路径下**不再定义一次性预付的未来 `delta_wait`**；`T_idle`
+  只按后续真实事件推进区间的实际 `dt` 逐段累计
 
 **`active_wait` 状态的语义边界**：
 
-WAIT 动作会把无人机切到 `active_wait`，但该状态只表示"本次 WAIT 已经选定、该 UAV 在
-下一次全局决策事件前不再派送"这一执行层占位语义；`T_idle` 的数值本身不按状态持续累计。
-`T_idle` 固定在 `step(WAIT_action)` 调用点按
+WAIT 动作会把无人机切到 `active_wait`，但 `active_wait` 的 reward 语义按来源分两条路径：
 
-```text
-delta_wait = t_next_global_decision_event - t_now
-```
+- `idle -> active_wait`：
+  - 仍表示“本次 WAIT 已经选定、该 UAV 在下一次全局决策事件前不再派送”
+  - `T_idle` 固定在 `step(WAIT_action)` 调用点按精确 `delta_wait` 一次性结算
+- `riding_with_truck -> active_wait`：
+  - 表示“本次 WAIT 已经选定、该 UAV 继续随车等待下一个真正触发车上 PPO 决策的站点”
+  - `T_idle` 不在入口一次性预付，而是在 `active_wait` 占位期间按每次真实事件推进区间
+    `[t_prev, t_next)` 的实际 `dt` 持续累计
 
-一次性结算。只要 `delta_wait` 的定义是精确的，这与"推进过程中累计到同一个
-delta_wait"在数值上等价，但实现更简单，也不需要引入"被其他 UAV 决策事件打断"的额外语义。
+这样定义的原因是：`riding_with_truck` WAIT 可能跨越多个环境返回边界（例如中途先发生其他
+UAV 的决策事件），若仍在入口一次性预付整段未来等待时长，会造成 reward 结算边界与环境实际
+推进边界脱节。
 
 `max_wait_decision_gap_sec` 新增到配置文件 `rh_alns_cmrappo.yaml` 的 `planner` 段。
 
@@ -2334,8 +2354,11 @@ r_timeout = -lambda_res_timeout * T_timeout_cost
 	   - `queueing_at_host`：已到达充换电宿主（`station / depot`），等待服务槽位
 	     （**T_queue 累计区间**）
 	   - `charging_or_swap`：正在充换电服务中
-	   - `active_wait`：主动选择 WAIT 动作后的占位等待状态；`T_idle` 在
-	     `step(WAIT_action)` 中按精确 `delta_wait` 一次性结算，不在该状态下持续累计
+	   - `active_wait`：主动选择 WAIT 动作后的占位等待状态；
+	     `idle -> active_wait` 路径下，`T_idle` 在 `step(WAIT_action)` 中按精确
+	     `delta_wait` 一次性结算；
+	     `riding_with_truck -> active_wait` 路径下，`T_idle` 按后续真实事件推进区间的
+	     实际 `dt` 持续累计
 	   - `fallback_recovery`：错过卡车后飞往备用宿主（`station` 或 `depot`）的整个兜底飞行阶段
 	     （**T_fallback 累计区间**）
 	   - `charging_on_truck`：mode C 成功回收，正在卡车上充换电（等待 `truck_drone_recover_time_s`）
@@ -2362,7 +2385,10 @@ r_timeout = -lambda_res_timeout * T_timeout_cost
 	               → [执行层选择 depot]   → return_to_depot
 	                  → [到达宿主] → _on_arrive_charging_host
 	                  → queueing_at_host / charging_or_swap → idle
-	     → [选 WAIT] → active_wait → [下一个环境事件] → idle / riding_with_truck
+		     → [idle 选 WAIT] → active_wait → [下一个全局决策事件或 gap 截断] → idle
+		     → [riding_with_truck 选 WAIT] → active_wait
+		                                  → [非触发站到达 / 其他 UAV 先触发决策] → active_wait
+		                                  → [触发站到达] → riding_with_truck
 	   ```
 
    说明：`charging_on_truck` 与 `riding_with_truck` 是两个独立状态，不是别名。
@@ -2375,11 +2401,13 @@ r_timeout = -lambda_res_timeout * T_timeout_cost
    `riding_with_truck`；`home_type == SourceType.DEPOT` 的无人机初始状态设为 `idle`。
    不需要任何额外配置层，`entities.json` 的 `home_type` 字段即为唯一来源。
 
-   - `waiting_for_truck` 与 `active_wait` 的区分：两者在状态机层面是不同的状态，
-   触发来源不同，`compute_reward()` 只需检查当前状态即可确定 `dt` 计入哪个桶，
-   不需要额外的 `_wait_cause` 标志：
-   - `return_to_rendezvous → [到达节点] → waiting_for_truck`（被动，T_wait）
-   - `idle / riding_with_truck → [选 WAIT 动作] → active_wait`（主动，T_idle）
+	   - `waiting_for_truck` 与 `active_wait` 的区分：两者在状态机层面是不同的状态，
+	   触发来源不同，`compute_reward()` 只需检查当前状态即可确定 `dt` 计入哪个桶。
+	   其中 `active_wait` 的 `T_idle` 结算路径还需区分其恢复目标状态：
+	   - `return_to_rendezvous → [到达节点] → waiting_for_truck`（被动，T_wait）
+	   - `idle → [选 WAIT 动作] → active_wait(resume_state=idle)`（主动，T_idle 入口一次性结算）
+	   - `riding_with_truck → [选 WAIT 动作] → active_wait(resume_state=riding_with_truck)`
+	     （主动，T_idle 按真实事件推进区间持续累计）
 
    - `fallback_recovery` 的退出规则必须显式依赖一段内部飞行账本，而不能只靠文字描述。
    `env_adapter` 在 UAV 进入 `fallback_recovery` 时，必须同步写入一组内部执行字段：
@@ -2447,8 +2475,10 @@ r_timeout = -lambda_res_timeout * T_timeout_cost
 3. 奖励与惩罚来源（必须与主目标逐项对应）
    - `T_complete`（仅无人机订单）
    - `T_wait`（UAV 被动等待卡车的物理等待时间，episode 级累计）
-   - `T_idle`（UAV 显式选择 WAIT 动作的 idle 时间，**在 `step(WAIT_action)` 按精确
-     `delta_wait` 一次性即时结算**）
+   - `T_idle`（UAV 显式选择 WAIT 动作的 idle 时间）：
+     - `idle` WAIT：在 `step(WAIT_action)` 按精确 `delta_wait` 一次性即时结算
+     - `riding_with_truck` WAIT：在 `active_wait(resume_state=riding_with_truck)` 期间，
+       按每次真实事件推进区间的实际 `dt` 即时累计
    - `T_queue`（UAV 在 `station / depot` 补能宿主等待服务槽位的累计排队时间）
    - `T_fallback`
    - `T_res_timeout`（reservation timeout 造成的局部损失）
@@ -2463,9 +2493,14 @@ r_timeout = -lambda_res_timeout * T_timeout_cost
    函数，在以下两个时机调用：
 
    - `_advance_to_event(t_next)`：推进到下一个事件，`dt = t_next - t_now`
-   - `step(WAIT_action)`：执行 WAIT 动作，`dt = delta_wait`
+   - `step(WAIT_action)`：
+     - `idle` 路径：显式推进 `delta_wait`
+     - `riding_with_truck` 路径：不预付未来完整 `delta_wait`，而是进入
+       `active_wait` 后由后续 `_advance_to_event(...)` 在真实事件边界上逐段结算
 
-   `_settle_per_dt_rewards(dt)` 统一结算所有"按时间流逝累加"的惩罚项（不含 `T_idle`）：
+   `_settle_per_dt_rewards(dt)` 统一结算所有"按时间流逝累加"的惩罚项。
+   其中 `idle` WAIT 的 `T_idle` 仍走 `step(WAIT_action)` 入口一次性结算路径；
+   只有 `riding_with_truck` WAIT 的 `T_idle` 会进入该函数的持续累计路径：
 
    ```python
    def _settle_per_dt_rewards(self, dt: float) -> float:
@@ -2476,7 +2511,8 @@ r_timeout = -lambda_res_timeout * T_timeout_cost
        for order in self._active_uav_orders():
            overdue_dt = max(0.0, t_next - max(t_prev, order.deadline))
            reward -= self._cfg.lambda_overdue * overdue_dt
-       # T_wait / T_queue / T_fallback：按当前训练状态分桶，不需要额外标志
+       # T_wait / T_queue / T_fallback 以及 riding_with_truck-WAIT 的 T_idle：
+       # 按当前训练状态分桶，不需要额外标志
        for drone_id, state in self._drone_state.items():
            if state == TrainingDroneState.WAITING_FOR_TRUCK:
                reward -= self._cfg.lambda_wait * dt
@@ -2484,17 +2520,29 @@ r_timeout = -lambda_res_timeout * T_timeout_cost
                reward -= self._cfg.lambda_queue * dt
            elif state == TrainingDroneState.FALLBACK_RECOVERY:
                reward -= self._cfg.lambda_miss * dt
+           elif (
+               state == TrainingDroneState.ACTIVE_WAIT
+               and self._active_wait_resume[drone_id] == TrainingDroneState.RIDING_WITH_TRUCK
+           ):
+               reward -= self._cfg.wait_idle_penalty_coef * dt
        return reward
    ```
 
-   `T_idle` 的结算**仅在** `step(WAIT_action)` 调用点额外叠加，不进入
-   `_settle_per_dt_rewards`，确保与 `T_wait` 的结算路径完全分开：
+   `T_idle` 的结算按来源分两条路径：
 
    ```python
-   # step(WAIT_action) 内部
+   # idle 路径：step(WAIT_action) 内部
    reward += self._settle_per_dt_rewards(delta_wait)
-   reward -= self._cfg.wait_idle_penalty_coef * delta_wait  # T_idle 专属
+   reward -= self._cfg.wait_idle_penalty_coef * delta_wait
+
+   # riding_with_truck 路径：不在 step(WAIT_action) 入口预付，
+   # 而是在 active_wait(resume_state=riding_with_truck) 期间
+   # 由后续 _settle_per_dt_rewards(dt) 按真实事件推进区间持续累计
    ```
+
+   这样做的目的，是保证 `riding_with_truck` WAIT 的 reward 结算边界与环境实际推进边界
+   保持一致；若中途先发生其他 UAV 的决策事件，当前 UAV 的 WAIT 承诺仍保持有效，其
+   `T_idle` 只对已经真实发生的等待时间收费，不对尚未发生的未来等待时长预收费。
 
    `T_overdue` 的送达处理：订单被送达时，从 `_active_uav_orders()` 中移除，
    后续推进不再对该订单累加，送达时不叠加额外惩罚（避免双重计入）。
@@ -2560,6 +2608,8 @@ r_timeout = -lambda_res_timeout * T_timeout_cost
 - `T_wait` 与 `T_idle` 在同一 episode 内累计值互不重叠：
   `waiting_for_truck` 状态产生的时间只进 `T_wait`，
   `active_wait` 状态产生的时间只进 `T_idle`
+- `riding_with_truck` 状态下 WAIT 不再按“任意下一站”预付未来等待时长；
+  只有当卡车到达 `_active_launch_stations` 中的真实触发站时，当前 WAIT 承诺才结束
 - `T_overdue` 在订单超过 deadline 后的每次时间推进中立刻开始累加，
   不等送达事件；订单送达后停止累加，送达时不叠加额外惩罚
 - `_build_coarse_plan_view(t_now)` 在卡车恰好到站时刻（`arrival_time == t_now`）
@@ -2579,6 +2629,8 @@ r_timeout = -lambda_res_timeout * T_timeout_cost
   `reservation_count`；不包含 `truck_eta_map` 和 `truck_backbone_route`（属于 CoarsePlanView）
 - `idle` 状态下 WAIT 的 `delta_wait` 不超过 `max_wait_decision_gap_sec`（60s），
   且 `T_idle` 在 `step(WAIT_action)` 中按精确 `delta_wait` 一次性扣罚，不走持续累计路径
+- `riding_with_truck` 状态下 WAIT 的 `T_idle` 由后续真实事件推进区间逐段累计，
+  不在 `step(WAIT_action)` 调用点一次性预付完整未来等待时长
 - 同一时刻多事件按"先区间成本、后点事件；到达类先合并再做 timeout；
   poisson 新订单在下一次 _build_coarse_plan_view() 才纳入 authorized_orders"的顺序处理
 - reservation timeout 的 `energy_feasible` 在每次 `_advance_to_event()` 时重新计算，
@@ -3519,6 +3571,10 @@ def _refresh_coarse_plan_if_needed(self) -> CoarsePlanView:
      - `riding_with_truck` 触发时，不直接使用
        `coarse_plan.recovery_pool[order]`，而是按 `trigger_station_id`
        动态生成 runtime recovery pool
+     - `candidate_builder` 当前已同时兼容
+       `trigger_type="riding_with_truck"`（文档对外语义名）与
+       `trigger_type="truck_station_arrival"`（env 内部事件名）；
+       二者都会走同一条“车到站触发 -> runtime recovery pool”路径
      - `best_mode_b_return_score` /
        `best_mode_b_host_type` /
        `predicted_queue_time_est`
@@ -3526,6 +3582,12 @@ def _refresh_coarse_plan_if_needed(self) -> CoarsePlanView:
    - 当前实现中的一个明确边界：
      - `station_wait_threshold_sec` 当前只作为 recovery 候选排序中的软信号，
        **不作为** mode C 的硬性非法判据；这与文档约束一致
+     - `CandidateOutput` 仍然**不挂在**
+       `EnvStepResult` / `DecisionContext` 上；但当前已提供
+       `candidate_builder.build_from_decision_context(...)` 与
+       `env_adapter.build_candidate_output(...)` 这两条公开重建入口，
+       外部调用方可基于既有 `DecisionContext` 显式重建并持有
+       `CandidateOutput`
 
 4. **`env_adapter.py` 已切到“统一 coarse plan 刷新入口 + Phase 6 候选构建器接线”**
    - `TrainingEnvAdapter` 新增：
@@ -3547,6 +3609,19 @@ def _refresh_coarse_plan_if_needed(self) -> CoarsePlanView:
      - 卡车经过站点后，会从 `_active_launch_stations` 中实时移除
      - 若某触发站点周边已无 pending UAV 订单，也会从 `_active_launch_stations`
        中实时移除
+   - 当前仍需明确区分的边界：
+     - 这里打通的是 **env 内部兼容链路**：`candidate_builder.build(...)`
+       -> `resolved_action_lookup.as_action_lookup()` -> `DecisionContext.action_lookup`
+     - 同时已补齐 **env 外部主消费入口**：
+       `env_adapter.build_candidate_output(decision_context, last_seen_plan_version=...)`
+       会基于 `DecisionContext` 快照重建 `CandidateOutput`，并校验其
+       `resolved_action_lookup.as_action_lookup()` 与
+       `DecisionContext.action_lookup` 完全一致
+     - `env_adapter` 内部为了生成兼容 `action_lookup`，当前传给
+       `candidate_builder.build(...)` 的 `last_seen_plan_version`
+       固定等于 `coarse_plan.plan_version`；因此这条**内部兼容链路**上的
+       `plan_version_delta` 不具备训练侧真实语义，真实语义仍应由外部调用方在
+       Phase 7 rollout / baseline / validation 侧按 UAV 自行维护
 
 5. **已显式修复“stale coarse plan 卡死新单”的闭环风险**
    - 文档中提到的风险已在 `env_adapter._has_authorized_orders_now(...)` 中做了保护
@@ -3580,6 +3655,15 @@ def _refresh_coarse_plan_if_needed(self) -> CoarsePlanView:
          1. 先显式生成旧 `_current_coarse_plan`
          2. 再注入旧 plan 不包含的新订单
          3. 验证会触发 replan、`plan_version` 递增、新订单被授权并成功入队
+   - 当前**尚未**覆盖的边界：
+     - `last_seen_plan_version` 在外部按 UAV 持久化维护后的
+       `plan_version_delta` 行为
+     - `InfraNodeFeatures.is_launch_candidate_station` 与执行侧
+       `_active_launch_stations` 的语义分离是否被后续观测编码正确处理
+   - 当前已新增覆盖：
+     - `env.current_decision_context -> env.build_candidate_output(...)`
+       这条公开入口可稳定基于同一 `DecisionContext` 快照重建
+       `CandidateOutput`
 
 8. **当前本地回归结果**
    - 已通过的验证命令：
@@ -3597,18 +3681,25 @@ def _refresh_coarse_plan_if_needed(self) -> CoarsePlanView:
 
 9. **本轮未完成、仍应保持清晰认知的边界**
    - `planner_bridge.py` 当前是**规则化骨架实现**，不是完整 RH-ALNS
-   - `CandidateOutput` 当前仍主要通过 `DecisionContext.action_lookup`
-     向旧接口兼容；Phase 7 训练主路径仍需显式消费
-     `CandidateOutput` 本体
+   - `CandidateOutput` 的数据结构、mask 语义、`resolved_action_lookup`
+     以及基于 `DecisionContext` 的公共重建入口已经落地；但
+     Phase 7 训练主路径以及后续 baseline / validation 脚本本身
+     仍未实现，尚未真正接入这条公开主消费链路
    - `last_seen_plan_version` 的跨 step / 按 UAV 持久化维护，当前仍应由
      Phase 7 rollout collector 或后续 baseline / validation 脚本承担；
      `env_adapter` 本身不持有这份外部消费态
+   - `CandidateFeatures.infra_features.node_features[*].is_launch_candidate_station`
+     当前反映的是 `CoarsePlanView.launch_candidate_stations`
+     这一 planner-issued snapshot upper bound，而**不是**执行侧实时集合
+     `_active_launch_stations`；因此它目前只能按“planner 快照特征”理解，
+     不能误当作“当前时刻一定会触发 riding_with_truck 决策”的实时真值
    - `ObservationTensorizer` / `model.py` / `rollout_buffer.py`
      尚未实现，这部分仍属于 Phase 7
    - 因此，本轮 Phase 6 的准确定位是：
      - **候选动作与 coarse-plan 接口已经落地**
-     - **训练前的环境侧编排已打通**
-     - **但完整 PPO 主循环尚未接入**
+     - **env 内部兼容 `action_lookup` 的编排链路已打通**
+     - **面向训练 / baseline / validation 的 `CandidateOutput` 公共重建入口已补齐**
+     - **完整 PPO 主循环尚未接入**
 
 ## 4.7 Phase 7：实现 PPO 训练主循环
 

@@ -42,7 +42,14 @@ from environment.state.order_manager import OrderManager
 
 from .actions import DispatchAction, EnvAction, GlobalWaitAction, WAIT_ACTION
 from .candidate_builder import CandidateBuilder
-from .contracts import CoarsePlanView, PlannerMode, PlannerTriggerContext, PolicyMode, RouteDriftRef
+from .contracts import (
+    CandidateOutput,
+    CoarsePlanView,
+    PlannerMode,
+    PlannerTriggerContext,
+    PolicyMode,
+    RouteDriftRef,
+)
 from .order_source_adapter import (
     OrderSourceConfig,
     OrderSourceMode,
@@ -310,7 +317,8 @@ class TrainingEnvAdapter:
         self._allow_empty_backbone_route = False
 
         self._drone_state: dict[DroneId, TrainingDroneState] = {}
-        # 仅用于 WAIT 动作后的“恢复到哪个基础状态”；不承载 reward 语义。
+        # 记录 active_wait 结束后应恢复到哪个基础状态。
+        # idle 路径仍在 step(WAIT) 入口一次性结算；riding_with_truck 路径按真实 dt 累计 T_idle。
         self._active_wait_resume: dict[DroneId, TrainingDroneState] = {}
         self._flight_legs: dict[DroneId, FlightLeg] = {}
         self._fallback_leg: dict[DroneId, FallbackLeg] = {}
@@ -402,6 +410,10 @@ class TrainingEnvAdapter:
             self._allow_empty_backbone_route = False
         else:
             self._allow_empty_backbone_route = True
+        if self._planner_bridge is not None:
+            self._planner_bridge.reset_episode(
+                allow_empty_backbone_route=self._allow_empty_backbone_route
+            )
 
         self._bind_truck_route()
         self._initialize_drone_states()
@@ -436,19 +448,28 @@ class TrainingEnvAdapter:
         }
 
         if isinstance(action, GlobalWaitAction):
-            delta_wait = self._compute_wait_delta(trigger.drone_id)
-            self._apply_wait_action(trigger.drone_id)
+            current_state = self._drone_state[trigger.drone_id]
             info["applied_action"] = "WAIT"
-            info["wait_delta"] = delta_wait
-            idle_penalty = -self._cfg.wait_idle_penalty_coef * delta_wait
-            reward += idle_penalty
-            reward_breakdown["idle"] = idle_penalty
-            reward += self._advance_to_event(self._t_now + delta_wait)
-            _merge_reward_breakdown(reward_breakdown, self._last_reward_breakdown)
-            self._resume_capped_wait_if_needed(trigger.drone_id)
-            if not self._decision_queue and not self.is_done():
+            if current_state == TrainingDroneState.IDLE:
+                delta_wait = self._compute_wait_delta(trigger.drone_id)
+                self._apply_wait_action(trigger.drone_id)
+                info["wait_delta"] = delta_wait
+                idle_penalty = -self._cfg.wait_idle_penalty_coef * delta_wait
+                reward += idle_penalty
+                reward_breakdown["idle"] = idle_penalty
+                reward += self._advance_to_event(self._t_now + delta_wait)
+                _merge_reward_breakdown(reward_breakdown, self._last_reward_breakdown)
+                self._resume_capped_wait_if_needed(trigger.drone_id)
+                if not self._decision_queue and not self.is_done():
+                    reward += self._advance_until_decision_or_done()
+                    _merge_reward_breakdown(reward_breakdown, self._last_reward_breakdown)
+            elif current_state == TrainingDroneState.RIDING_WITH_TRUCK:
+                self._apply_wait_action(trigger.drone_id)
+                info["wait_mode"] = "deferred_riding_with_truck"
                 reward += self._advance_until_decision_or_done()
                 _merge_reward_breakdown(reward_breakdown, self._last_reward_breakdown)
+            else:
+                raise RuntimeError(f"状态 {current_state.value} 不允许执行 WAIT")
         else:
             self._apply_dispatch_action(trigger, action)
             info["applied_action"] = {
@@ -488,6 +509,31 @@ class TrainingEnvAdapter:
         if not self._decision_queue or self.is_done():
             return None
         return self._build_decision_context(self._decision_queue[0])
+
+    def build_candidate_output(
+        self,
+        decision_context: DecisionContext,
+        *,
+        last_seen_plan_version: int,
+    ) -> CandidateOutput:
+        """基于一次既有决策快照重建外部可消费的 `CandidateOutput`。
+
+        该入口显式保持：
+          - `CandidateOutput` 仍由 env 外部调用方持有；
+          - 重建所依据的状态快照来自 `decision_context`，而不是 env 当前真值；
+          - 与兼容字段 `DecisionContext.action_lookup` 的可执行动作集合保持一致。
+        """
+        candidate_out = self._candidate_builder.build_from_decision_context(
+            decision_context,
+            last_seen_plan_version=last_seen_plan_version,
+        )
+        rebuilt_action_lookup = candidate_out.resolved_action_lookup.as_action_lookup()
+        if rebuilt_action_lookup != decision_context.action_lookup:
+            raise RuntimeError(
+                "CandidateOutput 与 DecisionContext.action_lookup 不一致；"
+                "请检查 decision_context 是否由同一 env / candidate_builder 生成"
+            )
+        return candidate_out
 
     # ---------------------------------------------------------------------
     # Core builders
@@ -692,8 +738,6 @@ class TrainingEnvAdapter:
             self._current_coarse_plan = coarse_plan
             self._active_launch_stations = set(coarse_plan.launch_candidate_stations)
             self._completed_backbone_nodes_since_plan.clear()
-        elif self._current_coarse_plan is None:
-            self._current_coarse_plan = coarse_plan
 
         self._prune_active_launch_stations(runtime_state)
         return self._current_coarse_plan
@@ -768,11 +812,13 @@ class TrainingEnvAdapter:
         *,
         drone_id: str,
         coarse_plan: CoarsePlanView,
+        runtime_state: RuntimeStateView | None = None,
         trigger_type: str | None = None,
         trigger_station_id: str | None = None,
     ) -> tuple[EnvAction, ...]:
         """为当前决策 UAV 构造可执行动作列表。"""
-        runtime_state = self.build_runtime_state_view()
+        if runtime_state is None:
+            runtime_state = self.build_runtime_state_view()
         effective_trigger_type = (
             trigger_type
             if trigger_type is not None
@@ -805,7 +851,7 @@ class TrainingEnvAdapter:
             self._active_wait_resume[drone_id] = TrainingDroneState.RIDING_WITH_TRUCK
         else:
             raise RuntimeError(f"状态 {current_state.value} 不允许执行 WAIT")
-        # Phase 5c 前不在 WAIT 上单独推进 delta_wait；这里仅用 active_wait 占位到下一次事件。
+        # idle 路径在 step(WAIT) 入口一次性结算；riding_with_truck 路径后续按真实 dt 累计。
         self._drone_state[drone_id] = TrainingDroneState.ACTIVE_WAIT
 
     def _apply_dispatch_action(
@@ -860,6 +906,7 @@ class TrainingEnvAdapter:
         action_lookup = self._build_action_lookup(
             drone_id=trigger.drone_id,
             coarse_plan=coarse_plan,
+            runtime_state=runtime_state,
             trigger_type=trigger.trigger_type,
             trigger_station_id=trigger.trigger_station_id,
         )
@@ -1478,11 +1525,18 @@ class TrainingEnvAdapter:
             breakdown["overdue"] = penalty
 
         wait_dt_total = 0.0
+        idle_wait_dt_total = 0.0
         queue_dt_total = 0.0
         fallback_dt_total = 0.0
         for drone_id, state in self._drone_state.items():
             if state == TrainingDroneState.WAITING_FOR_TRUCK:
                 wait_dt_total += dt
+            elif (
+                state == TrainingDroneState.ACTIVE_WAIT
+                and self._active_wait_resume.get(drone_id)
+                == TrainingDroneState.RIDING_WITH_TRUCK
+            ):
+                idle_wait_dt_total += dt
             elif state == TrainingDroneState.QUEUEING_AT_HOST:
                 queue_dt_total += dt
             elif state == TrainingDroneState.FALLBACK_RECOVERY:
@@ -1492,6 +1546,10 @@ class TrainingEnvAdapter:
             penalty = -self._cfg.lambda_wait * wait_dt_total
             reward += penalty
             breakdown["wait"] = penalty
+        if idle_wait_dt_total > _TIME_EPS:
+            penalty = -self._cfg.wait_idle_penalty_coef * idle_wait_dt_total
+            reward += penalty
+            breakdown["idle"] = penalty
         if queue_dt_total > _TIME_EPS:
             penalty = -self._cfg.lambda_queue * queue_dt_total
             reward += penalty
@@ -1791,7 +1849,7 @@ class TrainingEnvAdapter:
             return max(_TIME_EPS, target_time - self._t_now)
 
         if state == TrainingDroneState.RIDING_WITH_TRUCK:
-            next_station_t = self._next_station_arrival_time_on_route()
+            next_station_t = self._next_active_launch_station_arrival_time_on_route()
             if not math.isfinite(next_station_t):
                 return max(_TIME_EPS, self._cfg.upper_horizon_sec - self._t_now)
             return max(_TIME_EPS, min(next_station_t, self._cfg.upper_horizon_sec) - self._t_now)
@@ -1831,6 +1889,17 @@ class TrainingEnvAdapter:
         """返回卡车未来下一个 station 停靠时刻。"""
         for stop in self._planned_route_stops[self._planned_route_stop_i :]:
             if stop.node_type == "station" and stop.arrival_time > self._t_now + _TIME_EPS:
+                return stop.arrival_time
+        return math.inf
+
+    def _next_active_launch_station_arrival_time_on_route(self) -> float:
+        """返回卡车未来下一个真实触发站的到达时刻。"""
+        for stop in self._planned_route_stops[self._planned_route_stop_i :]:
+            if (
+                stop.node_type == "station"
+                and stop.node_id in self._active_launch_stations
+                and stop.arrival_time > self._t_now + _TIME_EPS
+            ):
                 return stop.arrival_time
         return math.inf
 
@@ -2203,7 +2272,9 @@ class TrainingEnvAdapter:
         t_cursor = last_stop.arrival_time
         patrol_k = min(len(stations), self._cfg.patrol_stations_per_loop)
 
-        while t_cursor < (self._cfg.upper_horizon_sec - self._cfg.patrol_min_remaining_sec):
+        # 一旦决定进入 poisson 巡站补全路径，就持续追加到 upper horizon，
+        # 避免 episode 尾段再次出现“未来 backbone 耗尽”的契约破口。
+        while t_cursor < self._cfg.upper_horizon_sec:
             current_pos = _clone_position(depot.location)
             available = list(stations)
             chosen: list[SwapStation] = []
