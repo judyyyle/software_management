@@ -12,7 +12,7 @@ import shutil
 import sys
 import time
 from pathlib import Path
-from typing import Any, Mapping, Sequence
+from typing import Any, Callable, Mapping, Sequence
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -80,6 +80,9 @@ class RealtimeSumoEpisodeRenderer:
         self._last_sim_time = 0.0
         self._live_order_ids: set[str] = set()
         self._live_drone_ids: set[str] = set()
+        self._poi_ids: set[str] = set()
+        self._polygon_ids: set[str] = set()
+        self._last_drone_snapshot: dict[str, dict[str, Any]] = {}
 
     def reset_episode(self) -> None:
         if not self._started:
@@ -98,6 +101,9 @@ class RealtimeSumoEpisodeRenderer:
         self._last_sim_time = 0.0
         self._live_order_ids.clear()
         self._live_drone_ids.clear()
+        self._poi_ids.clear()
+        self._polygon_ids.clear()
+        self._last_drone_snapshot.clear()
 
     def sync_snapshot(self, snapshot: Mapping[str, Any]) -> None:
         if not self._started:
@@ -115,11 +121,35 @@ class RealtimeSumoEpisodeRenderer:
             if not isinstance(current_decision, Mapping)
             else current_decision.get("drone_id")
         )
+        drone_payloads = self._normalize_drones(snapshot.get("drones", ()))
+        if self._last_drone_snapshot and target_time > self._last_sim_time + 1e-6:
+            start_time = float(self._last_sim_time)
+            self._advance_to(
+                target_time,
+                on_step=lambda sim_time: self._sync_drones(
+                    self._interpolate_drones(
+                        prev_by_id=self._last_drone_snapshot,
+                        next_drones=drone_payloads,
+                        start_time=start_time,
+                        end_time=target_time,
+                        sample_time=sim_time,
+                    ),
+                    deciding_drone_id=None if deciding_drone_id is None else str(deciding_drone_id),
+                ),
+            )
+        else:
+            self._advance_to(target_time)
+
         self._sync_orders(snapshot.get("orders", ()), t_now=target_time)
         self._sync_drones(
-            snapshot.get("drones", ()),
+            drone_payloads,
             deciding_drone_id=None if deciding_drone_id is None else str(deciding_drone_id),
         )
+        self._last_drone_snapshot = {
+            str(drone["drone_id"]): dict(drone)
+            for drone in drone_payloads
+            if isinstance(drone, Mapping) and str(drone.get("drone_id", "")).strip()
+        }
 
     def hold(self, seconds: float) -> None:
         if seconds > 0:
@@ -155,17 +185,24 @@ class RealtimeSumoEpisodeRenderer:
         view_ids = list(self._traci.gui.getIDList())
         return str(view_ids[0]) if view_ids else None
 
-    def _advance_to(self, target_time: float) -> None:
+    def _advance_to(
+        self,
+        target_time: float,
+        *,
+        on_step: Callable[[float], None] | None = None,
+    ) -> None:
         self._traci.switch(self._label)
         sim_time = float(self._traci.simulation.getTime())
         while sim_time + 1e-6 < target_time:
             next_time = min(target_time, sim_time + self._gui_step_sec)
-            self._traci.simulationStep(next_time)
             delta = max(0.0, next_time - sim_time)
+            self._traci.simulationStep(next_time)
+            sim_time = float(self._traci.simulation.getTime())
+            if on_step is not None:
+                on_step(sim_time)
             sleep_sec = delta / max(self._playback_speed, 1e-6)
             if sleep_sec > 0:
                 time.sleep(sleep_sec)
-            sim_time = float(self._traci.simulation.getTime())
         self._last_sim_time = float(target_time)
 
     def _sync_orders(self, orders: Sequence[Mapping[str, Any]] | Any, *, t_now: float) -> None:
@@ -193,6 +230,8 @@ class RealtimeSumoEpisodeRenderer:
                 color=color,
                 radius=26.0 if status in {"PENDING", "ASSIGNED"} else 20.0,
                 label=label,
+                shape_kind="circle",
+                poi_size=max(10.0, (26.0 if status in {"PENDING", "ASSIGNED"} else 20.0) * 0.9),
             )
 
         for stale_order_id in self._live_order_ids - active_ids:
@@ -233,6 +272,8 @@ class RealtimeSumoEpisodeRenderer:
                 color=color,
                 radius=18.0,
                 label=label,
+                shape_kind="triangle",
+                poi_size=1.0,
             )
 
         for stale_drone_id in self._live_drone_ids - active_ids:
@@ -249,44 +290,57 @@ class RealtimeSumoEpisodeRenderer:
         color: tuple[int, int, int, int],
         radius: float,
         label: str,
+        shape_kind: str,
+        poi_size: float,
     ) -> None:
         self._traci.switch(self._label)
         poi_id = _marker_id(namespace, object_id, "poi")
         polygon_id = _marker_id(namespace, object_id, "poly")
-        shape = _circle_shape(x=x, y=y, radius=radius)
+        shape = _marker_shape(shape_kind=shape_kind, x=x, y=y, radius=radius)
 
+        if poi_id not in self._poi_ids:
+            try:
+                self._traci.poi.add(
+                    poi_id,
+                    x,
+                    y,
+                    color,
+                    poiType=namespace,
+                    layer=20,
+                )
+            except Exception:
+                # 对象若已存在，转为 update 模式，并记住该 id，避免后续重复 add。
+                pass
+            self._poi_ids.add(poi_id)
         try:
-            self._traci.poi.add(
-                poi_id,
-                x,
-                y,
-                color,
-                poiType=namespace,
-                layer=20,
-            )
-            self._traci.poi.setWidth(poi_id, max(10.0, radius * 0.9))
-            self._traci.poi.setHeight(poi_id, max(10.0, radius * 0.9))
-        except Exception:
             self._traci.poi.setPosition(poi_id, x, y)
             self._traci.poi.setColor(poi_id, color)
             self._traci.poi.setType(poi_id, namespace)
-            self._traci.poi.setWidth(poi_id, max(10.0, radius * 0.9))
-            self._traci.poi.setHeight(poi_id, max(10.0, radius * 0.9))
-        self._traci.poi.setParameter(poi_id, "PARAM_TEXT", label)
-
-        try:
-            self._traci.polygon.add(
-                polygon_id,
-                shape,
-                color,
-                fill=True,
-                polygonType=namespace,
-                layer=19,
-                lineWidth=2,
-            )
+            self._traci.poi.setWidth(poi_id, poi_size)
+            self._traci.poi.setHeight(poi_id, poi_size)
+            self._traci.poi.setParameter(poi_id, "PARAM_TEXT", label)
         except Exception:
+            pass
+
+        if polygon_id not in self._polygon_ids:
+            try:
+                self._traci.polygon.add(
+                    polygon_id,
+                    shape,
+                    color,
+                    fill=True,
+                    polygonType=namespace,
+                    layer=19,
+                    lineWidth=2,
+                )
+            except Exception:
+                pass
+            self._polygon_ids.add(polygon_id)
+        try:
             self._traci.polygon.setShape(polygon_id, shape)
             self._traci.polygon.setColor(polygon_id, color)
+        except Exception:
+            pass
 
     def _remove_marker(self, namespace: str, object_id: str) -> None:
         self._traci.switch(self._label)
@@ -296,15 +350,59 @@ class RealtimeSumoEpisodeRenderer:
             self._traci.poi.remove(poi_id)
         except Exception:
             pass
+        self._poi_ids.discard(poi_id)
         try:
             self._traci.polygon.remove(polygon_id)
         except Exception:
             pass
+        self._polygon_ids.discard(polygon_id)
 
     def _to_sumo_xy(self, payload: Mapping[str, Any]) -> tuple[float, float]:
         x = float(payload["x"]) + self._offset_x
         y = float(payload["y"]) + self._offset_y
         return x, y
+
+    def _normalize_drones(
+        self,
+        drones: Sequence[Mapping[str, Any]] | Any,
+    ) -> tuple[dict[str, Any], ...]:
+        if not isinstance(drones, Sequence):
+            return ()
+        normalized: list[dict[str, Any]] = []
+        for drone in drones:
+            if not isinstance(drone, Mapping):
+                continue
+            drone_id = str(drone.get("drone_id", "")).strip()
+            if not drone_id:
+                continue
+            normalized.append(dict(drone))
+        return tuple(normalized)
+
+    def _interpolate_drones(
+        self,
+        *,
+        prev_by_id: Mapping[str, Mapping[str, Any]],
+        next_drones: Sequence[Mapping[str, Any]],
+        start_time: float,
+        end_time: float,
+        sample_time: float,
+    ) -> tuple[dict[str, Any], ...]:
+        if end_time <= start_time + 1e-6:
+            return tuple(dict(drone) for drone in next_drones if isinstance(drone, Mapping))
+        ratio = min(1.0, max(0.0, (sample_time - start_time) / (end_time - start_time)))
+        interpolated: list[dict[str, Any]] = []
+        for drone in next_drones:
+            if not isinstance(drone, Mapping):
+                continue
+            payload = dict(drone)
+            drone_id = str(payload.get("drone_id", "")).strip()
+            previous = prev_by_id.get(drone_id)
+            if previous is not None:
+                payload["x"] = _lerp(float(previous.get("x", payload["x"])), float(payload["x"]), ratio)
+                payload["y"] = _lerp(float(previous.get("y", payload["y"])), float(payload["y"]), ratio)
+                payload["z"] = _lerp(float(previous.get("z", payload.get("z", 0.0))), float(payload.get("z", 0.0)), ratio)
+            interpolated.append(payload)
+        return tuple(interpolated)
 
 
 def _resolve_sumo_gui(binary_override: str | None) -> str:
@@ -366,6 +464,12 @@ def _marker_id(namespace: str, object_id: str, suffix: str) -> str:
     return f"cmrappo-{namespace}-{object_id}-{suffix}"
 
 
+def _marker_shape(*, shape_kind: str, x: float, y: float, radius: float) -> list[tuple[float, float]]:
+    if shape_kind == "triangle":
+        return _triangle_shape(x=x, y=y, radius=radius)
+    return _circle_shape(x=x, y=y, radius=radius)
+
+
 def _circle_shape(*, x: float, y: float, radius: float, points: int = 14) -> list[tuple[float, float]]:
     return [
         (
@@ -374,6 +478,18 @@ def _circle_shape(*, x: float, y: float, radius: float, points: int = 14) -> lis
         )
         for idx in range(points)
     ]
+
+
+def _triangle_shape(*, x: float, y: float, radius: float) -> list[tuple[float, float]]:
+    return [
+        (x, y + radius),
+        (x - radius * 0.92, y - radius * 0.75),
+        (x + radius * 0.92, y - radius * 0.75),
+    ]
+
+
+def _lerp(start: float, end: float, ratio: float) -> float:
+    return start + (end - start) * ratio
 
 
 def _order_color(status: str) -> tuple[int, int, int, int]:
