@@ -507,7 +507,11 @@ PPO 的权限严格限定为：
    - `riding_with_truck` 路径下：原回收节点不再属于当前决策点实时计算得到的
      `runtime_recovery_pool(order)`
 4. 已起飞且订单已送达的 UAV 不回滚订单状态，只重算返程
-5. LSTM hidden state 不做全局硬重置，但观测中必须注入 `plan_version_delta`
+5. `LSTM hidden state`（时序隐藏状态）按 `drone_id`（无人机编号）单独维护，
+   不做全局硬重置，也不因其他 UAV 的事件直接推进；其他 UAV 的近期行为通过
+   `history_tokens`（历史事件摘要张量）进入当前 UAV 观测。
+   同时观测中必须注入 `plan_version_delta`（规划版本增量），避免 coarse plan
+   更新后时序状态与当前规划语义脱节
 
 ### 4.1.2 需要完成的具体工作
 
@@ -899,9 +903,22 @@ r_t =
   - `candidate`：候选集参数（`max_candidate_orders=32`、`max_candidate_recovery_per_order=4`、`max_candidate_actions=128`、`station_wait_threshold_sec=240` 等）
   - `action_space`：动作空间类型（`factorized`）、`enable_wait_action=true`、`include_mode_a_in_policy=false`
   - `reservation`：timeout 参数（`alpha=1.5`、`beta=1.2`、`gamma=0.3` 等）
-  - `policy`：模型结构（`encoder_type=attn_lstm_lite`、`d_model=128`、`nhead=8`、`lstm_hidden=128`、`hist_len=6`、`critic_mode=centralized_train_only`、`inference_mode=greedy` 等）
+  - `policy`：模型结构（`encoder_type=attn_lstm_lite`、`d_model=128`、`nhead=8`、`lstm_hidden=128`、`hist_len=6`、`critic_mode=centralized_train_only`、`inference_mode=greedy` 等）；Phase 7 还必须在这一配置族中补齐 `CriticTensorSchemaV1` 的容量上限、归一化基准与 `schema_version` 来源，避免训练代码另行硬编码
   - `reward`：惩罚权重（`lambda_wait=0.10`、`wait_idle_penalty_coef=0.10`、`lambda_queue=0.10`、`lambda_miss=0.15`、`lambda_res_timeout=0.10`、`lambda_overdue=0.20`、`R_delivery_bonus=60`、`max_overdue_sec=600`、`hard_overdue_penalty_sec=600`、`hard_failure_penalty_sec=1200` 等）
-  - `training`：PPO 超参数（`ppo_learning_rate=0.0003`、`rollout_steps=4096`、`batch_size=512` 等）
+  - `training`：PPO 超参数（`ppo_learning_rate=0.0003`、`rollout_steps=4096` 等）。这里的正式口径需要直接写死为单选结论：
+    - `Phase 7 V1 = recurrent_ppo=true`（正式启用 recurrent PPO / simplified TBPTT）
+    - `Phase 7 debug / pre-V1 = recurrent_ppo=false`（仅允许临时调试或链路打通，不属于 Phase 7 V1 验收路径）
+    - 最终训练产物 `policy.pt`（策略权重）只能来自 `recurrent_ppo=true` 路径
+    - 因此，Phase 7 V1 的 `training` 配置族必须进一步拆分并冻结：
+    - `sequence_len`：单条训练 sequence 的总长度（total unroll length）
+    - `burn_in_len`：sequence 前缀中仅用于推进 recurrent state、不参与 loss 的预热长度；Phase 7 V1 固定为 `0`
+    - `train_len`：单条 sequence 中实际参与 PPO loss 的有效训练长度；V1 下固定满足 `train_len = sequence_len - burn_in_len`
+    - `sequence_minibatch_size`：每个 PPO minibatch 中包含的 sequence 条数
+    - `target_minibatch_timesteps`：期望的有效训练 timestep 数，仅用于配置校验、日志统计与吞吐监控，不作为 sampler 主切分单位
+    - 旧字段 `training.batch_size` 不允许继续在 recurrent PPO 下承担“主采样单位”语义；推荐直接重命名为 `target_minibatch_timesteps`
+    - 若仓库中某个阶段仍暂时只有平铺 `batch_size` 口径，则该实现最多只能视为
+      `recurrent_ppo=false` 的 debug fallback（调试回退路径），不能据此宣称
+      “Phase 7 V1 recurrent PPO 已完成”
   - `curriculum`：课程学习噪声（首轮全部为 0）
 
 ### 4.1.6 产物
@@ -956,14 +973,18 @@ r_t =
      - `PlannerMeta`：上层规划触发参数（`coarse_replan_interval_sec`、`route_drift_trigger_ratio`、`fallback_burst_trigger_count`、`fallback_burst_window_sec`、`hard_failure_trigger_count`、`support_radius_km` 等）
      - `RewardMeta`：奖惩权重（`lambda_*`、`R_delivery_bonus`、`hard_failure_penalty_sec` 等）
      - `SharedRuntimeParamsSnapshot`：共享运行时参数快照（对应 `backend/config/drone_params.yaml` 的物理参数、能耗参数、服务时长参数）
-    - `EnvSemanticContractMeta`：环境语义契约摘要（mode C 回收节点类型、reservation timeout 开关、overdue 惩罚模式、`allow_empty_backbone_route` 等）
+     - `EnvSemanticContractMeta`：环境语义契约摘要（mode C 回收节点类型、reservation timeout 开关、overdue 惩罚模式、`allow_empty_backbone_route` 等）
      - `OnlineLockParams`：在线锁参数策略骨架（`locked_fields` / `tunable_fields`）
    - 新增 `TrainingRunMeta`：训练完成后才能填充的运行时字段（`model_version`、`trained_at`、`scene_id`、`scene_bundle_dir`、`training_input`）
    - 新增 `BenchmarkMeta`：benchmark 身份快照（`orders.json` 路径、整体摘要、`static_orders` / `dynamic_orders` 数量、`benchmark_use_dynamic_orders`）
-   - 新增 `TrainingInputMeta`：训练输入快照（订单源模式、benchmark 身份、泊松参数、seed、总步数）
+   - 新增 `TrainingInputMeta`：训练输入快照（订单源模式、benchmark 身份、泊松参数、`poisson_seed`、`training_seed`、总步数）
    - 新增 `build_meta_json_dict(meta, run)`：合并两部分生成完整 meta.json 内容
    - 设计原则：结构参数（Phase 1 冻结，`MetaJson`）与运行时字段（Phase 7 填充，`TrainingRunMeta`）分离，避免 `Optional` 字段弱化契约强度
    - 说明：更严格的 `meta.json` 完整性校验（例如训练主循环真实填充值校验、数值范围校验、写盘前终检）放到 Phase 7 的 `train_cmrappo.py` 中继续完善；Phase 1 先冻结字段结构与最小非空约束
+   - 说明：这里的 `training_seed` 不只是“写入 `meta.json` 的记录字段”，而是后续 Phase 7 训练入口必须真正消费的复现参数；至少要用于统一固定 `python random / numpy / torch` 的随机态，避免出现“元数据记录了 seed，但训练本身未按该 seed 执行”的伪复现
+   - 说明：当前 Phase 1 的 `meta.json` schema 已覆盖 `policy / action_space / candidate / planner / reward / runtime / env semantic contract`
+     等主契约，但尚未把 `CriticTensorSchemaV1`（价值网络张量结构契约）单独固化成
+     `MetaJson.critic_schema` 一级子契约；这部分必须在 Phase 7 正式训练前补齐，并写入 `meta.json`
 
 5. 当前仍未完成、需要在后续继续推进的项：
    - `CoarsePlanView` 的实际生成逻辑（`planner_bridge.py`，Phase 6）
@@ -978,7 +999,7 @@ r_t =
 
 - **Phase 2（scene_loader）**：`TrainingRunMeta.scene_id` 与 `scene_bundle_dir` 必须与 `scene_config.json` 中的实际值对齐；`scene_loader` 加载完成后应输出可直接填入 `TrainingRunMeta` 的字段值，不允许在 `train_cmrappo.py` 中再次硬编码场景路径
 - **Phase 3（order_source_adapter）**：`TrainingInputMeta` 的所有字段必须从 `rh_alns_cmrappo.yaml` 的 `data` / `training` 节读取；`order_source_adapter` 应在构建订单源配置时同步输出可填入 `TrainingInputMeta` 的字段快照
-- **Phase 7（train_cmrappo）**：训练完成时必须构造 `TrainingRunMeta`，调用 `build_meta_json_dict(MetaJson(...), TrainingRunMeta(...))` 序列化为 meta.json；`trained_at` 使用 ISO 8601 格式；不允许手写裸字典绕过契约；`MetaJson` 的各子契约字段值必须与本次训练实际使用的 yaml 参数严格一致，不允许复制粘贴旧版本值；并在写盘前补做完整性终检（benchmark 身份快照、共享运行时参数快照、scene_id / model_version / trained_at 等运行时字段齐全性）
+- **Phase 7（train_cmrappo）**：训练开始前必须先消费 `training.training_seed`，统一固定 `python random / numpy / torch`（以及当前可用设备 backend）的随机态；训练完成时必须按以下顺序固化产物：先保存最终 `policy.pt`，再构造 `TrainingRunMeta`，再调用 `build_meta_json_dict(MetaJson(...), TrainingRunMeta(...))` 生成 meta.json payload，最后在写盘前执行完整性终检后才允许写出 `meta.json`。`trained_at` 使用 ISO 8601 格式；不允许手写裸字典绕过契约；不允许在训练循环开始前预写一个看起来像“训练已完成”的 `meta.json`；`MetaJson` 的各子契约字段值必须与本次训练实际使用的 yaml 参数严格一致，不允许复制粘贴旧版本值；写盘前终检至少覆盖：benchmark 身份快照、共享运行时参数快照、`scene_id / scene_bundle_dir / model_version / trained_at` 等运行时字段齐全性、`training_input` 与本次实际订单源 / seed / 总步数一致性、`critic_schema_hash` 与本次 checkpoint 一致性，以及 `policy.pt / training_config_snapshot.yaml / train_metrics.jsonl` 等训练产物存在性。Phase 7 必须先在 `contracts.py` / `MetaJson` 中新增 `critic_schema`（价值网络张量结构契约）一级子契约，再写盘训练产物；不允许用临时“等价独立元数据段”替代正式契约，也不允许缺失 `CriticTensorSchemaV1` 的排序/截断/padding/归一化/存储规则
 - **Phase 11（模型产物固化）**：meta.json 由 `build_meta_json_dict` 生成后直接写入 `backend/weights/rh_alns_cmrappo/<version>/meta.json`；`benchmark_report.json` / `stochastic_report.json` 等报告文件路径在本阶段不进入 meta.json，但目录结构必须与 §4.11 保持一致，以便后续在线接入时直接定位
 
 ## 4.2 Phase 2：实现静态场景装载器
@@ -2192,8 +2213,8 @@ _settle_per_dt_rewards(dt = t_event - t_prev)
 1. 硬失败（airborne_energy_failure）
    → 先处理，避免后续事件基于已失效无人机计算
 
-2. 订单送达 / mode A 完成，结算 R_delivery_bonus
-   → 先结算正奖励，再做超时判定，避免"刚送达就被算超时"
+2. UAV 订单送达，结算 R_delivery_bonus；mode A 完成只更新系统上下文统计
+   → 先结算 UAV 送达正奖励，再做超时判定，避免"刚送达就被算超时"
 
 3. 到达类事件（合并处理，再做交互）
    3a. 卡车到站
@@ -3281,6 +3302,11 @@ if mode == C:
    - **无 history**：不包含 `history_tokens`；历史状态由 Phase 7 的 `ObservationTensorizer` 在 rollout 侧注入
    - **slot 对齐是核心约束**：`order_features[k]` 与 `order_mask[k]` 必须指向同一个候选订单；`recovery_features[k][j]` 与 `recovery_mask[k][j]` 必须指向同一个回收候选。这个对齐关系由 `candidate_builder` 一次性确定，Phase 7 的 `ObservationTensorizer` 只能按此顺序填充张量，不允许自行重排
    - **padding 语义**：不足 32 个订单时，多余 slot 的 `OrderFeatures.is_valid = False`，`order_mask[k] = False`；不足 4 个回收候选时同理
+   - **结构真值与动作合法性分离**：`OrderFeatures.is_valid` / `RecoveryFeatures.is_valid`
+     只表达“该 slot 是否承载真实对象”，供 Phase 7 的
+     `ObservationTensorizer` 构造结构性 padding mask；`order_mask` /
+     `mode_mask` / `recovery_mask` 则只表达“该动作当前是否允许 actor 采样”。
+     两者在当前实现中可能经常重合，但契约层语义不得合并
 
    `OrderFeatures` 中必须包含（由 `candidate_builder.build()` 时计算）：
 
@@ -3399,13 +3425,27 @@ if mode == C:
    `_active_launch_stations`（执行侧实时触发站点集合）
 5. `candidate_out = candidate_builder.build(runtime_state, coarse_plan, deciding_drone_id, trigger_type, trigger_station_id, last_seen_plan_version)
    -> CandidateOutput(candidate_features, factorized_action_schema, action_mask, resolved_action_lookup)`
-6. `ObservationTensorizer.tensorize(candidate_features, history_buffer) -> ObservationBatch`（Phase 7 职责）
-7. `policy` 或 `baseline` 消费 `ObservationBatch + action_mask`，输出结构化动作索引：
+6. `ObservationTensorizer.tensorize(candidate_features, history_buffer, ego_drone_id, t_decision) -> ObservationBatch`
+   （Phase 7 职责）
+   - 其中 `history_buffer`（历史缓冲区）固定表示 rollout 侧维护的
+     `global transition ring buffer`（全局转移环形缓冲区），存放最近发生的
+     `committed transition summaries`（已提交真实转移摘要）
+   - `ObservationTensorizer` 必须以当前 `ego_drone_id`（当前决策 UAV）为参考系，
+     将最近 `hist_len` 条全局转移摘要重编码为
+     `ego-conditioned history_tokens`（以当前 UAV 视角条件化的历史 token）
+7. `CriticBatchBuilder.build(decision_context_snapshot, critic_tensor_schema_meta) -> CriticBatch`
+   （仅 Phase 7 PPO 训练路径需要；规则型 baseline / 常规 benchmark greedy eval 不需要）
+8. `policy` 或 `baseline` 消费候选语义，输出结构化动作索引：
+   - PPO 主训练路径固定消费 `ObservationBatch + action_mask`，并由 critic 额外消费
+     同快照下构造的 `CriticBatch`
+   - 规则型 baseline 可直接消费 `CandidateOutput` 做打分，也可复用
+     `ObservationBatch`；但两条路径都必须遵守同一套 `action_mask`
+     与 slot 对齐语义
    - 若 `root_branch_idx = WAIT`，则选择 `WAIT_ACTION`
    - 若 `root_branch_idx = DISPATCH`，则选择
      `(order_idx, mode_idx, recovery_idx)`（订单索引、模式索引、回收点索引）
-8. 由 `candidate_out.resolved_action_lookup` 将上述结构化索引反查为最终 `env_action: EnvAction`
-9. `env_adapter.step(env_action)` 执行真实状态转移并结算 reward
+9. 由 `candidate_out.resolved_action_lookup` 将上述结构化索引反查为最终 `env_action: EnvAction`
+10. `env_adapter.step(env_action)` 执行真实状态转移并结算 reward
 
 其中：
 
@@ -3713,11 +3753,13 @@ def _refresh_coarse_plan_if_needed(self) -> CoarsePlanView:
 - `backend/training/model.py`
 - `backend/training/rollout_buffer.py`
 - `backend/training/observation_tensorizer.py`
+- `backend/training/critic_batch_builder.py`
 
 最小训练闭环需要：
 
 - 模型前向（factorized actor head + centralized critic head）
 - action mask 采样（三阶段 factorized）
+- `CriticBatch`（价值网络批）构造与写入
 - rollout 收集
 - advantage 计算（GAE，`gae_lambda=0.95`）
 - PPO 更新（`clip_coef=0.2`）
@@ -3730,8 +3772,21 @@ def _refresh_coarse_plan_if_needed(self) -> CoarsePlanView:
 1. Task encoder：对候选订单集合编码
 2. UAV / station / truck encoder：对局部载体与基础设施上下文编码
 3. Cross-attention：融合"当前决策无人机"和"候选订单/回收节点"关系
-4. LSTM temporal unit：建模最近 `hist_len=6` 步局部决策历史（6 个"局部决策事件步"，不是固定仿真秒步）
-5. Actor head：输出 factorized masked action logits（三阶段）
+4. history encoder（历史编码器）：编码最近 `hist_len=6` 个
+   `ego-conditioned global transition history tokens`（以当前 UAV 视角条件化的全局转移历史 token）。
+   这里的 6 步是 6 个“局部决策事件步/已提交真实转移摘要”，不是固定仿真秒步。
+   它的职责固定为：把当前决策时刻因果可见的显式历史摘要窗口编码成
+   `history_context`（历史上下文向量）；它属于单个 decision step（决策步）内的
+   `stateless encoder`（无状态编码器），不消费 rollout 侧按 UAV 维护的
+   `lstm_state`（循环隐藏状态），也不向 rollout 持久化自己的跨步状态
+5. recurrent core（循环核心，Phase 7 V1 默认为 LSTM）：只负责当前
+   `actor_drone_id`（当前决策无人机）自身的跨决策隐式记忆递推。
+   其输入应是当前 step 的 fused context（融合上下文，例如 `current_context +
+   history_context`），而不是把 `history_tokens` 本身当作 recurrent sequence（循环序列）
+   反复展开。`LSTM hidden state` 按 `drone_id` 单独维护，只在该 UAV 自己成为本次
+   actor 时推进；其他 UAV 的近期行为通过 `history_tokens` 进入当前观测，而不是共享同一份
+   hidden state
+6. Actor head：输出 factorized masked action logits（三阶段）
    - 顶层先输出 `root_branch_logits`（顶层分支 logits），顺序固定为 `[WAIT, DISPATCH]`
    - 仅当选择 `DISPATCH` 时，再消费 dispatch 分支的
      `order_logits / mode_logits / recovery_logits`
@@ -3747,7 +3802,15 @@ def _refresh_coarse_plan_if_needed(self) -> CoarsePlanView:
         `order_idx` 对应的那一行。
      两种实现都允许，但对外暴露给 PPO 的语义必须一致：只消费已选 `order_idx`
      对应的 recovery row
-6. Critic head：训练时使用 centralized critic（可额外读取全局订单池、UAV 可用性、station queue、coarse-plan 全局摘要）
+7. Critic head：训练时使用 centralized critic，但其额外全局输入必须通过
+   显式的 `CriticBatch`（价值网络批）契约提供，不允许在 `model.py` 内部隐式读取
+   全局状态。固定接口语义为：
+   - `policy_out = actor(observation_batch, action_mask)`
+   - `value = critic(observation_batch, critic_batch)`
+   - 其中 actor（策略头）只消费 `ObservationBatch + action_mask`；
+     critic（价值网络）在此基础上额外消费 `CriticBatch`
+   - `CriticBatch` 只在 Phase 7 训练 / rollout update（轨迹更新）路径中使用，
+     推理阶段与常规 greedy benchmark eval（贪心基准评估）不需要
 
 `WAIT`（全局等待动作）在训练实现中的接口语义固定为：
 
@@ -3764,6 +3827,8 @@ def _refresh_coarse_plan_if_needed(self) -> CoarsePlanView:
 
 - `d_model=128`、`nhead=8`、`ff_dim=256`、`lstm_hidden=128`、`lstm_layers=1`
 - `critic_mode=centralized_train_only`（在线推理不需要 centralized critic）
+- `critic_schema_name=CriticTensorSchemaV1`，且 `max_global_orders / max_global_uavs /
+  max_global_stations / normalizer_meta` 必须来自配置快照并写入 `meta.json`
 - `inference_mode=greedy`（推理阶段默认 greedy，不引入额外随机性）
 
 **观测张量规范（5 类 token）与 `ObservationTensorizer`**
@@ -3771,8 +3836,11 @@ def _refresh_coarse_plan_if_needed(self) -> CoarsePlanView:
 Phase 7 新增 `ObservationTensorizer`（`observation_tensorizer.py`），职责固定为：
 
 1. 消费 Phase 6 产出的 `CandidateFeatures`，按固定 slot 顺序将各字段编码为浮点张量
-2. 注入 `history_tokens`（最近 `hist_len=6` 个局部决策事件摘要，由 rollout 侧维护的历史缓冲区提供）
-3. 组装 `padding_mask`（标记哪些 slot 是 padding，供 attention 层屏蔽）
+2. 注入 `history_tokens`（最近 `hist_len=6` 个
+   `ego-conditioned global transition history tokens`，由 rollout 侧维护的全局历史缓冲区提供）
+3. 组装结构性 padding mask：`padding_mask`（订单层）、
+   `recovery_padding_mask`（回收候选层）与 `history_padding_mask`（历史层），
+   供各自编码层屏蔽 padding slot
 4. 输出 `ObservationBatch`，供 `model.py` 直接消费
 
 **边界约束**：`ObservationTensorizer` 的输出 shape 由 token 字段数量决定，不依赖 `d_model` / `nhead`。具体地：
@@ -3782,6 +3850,7 @@ Phase 7 新增 `ObservationTensorizer`（`observation_tensorizer.py`），职责
 - `recovery_tokens`：shape `[32, 4, recovery_feat_dim]`，`recovery_feat_dim` 由 `RecoveryFeatures` 的字段数决定
 - `infra_tokens`：shape `[n_infra_nodes, infra_feat_dim]`，`n_infra_nodes` 为 station + depot 总数
 - `history_tokens`：shape `[hist_len, hist_feat_dim]`，`hist_len=6`
+- `history_padding_mask`：shape `[hist_len]`，True 表示该 history slot 为 padding
 
 `model.py` 的第一层 linear 负责把各 token 从 `feat_dim` 投影到 `d_model=128`；这个投影属于模型内部，不属于 `ObservationTensorizer`。
 
@@ -3795,7 +3864,9 @@ class ObservationBatch:
     recovery_tokens: Tensor         # [32, 4, recovery_feat_dim]
     infra_tokens: Tensor            # [n_infra_nodes, infra_feat_dim]
     history_tokens: Tensor          # [hist_len, hist_feat_dim]
-    padding_mask: Tensor            # [32]，True 表示该 slot 为 padding，attention 层屏蔽
+    history_padding_mask: Tensor    # [hist_len]，True 表示该 history slot 为 padding
+    padding_mask: Tensor            # [32]，True 表示该 order slot 为 padding
+    recovery_padding_mask: Tensor   # [32, 4]，True 表示该 recovery slot 为 padding
 ```
 
 **5 类 token 的字段来源**：
@@ -3804,13 +3875,835 @@ class ObservationBatch:
 2. `order_tokens`（来自 `CandidateFeatures.order_features`，slot 顺序与 `order_mask` 严格对齐）：基础订单字段 + `best_mode_b_return_score` + `best_mode_b_host_type`（均由 Phase 6 `candidate_builder.build()` 时计算）
 3. `recovery_tokens`（来自 `CandidateFeatures.recovery_features`，slot 顺序与 `recovery_mask` 严格对齐）：按 `[order_slot, recovery_slot] = [32, 4]` 预先构建每个候选订单各自的回收节点候选表示；推理时仅在 `mode=C` 且已选定 `order_idx` 后消费对应 `recovery_tokens[order_idx]` 这一行。字段包含回收节点位置、ETA、`rendezvous_margin`、`reservation_count`
 4. `infra_tokens`（来自 `CandidateFeatures.infra_features`）：truck 骨架摘要 + station/depot 摘要（queue、ETA、parking_slots、node_charge_load_budget）
-5. `history_tokens`（由 rollout 侧历史缓冲区提供，不来自 `CandidateFeatures`）：最近 `hist_len=6` 个局部决策事件摘要
+5. `history_tokens`（由 rollout 侧历史缓冲区提供，不来自 `CandidateFeatures`）：
+   最近 `hist_len=6` 个
+   `ego-conditioned global transition history tokens`（以当前 UAV 视角条件化的全局转移历史 token）
+
+**`history_tokens` 契约冻结**
+
+为避免 Phase 7 对“历史”各自理解，`history_tokens` 的语义在此固定为：
+
+- 它不是仅当前 UAV 的私有历史（`self history`）
+- 也不是无筛选的裸全局事件日志（`raw global event log`）
+- 它表示：
+  最近 `hist_len` 个
+  `global committed transition summaries`（全局已提交真实转移摘要），
+  在当前决策 UAV 视角下重编码后的历史 token 序列
+
+这里的单条 `committed transition summary`（已提交真实转移摘要）固定指：
+
+- 某架 UAV 在某个 `DecisionContext` 下选择了一个动作
+- 该动作被 `env_adapter.step(action)` 正式提交
+- 环境推进完成该次 transition（转移）的真实状态演化与 reward settlement（奖励结算）
+- 再将这段真实演化压缩成一条摘要记录，写入 rollout 侧全局历史缓冲区
+
+因此：
+
+- 一次 `WAIT`（全局等待动作）对应 1 条 history 记录
+- 一次 `DISPATCH`（派送动作）对应 1 条 history 记录
+- 其间发生的 `delivery`（送达）、`reservation_timeout`（预留超时）、
+  `fallback_started`（进入兜底返程）、`queue_entered`（进入排队）等，只作为
+  该条 transition summary 的结果字段出现，不单独各占一个 history slot
+
+rollout 侧维护规则固定为：
+
+- 维护一份 `global transition ring buffer`（全局转移环形缓冲区），按真实发生顺序追加
+- 每次 `env_adapter.step(action)` 返回后，最多只追加 1 条
+  `TransitionSummary`（转移摘要）
+- 不为环境内部微事件单独追加 history 记录
+- `LSTM hidden state` 按 `drone_id` 单独维护，只在该 UAV 自己成为 actor
+  时推进；不允许所有 UAV 共享同一份 hidden state
+
+为避免“显式滑窗历史”和“隐式循环记忆”被同一个模块重复建模，Phase 7 在这里进一步冻结：
+
+- `history_tokens`（显式全局历史摘要窗口）不等于 recurrent sequence（循环序列）本身；
+  它表达的是**当前决策时刻因果可见**的最近 `hist_len` 条全局已提交转移摘要
+- `history_encoder`（历史编码器）只在单个 decision step（决策步）内对
+  `history_tokens` 做无状态编码，输出 `history_context`（历史上下文向量）；
+  它不得消费 `lstm_state_in`（输入循环隐藏状态），也不得产出需要跨 decision step
+  持久化的隐藏状态
+- `lstm_state`（循环隐藏状态）只表示当前 `actor_drone_id`（当前决策无人机）
+  自身的跨决策隐式记忆；真正跨 actor 决策序列连续 unroll（展开）的，只能是后续
+  `recurrent_core`（循环核心），而不是 `history_encoder`
+- 因此，Phase 7 V1 允许“显式历史窗口 + 隐式循环记忆”同时存在，但禁止由同一个
+  recurrent module（循环模块）同时承担
+  `history window encoder`（历史窗口编码器）和
+  `cross-step recurrent core`（跨步循环核心）两种职责
+- `history_tokens` 中保留 `self event`（当前 UAV 自身历史事件）是允许的；
+  这部分语义仍属于“当前时刻可见的全局事件记录”，不应被实现者误解为
+  “因此可以不再维护按 UAV 独立推进的 `lstm_state`”
+
+`ObservationTensorizer` 在消费这份全局历史时必须：
+
+- 以当前 `ego_drone_id`（当前决策 UAV）为参考系重编码最近 `hist_len` 条记录
+- 生成：
+  - `dt_since_event = t_decision - event_time`
+  - `is_self_event = (actor_drone_id == ego_drone_id)`
+  - `actor_rel_x / actor_rel_y`（相对于当前 ego UAV 的相对位置）
+- 当历史不足 `hist_len` 时，使用固定 padding token 补位，并通过
+  `history_padding_mask` 显式标记；不允许依赖全零数值让模型自行猜测
+
+推荐最小原始语义对象可冻结为：
+
+```python
+@dataclass(frozen=True)
+class TransitionSummary:
+    event_time: float
+    actor_drone_id: str
+
+    actor_pos_x: float
+    actor_pos_y: float
+
+    actor_training_state_before: str
+    actor_training_state_after: str
+    actor_home_type: str
+    actor_payload_class: str
+
+    trigger_type: str
+
+    root_branch: str                # WAIT / DISPATCH
+    dispatch_mode: str              # NONE / B / C
+    selected_recover_node_type: str # NONE / station / depot
+
+    has_selected_order: bool
+    selected_order_slot_rank: int
+    selected_order_deadline_slack_norm: float
+    selected_eta_to_deliver_norm: float
+    selected_rendezvous_margin_norm: float
+
+    energy_ratio_before: float
+    energy_ratio_after: float
+    queue_after_norm: float
+    plan_version_delta_at_event: int
+
+    delivered: bool
+    rendezvous_success: bool
+    reservation_timeout: bool
+    fallback_started: bool
+    hard_failure: bool
+    queue_entered: bool
+    service_completed: bool
+```
+
+字段语义固定如下：
+
+- `trigger_type` 必须保留，因为当前文档中 `idle`（地面空闲触发）与
+  `riding_with_truck`（随车搭载触发）共享 factorized action structure（分解式动作结构），
+  但 `WAIT` 的真实语义不同；若不记录 `trigger_type`，模型会把“原地等待”与“继续搭车”等价化
+- `selected_order_slot_rank` / `selected_order_deadline_slack_norm` /
+  `selected_eta_to_deliver_norm` / `selected_rendezvous_margin_norm` /
+  `energy_ratio_before` / `energy_ratio_after` / `queue_after_norm` /
+  `plan_version_delta_at_event` 必须保留，用于表达该次动作的风险结构，而不仅是结果标志
+- `actor_home_type` 与 `actor_payload_class` 建议同时保留，不做二选一；
+  它们分别表达宿主来源差异与载重类别差异
+- `selected_recover_node_type` 只保留 `node type`（节点类型），不保留原始 `node_id`
+- 对 `WAIT` 或 `mode=B` 等不适用路径，`dispatch_mode=NONE` /
+  `selected_recover_node_type=NONE`；相关数值字段统一填 `0`，并通过
+  `has_selected_order` 等布尔字段区分“真实 0”与“不适用”
+
+字段来源边界固定为：
+
+- 来自 `action-time snapshot`（动作提交时快照）的字段：
+  `trigger_type`、`root_branch`、`dispatch_mode`、`has_selected_order`、
+  `selected_order_slot_rank`、`selected_order_deadline_slack_norm`、
+  `selected_eta_to_deliver_norm`、`selected_rendezvous_margin_norm`、
+  `energy_ratio_before`、`plan_version_delta_at_event`、
+  `actor_training_state_before`
+- 来自 `transition-end snapshot`（转移结束时快照）的字段：
+  `event_time`、`actor_pos_x / actor_pos_y`、`actor_training_state_after`、
+  `energy_ratio_after`、`queue_after_norm` 以及全部 `result_flags`
+
+明确禁止进入 `history_tokens` / `TransitionSummary` 的内容：
+
+- `raw reward`（原始奖励标量）
+- `raw order_id / drone_id / node_id`（原始订单/无人机/节点 ID，`actor_drone_id`
+  仅允许保留在 rollout 内部缓冲区中，用于派生 `is_self_event`，不得直接入模）
+- `mode_a_background_completed`（卡车背景订单完成）
+- 未来真实订单
+- 当前 step 之后才因果可见的信息
+- 裸环境微事件日志
+
+这样冻结的目标是：
+
+- 让当前 UAV 能看见其他 UAV 的近期协作/拥挤/资源竞争上下文
+- 但不把历史退化成“噪声过高的全局事件流水”
+- 同时保留按 UAV 单独维护的 `LSTM hidden state`，承接个人时间记忆
+
+`ObservationTensorizer` 的结构性 mask 构造规则固定为：
+
+- `padding_mask[i] = (not CandidateFeatures.order_features[i].is_valid)`
+- `recovery_padding_mask[i][j] = (not CandidateFeatures.recovery_features[i][j].is_valid)`
+- `history_padding_mask[h] = True` 表示该 history slot 仅为补位，不承载真实转移摘要
+- 若 `padding_mask[i] = True`，则必须同时满足
+  `recovery_padding_mask[i, :] = [True, True, True, True]`，保持二维 slot 结构一致性
+- `recovery_tokens[i][j]` 仅在 `recovery_padding_mask[i][j] = False` 时承载真实物理语义；
+  否则只是固定 shape 下的补位值，不允许模型赋予其“真实回收候选”含义
 
 Padding/Masking 规则：
 
-- `padding_mask`：只用于 attention 层屏蔽无效 token（对应 `CandidateFeatures` 中 `is_valid=False` 的 slot）
-- `action_mask`：只用于 actor head 屏蔽物理非法动作（来自 `CandidateOutput` 的 `order_mask / mode_mask / recovery_mask`）
-- 两者不允许混用
+- `padding_mask`：只用于 order-level attention（订单层注意力）屏蔽 padding 的 order slot
+- `recovery_padding_mask`：只用于 recovery-level attention（回收候选层注意力）屏蔽
+  padding 的 recovery slot
+- `history_padding_mask`：只用于 history encoder / temporal unit（历史编码层/时序单元）
+  屏蔽不存在的历史记录
+- `action_mask`：只用于 actor head（策略头）屏蔽物理非法动作（来自
+  `CandidateOutput` 的 `order_mask / mode_mask / recovery_mask`）
+- `padding_mask / recovery_padding_mask / history_padding_mask` 与 `action_mask`
+  不允许混用
+
+`model.py`（策略模型）在消费这些 mask 时的职责固定为：
+
+1. order encoder（订单编码层）只能使用 `padding_mask` 做结构性屏蔽
+2. recovery encoder（回收候选编码层）只能使用
+   `recovery_padding_mask[order_idx]` 做结构性屏蔽
+3. history encoder / temporal unit 只能使用 `history_padding_mask`
+   处理“历史不足 `hist_len`”的补位记录，不能把它与动作合法性屏蔽混用
+4. actor head（策略头）输出 logits（对数几率）后，才使用
+   `order_mask / mode_mask / recovery_mask` 做动作合法性屏蔽
+5. 当选择 `mode=C` 时，只允许消费已选 `order_idx` 对应的
+   `recovery_tokens[order_idx]` 与 `recovery_padding_mask[order_idx]`
+6. 不允许把 `CandidateOutput.recovery_mask` 直接复用为 recovery attention 的结构性 mask；
+   前者表达“该动作当前不可采样”，后者表达“该 slot 根本不存在”
+
+关于“哪些信息应该显式提供、哪些信息应该交给模型学习”的边界，Phase 7 固定如下：
+
+- `padding_mask / recovery_padding_mask / history_padding_mask` 属于**数据结构真值**，
+  表示哪些 slot 根本不承载真实对象；这部分不应由模型从补位值中自行猜测，
+  而应由上游显式提供
+- `recovery_tokens` 中真实候选之间的优劣比较，例如更大的 `rendezvous_margin`、
+  更小的 `predicted_queue_time_est`、更优的后续拥挤代价，则属于策略应当学习的部分
+- 当前 Phase 6 实现中，`RecoveryFeatures.is_valid=False` 与 `recovery_mask=False`
+  在许多样本上可能高度重合；但这只是现实现象，不构成两者语义等价。后续若引入
+  “结构上存在、但当前动作上不可采样”的 recovery 候选，仍必须能被两套 mask 独立表达
+
+数值安全约束：
+
+- 允许某个真实订单 `order_idx` 出现
+  `recovery_padding_mask[order_idx] = [True, True, True, True]`，这表示该订单当前
+  没有任何可编码的 recovery 候选，通常对应 `mode_mask[order_idx][C] = False`
+- 对这种“全 padding 行”，`model.py` 不得直接执行普通 recovery-level attention
+  softmax；必须采用以下两种等价安全策略之一：
+  1. 在进入 recovery 分支前由 `mode_mask` 短路，使该订单根本不进入 recovery 编码路径
+  2. 显式跳过该行 recovery attention，并返回零向量或固定哨兵向量
+- 上述“全 padding 行”的数值安全处理属于 Phase 7 `model.py` 的职责；
+  Phase 6 的 `candidate_builder` 只需保证 `is_valid` 与 slot 对齐，不负责 attention 数值实现
+
+**`CriticBatch`（价值网络批）与 `CriticBatchBuilder`**
+
+为避免 `centralized critic` 在 Phase 7 落地时分裂成“一版只吃局部观测”和“另一版偷偷读取全局状态”两套实现，
+critic 额外输入必须冻结为独立契约 `CriticBatch`，并由
+`CriticBatchBuilder`（`critic_batch_builder.py`）在训练侧显式构造。
+
+Phase 边界固定为：
+
+- **Phase 6（`candidate_builder.py`）**：不构造 `CriticBatch`；仍只负责
+  `CandidateOutput(candidate_features, factorized_action_schema, action_mask, resolved_action_lookup)`
+- **Phase 7（`critic_batch_builder.py`）**：基于与 `ObservationBatch` 同一份
+  `DecisionContext` 快照构造 `CriticBatch`，并与
+  `ObservationBatch / action_mask / resolved_action_lookup` 一起写入
+  `rollout_buffer.py`
+- **Phase 8（`validate_benchmark.py` / `greedy_local_policy.py`）**：
+  常规 greedy baseline（贪心基线）与 policy greedy eval（策略贪心评估）不依赖
+  `CriticBatch`；若后续实现 benchmark 训练诊断或 value 评估，可复用同一契约，
+  但不改变其“训练专用输入”的边界
+
+`CriticBatch` 不允许只冻结到“语义对象”层，还必须冻结到**实际 tensor schema（张量结构契约）**
+层。否则即使 `global_order_pool_state / global_uav_state / global_station_state`
+这些对象名称保持不变，不同实现仍可能在排序、截断、padding、归一化与写盘方式上各自漂移，
+导致 value head（价值头）在不同 run（训练轮次）中拟合的并不是同一个状态空间。
+
+因此，Phase 7 第一版必须正式定义：
+
+**`CriticTensorSchemaV1`（价值网络张量结构契约 V1）**
+
+它至少回答以下 8 件事：
+
+1. `CriticBatch` 具体有哪些 tensor（张量）
+2. 每个 tensor 的固定 shape（形状）
+3. 每类 token 的字段顺序
+4. 全局对象的排序规则（ordering rule）
+5. 超过容量时的截断规则（truncation rule）
+6. 不足容量时的 padding / mask 规则
+7. 数值归一化规则（normalization rule）
+8. 写入 `rollout_buffer.py` 与 `meta.json` 的存储/持久化规则
+
+`CriticTensorSchemaV1` 对 critic 的定位固定为：
+
+- actor（策略头）只看当前 UAV 可得的局部候选观测与 `action_mask`
+- critic（价值网络）在训练阶段额外看当前时刻**真实可得**的全局系统状态，
+  用于更稳定地估计 `V(s_t)`（状态价值）
+- inference（推理）不依赖 critic
+
+这属于 `centralized_train_only critic`（仅训练阶段使用的集中式价值网络）边界，
+符合 CTDE（集中训练、分布执行）思想；但 critic 虽然可以看全局，
+也只能看**当前时刻真实可得**的全局状态，不能看未来真实结果
+
+**`CriticTensorSchemaV1` 推荐最小语义范围**
+
+1. `global_order_pool_state`（全局订单池状态）
+   - 范围固定为：当前时刻所有仍会影响未来回报的 active orders（活动订单），
+     至少包含 `pending_orders + assigned_orders`
+   - 不包含：`completed / timeout removed / hard removed / future unspawned orders`
+   - 若后续希望表达“已进入执行中”的细分状态，不新增独立
+     `in_progress_orders` 集合，而应通过 token 内部的 `status`（状态）字段表达，
+     避免不同实现各自发明集合边界
+   - 必须显式区分：
+     - `is_uav_primary_scope`（是否属于 UAV 主指标范围）
+     - `is_mode_a_background`（是否属于 mode A 背景订单）
+     - `is_assigned`
+     - `is_overdue`
+
+2. `global_uav_state`（全局 UAV 状态）
+   - 范围：所有 UAV 在当前决策时刻的运行状态
+   - 至少包含：
+     - `training_state`
+     - 剩余电量 / 电量比例
+     - `eta_to_available`
+     - `is_current_actor`
+     - `is_riding_with_truck`
+     - `has_reservation`
+     - `reservation_remaining_sec`
+     - `carrying_order_exists`
+     - `dispatch_mode`
+     - `uav_type / payload class`
+
+3. `global_station_state`（全局站点/仓库状态）
+   - 范围：所有 `station / depot` 的系统负载状态
+   - 典型字段：`queue_length`、`available_slots`、`predicted_queue_time_est`、
+     `reservation_count`、`node_charge_load_budget`、`truck_eta_remaining`
+   - 与 `ObservationBatch.infra_tokens` 的关系固定为：
+     - `ObservationBatch.infra_tokens` 服务 actor 的局部决策，强调当前候选动作相关的
+       基础设施摘要，推理阶段必须可用
+     - `CriticBatch.global_station_tokens` 服务 critic 的全局估值，强调所有节点的系统负载、
+       队列、reservation 与未来到达压力，只用于训练价值估计
+   - 若同时包含 `is_future_truck_stop` 与 `is_active_launch_station`，必须显式区分：
+     - 前者来自当前 `coarse_plan` / backbone（规划器快照语义）
+     - 后者来自执行侧实时集合 `_active_launch_stations`（运行时真值）
+
+4. `coarse_plan_summary_state`（粗规划摘要）
+   - 使用 summary vector（摘要向量）
+   - 至少包含：`plan_version`、剩余 truck backbone 长度、未来
+     `launch_candidate_stations` 数量、`authorized_orders` 数量、route drift 摘要、
+     fallback / hard failure 窗口统计
+
+5. `global_system_summary_state`（全局系统摘要）
+   - Phase 7 V1 建议新增独立 summary vector，而不是只依赖 top-K tokens
+   - 典型字段：`active_order_count`、`pending_order_count`、`assigned_order_count`、
+     `overdue_order_count`、`mode_a_background_count`、`station_queue_total`、
+     `reservation_total`、`fallback_count_window`、`hard_failure_count_window` 等
+   - 目的：当 active orders 超过 `K_order` 时，即使详细 token 被截断，
+     critic 也仍然知道系统整体压力
+
+**`CriticTensorSchemaV1` 默认张量结构**
+
+```python
+@dataclass(frozen=True)
+class CriticBatch:
+    global_order_pool_tokens: Tensor        # [K_order, F_order]
+    global_uav_tokens: Tensor               # [K_uav, F_uav]
+    global_station_tokens: Tensor           # [K_station, F_station]
+    coarse_plan_summary_vec: Tensor         # [F_plan]
+    global_system_summary_vec: Tensor       # [F_sys]
+
+    global_order_padding_mask: Tensor       # [K_order]
+    global_uav_padding_mask: Tensor         # [K_uav]
+    global_station_padding_mask: Tensor     # [K_station]
+```
+
+Phase 7 V1 默认容量建议冻结为：
+
+- `K_order = 64`
+- `K_uav = 16`
+- `K_station = 11`（当前场景为 `10 station + 1 depot`）
+
+说明：
+
+- 上述值是 **Phase 7 V1 默认值**，不是理论常量
+- 它们可配置，但一旦某次 run 开始正式训练，必须整局固定，并写入
+  `meta.json`
+- `global_order_pool_tokens / global_uav_tokens / global_station_tokens`
+  使用 token + padding mask 形式是当前默认实现；
+  `coarse_plan_summary_vec / global_system_summary_vec` 使用 summary vector
+  形式是当前默认实现
+
+**排序规则（ordering rule）**
+
+`global_order_pool_tokens`：
+
+- 排序键固定为：
+
+  ```text
+  sort_key(order) =
+  (
+    scope_rank,         # 0 = is_uav_primary_scope, 1 = is_mode_a_background
+    overdue_rank,       # 0 = is_overdue, 1 = not_overdue
+    status_rank,        # 0 = pending, 1 = assigned / executing
+    deadline_slack_sec, # 越小越靠前
+    priority_band,
+    spawn_time_sec,
+    stable_order_id
+  )
+  ```
+
+- 这样第 `0` 个 order token 恒表示“当前最紧急、最影响 UAV 主目标的订单”，
+  而不是偶然的字典遍历第一个
+
+`global_uav_tokens`：
+
+- `slot 0` 固定为当前决策 UAV
+- 其余 UAV 在默认不截断场景下按 `stable_drone_id` 排序
+- 若未来 UAV 数量超过 `K_uav`，则：
+  - 当前决策 UAV 必保留
+  - 其他 UAV 按 `fallback / low_energy / has_reservation / eta_to_available / stable_drone_id`
+    的优先级截断保留
+
+`global_station_tokens`：
+
+- 当前阶段默认不做 top-K，直接全量保留
+- `slot 0 = depot`
+- `slot 1.. = stations sorted by stable_node_id`
+- 若未来站点数量超过 `K_station`，则：
+  - `depot` 必保留
+  - 卡车未来会经过的 `station` 优先
+  - `active_launch_station` 优先
+  - 剩余按 `stable_node_id` 截断
+
+**截断规则（truncation rule）**
+
+- `global_order_pool_tokens` 固定采用
+  `top-K urgent active orders`（前 K 个最紧急活动订单）
+- `K_order = critic.max_global_orders`
+- 超过 `K_order` 的订单不进入 token 序列，但其数量与聚合统计必须进入
+  `global_system_summary_vec`
+- 不允许使用“插入顺序截断”或“字典遍历顺序截断”，因为在泊松流高峰期这会让 critic
+  看不到当前最危险的超时边缘订单
+
+**padding / mask 规则**
+
+- `padding token` 统一填 `0`
+- `padding_mask=True` 表示该 slot 不承载真实对象
+- 模型必须在 attention / pooling 时显式屏蔽 padding slot
+- 不允许模型从全零 token 自行推断 padding
+
+固定定义：
+
+- `global_order_padding_mask[i] = True  <=> order slot i is padding`
+- `global_uav_padding_mask[i] = True    <=> uav slot i is padding`
+- `global_station_padding_mask[i] = True <=> station slot i is padding`
+
+空集合时：
+
+- `tokens = all zeros`
+- `padding_mask = all True`
+- `global_system_summary_vec` / `coarse_plan_summary_vec` 仍然填真实统计值，
+  例如 `active_order_count=0`
+
+critic 侧的 padding 语义与 `ObservationBatch` 一致：padding mask 属于结构真值，
+不应交给模型自己猜测
+
+**归一化规则（normalization rule）**
+
+必须明确禁止：
+
+- 按当前 batch 最大值归一化
+- 按当前 rollout 最大值归一化
+- 按本次验证集动态统计归一化
+
+统一原则：
+
+- 所有归一化基准必须来自配置或场景固定量
+- 必须写入 `meta.json`
+
+推荐最小 `NormalizerMeta`（归一化元数据）口径：
+
+```text
+time_norm_sec      = upper_horizon_sec
+distance_norm_m    = map_diagonal_m
+payload_norm_kg    = 10.0
+energy_norm        = uav_type_capacity_j
+eta_norm_sec       = upper_horizon_sec
+queue_norm_cap     = configured_queue_cap_or_station_slots
+```
+
+推荐公式可以写死为：
+
+- `deadline_slack_norm = clip((deadline_sec - t_now) / upper_horizon_sec, lower, upper)`
+- `age_norm = clip((t_now - spawn_time_sec) / upper_horizon_sec, 0, 1)`
+- `queue_length_norm = clip(queue_length / queue_norm_cap, 0, 1)`
+- `truck_eta_remaining_norm` 若当前无 `truck_eta`，不能只靠 `0` 表示，
+  还必须配 `has_truck_eta` 标志位
+
+**快照规则（snapshot rule，最高优先级约束）**
+
+`CriticBatch` 必须从 **pre-action DecisionContext snapshot（动作执行前决策快照）**
+构造。完整顺序固定为：
+
+1. `env_adapter` 在当前事件触发点冻结 `DecisionContext`
+2. `candidate_builder` 从同一份 `DecisionContext` 构造 `CandidateOutput`
+3. `ObservationTensorizer` 构造 `ObservationBatch`
+4. `CriticBatchBuilder` 构造 `CriticBatch`
+5. `policy.forward(observation_batch, action_mask, critic_batch)`
+6. 采样 / greedy 得到动作
+7. `env_adapter.step(action)`
+8. `reward / done / next_state` 写入 `rollout_buffer.py`
+
+不允许：
+
+- 先 `env.step(action)`，再回头补构造 `CriticBatch`
+
+否则 critic 会混入 post-action 信息。
+
+`CriticBatchBuilder` 的公开接口建议固定为：
+
+```python
+CriticBatchBuilder.build(
+    decision_context: DecisionContext,
+    critic_tensor_schema_meta: CriticTensorSchemaMeta,
+) -> CriticBatch
+```
+
+不建议再把 `runtime_state` / `coarse_plan` 作为
+`DecisionContext` 之外的重复入参，以免调用方传入与快照不一致的对象。
+
+**存储契约（storage contract）**
+
+`rollout_buffer.py` 默认必须存“构造后的张量”（materialized tensors），
+而不是依赖 PPO update（PPO 更新）时重新调用 builder 现算。
+
+固定规则为：
+
+- PPO update 路径存：
+  `observation_batch_tensor / critic_batch_tensor / action_mask_tensor /
+  resolved_action_indices / log_prob_old / value_old / reward / done /
+  lstm_state_in / lstm_state_out / critic_schema_hash`
+- 原始 `decision_context_debug_snapshot` 可以作为 debug / audit 可选保存，
+  但不得作为默认训练更新的重建来源
+
+原因：
+
+- 若 rollout 只存原始对象，恢复训练时 builder 代码一变，旧 rollout 会被重新解释；
+  同一条轨迹不再是原训练时的输入，PPO 更新结果会漂
+
+**Recurrent PPO V1 序列训练约束**
+
+为避免本项目的 LSTM 只在“采样时看起来接上了”，而在 PPO update（PPO 更新）
+阶段又退化回“按独立 timestep（时间步）重算”的伪 recurrent 实现，Phase 7
+必须把第一版 recurrent PPO（循环 PPO）训练约束单独冻结如下。
+
+这里的单选结论再次固定为：
+
+- `Phase 7 V1 = recurrent_ppo=true`（正式验收口径）
+- `Phase 7 debug / pre-V1 = recurrent_ppo=false`（仅允许调试链路，不属于正式验收）
+- 因此，下文所有 `sequence`（序列）/ `lstm_state`（循环隐藏状态）/
+  `valid_timestep_mask`（有效时间步掩码）/ `sequence minibatch`（序列级小批量）
+  约束，均不是“未来可选优化项”，而是 `Phase 7 V1` 的正式 contract（契约）
+- 任何仍然使用“平铺 rollout -> 平铺 timestep batch -> 直接 PPO update”的实现，
+  即使表面上保存了 `lstm_state_in / lstm_state_out`，本质上也只能归类为
+  `pseudo recurrent PPO`（伪循环 PPO）或 `recurrent_ppo=false` 的 debug fallback，
+  不能作为 `Phase 7 V1` 的正式训练产物生成路径
+
+**Phase 7 V1 必须做**
+
+1. `hidden state`（隐藏状态）按 `drone_id` 单独保存/恢复
+   - rollout 收集阶段必须维护 `drone_id -> lstm_state` 的映射
+   - 仅当该 UAV 自己成为本次 actor 时，才推进它自己的 hidden state
+   - 这里的 `lstm_state` 语义固定为当前 `actor_drone_id`（当前决策无人机）的
+     `recurrent core state`（循环核心隐藏状态），不是 `history_encoder`
+     的局部编码缓存
+   - PPO update 重算 `log_prob / value` 时，必须消费 rollout 中保存的
+     `lstm_state_in`，不允许统一传 `None`
+   - 若模型实现同时保留 `history_tokens`（显式全局历史摘要窗口）与
+     `lstm_state`（隐式循环记忆），则必须满足：
+     `history_encoder` 每个 timestep（时间步）从当前观测重新编码，
+     `recurrent_core` 才负责 sequence 内连续 unroll；不允许把同一个
+     recurrent module（循环模块）同时拿来做 `history_tokens` 编码和
+     cross-step hidden state 递推
+   - 对 `simplified TBPTT`（简化版截断反向传播）的训练侧语义必须进一步写死：
+     在一个 sequence 内，`model.forward_sequence(...)` 必须从该 sequence
+     首个真实 timestep 的 `lstm_state_in` 作为初始 recurrent state 开始连续
+     unroll；不允许在 sequence 内每个 timestep 上分别取各自保存的
+     `lstm_state_in` 独立做 `forward_step(...)`
+   - 也就是说，`lstm_state_in` 在 PPO update 中的主作用是提供
+     `sequence initial state`（序列起点隐藏状态），而不是把 sequence
+     内每个 timestep 都变成“独立重置点”
+   - 错误实现示意：
+     对同一 sequence 做
+     `for t in sequence: output_t = model.forward_step(obs_t, lstm_state_in_t)`
+     这种写法虽然表面上“消费了 rollout 中保存的 recurrent state”，
+     但本质上仍是伪 recurrent PPO，不符合本节冻结语义
+   - 正确实现示意：
+     `h0 = first_real_timestep.lstm_state_in`
+     `outputs = model.forward_sequence(obs_seq, h0)`
+     然后在 sequence 内依时间顺序连续递推 hidden state
+   - 因此，Phase 7 V1 明确禁止“只有平铺 timestep tensor，再给每个 timestep
+     单独喂一个保存态”的 update 伪实现；sequence 内必须保留真实的 recurrent
+     state transition
+
+2. `episode chunking`（按 episode 切块）
+   - rollout update 路径必须先按 `done` 边界切分 episode
+   - 不允许把跨 episode 的时间步拼进同一条 sequence（序列）
+   - 若某个 episode 长度超过单次训练 sequence 长度上限，再在 episode 内继续切块
+   - 但对本项目这种“多 UAV 轮流成为 actor”的单环境时间线，
+     sequence continuity（序列连续性）不能仅按全局 timestep 顺序定义，
+     而必须按以下复合边界冻结：
+     `episode_id + actor_drone_id + recurrent_segment_id`
+   - 也就是说，Phase 7 V1 的 recurrent sequence 不是“某个 episode 下按全局交错
+     actor 时间线直接切出来的一段连续 timestep”，而是“同一 episode 内、
+     同一 actor UAV、且属于同一个连续 recurrent 生命周期段”的局部决策子序列
+   - 在该边界之内，再按固定 `seq_len` 做 chunk；不允许一条 sequence
+     同时包含：
+     - 两个不同 `actor_drone_id`
+     - 两个不同 `recurrent_segment_id`
+     - 或跨 episode 的 timestep
+   - `recurrent_segment_id` 的定义固定为：
+     同一 `actor_drone_id` 在同一 `episode_id` 内的第几个连续 recurrent
+     生命周期段
+   - `recurrent_segment_id` 在以下边界必须递增：
+     - episode reset 后重新开始时
+     - 该 UAV 的 hidden state 被显式清零 / 强制 reset 时
+     - 该 UAV 因 hard failure、替换、重新激活等语义导致 recurrent 生命周期中断时
+   - 即使 Phase 7 V1 当前实现里未必真的触发上述所有场景，也必须把该字段语义
+     先冻结下来，避免后续实现把“同一 drone、同一 episode、但 hidden state
+     已重置”的片段错误拼进一条 sequence
+
+3. `sequence minibatch`（序列级小批量）
+   - PPO update 的最小采样单元固定为 sequence，而不是“打散后的单 timestep”
+   - 同一个 minibatch 内允许包含多条 sequence
+   - 但每条 sequence 内的时间顺序必须保留，不能在 sequence 内再次洗牌
+   - `recurrent_ppo=true` 时，训练侧配置语义必须冻结为：
+     - `sequence_len`：单条 materialized sequence 的总长度
+     - `burn_in_len`：sequence 前缀中的 burn-in 长度；Phase 7 V1 固定为 `0`
+     - `train_len`：单条 sequence 中实际参与 PPO loss 的长度；V1 下固定满足
+       `train_len = sequence_len - burn_in_len`
+     - `sequence_minibatch_size`：每个 PPO minibatch 中的 sequence 条数
+     - `target_minibatch_timesteps`：期望的有效训练 timestep 数，
+       仅用于配置校验、日志统计与吞吐监控，不作为 sampler 主切分单位
+   - 因此，当 `recurrent_ppo=true` 时，PPO update 的主采样单位固定是
+     sequence，而不是 timestep；sampler 必须以 `sequence_minibatch_size`
+     为准，不允许再把 `training.batch_size` 解释成“每个 minibatch 的 timestep 数”
+   - 为避免普通 PPO 与 recurrent PPO 共享同名字段造成歧义，
+     文档正式口径推荐将旧字段 `training.batch_size` 重命名为
+     `target_minibatch_timesteps`
+   - 若为了兼容旧配置暂时保留 `training.batch_size`：
+     - 它在 `recurrent_ppo=true` 下只能被视为
+       `target_minibatch_timesteps` 的过渡别名
+     - 不得直接驱动 sampler 切分
+     - 若 `batch_size` 与 `target_minibatch_timesteps` 同时存在且取值不一致，
+       应视为配置错误，而不是任选其一静默继续
+   - 配置校验关系建议固定为：
+     - 理想满载情况下，
+       `sequence_minibatch_size * train_len ~= target_minibatch_timesteps`
+     - 若因尾段 padding / `valid_timestep_mask` 导致实际有效 timestep 低于
+       `target_minibatch_timesteps`，这是允许的；但 sampler 的第一主语义仍然是
+       “抽多少条 sequence”，而不是“硬凑多少个 timestep”
+
+4. `sequence loss mask`（序列损失掩码）
+   - 当一个 episode 尾段不足固定 `seq_len` 时，允许 padding（补位）
+   - 但 policy loss / value loss / entropy / KL 统计必须只对 `valid_timestep_mask=True`
+     的真实时间步生效
+   - 若启用 `advantage normalization`（优势标准化），其 `mean/std`
+     也必须只在 `valid_timestep_mask=True` 的真实 timestep 上计算；
+     不允许把 padding timestep 一并计入优势归一化统计
+   - 因此，`valid_timestep_mask` 的作用域不仅覆盖 PPO loss 本身，
+     也覆盖 loss 前的优势标准化、熵/KL 聚合统计以及这些统计项的分母归一化
+   - 不允许把 padding timestep 当作真实样本参与 PPO clip、value 回归或熵计算
+
+5. `GAE / returns`（优势与回报目标）计算顺序固定
+   - `GAE` 与 `returns` 必须先沿原始 rollout 的完整 episode 时间线计算，
+     再做 `actor_drone_id + recurrent_segment_id` 维度上的 sequence
+     materialization（序列物化）与 chunking（切块）
+   - 不允许先把 trajectory 切成 sequence chunk，再在 chunk 内各自重新定义
+     advantage / return 边界
+   - 也就是说，`done` 边界首先服务于完整 episode 级的 bootstrapping /
+     GAE 终止语义；sequence chunking 是其后的训练组织步骤，而不是反过来决定
+     value target 的边界
+
+6. `materialized recurrent contract`（物化循环状态契约）
+   - rollout record 默认必须显式存：
+     `lstm_state_in / lstm_state_out / episode_id / actor_drone_id /
+     recurrent_segment_id / local_decision_index / local_chunk_idx /
+     sequence_id / sequence_pos / valid_timestep_mask`
+   - 其中 `episode_id / actor_drone_id / recurrent_segment_id /
+     local_decision_index / local_chunk_idx / sequence_id / sequence_pos /
+     valid_timestep_mask`
+     可以作为显式字段存储，也可以在 `RolloutBatchView` 构造阶段从 transition
+     顺序和 `done` 边界确定后一次性物化
+   - `sequence_id` 不应被理解为“episode 内全局递增编号”，而应理解为一条
+     materialized sequence chunk（已物化训练序列块）的唯一标识；
+     其语义由以下复合键确定：
+     `sequence_id = hash_or_tuple(episode_id, actor_drone_id, recurrent_segment_id, local_chunk_idx)`
+   - 各字段语义固定为：
+     - `episode_id`：当前训练 episode 编号
+     - `actor_drone_id`：该条 transition / sequence 对应的 actor UAV 编号
+     - `recurrent_segment_id`：同一 UAV 在同一 episode 内的连续 recurrent 生命周期段编号
+     - `local_decision_index`：该 UAV 在当前 `episode_id + recurrent_segment_id`
+       范围内的第几个真实 actor 决策步
+     - `local_chunk_idx`：将该局部决策子序列按 `seq_len` 切块后得到的 chunk 编号
+     - `sequence_pos`：当前 timestep 在所属 sequence chunk 内的位置
+   - 但 PPO update 路径不得再退化回“只有平铺 timestep tensor，没有 sequence 边界语义”
+
+**Phase 7 V1 可以不做**
+
+- `burn-in`（预热段）可以先不做，固定为 `burn_in_len = 0`
+- 更复杂的 `TBPTT`（Truncated Backpropagation Through Time，长序列截断反向传播）
+  可以先不做
+- 多 worker / 多 env 的 recurrent replay（循环经验重放）可以先不做
+- 基于 value bootstrap 的交错序列采样、跨 env packed sequence、RNN state cache
+  压缩等优化都不属于 Phase 7 V1 必要项
+
+**文档必须预留**
+
+- 当前 Phase 7 采用的是
+  `simplified TBPTT`（简化版截断反向传播）口径：
+  - `burn_in_len = 0`
+  - `num_envs = 1`
+  - sequence continuity 固定按
+    `(episode_id, actor_drone_id, recurrent_segment_id)` 构造
+  - sequence 内保留时间顺序，sequence 之间可做 minibatch 级打乱
+  - `lstm_state_in` 只作为 sequence 首步的初始 recurrent state；
+    sequence 内必须连续 unroll，不允许把每个 timestep 都当独立 reset 点
+- 未来若升级到更强版 recurrent PPO，可以在不改变
+  `ObservationBatch / CriticBatch / action_mask / resolved_action_indices /
+  lstm_state_in` 基础契约的前提下，继续增加：
+  - `burn_in_len > 0`
+  - 更长 `seq_len`
+  - 多 env / 多 worker recurrent rollout
+  - 更标准的 TBPTT 调度
+
+**工程落地评估（基于当前代码产物）**
+
+结论需要拆成“文档正式口径”与“当前代码状态”两层表达，不能再混写：
+
+- **文档正式口径**：`Phase 7 V1` 已明确固定为 `recurrent_ppo=true`
+  的 `simplified recurrent PPO / simplified TBPTT` 路径；不需要额外新开一个
+  Phase 来定义这套 contract（契约）
+- **当前代码状态**：截至本轮代码产物，`Recurrent PPO`（循环 PPO）正式验收口径
+  仍**未实现完成**；当前实现只能算
+  `Phase 7 训练链路已接通 + recurrent 前置语义已部分补齐`，
+  不能宣称“Phase 7 V1 已完成”
+
+原因如下：
+
+- 已具备 `num_envs = 1` 的单环境训练前提，当前配置已冻结该前提
+- `rollout_buffer.py` 已经是 materialized tensor 路径，并且已显式存
+  `lstm_state_in / lstm_state_out`
+- `train_cmrappo.py` 已经具备按 `drone_id` 保存/恢复 hidden state 的实现基础
+- 当前 PPO update 已能访问完整 transition 序列，因此在 update 前增加
+  `episode chunking -> sequence batching -> valid_timestep_mask`
+  的派生层，不会破坏现有
+  `DecisionContext -> ObservationBatch / CriticBatch -> RolloutBuffer` 主链路
+- 但当前代码仍未完成以下 `Phase 7 V1` 必需项：
+  - 基于 `episode_id + actor_drone_id + recurrent_segment_id` 的 sequence
+    materialization（序列物化）
+  - `sequence_len / burn_in_len / train_len / sequence_minibatch_size /
+    target_minibatch_timesteps` 的正式训练配置切分
+  - 以 sequence 为主采样单位的 PPO update sampler（采样器）
+  - `valid_timestep_mask` 作用域下的 loss / KL / entropy / advantage normalization
+    统计
+  - 明确排除“平铺 timestep batch 直接 update”的伪 recurrent 路径
+
+但也必须明确：
+
+- 当前代码若只做到“按 `drone_id` 恢复 hidden state + update 时重放
+  `lstm_state_in`”，仍**不等于**已经完成本节定义的 Recurrent PPO V1
+- 真正补齐 V1 还需要：
+  - 在 PPO update 前生成 sequence 边界
+  - 明确 `sequence_len / burn_in_len / train_len / sequence_minibatch_size /
+    target_minibatch_timesteps` 的训练侧配置，并完成 `training.batch_size`
+    向 recurrent PPO 新口径的迁移/废弃
+  - 为尾段 padding 增加 `valid_timestep_mask`
+  - 让 PPO 各项 loss 与统计只消费 mask 后的真实 timestep
+
+因此，本节的推荐执行顺序固定为：
+
+1. 先修正 `hidden state` 按 UAV 保存/恢复与 update 重放问题
+2. 再实现 `episode chunking`
+3. 再实现 `sequence minibatch + valid_timestep_mask`
+4. 最后才考虑 `burn-in` 或更复杂 TBPTT
+
+**`meta.json` 持久化规则**
+
+训练 run 必须把 `CriticTensorSchemaV1` 写入 `MetaJson.critic_schema`，
+并随 `meta.json` 一起持久化；不得退化成临时独立字段段或日志注释。
+
+`critic_schema` 至少应记录：
+
+- `name` / `schema_version` / `schema_hash`
+- `max_global_orders / max_global_uavs / max_global_stations`
+- `ordering_rules`
+- `truncation_rules`
+- `padding_rules`
+- `normalization` 基准
+- `snapshot_rule = pre_action_decision_context`
+- `storage_mode = materialized_tensors_in_rollout_buffer`
+- `causal_blacklist`
+
+其中 `schema_hash` 的计算输入至少必须覆盖：
+
+- 每类 token 的字段顺序
+- `K_order / K_uav / K_station`
+- `ordering_rules / truncation_rules / padding_rules`
+- `normalization` 基准
+- `snapshot_rule / storage_mode`
+
+字段清单（如 `order_token_fields / uav_token_fields / station_token_fields`）
+建议一并写入；若第一版实现压力较大，至少也要把排序、截断、padding、
+归一化与 snapshot/storage 规则完整写入
+
+**checkpoint 兼容规则**
+
+加载 checkpoint 时，必须校验 `critic_schema_hash`。
+
+- 若当前代码生成的 `critic_schema_hash` 与 checkpoint / `meta.json`
+  中记录的不一致：
+  - 禁止 `resume training`
+  - 禁止复用 optimizer state
+  - 若要继续训练，只能作为 new run / fine-tune 重新开始，并生成新的
+    `model_version`
+
+不允许只靠 shape 判断兼容；`shape` 一样而字段顺序或归一化规则改变时，
+语义也可能完全不同
+
+**因果可得信息约束**
+
+`CriticBatch` 只能包含当前决策时刻已经存在、因果可得的信息；不允许把未来真实结果泄漏给 critic。
+明确禁止：
+
+- 未来 poisson 订单
+- 未来 benchmark 动态订单的完整列表（若在当前时刻尚未 spawn）
+- 未来真实排队结果
+- 任何依赖 `env.step(action)` 之后状态演化才可得的字段
+
+否则 critic 会退化为“离线 oracle（预言机）价值网络”，导致 advantage 对 actor
+不可学习的信息过拟合。
+
+**时间对齐规则（最高优先级约束）**
+
+`ObservationBatch`、`CriticBatch`、`action_mask`、`resolved_action_lookup`
+必须来自**同一个 `DecisionContext` 快照**。在事件驱动环境下，这条规则固定为：
+
+- 该快照至少由以下量共同确定：
+  `t_decision`（决策时刻）、`deciding_drone_id`、`trigger_type`、
+  `trigger_station_id`、`coarse_plan.plan_version`
+- `env_adapter.step(action)` 之前，必须完成该 transition 的
+  `ObservationBatch / CriticBatch / action_mask / resolved_action_lookup`
+  构造，并把它们绑定到当前 transition record；实现上可以先暂存、再在 step 返回后补齐
+  `reward / done / next_state`
+- 不允许在 `step()` 之后、reward settlement（奖励结算）之后、或 replan
+  之后，重新构造当前 transition 的 `CriticBatch`
+- 若 actor 采样时所见 `coarse_plan.plan_version = k`，则 critic 评估该 transition 时
+  也必须仍基于 `plan_version = k` 的同一份 snapshot，而不是使用 step 后新生成的
+  `plan_version = k + 1`
+- 同理，若 `ObservationBatch` 对应的是动作执行前的状态 `s_t`，则
+  `CriticBatch` 也必须对应同一时刻的 `s_t`；不得错位为 `s_{t+1}` 或
+  “`s_t` 被 step/replan 变异后的版本”
+
+这条时间对齐规则的工程落点固定为：`CriticBatchBuilder` 以
+`DecisionContext` 快照为输入构造 `CriticBatch`，并由 `rollout_buffer.py`
+先把该快照对应的 actor / critic 输入固化到当前 transition 记录，再在
+`env_adapter.step(action)` 返回后补齐 `reward / done / next_state`；无论实现采用
+“先暂存后补齐”还是“一次性 append”，都不得在 step 之后重新构造当前 transition 的
+`CriticBatch`。
 
 训练时必须保证：
 
@@ -3833,6 +4726,9 @@ Padding/Masking 规则：
 - `train_cmrappo.py` 运行时强制校验 `order_source_mode == poisson`
 - 训练配置快照必须记录 `arrival_rate`、`seed`、deadline 窗口参数
 - 写入 `meta.json` 时必须同时记录 benchmark 身份快照（当前建议使用 `orders.json` 路径/摘要 + `static_orders` / `dynamic_orders` 数量），并与泊松参数、随机种子一起构成订单源确定性描述
+- 写入 `meta.json` 时还必须在 `MetaJson.critic_schema` 中记录本次 run 实际采用的
+  `CriticTensorSchemaV1`（含 `schema_hash`、排序/截断/padding/归一化/存储规则），否则该训练 run
+  不可严格复现
 - 若用户误传 `benchmark` 或 `hybrid` 到训练主循环，应直接报错，避免训练分布漂移
 
 训练输出必须包含：
@@ -3848,6 +4744,252 @@ Padding/Masking 规则：
 - 能稳定保存权重和元数据
 - 固定 benchmark 的 UAV-scope 回放指标出现提升趋势
 - reward 提升时，主目标分解项（含 `T_res_timeout`）也能同步解释，而不是只表现为黑盒数值变化
+
+### 4.7.1 本轮实际已落地的代码改动（如实记录）
+
+本轮已在代码中实际补齐以下 Phase 7 相关模块与接口，不涉及 `greedy`、`market`
+现有算法实现的复用：
+
+1. **`DecisionContext` 已升级为 Phase 7 的完整 pre-action snapshot**
+   - 修改文件：
+     - `backend/training/env_adapter.py`
+   - 实际改动：
+     - 在 `DecisionContext` 中新增：
+       - `t_decision`
+       - `planner_snapshot`
+       - `execution_snapshot`
+     - 其中：
+       - `planner_snapshot` 当前包含 `backlog_new_orders`、
+         `fallback_count_in_window`、`hard_failure_count_in_window`、
+         `route_drift_ratio`、`completed_backbone_count`、
+         `expected_backbone_count`、`total_backbone_count`、
+         `active_launch_stations`
+       - `execution_snapshot` 当前包含：
+         - `uav_eta_to_available`
+         - `uav_dispatch_mode`
+     - `RuntimeStateView` 保持为纯运行时真值快照，没有回填 planner / critic 派生信号
+
+2. **正式补齐 Phase 7 契约层**
+   - 修改文件：
+     - `backend/training/contracts.py`
+   - 实际新增契约：
+     - `DecisionPlannerSnapshot`
+     - `DecisionExecutionSnapshot`
+     - `FactorizedActionMask`
+     - `ResolvedActionIndices`
+     - `ObservationBatch`
+     - `TransitionSummary`
+     - `CriticBatch`
+     - `CriticNormalizationMeta`
+     - `CriticTensorSchemaMeta`
+   - 实际改动：
+     - `MetaJson` 新增正式一级子契约 `critic_schema`
+     - `CriticTensorSchemaMeta` 已实现 `schema_hash` 计算逻辑，哈希输入覆盖：
+       - token 字段顺序
+       - `K_order / K_uav / K_station`
+       - 排序 / 截断 / padding 规则
+       - normalization 基准
+       - snapshot / storage 规则
+
+3. **补齐 Phase 7 配置项，避免训练代码硬编码 critic schema**
+   - 修改文件：
+     - `backend/config/rh_alns_cmrappo.yaml`
+   - 实际新增字段：
+     - `policy.critic_schema_name`
+     - `policy.critic_schema_version`
+     - `policy.max_global_orders`
+     - `policy.max_global_uavs`
+     - `policy.max_global_stations`
+     - `policy.queue_norm_cap`
+     - `policy.energy_norm_strategy`
+
+4. **已新增 `ObservationTensorizer` 并接到现有 `CandidateOutput`**
+   - 新增文件：
+     - `backend/training/observation_tensorizer.py`
+   - 实际实现内容：
+     - 将 `CandidateOutput.candidate_features` 编码为固定 shape 的：
+       - `uav_self_token`
+       - `order_tokens`
+       - `recovery_tokens`
+       - `infra_tokens`
+       - `history_tokens`
+     - 生成：
+       - `padding_mask`
+       - `recovery_padding_mask`
+       - `history_padding_mask`
+       - `FactorizedActionMask`
+     - 已提供 `TransitionSummary` 构造逻辑，用于 rollout 后将真实 transition
+       压缩写入历史缓冲区
+
+5. **已新增 `CriticBatchBuilder` 并按同一份 `DecisionContext` 构造 critic 输入**
+   - 新增文件：
+     - `backend/training/critic_batch_builder.py`
+   - 实际实现内容：
+     - 提供：
+       - `build_default_critic_tensor_schema_meta(...)`
+       - `CriticBatchBuilder.build(decision_context, critic_tensor_schema_meta)`
+     - 已按 Phase 7 当前口径物化：
+       - `global_order_pool_tokens`
+       - `global_uav_tokens`
+       - `global_station_tokens`
+       - `coarse_plan_summary_vec`
+       - `global_system_summary_vec`
+       - 对应 padding mask
+     - 当前已实现 ordering / truncation / normalization / padding 的代码级落地
+
+6. **已新增 materialized rollout buffer**
+   - 新增文件：
+     - `backend/training/rollout_buffer.py`
+   - 实际实现内容：
+     - 支持“先固化 pre-action 输入，再在 step 后补 reward/done”的两阶段接口：
+       - `begin_transition(...)`
+       - `finalize_transition(...)`
+     - 默认存储的是 materialized tensors 对应对象，而不是事后重建
+     - 已实现 `compute_gae(...)`
+
+7. **已新增 Phase 7 模型骨架**
+   - 新增文件：
+     - `backend/training/model.py`
+   - 实际实现内容：
+     - 新增 `SharedPPOActorCritic`
+     - 已实现：
+       - actor forward
+       - critic forward
+       - factorized action sampling
+       - action evaluation（供 PPO update 用）
+     - 已修复当前训练主路径所需的 batch/device 基础语义：
+       - 不再使用会把 `[B, F] / [B, N, F]` 再次 `unsqueeze` 的通用 batch 包装逻辑
+       - 改为按字段 rank（维度阶数）显式规范：
+         - 单样本：`[F] / [N, F] / [N, M, F]`
+         - batch：`[B, F] / [B, N, F] / [B, N, M, F]`
+       - `observation_batch / critic_batch / action_mask / lstm_state`
+         在 `model.forward()` / `sample_action()` / `evaluate_actions()` 中
+         会统一迁移到模型当前 device，避免后续在 `cuda` / `mps` /
+         `cpu` 路径上出现 device mismatch
+     - 当前模型是“可训练最小版”，不是文档中完整 cross-attention 设计的最终形态
+
+8. **已新增训练主循环入口，并与前面 phases 的产物对接**
+   - 新增文件：
+     - `backend/training/train_cmrappo.py`
+   - 实际实现内容：
+     - 强制 `order_source_mode == poisson`
+     - 直接复用既有链路：
+       - `DecisionContext`
+       - `env.build_candidate_output(...)`
+       - `CandidateOutput.resolved_action_lookup`
+       - `env.step(env_action)`
+     - 已接入：
+       - `ObservationTensorizer`
+       - `CriticBatchBuilder`
+       - `RolloutBuffer`
+       - `SharedPPOActorCritic`
+       - PPO update
+       - `meta.json` 写盘
+       - `policy.pt` checkpoint 写盘
+       - 训练入口现在会在启动早期消费 `training.training_seed`，
+         统一固定 `python random / numpy / torch` 的随机态；
+         若设备 backend 可用，则同样对 `cuda` / `mps` 执行对应的 seed 固定，
+         使 `training_seed` 成为真实训练行为的一部分，而不是只记录进元数据
+       - `meta.json` 的持久化时序已进一步收紧：
+         不再在训练开始前预写 `meta.json`，而是改为训练循环完成后，
+         先固化最终 `policy.pt`，再构造 `TrainingRunMeta` / `meta payload`，
+         再执行写盘前终检，最后才真正写出 `meta.json`
+       - 写盘前终检已显式覆盖：
+         - `policy.pt` / `training_config_snapshot.yaml` / `train_metrics.jsonl`
+           存在性
+         - `scene_id / scene_bundle_dir / model_version / trained_at`
+           等运行时字段齐全性与一致性
+         - `training_input` 中的 `order_source_mode / poisson_seed /
+           training_seed / total_timesteps` 与本次训练实际输入的一致性
+         - benchmark 身份快照与 `critic_schema_hash` 的一致性
+       - 已修复 recurrent（循环状态）与设备选择的关键工程语义：
+         - rollout 收集阶段改为按 `drone_id -> lstm_state` 保存/恢复 hidden state，
+           不再让所有 UAV 共享单一 `lstm_state`
+         - 仅当前 `deciding_drone_id` 对应的 hidden state 会在该 UAV 成为 actor
+           时推进，符合文档中“按 UAV 单独维护”的冻结语义
+         - `RolloutBuffer` 中已保存的 `lstm_state_in` 现在会在 PPO update 重算
+           `log_prob / value` 时重新堆叠并回传 `model.forward()`，
+           不再统一传 `None`
+         - rollout 采样前向已包进 `torch.no_grad()`，并把保存到
+           `lstm_state_by_drone / RolloutBuffer` 的 recurrent state
+           统一做 `detach().cpu().clone()`，避免图泄漏与设备耦合
+         - `device=auto` 现在按 `cuda -> mps -> cpu` 顺序解析，
+           并在训练启动时输出当前实际使用设备的 debug 信息
+       - 但必须明确：上述内容只说明“recurrent rollout 前置语义已部分接通”，
+         **不等于** `Phase 7 V1 recurrent_ppo=true` 已完成；
+         目前的 PPO update 仍是平铺 timestep tensor（时间步张量）重算，
+         尚未进入文档正式要求的 sequence materialization / sequence minibatch
+         训练口径
+
+9. **已补 Phase 7 自测，并回归现有 Phase 5c / Phase 6**
+   - 新增文件：
+     - `backend/training/test_phase7_snapshot_and_tensorizers.py`
+     - `backend/training/test_phase7_model_runtime.py`
+   - 本轮已实际通过的命令：
+     - `python -m compileall backend/training`
+     - `python -m unittest backend.training.test_phase7_model_runtime`
+     - `python -m unittest backend.training.test_phase7_snapshot_and_tensorizers`
+     - `python -m unittest backend.training.test_phase6_integration backend.training.test_env_adapter_phase5c`
+   - 本轮新增覆盖点：
+     - `model.py` 单样本 / batch 前向 shape 语义
+     - `model.py` 的 device 一致性（避免 CPU tensor 混入 `cuda/mps` 前向）
+     - PPO update 重放 `lstm_state_in` 时的 batch 堆叠逻辑
+     - batched recurrent state 传回 `SharedPPOActorCritic.forward()` 的形状正确性
+
+### 4.7.2 本轮尚未完成或尚未验证的项（如实记录）
+
+以下内容目前仍不能宣称“Phase 7 已完全完成”，需明确保留：
+
+在这些未完成项之上，有一条总前提必须先明确：
+
+- 文档正式口径已经固定为 `Phase 7 V1 = recurrent_ppo=true`
+- 但当前代码仍未完成：
+  - 按 `episode_id + actor_drone_id + recurrent_segment_id` 物化训练 sequence
+  - `sequence_len / burn_in_len / train_len / sequence_minibatch_size /
+    target_minibatch_timesteps` 的正式配置切分与消费
+  - 以 sequence 为主采样单位的 PPO update
+  - `valid_timestep_mask` 下的 loss / KL / entropy / advantage normalization
+    统计
+- 因此，当前实现只能视为
+  `Phase 7 训练主链路已接通，但 Recurrent PPO V1 未达标`
+- 在这一状态下，任何来自当前平铺 update 路径的 `policy.pt`
+  都不应被宣称为 `Phase 7 V1` 正式验收权重
+
+1. **尚未实际跑通训练**
+   - 当前开发环境已安装 `torch`，且相关 Phase 7 / Phase 6 / Phase 5c 单测已实际通过
+   - 但本轮仍没有真实执行 `train_cmrappo.py` 的完整训练回合
+   - 也没有产出经过真实训练得到的 `policy.pt`
+
+2. **`model.py` 当前是最小可训练实现，不等于文档中的最终结构**
+   - 当前实现没有完整落地文档里描述的更强版 cross-attention 架构
+   - 更准确地说，现状是：
+     - 已有可工作的 actor/critic 骨架
+     - 但仍属于第一版工程接线实现
+
+3. **训练输出中的“已保存权重并出现收敛趋势”尚未被验证**
+   - 本轮没有验证：
+     - 训练前几轮是否稳定
+     - PPO loss / KL / entropy 是否合理
+     - benchmark 指标是否提升
+   - 因此原文中关于训练效果的验收标准，目前仍只是目标，不应视为已达成
+
+4. **本轮没有实现 Phase 8/9 的验证与 baseline 闭环**
+   - 尚未新增：
+     - `validate_benchmark.py`
+     - `validate_stochastic.py`
+     - `baselines/greedy_local_policy.py`
+   - 因而目前还没有用真实训练权重与固定 benchmark 做离线对比
+
+5. **当前 `train_cmrappo.py` / `model.py` 的可运行前提仍依赖额外训练环境**
+   - 当前环境已满足最基本的 `torch` 依赖，可运行训练相关单测
+   - 但完整训练仍依赖实际可用的训练设备与对应 `torch backend`
+   - 训练入口目前已做到：
+     - 导入路径闭合
+     - 训练 seed 固定闭合
+     - 元数据组装与写盘时序闭合
+     - 写盘前终检闭合
+     - 代码级链路闭合
+   - 但尚未做到“当前开发环境下直接完成一次真实训练”
 
 ## 4.8 Phase 8：固定 benchmark 离线验证
 
@@ -3883,6 +5025,10 @@ baseline 设计（本阶段正式采用）：
    - `candidate_builder`
    - `CoarsePlanView`
    - factorized action space 与 `action_mask`
+   - 若 baseline 复用 Phase 7 的 token encoder（特征编码器），则也必须遵守
+     `padding_mask / recovery_padding_mask / action_mask` 的同一分工；
+     若 baseline 直接在 `CandidateOutput` 上做规则打分，则可以不消费
+     `ObservationBatch`，但不得改变这些 mask 的契约语义
 2. baseline 为确定性策略，不做训练，不引入额外随机性
 3. 候选订单选择规则采用加权贪心分数：
    ```text
@@ -4048,6 +5194,8 @@ backend/weights/rh_alns_cmrappo/<version>/
 `meta.json` 至少包含：
 
 - 模型结构参数
+- `MetaJson.critic_schema = CriticTensorSchemaV1`（至少含 `schema_version / schema_hash /
+  ordering_rules / truncation_rules / padding_rules / normalization / snapshot_rule / storage_mode`）
 - 候选集参数
 - 上层规划参数（含 `CoarsePlanView` 接口版本）
 - 奖励/惩罚参数（含 `lambda_res_timeout` 和 `hard_failure_penalty_sec`）

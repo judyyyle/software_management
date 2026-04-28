@@ -239,6 +239,45 @@ class TestTrainingEnvAdapterPhase5c(unittest.TestCase):
         self.assertAlmostEqual(breakdown["wait"], -env._cfg.lambda_wait * 5.0, places=6)
         self.assertAlmostEqual(breakdown["queue"], -env._cfg.lambda_queue * 5.0, places=6)
 
+    def test_mode_a_background_completion_updates_stats_without_reward(self) -> None:
+        env = self._make_env()
+        result = env.reset()
+        self.assertIn("system_context_stats", result.info)
+
+        order_mgr = env._require_order_manager()
+        order_mgr.pending_orders.clear()
+        order_mgr.assigned_orders.clear()
+        order_mgr.completed_orders.clear()
+        order_mgr._next_order_time = math.inf
+        order_mgr._scheduled_dynamic = []
+        order_mgr._scheduled_dynamic_i = 0
+        env._decision_queue.clear()
+
+        background_stop = next(
+            stop
+            for stop in env._planned_route_stops
+            if stop.node_type == "customer" and stop.order_id in env._background_mode_a_pending
+        )
+
+        reward = env._advance_to_event(background_stop.arrival_time)
+
+        self.assertEqual(reward, 0.0)
+        self.assertNotIn("delivery_bonus", env._last_reward_breakdown)
+
+        stats = env.build_system_context_stats()
+        self.assertGreaterEqual(stats["mode_a_background_order_count"], 1)
+        self.assertEqual(stats["mode_a_background_completed_count"], 1)
+        self.assertAlmostEqual(
+            stats["mode_a_background_completion_time_sum"],
+            background_stop.arrival_time,
+            places=6,
+        )
+        self.assertEqual(len(stats["truck_background_order_completion_events"]), 1)
+        self.assertEqual(
+            stats["truck_background_order_completion_events"][0]["order_id"],
+            background_stop.order_id,
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
