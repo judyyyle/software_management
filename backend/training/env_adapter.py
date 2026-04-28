@@ -737,6 +737,70 @@ class TrainingEnvAdapter:
             "system_context_stats": self.build_system_context_stats(),
         }
 
+    def build_visualization_snapshot(self) -> dict[str, Any]:
+        """返回供实时可视化使用的轻量级状态快照。"""
+        runtime_state = self.build_runtime_state_view()
+        order_mgr = self._require_order_manager()
+        truck = self._require_truck()
+        decision = self.current_decision_context
+
+        orders: list[dict[str, Any]] = []
+        active_orders = list(runtime_state.pending_orders.values()) + list(runtime_state.assigned_orders.values())
+        for order in active_orders:
+            if not self._is_uav_primary_order(order):
+                continue
+            orders.append(self._serialize_visual_order(order))
+        for order in order_mgr.completed_orders:
+            if not self._is_uav_primary_order(order):
+                continue
+            orders.append(self._serialize_visual_order(order))
+        orders.sort(key=lambda item: (item["status"], item["order_id"]))
+
+        drones = [
+            {
+                "drone_id": drone_state.drone_id,
+                "status": drone_state.training_state,
+                "x": float(drone_state.current_loc.x),
+                "y": float(drone_state.current_loc.y),
+                "z": float(drone_state.current_loc.z),
+                "battery_ratio": float(drone_state.battery_ratio),
+                "battery_current": float(drone_state.battery_current),
+                "battery_max": float(drone_state.battery_max),
+                "carrying_order_id": drone_state.carrying_order_id,
+                "reservation_node_id": (
+                    drone_state.reservation.recover_node
+                    if drone_state.reservation is not None
+                    else None
+                ),
+            }
+            for drone_state in sorted(
+                runtime_state.drone_states.values(),
+                key=lambda item: item.drone_id,
+            )
+        ]
+
+        return {
+            "t_now": float(runtime_state.t_now),
+            "truck": {
+                "truck_id": str(self._truck_id or ""),
+                "x": float(truck.current_loc.x),
+                "y": float(truck.current_loc.y),
+                "z": float(truck.current_loc.z),
+            },
+            "drones": drones,
+            "orders": orders,
+            "current_decision": (
+                {
+                    "drone_id": str(decision.deciding_drone_id),
+                    "trigger_type": str(decision.trigger_type),
+                    "trigger_station_id": decision.trigger_station_id,
+                }
+                if decision is not None
+                else None
+            ),
+            "last_reward_breakdown": dict(self._last_reward_breakdown),
+        }
+
     def _build_coarse_plan_view(self, t_now: float) -> CoarsePlanView:
         """在给定时刻构造 Phase 5 内联 coarse plan。
 
@@ -2080,6 +2144,25 @@ class TrainingEnvAdapter:
         ]
         active.sort(key=lambda item: item.order_id)
         return tuple(active)
+
+    def _serialize_visual_order(self, order: Order) -> dict[str, Any]:
+        return {
+            "order_id": str(order.order_id),
+            "status": str(order.status.value),
+            "x": float(order.delivery_loc.x),
+            "y": float(order.delivery_loc.y),
+            "z": float(order.delivery_loc.z),
+            "create_time": float(order.create_time),
+            "deadline": float(order.deadline),
+            "payload_weight": float(order.payload_weight),
+            "assigned_mode": order.assigned_mode,
+            "assigned_vehicle_id": order.assigned_vehicle_id,
+            "actual_deliver_time": (
+                None
+                if order.actual_deliver_time is None
+                else float(order.actual_deliver_time)
+            ),
+        }
 
     def _is_uav_primary_order(self, order: Order) -> bool:
         """判断订单是否属于 UAV 主指标统计范围。"""
