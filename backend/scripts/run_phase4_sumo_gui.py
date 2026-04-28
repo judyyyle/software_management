@@ -18,9 +18,7 @@ import argparse
 import json
 import os
 import shutil
-import subprocess
 import sys
-import xml.etree.ElementTree as ET
 from pathlib import Path
 
 
@@ -33,6 +31,7 @@ from training.export_sumo_truck_route import (
     export_phase4_truck_route,
     format_execution_route_id_sequence,
 )
+from training.sumo_net_normalizer import normalize_net_with_netconvert, resolve_netconvert
 
 
 DEFAULT_SUMOCFG = (
@@ -60,58 +59,6 @@ def _resolve_sumo_gui(binary_override: str | None) -> str:
         "未找到 `sumo-gui`。请先安装 SUMO，或使用 "
         "`--sumo-gui-bin /path/to/sumo-gui` 指定可执行文件。"
     )
-
-
-def _resolve_netconvert(sumo_gui_bin: str) -> str | None:
-    sibling = Path(sumo_gui_bin).resolve().with_name("netconvert")
-    if sibling.is_file():
-        return str(sibling)
-    return shutil.which("netconvert")
-
-
-def _sumocfg_net_path(sumocfg: Path) -> Path | None:
-    root = ET.parse(sumocfg).getroot()
-    for elem in root.iter():
-        if elem.tag.endswith("net-file"):
-            value = elem.get("value")
-            if value:
-                return (sumocfg.parent / value).resolve()
-    return None
-
-
-def _normalize_net_with_netconvert(*, sumocfg: Path, netconvert_bin: str | None) -> None:
-    if not netconvert_bin:
-        return
-    net_path = _sumocfg_net_path(sumocfg)
-    if not net_path or not net_path.is_file():
-        return
-    tmp_path = net_path.with_suffix(".netconvert.tmp.xml")
-    result = subprocess.run(
-        [
-            netconvert_bin,
-            "-s",
-            str(net_path),
-            "-o",
-            str(tmp_path),
-            "--ignore-errors",
-            "--ignore-errors.connections",
-        ],
-        capture_output=True,
-        text=True,
-        cwd=str(sumocfg.parent),
-    )
-    if result.returncode != 0:
-        if result.stdout:
-            print(result.stdout, end="")
-        if result.stderr:
-            print(result.stderr, end="", file=sys.stderr)
-        raise subprocess.CalledProcessError(
-            result.returncode,
-            result.args,
-            output=result.stdout,
-            stderr=result.stderr,
-        )
-    tmp_path.replace(net_path)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -156,9 +103,9 @@ def main(argv: list[str] | None = None) -> int:
         )
 
     sumo_gui_bin = _resolve_sumo_gui(args.sumo_gui_bin or None)
-    _normalize_net_with_netconvert(
+    normalize_net_with_netconvert(
         sumocfg=sumocfg,
-        netconvert_bin=_resolve_netconvert(sumo_gui_bin),
+        netconvert_bin=resolve_netconvert(sumo_gui_bin),
     )
     if not args.no_debug_print:
         _print_debug_trace_summary(sumocfg.parent / DEFAULT_DEBUG_TRACE_NAME)
