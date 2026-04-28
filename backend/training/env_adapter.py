@@ -744,17 +744,19 @@ class TrainingEnvAdapter:
         truck = self._require_truck()
         decision = self.current_decision_context
 
-        orders: list[dict[str, Any]] = []
+        visual_order_by_id: dict[str, dict[str, Any]] = {}
+        for order in self._scene_ctx.static_orders:
+            visual_order_by_id[str(order.order_id)] = self._serialize_visual_order(order)
+
         active_orders = list(runtime_state.pending_orders.values()) + list(runtime_state.assigned_orders.values())
         for order in active_orders:
-            if not self._is_uav_primary_order(order):
-                continue
-            orders.append(self._serialize_visual_order(order))
+            visual_order_by_id[str(order.order_id)] = self._serialize_visual_order(order)
         for order in order_mgr.completed_orders:
-            if not self._is_uav_primary_order(order):
-                continue
-            orders.append(self._serialize_visual_order(order))
-        orders.sort(key=lambda item: (item["status"], item["order_id"]))
+            visual_order_by_id[str(order.order_id)] = self._serialize_visual_order(order)
+        orders = sorted(
+            visual_order_by_id.values(),
+            key=lambda item: (float(item["create_time"]), item["order_id"]),
+        )
 
         drones = [
             {
