@@ -17,6 +17,8 @@ HiveLogix — RH-ALNS / CMRAPPO 共享契约定义。
 
 from __future__ import annotations
 
+import hashlib
+import json
 from dataclasses import asdict, dataclass, field
 from enum import StrEnum
 from typing import Any, FrozenSet, Mapping, TypeAlias
@@ -509,6 +511,205 @@ class CandidateOutput:
     resolved_action_lookup: ResolvedActionLookup
 
 
+@dataclass(frozen=True)
+class DecisionPlannerSnapshot:
+    """Phase 7 pre-action snapshot 中的 planner/执行派生信号。"""
+
+    backlog_new_orders: int
+    fallback_count_in_window: int
+    hard_failure_count_in_window: int
+    route_drift_ratio: float
+    completed_backbone_count: int
+    expected_backbone_count: int
+    total_backbone_count: int
+    active_launch_stations: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class DecisionExecutionSnapshot:
+    """Phase 7 pre-action snapshot 中的执行层派生信号。"""
+
+    uav_eta_to_available: Mapping[str, float]
+    uav_dispatch_mode: Mapping[str, str]
+
+
+@dataclass(frozen=True)
+class FactorizedActionMask:
+    """factorized actor head 消费的结构化动作 mask。"""
+
+    root_branch_mask: Any
+    order_mask: Any
+    mode_mask: Any
+    recovery_mask: Any
+
+
+@dataclass(frozen=True)
+class ResolvedActionIndices:
+    """一次结构化动作采样/贪心结果。"""
+
+    root_branch_idx: int
+    order_idx: int | None = None
+    mode_idx: int | None = None
+    recovery_idx: int | None = None
+
+    def __post_init__(self) -> None:
+        if self.root_branch_idx == 0:
+            if any(
+                item is not None
+                for item in (self.order_idx, self.mode_idx, self.recovery_idx)
+            ):
+                raise ValueError("WAIT 分支不应携带 order/mode/recovery 索引")
+            return
+
+        if self.root_branch_idx != 1:
+            raise ValueError(f"未知 root_branch_idx: {self.root_branch_idx}")
+        if self.order_idx is None or self.mode_idx is None:
+            raise ValueError("DISPATCH 分支必须携带 order_idx 与 mode_idx")
+        if self.mode_idx == 0 and self.recovery_idx is not None:
+            raise ValueError("mode B 不应携带 recovery_idx")
+        if self.mode_idx == 1 and self.recovery_idx is None:
+            raise ValueError("mode C 必须携带 recovery_idx")
+
+
+@dataclass(frozen=True)
+class ObservationBatch:
+    """Phase 7 actor 输入。所有 tensor 已 materialize。"""
+
+    uav_self_token: Any
+    order_tokens: Any
+    recovery_tokens: Any
+    infra_tokens: Any
+    history_tokens: Any
+    history_padding_mask: Any
+    padding_mask: Any
+    recovery_padding_mask: Any
+
+
+@dataclass(frozen=True)
+class TransitionSummary:
+    """全局已提交真实转移的摘要记录。"""
+
+    event_time: float
+    actor_drone_id: str
+    actor_pos_x: float
+    actor_pos_y: float
+    actor_training_state_before: str
+    actor_training_state_after: str
+    actor_home_type: str
+    actor_payload_class: str
+    trigger_type: str
+    root_branch: str
+    dispatch_mode: str
+    selected_recover_node_type: str
+    has_selected_order: bool
+    selected_order_slot_rank: int
+    selected_order_deadline_slack_norm: float
+    selected_eta_to_deliver_norm: float
+    selected_rendezvous_margin_norm: float
+    energy_ratio_before: float
+    energy_ratio_after: float
+    queue_after_norm: float
+    plan_version_delta_at_event: int
+    delivered: bool
+    rendezvous_success: bool
+    reservation_timeout: bool
+    fallback_started: bool
+    hard_failure: bool
+    queue_entered: bool
+    service_completed: bool
+
+
+@dataclass(frozen=True)
+class CriticBatch:
+    """Phase 7 centralized critic 输入。"""
+
+    global_order_pool_tokens: Any
+    global_uav_tokens: Any
+    global_station_tokens: Any
+    coarse_plan_summary_vec: Any
+    global_system_summary_vec: Any
+    global_order_padding_mask: Any
+    global_uav_padding_mask: Any
+    global_station_padding_mask: Any
+
+
+@dataclass(frozen=True)
+class CriticNormalizationMeta:
+    """CriticTensorSchemaV1 固定归一化基准。"""
+
+    time_norm_sec: float
+    distance_norm_m: float
+    payload_norm_kg: float
+    eta_norm_sec: float
+    queue_norm_cap: float
+    energy_norm_strategy: str
+    light_battery_capacity_j: float
+    heavy_battery_capacity_j: float
+
+
+@dataclass(frozen=True)
+class CriticTensorSchemaMeta:
+    """价值网络张量结构契约。"""
+
+    name: str
+    schema_version: str
+    max_global_orders: int
+    max_global_uavs: int
+    max_global_stations: int
+    order_token_fields: tuple[str, ...]
+    uav_token_fields: tuple[str, ...]
+    station_token_fields: tuple[str, ...]
+    coarse_plan_summary_fields: tuple[str, ...]
+    global_system_summary_fields: tuple[str, ...]
+    ordering_rules: tuple[str, ...]
+    truncation_rules: tuple[str, ...]
+    padding_rules: tuple[str, ...]
+    normalization: CriticNormalizationMeta
+    snapshot_rule: str
+    storage_mode: str
+    causal_blacklist: tuple[str, ...]
+    schema_hash: str = field(init=False)
+
+    def __post_init__(self) -> None:
+        if not self.name:
+            raise ValueError("critic schema name 不能为空")
+        if not self.schema_version:
+            raise ValueError("critic schema_version 不能为空")
+        if self.max_global_orders <= 0:
+            raise ValueError("max_global_orders 必须为正数")
+        if self.max_global_uavs <= 0:
+            raise ValueError("max_global_uavs 必须为正数")
+        if self.max_global_stations <= 0:
+            raise ValueError("max_global_stations 必须为正数")
+
+        payload = {
+            "name": self.name,
+            "schema_version": self.schema_version,
+            "max_global_orders": self.max_global_orders,
+            "max_global_uavs": self.max_global_uavs,
+            "max_global_stations": self.max_global_stations,
+            "order_token_fields": self.order_token_fields,
+            "uav_token_fields": self.uav_token_fields,
+            "station_token_fields": self.station_token_fields,
+            "coarse_plan_summary_fields": self.coarse_plan_summary_fields,
+            "global_system_summary_fields": self.global_system_summary_fields,
+            "ordering_rules": self.ordering_rules,
+            "truncation_rules": self.truncation_rules,
+            "padding_rules": self.padding_rules,
+            "normalization": asdict(self.normalization),
+            "snapshot_rule": self.snapshot_rule,
+            "storage_mode": self.storage_mode,
+            "causal_blacklist": self.causal_blacklist,
+        }
+        object.__setattr__(
+            self,
+            "schema_hash",
+            hashlib.sha256(
+                json.dumps(payload, ensure_ascii=True, sort_keys=True).encode("utf-8")
+            ).hexdigest(),
+        )
+
+
 # ── meta.json 契约 ────────────────────────────────────────────────────────────
 
 
@@ -666,6 +867,7 @@ class MetaJson:
     candidate: CandidateMeta
     planner: PlannerMeta
     reward: RewardMeta
+    critic_schema: CriticTensorSchemaMeta
     shared_runtime_params_snapshot: SharedRuntimeParamsSnapshot
     env_semantic_contract: EnvSemanticContractMeta
     online_lock_params: OnlineLockParams
@@ -763,7 +965,13 @@ __all__ = [
     "CandidateMeta",
     "CandidateOutput",
     "CoarsePlanView",
+    "CriticBatch",
+    "CriticNormalizationMeta",
+    "CriticTensorSchemaMeta",
+    "DecisionExecutionSnapshot",
+    "DecisionPlannerSnapshot",
     "FactorizedActionSchema",
+    "FactorizedActionMask",
     "DroneRuntimeParamsSnapshot",
     "EnvSemanticContractMeta",
     "EtaSec",
@@ -772,6 +980,7 @@ __all__ = [
     "MetaJson",
     "NodeChargeLoadBudget",
     "NodeId",
+    "ObservationBatch",
     "OnlineLockParams",
     "OrderFeatures",
     "OrderId",
@@ -783,6 +992,7 @@ __all__ = [
     "PolicyMode",
     "PriorityBand",
     "RecoveryFeatures",
+    "ResolvedActionIndices",
     "ResolvedActionLookup",
     "ResolvedDispatchKey",
     "RewardMeta",
@@ -792,6 +1002,7 @@ __all__ = [
     "SolverEnergyRuntimeSnapshot",
     "TrainingInputMeta",
     "TrainingRunMeta",
+    "TransitionSummary",
     "UavSelfFeatures",
     "build_meta_json_dict",
 ]
