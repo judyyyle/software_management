@@ -297,6 +297,7 @@ class RealtimeSumoEpisodeRenderer:
         poi_id = _marker_id(namespace, object_id, "poi")
         polygon_id = _marker_id(namespace, object_id, "poly")
         shape = _marker_shape(shape_kind=shape_kind, x=x, y=y, radius=radius)
+        polygon_layer, poi_layer = _marker_layers(namespace)
 
         if poi_id not in self._poi_ids:
             try:
@@ -306,7 +307,7 @@ class RealtimeSumoEpisodeRenderer:
                     y,
                     color,
                     poiType=namespace,
-                    layer=20,
+                    layer=poi_layer,
                 )
             except Exception:
                 # 对象若已存在，转为 update 模式，并记住该 id，避免后续重复 add。
@@ -330,7 +331,7 @@ class RealtimeSumoEpisodeRenderer:
                     color,
                     fill=True,
                     polygonType=namespace,
-                    layer=19,
+                    layer=polygon_layer,
                     lineWidth=2,
                 )
             except Exception:
@@ -462,6 +463,12 @@ def _candidate_sumo_tools_dirs(sumo_gui_bin: str) -> tuple[Path, ...]:
 
 def _marker_id(namespace: str, object_id: str, suffix: str) -> str:
     return f"cmrappo-{namespace}-{object_id}-{suffix}"
+
+
+def _marker_layers(namespace: str) -> tuple[int, int]:
+    if namespace == "drone":
+        return (39, 40)
+    return (19, 20)
 
 
 def _marker_shape(*, shape_kind: str, x: float, y: float, radius: float) -> list[tuple[float, float]]:
