@@ -2,7 +2,7 @@
 
 **基准 run**：`phase7_20260428_run01`（1.5M steps，367 updates）  
 **调整目标**：修复熵崩溃、WAIT 动作主导、Critic 不稳定三个核心问题  
-**修改文件**：`backend/config/rh_alns_cmrappo.yaml`
+**修改文件**：`backend/config/rh_alns_cmrappo.yaml`、`backend/training/train_cmrappo.py`
 
 ---
 
@@ -80,18 +80,54 @@ hard_overdue 额外：   -0.15 × 600s = -90
 | `entropy_coef` | 0.01 | **0.03** | 3x 增强熵正则化，防止策略过早坍缩为确定性 |
 | `value_loss_coef` | 0.50 | **0.25** | 降低 Critic loss 对 policy 梯度的污染权重，缓解 value loss spike 的影响 |
 | `target_kl` | 0.03 | **0.05** | 放宽 KL 阈值，允许每个 rollout 完成更充分的 epoch 更新，提高样本利用率 |
+| `vf_clip_coef` | 无 | **0.20** | 新增 value function clipping，从根本上稳定 Critic 训练（见 2.3 节） |
+
+### 2.3 Value Function Clipping 代码实现
+
+**问题**：Run01 的 `_ppo_update` 中 value loss 没有 clipping，Critic 每次更新可以任意偏离 rollout 时的旧估值，导致 loss spike 反复污染 policy 梯度。
+
+**实现方案**：在 `train_cmrappo.py` 中做了以下改动：
+
+1. `_TrainingConfig` 新增字段 `vf_clip_coef: float`
+
+2. `_SequenceMiniBatch` 新增字段 `old_values: Any`，存储 rollout 时 Critic 的旧估值
+
+3. `_build_sequence_minibatch` 从每个 `RolloutTransition.value_old` 提取旧估值，填入 `old_values` 数组（shape: `batch_size × seq_len`），转为 tensor 后放入 minibatch
+
+4. `_ppo_update` 中 value loss 计算改为 clipped 版本：
+
+```python
+# 旧（无 clipping）
+value_loss = 0.5 * _masked_mean_tensor(
+    (values_flat - returns) ** 2,
+    valid_mask_flat,
+)
+
+# 新（带 clipping）
+v_clipped = old_values_flat + torch.clamp(
+    values_flat - old_values_flat,
+    -train_cfg.vf_clip_coef,
+    train_cfg.vf_clip_coef,
+)
+vl_unclipped = (values_flat - returns) ** 2
+vl_clipped = (v_clipped - returns) ** 2
+value_loss = 0.5 * _masked_mean_tensor(
+    torch.max(vl_unclipped, vl_clipped),
+    valid_mask_flat,
+)
+```
+
+**数据流**：`RolloutTransition.value_old`（rollout 采集时存入）→ `_build_sequence_minibatch` 提取 → `_SequenceMiniBatch.old_values` → `_ppo_update` 中作为 clipping 基准。`value_old` 字段在 `rollout_buffer.py` 中已存在，无需修改 rollout buffer。
 
 ---
 
-## 三、未在 Run02 实施的后续优化项
+## 三、待后续 run 处理的优化项
 
-以下问题已识别，但需要代码改动，留待后续 run 处理：
+以下问题已识别，留待后续处理：
 
-1. **Value function clipping**：在 `train_cmrappo.py` 的 `_ppo_update` 中加入 `vf_clip_coef`，从根本上解决 Critic 不稳定问题。
+1. **Reservation timeout 过高**：stochastic 各档几乎每次派单都伴随 reservation timeout（low: 13次/5ep，high: 38次/5ep），需要检查 `alpha=1.5, beta=1.2` 的预约窗口估算是否过于保守。
 
-2. **Reservation timeout 过高**：stochastic 各档几乎每次派单都伴随 reservation timeout（low: 13次/5ep，high: 38次/5ep），需要检查 `alpha=1.5, beta=1.2` 的预约窗口估算是否过于保守。
-
-3. **Curriculum 开启**：当前 `curriculum.enabled: false`，待 Run02 验证基础行为正常后，Run03 可开启 `station_queue_noise` 和 `truck_delay_noise` 提升泛化能力。
+2. **Curriculum 开启**：当前 `curriculum.enabled: false`，待 Run02 验证基础行为正常后，Run03 可开启 `station_queue_noise` 和 `truck_delay_noise` 提升泛化能力。
 
 ---
 

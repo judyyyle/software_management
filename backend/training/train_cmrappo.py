@@ -20,7 +20,7 @@ from collections import deque
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Mapping, Sequence
+from typing import Any, Callable, Mapping, Sequence
 
 import numpy as np
 
@@ -154,6 +154,7 @@ def train_cmrappo(
     output_dir: str | Path,
     config_path: str | Path = DEFAULT_CONFIG_PATH,
     model_version: str | None = None,
+    event_hook: Callable[[str, Mapping[str, Any]], None] | None = None,
 ) -> dict[str, Any]:
     _require_torch()
     scene_ctx = load_default_scene(config_path=config_path)
@@ -255,6 +256,18 @@ def train_cmrappo(
         global_step_start=0,
         update_start=0,
     )
+    _emit_event_hook(
+        event_hook,
+        "train_reset",
+        {
+            "phase": "train",
+            "episode_id": episode_id,
+            "global_step": global_step,
+            "update_idx": update_idx,
+            "env": env,
+            "result": current_result,
+        },
+    )
     while global_step < train_cfg.total_timesteps:
         rollout = RolloutBuffer(capacity=train_cfg.rollout_steps)
         while rollout.size < rollout.capacity and global_step < train_cfg.total_timesteps:
@@ -273,6 +286,18 @@ def train_cmrappo(
                 lstm_state_by_drone.clear()
                 recurrent_segment_id_by_drone.clear()
                 local_decision_cursor.clear()
+                _emit_event_hook(
+                    event_hook,
+                    "train_reset",
+                    {
+                        "phase": "train",
+                        "episode_id": episode_id,
+                        "global_step": global_step,
+                        "update_idx": update_idx,
+                        "env": env,
+                        "result": current_result,
+                    },
+                )
             decision_context = current_result.decision_context
             if decision_context is None:
                 current_result = env.reset()
@@ -289,6 +314,18 @@ def train_cmrappo(
                 lstm_state_by_drone.clear()
                 recurrent_segment_id_by_drone.clear()
                 local_decision_cursor.clear()
+                _emit_event_hook(
+                    event_hook,
+                    "train_reset",
+                    {
+                        "phase": "train",
+                        "episode_id": episode_id,
+                        "global_step": global_step,
+                        "update_idx": update_idx,
+                        "env": env,
+                        "result": current_result,
+                    },
+                )
                 continue
 
             drone_id = str(decision_context.deciding_drone_id)
@@ -373,15 +410,42 @@ def train_cmrappo(
             current_result = step_result
             global_step += 1
             _record_episode_step(episode_acc, reward=float(step_result.reward))
+            _emit_event_hook(
+                event_hook,
+                "train_step",
+                {
+                    "phase": "train",
+                    "episode_id": episode_id,
+                    "global_step": global_step,
+                    "update_idx": update_idx,
+                    "env": env,
+                    "decision_context": decision_context,
+                    "env_action": env_action,
+                    "step_result": step_result,
+                },
+            )
             if step_result.done:
+                episode_metrics = _finalize_episode_metrics(
+                    accumulator=episode_acc,
+                    episode_snapshot=env.build_episode_metrics_snapshot(),
+                    global_step_end=global_step,
+                    update_idx_end=update_idx,
+                )
                 _append_metrics(
                     episode_metrics_path,
-                    _finalize_episode_metrics(
-                        accumulator=episode_acc,
-                        episode_snapshot=env.build_episode_metrics_snapshot(),
-                        global_step_end=global_step,
-                        update_idx_end=update_idx,
-                    ),
+                    episode_metrics,
+                )
+                _emit_event_hook(
+                    event_hook,
+                    "train_episode_end",
+                    {
+                        "phase": "train",
+                        "episode_id": episode_id,
+                        "global_step": global_step,
+                        "update_idx": update_idx,
+                        "env": env,
+                        "episode_metrics": episode_metrics,
+                    },
                 )
 
         last_value = 0.0
@@ -1572,6 +1636,16 @@ def _build_meta_payload(
 def _append_metrics(path: Path, payload: Mapping[str, Any]) -> None:
     with path.open("a", encoding="utf-8") as fh:
         fh.write(json.dumps(dict(payload), ensure_ascii=False) + "\n")
+
+
+def _emit_event_hook(
+    event_hook: Callable[[str, Mapping[str, Any]], None] | None,
+    event_name: str,
+    payload: Mapping[str, Any],
+) -> None:
+    if event_hook is None:
+        return
+    event_hook(str(event_name), payload)
 
 
 def _write_json(*, path: Path, payload: Mapping[str, Any]) -> None:
