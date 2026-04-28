@@ -75,6 +75,7 @@ class _TrainingConfig:
     gamma: float
     gae_lambda: float
     clip_coef: float
+    vf_clip_coef: float
     entropy_coef: float
     value_loss_coef: float
     max_grad_norm: float
@@ -125,6 +126,7 @@ class _SequenceMiniBatch:
     action_mask: Any
     action_indices: dict[str, Any]
     old_log_probs: Any
+    old_values: Any
     returns: Any
     advantages: Any
     valid_timestep_mask: Any
@@ -921,6 +923,7 @@ def _ppo_update(
             )
 
             old_log_probs = minibatch.old_log_probs.reshape(-1)
+            old_values_flat = minibatch.old_values.reshape(-1)
             returns = minibatch.returns.reshape(-1)
             advantages_flat = advantages_t.reshape(-1)
             valid_mask_flat = valid_mask.reshape(-1)
@@ -937,8 +940,15 @@ def _ppo_update(
                 torch.min(unclipped, clipped),
                 valid_mask_flat,
             )
+            v_clipped = old_values_flat + torch.clamp(
+                values_flat - old_values_flat,
+                -train_cfg.vf_clip_coef,
+                train_cfg.vf_clip_coef,
+            )
+            vl_unclipped = (values_flat - returns) ** 2
+            vl_clipped = (v_clipped - returns) ** 2
             value_loss = 0.5 * _masked_mean_tensor(
-                (values_flat - returns) ** 2,
+                torch.max(vl_unclipped, vl_clipped),
                 valid_mask_flat,
             )
             entropy_loss = _masked_mean_tensor(entropy, valid_mask_flat)
@@ -1139,6 +1149,7 @@ def _build_sequence_minibatch(
     mode_idx = np.zeros((batch_size, seq_len), dtype=np.int64)
     recovery_idx = np.zeros((batch_size, seq_len), dtype=np.int64)
     old_log_probs = np.zeros((batch_size, seq_len), dtype=np.float32)
+    old_values = np.zeros((batch_size, seq_len), dtype=np.float32)
     returns = np.zeros((batch_size, seq_len), dtype=np.float32)
     advantages = np.zeros((batch_size, seq_len), dtype=np.float32)
     valid_timestep_mask = np.zeros((batch_size, seq_len), dtype=np.bool_)
@@ -1170,6 +1181,7 @@ def _build_sequence_minibatch(
                 0 if action.recovery_idx is None else int(action.recovery_idx)
             )
             old_log_probs[seq_row, step_idx] = float(transition.log_prob_old)
+            old_values[seq_row, step_idx] = float(transition.value_old)
             returns[seq_row, step_idx] = float(sequence.returns[step_idx])
             advantages[seq_row, step_idx] = float(sequence.advantages[step_idx])
             valid_timestep_mask[seq_row, step_idx] = bool(sequence.valid_timestep_mask[step_idx])
@@ -1195,6 +1207,7 @@ def _build_sequence_minibatch(
             "recovery_idx": torch.as_tensor(recovery_idx, dtype=torch.long, device=device),
         },
         old_log_probs=torch.as_tensor(old_log_probs, dtype=torch.float32, device=device),
+        old_values=torch.as_tensor(old_values, dtype=torch.float32, device=device),
         returns=torch.as_tensor(returns, dtype=torch.float32, device=device),
         advantages=torch.as_tensor(advantages, dtype=torch.float32, device=device),
         valid_timestep_mask=torch.as_tensor(valid_timestep_mask, dtype=torch.bool, device=device),
@@ -1872,6 +1885,7 @@ def _load_training_config(config_path: Path) -> _TrainingConfig:
         gamma=float(training["gamma"]),
         gae_lambda=float(training["gae_lambda"]),
         clip_coef=float(training["clip_coef"]),
+        vf_clip_coef=float(training.get("vf_clip_coef", 0.2)),
         entropy_coef=float(training["entropy_coef"]),
         value_loss_coef=float(training["value_loss_coef"]),
         max_grad_norm=float(training["max_grad_norm"]),
