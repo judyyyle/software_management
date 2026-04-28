@@ -40,7 +40,14 @@ from .env_adapter import (
 from .actions import DispatchAction, GlobalWaitAction, WAIT_ACTION
 from .candidate_builder import CandidateBuilder
 from .contracts import CandidateOutput
+from .critic_batch_builder import (
+    CriticBatchBuilder,
+    build_default_critic_tensor_schema_meta,
+)
+from .observation_tensorizer import ObservationTensorizer
 from .planner_bridge import PlannerBridge
+from .rollout_buffer import RolloutBuffer
+from .train_cmrappo import train_cmrappo
 from .export_sumo_truck_route import (
     Phase4ExportResult,
     TruckExecutionRoute,
@@ -58,9 +65,11 @@ __all__ = [
     "TruckExecutionRoute",
     "build_order_source",
     "build_order_source_preview_summary",
+    "build_default_critic_tensor_schema_meta",
     "CandidateBuilder",
     "CandidateOutput",
     "configure_order_manager_for_source",
+    "CriticBatchBuilder",
     "DecisionContext",
     "DispatchAction",
     "EnvStepResult",
@@ -70,11 +79,14 @@ __all__ = [
     "load_default_scene",
     "load_training_scene",
     "NodeStateView",
+    "ObservationTensorizer",
     "preview_dynamic_order_stream",
     "PlannerBridge",
     "ReservationStateView",
+    "RolloutBuffer",
     "RuntimeStateView",
     "TrainingDroneState",
     "TrainingEnvAdapter",
     "WAIT_ACTION",
+    "train_cmrappo",
 ]

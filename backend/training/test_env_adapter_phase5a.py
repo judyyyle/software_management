@@ -41,6 +41,7 @@ class TestTrainingEnvAdapterPhase5a(unittest.TestCase):
 
         self.assertIsNotNone(result.decision_context)
         self.assertFalse(result.done)
+        self.assertIn("system_context_stats", result.info)
 
         max_steps = 256
         for _ in range(max_steps):
@@ -64,6 +65,7 @@ class TestTrainingEnvAdapterPhase5a(unittest.TestCase):
         self.assertTrue(result.done, "episode 未在步数预算内结束，可能存在状态机卡死")
         self.assertLessEqual(result.runtime_state.t_now, env._cfg.upper_horizon_sec + 1e-6)
         self.assertFalse(env._fallback_leg, "episode 结束后 fallback 账本应为空")
+        self.assertIn("system_context_stats", result.info)
 
     def test_fallback_leg_clears_on_host_arrival(self) -> None:
         env = self._make_env()

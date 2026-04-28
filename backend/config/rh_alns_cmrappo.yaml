@@ -233,17 +233,27 @@ policy:
   max_order_tokens: 32
   max_recovery_tokens: 4
 
+  critic_schema_name: CriticTensorSchemaV1
+  critic_schema_version: v1
+  max_global_orders: 64
+  max_global_uavs: 16
+  max_global_stations: 11
+
+  # Critic 归一化基准必须来自固定配置/场景量，不允许按 batch/rollout 动态统计。
+  queue_norm_cap: 8.0
+  energy_norm_strategy: per_uav_battery_max
+
 reward:
   # UAV-scope 主指标权重：仅评价无人机可配送订单。
-  lambda_wait: 0.10
-  wait_idle_penalty_coef: 0.10
+  lambda_wait: 0.25
+  wait_idle_penalty_coef: 0.25
   lambda_queue: 0.10
   lambda_miss: 0.15
   lambda_res_timeout: 0.10
-  lambda_overdue: 0.20
+  lambda_overdue: 0.15
 
   # 正奖励仅保留送达奖励，避免 reward 结构过于混杂。
-  R_delivery_bonus: 60
+  R_delivery_bonus: 100
 
   # 超时强制移除与硬失败惩罚。
   max_overdue_sec: 600
@@ -268,16 +278,23 @@ training:
   total_timesteps: 1500000
   ppo_learning_rate: 0.0003
   rollout_steps: 4096
+  recurrent_ppo: true
+  sequence_len: 16
+  burn_in_len: 0
+  train_len: 16
+  sequence_minibatch_size: 32
+  target_minibatch_timesteps: 512
+  # 兼容旧字段；在 recurrent PPO 下只允许作为 target_minibatch_timesteps 的过渡别名。
   batch_size: 512
   ppo_epochs: 4
   gamma: 0.99
   gae_lambda: 0.95
   clip_coef: 0.20
-  entropy_coef: 0.01
-  value_loss_coef: 0.50
+  entropy_coef: 0.03
+  value_loss_coef: 0.25
   max_grad_norm: 1.0
   normalize_advantage: true
-  target_kl: 0.03
+  target_kl: 0.05
 
   # 训练/评估过程控制。
   log_interval_updates: 1
