@@ -22,6 +22,7 @@ if str(BACKEND_DIR) not in sys.path:
 
 
 from training.export_sumo_truck_route import export_phase4_truck_route
+from training.sumo_net_normalizer import normalize_net_with_netconvert, resolve_netconvert
 from training.scene_loader import DEFAULT_CONFIG_PATH, load_default_scene
 
 
@@ -58,6 +59,10 @@ class RealtimeSumoEpisodeRenderer:
             raise FileNotFoundError(f"SUMO 配置不存在: {self._sumocfg}")
         if not self._net_path.is_file():
             raise FileNotFoundError(f"SUMO 路网不存在: {self._net_path}")
+        normalize_net_with_netconvert(
+            sumocfg=self._sumocfg,
+            netconvert_bin=resolve_netconvert(self._sumo_gui_bin),
+        )
 
         net = self._sumolib.net.readNet(str(self._net_path))
         offset_x, offset_y = net.getLocationOffset()
