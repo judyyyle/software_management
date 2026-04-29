@@ -254,6 +254,18 @@ class TestTrainingEnvAdapterPhase5a(unittest.TestCase):
             places=6,
         )
 
+    def test_poisson_patrol_loop_keeps_future_backbone_alive_near_upper_horizon(self) -> None:
+        env = self._make_env()
+        env.reset()
+
+        future_visits = env._future_backbone_visits(env._cfg.upper_horizon_sec - 1.0)
+        self.assertTrue(
+            future_visits,
+            "poisson 巡站循环应保证 upper_horizon 前仍存在 future backbone 节点",
+        )
+        self.assertEqual(future_visits[-1].node_id, env._depot_id)
+        self.assertGreater(future_visits[-1].arrival_time, env._cfg.upper_horizon_sec - 1.0)
+
 
 if __name__ == "__main__":
     unittest.main()
