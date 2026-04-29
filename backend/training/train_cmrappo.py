@@ -17,7 +17,7 @@ import json
 import random
 import shutil
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
@@ -47,7 +47,11 @@ from .critic_batch_builder import CriticBatchBuilder
 from .model import SharedPPOActorCritic
 from .observation_tensorizer import ObservationTensorizer
 from .order_source_adapter import OrderSourceMode, build_order_source, ensure_mode_allowed
-from .rollout_buffer import RolloutBuffer, RolloutTransition
+from .rollout_buffer import (
+    RolloutTransition,
+    build_batch_view_from_transitions,
+    compute_gae,
+)
 from .scene_loader import DEFAULT_CONFIG_PATH, load_default_scene
 from .env_adapter import TrainingEnvAdapter
 
@@ -75,7 +79,6 @@ class _TrainingConfig:
     gamma: float
     gae_lambda: float
     clip_coef: float
-    vf_clip_coef: float
     entropy_coef: float
     value_loss_coef: float
     max_grad_norm: float
@@ -133,6 +136,126 @@ class _SequenceMiniBatch:
     lstm_state_in: Any | None
     sequence_count: int
     padded_timesteps: int
+
+
+def _extract_attributed_step_reward_parts(*, step_result: Any) -> tuple[float, float]:
+    reward_breakdown = dict(getattr(step_result, "info", {}).get("reward_breakdown", {}))
+    carry_in_reward = float(reward_breakdown.get("attributed_carry_in", 0.0))
+    if "attributed_post_action" in reward_breakdown:
+        post_action_reward = float(reward_breakdown["attributed_post_action"])
+    else:
+        post_action_reward = float(step_result.reward) - carry_in_reward
+    return carry_in_reward, post_action_reward
+
+
+def _insert_finalized_transition_in_order(
+    *,
+    rollout_backlog: list[RolloutTransition],
+    transition: RolloutTransition,
+) -> None:
+    insert_at = len(rollout_backlog)
+    target_index = int(transition.global_decision_index)
+    while insert_at > 0:
+        prev_index = int(rollout_backlog[insert_at - 1].global_decision_index)
+        if prev_index <= target_index:
+            break
+        insert_at -= 1
+    rollout_backlog.insert(insert_at, transition)
+
+
+def _finalize_pending_transition_for_next_decision(
+    *,
+    pending_transition_by_drone: dict[str, RolloutTransition],
+    rollout_backlog: list[RolloutTransition],
+    successor_bootstrap_values: dict[tuple[int, str, int], float],
+    drone_id: str,
+    carry_in_reward: float,
+    next_value: float,
+) -> None:
+    pending = pending_transition_by_drone.pop(drone_id, None)
+    if pending is None:
+        return
+    reward_so_far = 0.0 if pending.reward is None else float(pending.reward)
+    finalized = replace(
+        pending,
+        reward=reward_so_far + float(carry_in_reward),
+        done=False,
+    )
+    _insert_finalized_transition_in_order(
+        rollout_backlog=rollout_backlog,
+        transition=finalized,
+    )
+    key = (
+        int(pending.episode_id),
+        str(pending.actor_drone_id),
+        int(pending.recurrent_segment_id),
+    )
+    successor_bootstrap_values[key] = float(next_value)
+
+
+def _flush_terminal_pending_transitions(
+    *,
+    pending_transition_by_drone: dict[str, RolloutTransition],
+    rollout_backlog: list[RolloutTransition],
+    terminal_reward_by_drone: Mapping[str, float],
+) -> None:
+    for drone_id, pending in tuple(pending_transition_by_drone.items()):
+        reward_so_far = 0.0 if pending.reward is None else float(pending.reward)
+        finalized = replace(
+            pending,
+            reward=reward_so_far + float(terminal_reward_by_drone.get(drone_id, 0.0)),
+            done=True,
+        )
+        _insert_finalized_transition_in_order(
+            rollout_backlog=rollout_backlog,
+            transition=finalized,
+        )
+    pending_transition_by_drone.clear()
+
+
+def _build_rollout_prefix_boundary_bootstrap_values(
+    *,
+    current_result: Any,
+    episode_id: int,
+    env: TrainingEnvAdapter,
+    tensorizer: ObservationTensorizer,
+    critic_builder: CriticBatchBuilder,
+    critic_schema: CriticTensorSchemaMeta,
+    model: Any,
+    history_buffer: Sequence[Any],
+    last_seen_plan_version_by_drone: Mapping[str, int],
+    lstm_state_by_drone: Mapping[str, Any],
+    recurrent_segment_id_by_drone: Mapping[str, int],
+    successor_bootstrap_values: Mapping[tuple[int, str, int], float],
+) -> dict[tuple[int, str, int], float]:
+    return {
+        **_build_current_boundary_bootstrap_values(
+            current_result=current_result,
+            episode_id=episode_id,
+            env=env,
+            tensorizer=tensorizer,
+            critic_builder=critic_builder,
+            critic_schema=critic_schema,
+            model=model,
+            history_buffer=history_buffer,
+            last_seen_plan_version_by_drone=last_seen_plan_version_by_drone,
+            lstm_state_by_drone=lstm_state_by_drone,
+            recurrent_segment_id_by_drone=recurrent_segment_id_by_drone,
+        ),
+        **successor_bootstrap_values,
+    }
+
+
+def _maybe_record_probe_successor_bootstrap_value(
+    *,
+    successor_bootstrap_values: dict[tuple[int, str, int], float],
+    episode_id: int,
+    drone_id: str,
+    recurrent_segment_id: int,
+    value_old: float,
+) -> None:
+    key = (int(episode_id), str(drone_id), int(recurrent_segment_id))
+    successor_bootstrap_values.setdefault(key, float(value_old))
 
 
 @dataclass
@@ -252,7 +375,7 @@ def train_cmrappo(
         phase="train",
         episode_id=episode_id,
         order_source_mode=str(order_source.mode.value),
-        order_source_seed=int(order_source.seed),
+        order_source_seed=env.current_episode_order_source_seed(),
         global_step_start=0,
         update_start=0,
     )
@@ -268,17 +391,52 @@ def train_cmrappo(
             "result": current_result,
         },
     )
-    while global_step < train_cfg.total_timesteps:
-        rollout = RolloutBuffer(capacity=train_cfg.rollout_steps)
-        while rollout.size < rollout.capacity and global_step < train_cfg.total_timesteps:
+    rollout_backlog: list[RolloutTransition] = []
+    pending_transition_by_drone: dict[str, RolloutTransition] = {}
+    successor_bootstrap_values: dict[tuple[int, str, int], float] = {}
+    while (
+        global_step < train_cfg.total_timesteps
+        or rollout_backlog
+        or pending_transition_by_drone
+    ):
+        while global_step < train_cfg.total_timesteps:
+            if (
+                len(rollout_backlog) >= train_cfg.rollout_steps
+                and (
+                    _resolve_rollout_prefix_bootstrap_values(
+                        transitions=rollout_backlog,
+                        prefix_len=len(rollout_backlog),
+                        boundary_bootstrap_values=_build_rollout_prefix_boundary_bootstrap_values(
+                            current_result=current_result,
+                            episode_id=episode_id,
+                            env=env,
+                            tensorizer=tensorizer,
+                            critic_builder=critic_builder,
+                            critic_schema=critic_schema,
+                            model=model,
+                            history_buffer=history_buffer,
+                            last_seen_plan_version_by_drone=last_seen_plan_version_by_drone,
+                            lstm_state_by_drone=lstm_state_by_drone,
+                            recurrent_segment_id_by_drone=recurrent_segment_id_by_drone,
+                            successor_bootstrap_values=successor_bootstrap_values,
+                        ),
+                        current_runtime_state=current_result.runtime_state,
+                        episode_terminated_at_boundary=bool(current_result.done),
+                    )
+                    is not None
+                )
+            ):
+                break
             if current_result.done:
+                if pending_transition_by_drone:
+                    raise RuntimeError("episode 已结束，但仍有未 finalize 的 pending transition")
                 current_result = env.reset()
                 episode_id += 1
                 episode_acc = _EpisodeAccumulator(
                     phase="train",
                     episode_id=episode_id,
                     order_source_mode=str(order_source.mode.value),
-                    order_source_seed=int(order_source.seed),
+                    order_source_seed=env.current_episode_order_source_seed(),
                     global_step_start=global_step,
                     update_start=update_idx,
                 )
@@ -300,13 +458,15 @@ def train_cmrappo(
                 )
             decision_context = current_result.decision_context
             if decision_context is None:
+                if pending_transition_by_drone:
+                    raise RuntimeError("decision_context 丢失时仍有未 finalize 的 pending transition")
                 current_result = env.reset()
                 episode_id += 1
                 episode_acc = _EpisodeAccumulator(
                     phase="train",
                     episode_id=episode_id,
                     order_source_mode=str(order_source.mode.value),
-                    order_source_seed=int(order_source.seed),
+                    order_source_seed=env.current_episode_order_source_seed(),
                     global_step_start=global_step,
                     update_start=update_idx,
                 )
@@ -360,6 +520,7 @@ def train_cmrappo(
                     action_mask=action_mask,
                     deterministic=False,
                 )
+            value_old = float(policy_out.value.detach().cpu().item())
             action_indices = ResolvedActionIndices(**sampled_action)
             env_action = candidate_out.resolved_action_lookup.resolve(
                 root_branch_idx=action_indices.root_branch_idx,
@@ -367,28 +528,50 @@ def train_cmrappo(
                 mode_idx=action_indices.mode_idx,
                 recovery_idx=action_indices.recovery_idx,
             )
-            slot = rollout.begin_transition(
+            step_result = env.step(env_action)
+            carry_in_reward, post_action_reward = _extract_attributed_step_reward_parts(
+                step_result=step_result
+            )
+            _finalize_pending_transition_for_next_decision(
+                pending_transition_by_drone=pending_transition_by_drone,
+                rollout_backlog=rollout_backlog,
+                successor_bootstrap_values=successor_bootstrap_values,
+                drone_id=drone_id,
+                carry_in_reward=carry_in_reward,
+                next_value=value_old,
+            )
+            current_transition = RolloutTransition(
                 observation_batch=observation_batch,
                 critic_batch=critic_batch,
                 action_mask=action_mask,
                 action_indices=action_indices,
                 log_prob_old=float(log_prob.detach().cpu().item()),
-                value_old=float(policy_out.value.detach().cpu().item()),
+                value_old=value_old,
                 critic_schema_hash=critic_schema.schema_hash,
+                reward=post_action_reward,
+                done=True if step_result.done else None,
                 lstm_state_in=_detach_lstm_state(lstm_state=lstm_state_in),
+                lstm_state_out=_detach_lstm_state(lstm_state=next_lstm_state),
                 episode_id=episode_id,
                 actor_drone_id=drone_id,
                 recurrent_segment_id=recurrent_segment_id,
                 local_decision_index=local_decision_index,
+                global_decision_index=global_step,
                 decision_context_debug_snapshot=decision_context,
             )
-            step_result = env.step(env_action)
-            rollout.finalize_transition(
-                slot,
-                reward=float(step_result.reward),
-                done=bool(step_result.done),
-                lstm_state_out=_detach_lstm_state(lstm_state=next_lstm_state),
-            )
+            if step_result.done:
+                _insert_finalized_transition_in_order(
+                    rollout_backlog=rollout_backlog,
+                    transition=current_transition,
+                )
+                terminal_reward_by_drone = env.consume_terminal_agent_costs()
+                _flush_terminal_pending_transitions(
+                    pending_transition_by_drone=pending_transition_by_drone,
+                    rollout_backlog=rollout_backlog,
+                    terminal_reward_by_drone=terminal_reward_by_drone,
+                )
+            else:
+                pending_transition_by_drone[drone_id] = current_transition
             history_buffer.append(
                 tensorizer.build_transition_summary(
                     decision_context=decision_context,
@@ -448,52 +631,83 @@ def train_cmrappo(
                     },
                 )
 
-        last_value = 0.0
-        if not current_result.done and current_result.decision_context is not None:
-            next_drone_id = str(current_result.decision_context.deciding_drone_id)
-            next_candidate = _build_candidate_output(
+        if global_step >= train_cfg.total_timesteps and pending_transition_by_drone:
+            current_result = _drain_pending_transitions_after_collection(
+                current_result=current_result,
                 env=env,
-                decision_context=current_result.decision_context,
+                model=model,
+                tensorizer=tensorizer,
+                critic_builder=critic_builder,
+                critic_schema=critic_schema,
                 last_seen_plan_version_by_drone=last_seen_plan_version_by_drone,
+                history_buffer=history_buffer,
+                lstm_state_by_drone=lstm_state_by_drone,
+                recurrent_segment_id_by_drone=recurrent_segment_id_by_drone,
+                pending_transition_by_drone=pending_transition_by_drone,
+                rollout_backlog=rollout_backlog,
+                successor_bootstrap_values=successor_bootstrap_values,
             )
-            next_observation = tensorizer.build(
-                decision_context=current_result.decision_context,
-                candidate_out=next_candidate,
-                transition_history=tuple(history_buffer),
+        if global_step >= train_cfg.total_timesteps and rollout_backlog:
+            current_result = _advance_until_rollout_bootstraps_resolved_after_collection(
+                current_result=current_result,
+                episode_id=episode_id,
+                env=env,
+                model=model,
+                tensorizer=tensorizer,
+                critic_builder=critic_builder,
+                critic_schema=critic_schema,
+                last_seen_plan_version_by_drone=last_seen_plan_version_by_drone,
+                history_buffer=history_buffer,
+                lstm_state_by_drone=lstm_state_by_drone,
+                recurrent_segment_id_by_drone=recurrent_segment_id_by_drone,
+                rollout_backlog=rollout_backlog,
+                successor_bootstrap_values=successor_bootstrap_values,
             )
-            next_action_mask = tensorizer.build_action_mask(next_candidate)
-            next_critic_batch = critic_builder.build(
-                decision_context=current_result.decision_context,
-                critic_tensor_schema_meta=critic_schema,
-            )
-            with torch.no_grad():
-                next_policy_out, _ = model.forward(
-                    observation_batch=next_observation,
-                    action_mask=next_action_mask,
-                    critic_batch=next_critic_batch,
-                    lstm_state=lstm_state_by_drone.get(next_drone_id),
-                )
-            last_value = float(next_policy_out.value.detach().cpu().item())
 
-        batch_view = rollout.build_batch_view(
-            last_value=last_value,
-            gamma=train_cfg.gamma,
-            gae_lambda=train_cfg.gae_lambda,
+        if not rollout_backlog:
+            break
+        batch_size = len(rollout_backlog)
+        boundary_bootstrap_values = _build_rollout_prefix_boundary_bootstrap_values(
+            current_result=current_result,
+            episode_id=episode_id,
+            env=env,
+            tensorizer=tensorizer,
+            critic_builder=critic_builder,
+            critic_schema=critic_schema,
+            model=model,
+            history_buffer=history_buffer,
+            last_seen_plan_version_by_drone=last_seen_plan_version_by_drone,
+            lstm_state_by_drone=lstm_state_by_drone,
+            recurrent_segment_id_by_drone=recurrent_segment_id_by_drone,
+            successor_bootstrap_values=successor_bootstrap_values,
         )
+        tail_bootstrap_values = _resolve_rollout_prefix_bootstrap_values(
+            transitions=rollout_backlog,
+            prefix_len=batch_size,
+            boundary_bootstrap_values=boundary_bootstrap_values,
+            current_runtime_state=current_result.runtime_state,
+            episode_terminated_at_boundary=bool(current_result.done),
+        )
+        if tail_bootstrap_values is None:
+            raise RuntimeError("rollout prefix bootstrap 未解析完成，不能执行 PPO update")
+        batch_view = build_batch_view_from_transitions(rollout_backlog[:batch_size])
         ppo_stats = _ppo_update(
             model=model,
             optimizer=optimizer,
             batch_view=batch_view,
             train_cfg=train_cfg,
             device=device,
+            tail_bootstrap_values=tail_bootstrap_values,
         )
+        rollout_backlog.clear()
+        successor_bootstrap_values.clear()
         update_idx += 1
         _append_metrics(
             metrics_path,
             {
                 "update": update_idx,
                 "global_step": global_step,
-                "rollout_size": rollout.size,
+                "rollout_size": batch_size,
                 **ppo_stats,
             },
         )
@@ -642,6 +856,10 @@ def _run_periodic_evaluation(
     model.eval()
     try:
         generated_at = datetime.now(timezone.utc).isoformat()
+        # benchmark 当前是确定性 replay：固定订单流 + deterministic policy。
+        # 因此重复跑多次不会提供额外信息，统一折叠为单次评估，并显式记录
+        # configured 次数与 effective 次数，避免报表误导 postmortem。
+        benchmark_episode_count = 1
         benchmark_episodes = [
             _evaluate_policy_episode(
                 scene_ctx=scene_ctx,
@@ -659,9 +877,8 @@ def _run_periodic_evaluation(
                 policy_cfg=policy_cfg,
                 device=device,
                 eval_phase="benchmark",
-                episode_id=episode_idx,
+                episode_id=0,
             )
-            for episode_idx in range(train_cfg.benchmark_eval_episodes)
         ]
         benchmark_report = _summarize_episode_records(
             split="benchmark",
@@ -672,7 +889,9 @@ def _run_periodic_evaluation(
             generated_at=generated_at,
             extra={
                 "benchmark_seed": int(eval_cfg.benchmark_seed),
-                "benchmark_eval_episodes": int(train_cfg.benchmark_eval_episodes),
+                "benchmark_eval_episodes_configured": int(train_cfg.benchmark_eval_episodes),
+                "benchmark_effective_episode_count": int(benchmark_episode_count),
+                "benchmark_deterministic_replay": True,
             },
         )
 
@@ -764,7 +983,7 @@ def _evaluate_policy_episode(
         phase=eval_phase,
         episode_id=episode_id,
         order_source_mode=str(order_source.mode.value),
-        order_source_seed=int(order_source.seed),
+        order_source_seed=env.current_episode_order_source_seed(),
     )
 
     while not result.done:
@@ -925,6 +1144,141 @@ def _restore_rng_state(state: Mapping[str, Any]) -> None:
         torch.cuda.set_rng_state_all(state["torch_cuda"])
 
 
+def _build_current_boundary_bootstrap_values(
+    *,
+    current_result: Any,
+    episode_id: int,
+    env: TrainingEnvAdapter,
+    tensorizer: ObservationTensorizer,
+    critic_builder: CriticBatchBuilder,
+    critic_schema: Any,
+    model: Any,
+    history_buffer: Sequence[Any],
+    last_seen_plan_version_by_drone: Mapping[str, int],
+    lstm_state_by_drone: Mapping[str, Any],
+    recurrent_segment_id_by_drone: Mapping[str, int],
+) -> dict[tuple[int, str, int], float]:
+    decision_context = current_result.decision_context
+    if current_result.done or decision_context is None:
+        return {}
+
+    drone_id = str(decision_context.deciding_drone_id)
+    candidate_out = _build_candidate_output(
+        env=env,
+        decision_context=decision_context,
+        last_seen_plan_version_by_drone=last_seen_plan_version_by_drone,
+    )
+    observation_batch = tensorizer.build(
+        decision_context=decision_context,
+        candidate_out=candidate_out,
+        transition_history=tuple(history_buffer),
+    )
+    action_mask = tensorizer.build_action_mask(candidate_out)
+    critic_batch = critic_builder.build(
+        decision_context=decision_context,
+        critic_tensor_schema_meta=critic_schema,
+    )
+    with torch.no_grad():
+        policy_out, _ = model.forward(
+            observation_batch=observation_batch,
+            action_mask=action_mask,
+            critic_batch=critic_batch,
+            lstm_state=lstm_state_by_drone.get(drone_id),
+        )
+    key = (
+        int(episode_id),
+        drone_id,
+        int(recurrent_segment_id_by_drone.get(drone_id, 0)),
+    )
+    return {key: float(policy_out.value.detach().cpu().item())}
+
+
+def _resolve_rollout_prefix_bootstrap_values(
+    *,
+    transitions: Sequence[RolloutTransition],
+    prefix_len: int,
+    boundary_bootstrap_values: Mapping[tuple[int, str, int], float],
+    current_runtime_state: Any,
+    episode_terminated_at_boundary: bool,
+) -> dict[tuple[int, str, int], float] | None:
+    if prefix_len <= 0:
+        raise ValueError("prefix_len 必须为正数")
+    if prefix_len > len(transitions):
+        raise ValueError("prefix_len 不能超过当前 rollout backlog 长度")
+
+    tail_index_by_key: dict[tuple[int, str, int], int] = {}
+    for idx, transition in enumerate(transitions[:prefix_len]):
+        key = (
+            int(transition.episode_id),
+            str(transition.actor_drone_id),
+            int(transition.recurrent_segment_id),
+        )
+        tail_index_by_key[key] = idx
+
+    resolved: dict[tuple[int, str, int], float] = {}
+    for key, last_idx in tail_index_by_key.items():
+        last_transition = transitions[last_idx]
+        if bool(last_transition.done):
+            resolved[key] = 0.0
+            continue
+
+        bootstrap_value = _find_rollout_tail_bootstrap_value(
+            transitions=transitions,
+            start_idx=last_idx + 1,
+            key=key,
+        )
+        if bootstrap_value is not None:
+            resolved[key] = bootstrap_value
+            continue
+        if key in boundary_bootstrap_values:
+            resolved[key] = float(boundary_bootstrap_values[key])
+            continue
+        if _is_failed_drone_in_runtime_state(
+            runtime_state=current_runtime_state,
+            drone_id=key[1],
+        ):
+            resolved[key] = 0.0
+            continue
+        if episode_terminated_at_boundary:
+            resolved[key] = 0.0
+            continue
+        return None
+    return resolved
+
+
+def _find_rollout_tail_bootstrap_value(
+    *,
+    transitions: Sequence[RolloutTransition],
+    start_idx: int,
+    key: tuple[int, str, int],
+) -> float | None:
+    episode_id, drone_id, recurrent_segment_id = key
+    for later in transitions[start_idx:]:
+        later_episode_id = int(later.episode_id)
+        if later_episode_id > episode_id:
+            return 0.0
+        if later_episode_id < episode_id:
+            continue
+        if str(later.actor_drone_id) == drone_id:
+            later_segment_id = int(later.recurrent_segment_id)
+            if later_segment_id == recurrent_segment_id:
+                return float(later.value_old)
+            if later_segment_id > recurrent_segment_id:
+                return 0.0
+        if bool(later.done):
+            return 0.0
+    return None
+
+
+def _is_failed_drone_in_runtime_state(*, runtime_state: Any, drone_id: str) -> bool:
+    if runtime_state is None:
+        return False
+    drone_states = getattr(runtime_state, "drone_states", None)
+    if drone_states is None or drone_id not in drone_states:
+        return False
+    return str(drone_states[drone_id].training_state) == "airborne_energy_failure"
+
+
 def _ppo_update(
     *,
     model: Any,
@@ -932,10 +1286,14 @@ def _ppo_update(
     batch_view: Any,
     train_cfg: _TrainingConfig,
     device: Any,
+    tail_bootstrap_values: Mapping[tuple[int, str, int], float],
 ) -> dict[str, float]:
     sequences = _materialize_recurrent_sequences(
         batch_view=batch_view,
         sequence_len=train_cfg.sequence_len,
+        gamma=train_cfg.gamma,
+        gae_lambda=train_cfg.gae_lambda,
+        tail_bootstrap_values=tail_bootstrap_values,
     )
     if not sequences:
         raise RuntimeError("当前 rollout 未物化出任何 recurrent sequence")
@@ -1004,18 +1362,23 @@ def _ppo_update(
                 torch.min(unclipped, clipped),
                 valid_mask_flat,
             )
-            v_clipped = old_values_flat + torch.clamp(
-                values_flat - old_values_flat,
-                -train_cfg.vf_clip_coef,
-                train_cfg.vf_clip_coef,
-            )
-            vl_unclipped = (values_flat - returns) ** 2
-            vl_clipped = (v_clipped - returns) ** 2
             value_loss = 0.5 * _masked_mean_tensor(
-                torch.max(vl_unclipped, vl_clipped),
+                (values_flat - returns) ** 2,
                 valid_mask_flat,
             )
             entropy_loss = _masked_mean_tensor(entropy, valid_mask_flat)
+            approx_kl_t = _compute_masked_approx_kl(
+                old_log_probs=old_log_probs,
+                new_log_probs=new_log_probs,
+                valid_mask=valid_mask_flat,
+            )
+            latest_approx_kl = float(approx_kl_t.detach().cpu().item())
+            latest_policy_loss = float(policy_loss.detach().cpu().item())
+            latest_value_loss = float(value_loss.detach().cpu().item())
+            latest_entropy = float(entropy_loss.detach().cpu().item())
+            if latest_approx_kl > train_cfg.target_kl:
+                stop_early = True
+                break
             loss = (
                 policy_loss
                 + train_cfg.value_loss_coef * value_loss
@@ -1026,19 +1389,6 @@ def _ppo_update(
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), train_cfg.max_grad_norm)
             optimizer.step()
-
-            latest_approx_kl = float(
-                _masked_mean_tensor(
-                    (old_log_probs - new_log_probs).abs(),
-                    valid_mask_flat,
-                ).detach().cpu().item()
-            )
-            latest_policy_loss = float(policy_loss.detach().cpu().item())
-            latest_value_loss = float(value_loss.detach().cpu().item())
-            latest_entropy = float(entropy_loss.detach().cpu().item())
-            if latest_approx_kl > train_cfg.target_kl:
-                stop_early = True
-                break
         if stop_early:
             break
 
@@ -1054,7 +1404,13 @@ def _ppo_update(
                 )
             )
         ),
-        "return_mean": float(np.mean(batch_view.returns)),
+        "return_mean": float(
+            np.mean(
+                np.concatenate(
+                    [sequence.returns[sequence.valid_timestep_mask] for sequence in sequences]
+                )
+            )
+        ),
         "reward_mean": float(np.mean(batch_view.rewards)),
         "sequence_count": float(len(sequences)),
         "valid_timestep_count": float(total_valid_timesteps),
@@ -1079,6 +1435,219 @@ def _build_candidate_output(
     )
 
 
+def _drain_pending_transitions_after_collection(
+    *,
+    current_result: Any,
+    env: TrainingEnvAdapter,
+    model: Any,
+    tensorizer: ObservationTensorizer,
+    critic_builder: CriticBatchBuilder,
+    critic_schema: CriticTensorSchemaMeta,
+    last_seen_plan_version_by_drone: dict[str, int],
+    history_buffer: deque[Any],
+    lstm_state_by_drone: dict[str, Any],
+    recurrent_segment_id_by_drone: dict[str, int],
+    pending_transition_by_drone: dict[str, RolloutTransition],
+    rollout_backlog: list[RolloutTransition],
+    successor_bootstrap_values: dict[tuple[int, str, int], float],
+) -> Any:
+    while pending_transition_by_drone:
+        if current_result.done:
+            terminal_reward_by_drone = env.consume_terminal_agent_costs()
+            _flush_terminal_pending_transitions(
+                pending_transition_by_drone=pending_transition_by_drone,
+                rollout_backlog=rollout_backlog,
+                terminal_reward_by_drone=terminal_reward_by_drone,
+            )
+            return current_result
+
+        decision_context = current_result.decision_context
+        if decision_context is None:
+            raise RuntimeError("drain pending transitions 时缺少 decision_context")
+
+        drone_id = str(decision_context.deciding_drone_id)
+        lstm_state_in = lstm_state_by_drone.get(drone_id)
+        candidate_out = _build_candidate_output(
+            env=env,
+            decision_context=decision_context,
+            last_seen_plan_version_by_drone=last_seen_plan_version_by_drone,
+        )
+        observation_batch = tensorizer.build(
+            decision_context=decision_context,
+            candidate_out=candidate_out,
+            transition_history=tuple(history_buffer),
+        )
+        action_mask = tensorizer.build_action_mask(candidate_out)
+        critic_batch = critic_builder.build(
+            decision_context=decision_context,
+            critic_tensor_schema_meta=critic_schema,
+        )
+        with torch.no_grad():
+            policy_out, next_lstm_state = model.forward(
+                observation_batch=observation_batch,
+                action_mask=action_mask,
+                critic_batch=critic_batch,
+                lstm_state=lstm_state_in,
+            )
+            sampled_action, _ = model.sample_action(
+                policy_out=policy_out,
+                action_mask=action_mask,
+                deterministic=False,
+            )
+        value_old = float(policy_out.value.detach().cpu().item())
+        action_indices = ResolvedActionIndices(**sampled_action)
+        env_action = candidate_out.resolved_action_lookup.resolve(
+            root_branch_idx=action_indices.root_branch_idx,
+            order_idx=action_indices.order_idx,
+            mode_idx=action_indices.mode_idx,
+            recovery_idx=action_indices.recovery_idx,
+        )
+        step_result = env.step(env_action)
+        carry_in_reward, _post_action_reward = _extract_attributed_step_reward_parts(
+            step_result=step_result
+        )
+        _finalize_pending_transition_for_next_decision(
+            pending_transition_by_drone=pending_transition_by_drone,
+            rollout_backlog=rollout_backlog,
+            successor_bootstrap_values=successor_bootstrap_values,
+            drone_id=drone_id,
+            carry_in_reward=carry_in_reward,
+            next_value=value_old,
+        )
+        history_buffer.append(
+            tensorizer.build_transition_summary(
+                decision_context=decision_context,
+                candidate_out=candidate_out,
+                action_indices=action_indices,
+                step_result=step_result,
+            )
+        )
+        last_seen_plan_version_by_drone[decision_context.deciding_drone_id] = (
+            decision_context.coarse_plan.plan_version
+        )
+        lstm_state_by_drone[drone_id] = _detach_lstm_state(lstm_state=next_lstm_state)
+        _reset_recurrent_state_for_failed_drones(
+            runtime_state=step_result.runtime_state,
+            lstm_state_by_drone=lstm_state_by_drone,
+            recurrent_segment_id_by_drone=recurrent_segment_id_by_drone,
+        )
+        current_result = step_result
+
+    return current_result
+
+
+def _advance_until_rollout_bootstraps_resolved_after_collection(
+    *,
+    current_result: Any,
+    episode_id: int,
+    env: TrainingEnvAdapter,
+    model: Any,
+    tensorizer: ObservationTensorizer,
+    critic_builder: CriticBatchBuilder,
+    critic_schema: CriticTensorSchemaMeta,
+    last_seen_plan_version_by_drone: dict[str, int],
+    history_buffer: deque[Any],
+    lstm_state_by_drone: dict[str, Any],
+    recurrent_segment_id_by_drone: dict[str, int],
+    rollout_backlog: Sequence[RolloutTransition],
+    successor_bootstrap_values: dict[tuple[int, str, int], float],
+) -> Any:
+    while True:
+        resolved = _resolve_rollout_prefix_bootstrap_values(
+            transitions=rollout_backlog,
+            prefix_len=len(rollout_backlog),
+            boundary_bootstrap_values=_build_rollout_prefix_boundary_bootstrap_values(
+                current_result=current_result,
+                episode_id=episode_id,
+                env=env,
+                tensorizer=tensorizer,
+                critic_builder=critic_builder,
+                critic_schema=critic_schema,
+                model=model,
+                history_buffer=history_buffer,
+                last_seen_plan_version_by_drone=last_seen_plan_version_by_drone,
+                lstm_state_by_drone=lstm_state_by_drone,
+                recurrent_segment_id_by_drone=recurrent_segment_id_by_drone,
+                successor_bootstrap_values=successor_bootstrap_values,
+            ),
+            current_runtime_state=current_result.runtime_state,
+            episode_terminated_at_boundary=bool(current_result.done),
+        )
+        if resolved is not None:
+            return current_result
+        if current_result.done:
+            raise RuntimeError("episode 已结束，但 rollout prefix bootstrap 仍未解析完成")
+
+        decision_context = current_result.decision_context
+        if decision_context is None:
+            raise RuntimeError("bootstrap probe 时缺少 decision_context")
+
+        drone_id = str(decision_context.deciding_drone_id)
+        lstm_state_in = lstm_state_by_drone.get(drone_id)
+        recurrent_segment_id = int(recurrent_segment_id_by_drone.get(drone_id, 0))
+        candidate_out = _build_candidate_output(
+            env=env,
+            decision_context=decision_context,
+            last_seen_plan_version_by_drone=last_seen_plan_version_by_drone,
+        )
+        observation_batch = tensorizer.build(
+            decision_context=decision_context,
+            candidate_out=candidate_out,
+            transition_history=tuple(history_buffer),
+        )
+        action_mask = tensorizer.build_action_mask(candidate_out)
+        critic_batch = critic_builder.build(
+            decision_context=decision_context,
+            critic_tensor_schema_meta=critic_schema,
+        )
+        with torch.no_grad():
+            policy_out, next_lstm_state = model.forward(
+                observation_batch=observation_batch,
+                action_mask=action_mask,
+                critic_batch=critic_batch,
+                lstm_state=lstm_state_in,
+            )
+            sampled_action, _ = model.sample_action(
+                policy_out=policy_out,
+                action_mask=action_mask,
+                deterministic=False,
+            )
+        value_old = float(policy_out.value.detach().cpu().item())
+        _maybe_record_probe_successor_bootstrap_value(
+            successor_bootstrap_values=successor_bootstrap_values,
+            episode_id=episode_id,
+            drone_id=drone_id,
+            recurrent_segment_id=recurrent_segment_id,
+            value_old=value_old,
+        )
+        action_indices = ResolvedActionIndices(**sampled_action)
+        env_action = candidate_out.resolved_action_lookup.resolve(
+            root_branch_idx=action_indices.root_branch_idx,
+            order_idx=action_indices.order_idx,
+            mode_idx=action_indices.mode_idx,
+            recovery_idx=action_indices.recovery_idx,
+        )
+        step_result = env.step(env_action)
+        history_buffer.append(
+            tensorizer.build_transition_summary(
+                decision_context=decision_context,
+                candidate_out=candidate_out,
+                action_indices=action_indices,
+                step_result=step_result,
+            )
+        )
+        last_seen_plan_version_by_drone[decision_context.deciding_drone_id] = (
+            decision_context.coarse_plan.plan_version
+        )
+        lstm_state_by_drone[drone_id] = _detach_lstm_state(lstm_state=next_lstm_state)
+        _reset_recurrent_state_for_failed_drones(
+            runtime_state=step_result.runtime_state,
+            lstm_state_by_drone=lstm_state_by_drone,
+            recurrent_segment_id_by_drone=recurrent_segment_id_by_drone,
+        )
+        current_result = step_result
+
+
 def _detach_lstm_state(
     *,
     lstm_state: Any | None,
@@ -1093,7 +1662,12 @@ def _materialize_recurrent_sequences(
     *,
     batch_view: Any,
     sequence_len: int,
+    gamma: float,
+    gae_lambda: float,
+    tail_bootstrap_values: Mapping[tuple[int, str, int], float],
 ) -> list[_MaterializedSequence]:
+    # 按 (episode_id, drone_id, segment_id) 分组，收集每个 drone 在本 rollout 中的
+    # 全部 transition 索引，并按 local_decision_index 排序。
     grouped_indices: dict[tuple[int, str, int], list[int]] = {}
     for idx, transition in enumerate(batch_view.transitions):
         key = (
@@ -1108,17 +1682,51 @@ def _materialize_recurrent_sequences(
         indices.sort(
             key=lambda item_idx: int(batch_view.transitions[item_idx].local_decision_index)
         )
+
+        # 提取该 drone 序列的 rewards / dones / values
+        drone_rewards = np.asarray(
+            [float(batch_view.transitions[i].reward) for i in indices],
+            dtype=np.float32,
+        )
+        drone_dones = np.asarray(
+            [bool(batch_view.transitions[i].done) for i in indices],
+            dtype=np.bool_,
+        )
+        drone_values = np.asarray(
+            [float(batch_view.transitions[i].value_old) for i in indices],
+            dtype=np.float32,
+        )
+
+        # bootstrap：若序列末尾 done=True（episode 结束），bootstrap=0；
+        # 否则必须显式使用该 drone/segment 在 rollout 边界之后解析出的同 actor value。
+        last_done = bool(drone_dones[-1])
+        if last_done:
+            drone_last_value = 0.0
+        else:
+            if key not in tail_bootstrap_values:
+                raise RuntimeError(
+                    "缺少 rollout 尾部 bootstrap value: "
+                    f"episode={key[0]}, drone={key[1]}, segment={key[2]}"
+                )
+            drone_last_value = float(tail_bootstrap_values[key])
+
+        # 对该 drone 的完整序列独立计算 GAE
+        drone_advantages, drone_returns = compute_gae(
+            rewards=drone_rewards,
+            dones=drone_dones,
+            values=drone_values,
+            last_value=drone_last_value,
+            gamma=gamma,
+            gae_lambda=gae_lambda,
+        )
+
+        # 按 sequence_len 切块
         for local_chunk_idx, start in enumerate(range(0, len(indices), sequence_len)):
             chunk_indices = indices[start : start + sequence_len]
-            transitions = tuple(batch_view.transitions[item_idx] for item_idx in chunk_indices)
-            advantages = np.asarray(
-                [batch_view.advantages[item_idx] for item_idx in chunk_indices],
-                dtype=np.float32,
-            )
-            returns = np.asarray(
-                [batch_view.returns[item_idx] for item_idx in chunk_indices],
-                dtype=np.float32,
-            )
+            chunk_slice = slice(start, start + len(chunk_indices))
+            transitions = tuple(batch_view.transitions[i] for i in chunk_indices)
+            advantages = drone_advantages[chunk_slice].copy()
+            returns = drone_returns[chunk_slice].copy()
             valid_mask = np.ones((len(chunk_indices),), dtype=np.bool_)
             sequences.append(
                 _MaterializedSequence(
@@ -1449,6 +2057,15 @@ def _masked_mean_tensor(values: Any, valid_mask: Any) -> Any:
     weights = valid_mask.to(dtype=values.dtype)
     denom = weights.sum().clamp(min=1.0)
     return (values * weights).sum() / denom
+
+
+def _compute_masked_approx_kl(
+    *,
+    old_log_probs: Any,
+    new_log_probs: Any,
+    valid_mask: Any,
+) -> Any:
+    return _masked_mean_tensor(old_log_probs - new_log_probs, valid_mask)
 
 
 def _normalize_advantages_masked(*, advantages: Any, valid_mask: Any) -> Any:
@@ -1959,7 +2576,6 @@ def _load_training_config(config_path: Path) -> _TrainingConfig:
         gamma=float(training["gamma"]),
         gae_lambda=float(training["gae_lambda"]),
         clip_coef=float(training["clip_coef"]),
-        vf_clip_coef=float(training.get("vf_clip_coef", 0.2)),
         entropy_coef=float(training["entropy_coef"]),
         value_loss_coef=float(training["value_loss_coef"]),
         max_grad_norm=float(training["max_grad_norm"]),

@@ -316,6 +316,8 @@ class TrainingEnvAdapter:
         self._heavy_payload_capacity = self._resolve_heavy_payload_capacity()
 
         self._t_now = 0.0
+        self._reset_count = 0
+        self._current_episode_order_source_seed = int(self._order_source.seed)
         self._planned_route_stops: list[PlannedStop] = []
         self._planned_route_stop_i = 1
         self._full_backbone_cache: list[BackboneVisit] = []
@@ -342,6 +344,9 @@ class TrainingEnvAdapter:
         self._background_mode_a_completion_time_sum = 0.0
         self._truck_background_order_completion_events: list[dict[str, Any]] = []
         self._last_reward_breakdown: dict[str, float] = {}
+        # 每个无人机自上次决策以来累积的归因成本（方案一强化版）。
+        # key = drone_id，value = 该无人机应承担的负奖励总量（已含符号，即负值）。
+        self._agent_cost_accum: dict[DroneId, float] = {}
         self._current_coarse_plan: CoarsePlanView | None = None
         self._active_launch_stations: set[str] = set()
         self._fallback_event_times: list[float] = []
@@ -388,7 +393,13 @@ class TrainingEnvAdapter:
           3. 初始化训练侧状态机；
           4. 注入 t=0 的订单并生成初始决策点。
         """
-        random.seed(self._order_source.seed)
+        episode_seed = int(self._order_source.seed)
+        if self._order_source.mode == OrderSourceMode.POISSON:
+            episode_seed += int(self._reset_count)
+            random.seed(episode_seed)
+        else:
+            random.seed(episode_seed)
+        self._current_episode_order_source_seed = episode_seed
 
         self._entity_manager = EntityManager()
         self._entity_manager.load_from_config({"entities": self._scene_ctx.entities_raw})
@@ -418,6 +429,7 @@ class TrainingEnvAdapter:
         self._background_mode_a_completion_time_sum = 0.0
         self._truck_background_order_completion_events.clear()
         self._last_reward_breakdown = {}
+        self._agent_cost_accum.clear()
         self._current_coarse_plan = None
         self._active_launch_stations.clear()
         self._fallback_event_times.clear()
@@ -464,50 +476,65 @@ class TrainingEnvAdapter:
         if not self._decision_queue:
             self._advance_until_decision_or_done()
 
+        self._reset_count += 1
         return self._build_step_result(reward=0.0, info={"event": "reset"})
 
     def step(self, action: EnvAction) -> EnvStepResult:
-        """消费当前决策点的一个动作，并推进到下一个决策点或 episode 结束。"""
+        """消费当前决策点的一个动作，并推进到下一个决策点或 episode 结束。
+
+        奖励归因（方案一强化版）：
+          - 先取走当前决策无人机自“上一次它自己决策”以来累计的 carry-in 奖励；
+          - 再结算本次动作窗口内该无人机新产生的归因成本；
+          - 最终 PPO reward = carry-in + 本次动作窗口新增奖励；
+          - 其他无人机在同一时间窗口内产生的成本留在各自的累积器中，
+            等到它们自己的决策点时再被取走。
+        """
         if self.is_done():
             raise RuntimeError("episode 已结束，不能继续 step()")
         if not self._decision_queue:
             raise RuntimeError("当前没有可执行的 decision context")
 
         trigger = self._decision_queue.pop(0)
+        deciding_drone_id = trigger.drone_id
         decision = self._build_decision_context(trigger)
         if not self._is_action_allowed(action, decision.action_lookup):
             raise ValueError(f"非法动作: {action}")
 
-        reward = 0.0
+        # 方案一强化版的关键语义：
+        # 当前 drone 在别人动作窗口内累计的自身成本，不应在这里丢失，而应在它自己
+        # 下一次决策时以 carry-in 的形式被取走。
+        carried_reward = self._agent_cost_accum.pop(deciding_drone_id, 0.0)
         reward_breakdown: dict[str, float] = {}
         self._last_reward_breakdown = {}
         info: dict[str, Any] = {
-            "drone_id": trigger.drone_id,
+            "drone_id": deciding_drone_id,
             "trigger_type": trigger.trigger_type,
             "trigger_station_id": trigger.trigger_station_id,
         }
 
         if isinstance(action, GlobalWaitAction):
             self._episode_wait_action_count += 1
-            current_state = self._drone_state[trigger.drone_id]
+            current_state = self._drone_state[deciding_drone_id]
             info["applied_action"] = "WAIT"
             if current_state == TrainingDroneState.IDLE:
-                delta_wait = self._compute_wait_delta(trigger.drone_id)
-                self._apply_wait_action(trigger.drone_id)
+                delta_wait = self._compute_wait_delta(deciding_drone_id)
+                self._apply_wait_action(deciding_drone_id)
                 info["wait_delta"] = delta_wait
+                # T_idle（IDLE 路径）：一次性精确结算，累加进累积器（保留跨区间已积累的成本）
                 idle_penalty = -self._cfg.wait_idle_penalty_coef * delta_wait
-                reward += idle_penalty
-                reward_breakdown["idle"] = idle_penalty
-                reward += self._advance_to_event(self._t_now + delta_wait)
+                self._agent_cost_accum[deciding_drone_id] = (
+                    self._agent_cost_accum.get(deciding_drone_id, 0.0) + idle_penalty
+                )
+                self._advance_to_event(self._t_now + delta_wait)
                 _merge_reward_breakdown(reward_breakdown, self._last_reward_breakdown)
-                self._resume_capped_wait_if_needed(trigger.drone_id)
+                self._resume_capped_wait_if_needed(deciding_drone_id)
                 if not self._decision_queue and not self.is_done():
-                    reward += self._advance_until_decision_or_done()
+                    self._advance_until_decision_or_done()
                     _merge_reward_breakdown(reward_breakdown, self._last_reward_breakdown)
             elif current_state == TrainingDroneState.RIDING_WITH_TRUCK:
-                self._apply_wait_action(trigger.drone_id)
+                self._apply_wait_action(deciding_drone_id)
                 info["wait_mode"] = "deferred_riding_with_truck"
-                reward += self._advance_until_decision_or_done()
+                self._advance_until_decision_or_done()
                 _merge_reward_breakdown(reward_breakdown, self._last_reward_breakdown)
             else:
                 raise RuntimeError(f"状态 {current_state.value} 不允许执行 WAIT")
@@ -523,8 +550,17 @@ class TrainingEnvAdapter:
                 "recover_node_id": action.recover_node_id,
             }
             if not self._decision_queue:
-                reward += self._advance_until_decision_or_done()
+                self._advance_until_decision_or_done()
                 _merge_reward_breakdown(reward_breakdown, self._last_reward_breakdown)
+
+        # 本次 transition 的 reward 由两部分组成：
+        # 1. carry-in：该无人机在别人动作期间已累计、延迟到本次决策点取走的成本；
+        # 2. post-action：该无人机在本次动作窗口内新产生的归因成本。
+        post_action_reward = self._agent_cost_accum.pop(deciding_drone_id, 0.0)
+        reward = carried_reward + post_action_reward
+        reward_breakdown["attributed_carry_in"] = carried_reward
+        reward_breakdown["attributed_post_action"] = post_action_reward
+        reward_breakdown["attributed_total"] = reward
 
         self._last_reward_breakdown = reward_breakdown
 
@@ -547,6 +583,21 @@ class TrainingEnvAdapter:
         ):
             return True
         return False
+
+    def current_episode_order_source_seed(self) -> int:
+        """返回当前 episode 实际使用的订单源随机种子。"""
+        return int(self._current_episode_order_source_seed)
+
+    def consume_terminal_agent_costs(self) -> dict[str, float]:
+        """在 episode 结束后取走各无人机尚未结算的尾部归因成本。"""
+        if not self.is_done():
+            raise RuntimeError("episode 尚未结束，不能消费 terminal agent costs")
+        pending = {
+            str(drone_id): float(reward)
+            for drone_id, reward in self._agent_cost_accum.items()
+        }
+        self._agent_cost_accum.clear()
+        return pending
 
     @property
     def current_decision_context(self) -> DecisionContext | None:
@@ -1240,20 +1291,22 @@ class TrainingEnvAdapter:
     # Event loop
     # ---------------------------------------------------------------------
 
-    def _advance_until_decision_or_done(self) -> float:
+    def _advance_until_decision_or_done(self) -> None:
         """持续推进事件，直到出现新的决策点或 episode 结束。"""
-        reward = 0.0
         while not self.is_done() and not self._decision_queue:
             next_time = self._next_event_time()
             if math.isinf(next_time):
                 next_time = self._cfg.upper_horizon_sec
             if next_time <= self._t_now + _TIME_EPS:
                 next_time = min(self._cfg.upper_horizon_sec, self._t_now + 1.0)
-            reward += self._advance_to_event(next_time)
-        return reward
+            self._advance_to_event(next_time)
 
     def _advance_to_event(self, t_next: float) -> float:
-        """推进到给定绝对时刻，并结算该区间内跨过的事件。"""
+        """推进到给定绝对时刻，并结算该区间内跨过的事件。
+
+        返回值为全局事件奖励（仅用于 _last_reward_breakdown 记录）。
+        per-dt 成本和事件奖励均已写入 _agent_cost_accum，step() 从中按 drone 取值。
+        """
         if t_next < self._t_now - _TIME_EPS:
             raise ValueError(f"不能回退时间: t_next={t_next}, t_now={self._t_now}")
 
@@ -1263,13 +1316,14 @@ class TrainingEnvAdapter:
 
         self._sync_in_transit_positions(t_next)
 
-        reward, reward_breakdown = self._settle_per_dt_rewards(
+        # per-dt 成本已写入 _agent_cost_accum，global_reward 仅用于 breakdown 记录
+        _global_per_dt, reward_breakdown = self._settle_per_dt_rewards(
             t_prev=self._t_now,
             t_next=t_next,
         )
         hard_failure_ready = self._collect_airborne_failure_events(t_next)
         failed_drones = {drone_id for drone_id, _, _ in hard_failure_ready}
-        # delivery 先处理，保持“送达奖励优先于后续到达交互”的顺序。
+        # delivery 先处理，保持"送达奖励优先于后续到达交互"的顺序。
         delivery_ready = [
             (drone_id, leg)
             for drone_id, leg in self._collect_flight_events(t_next, kind="deliver")
@@ -1291,6 +1345,7 @@ class TrainingEnvAdapter:
         ]
         truck_stops = self._collect_truck_stops(t_next)
 
+        event_reward = 0.0
         delivery_reward = 0.0
         hard_failure_reward = 0.0
         hard_overdue_reward = 0.0
@@ -1298,11 +1353,21 @@ class TrainingEnvAdapter:
 
         # 1. 硬失败事件：半空停电会在到达事件之前截断当前飞行段。
         for drone_id, _leg, _failure_time in hard_failure_ready:
-            hard_failure_reward += self._process_airborne_failure_event(drone_id)
+            penalty = self._process_airborne_failure_event(drone_id)
+            hard_failure_reward += penalty
+            # 归因给失败的无人机
+            self._agent_cost_accum[drone_id] = (
+                self._agent_cost_accum.get(drone_id, 0.0) + penalty
+            )
 
         # 2. UAV 订单送达 / mode A 背景完成（只记系统上下文统计，不进 PPO reward）
         for drone_id, leg in delivery_ready:
-            delivery_reward += self._process_delivery_event(drone_id, leg)
+            bonus = self._process_delivery_event(drone_id, leg)
+            delivery_reward += bonus
+            # 送达奖励归因给完成送达的无人机
+            self._agent_cost_accum[drone_id] = (
+                self._agent_cost_accum.get(drone_id, 0.0) + bonus
+            )
         for stop in truck_stops:
             if stop.node_type == "customer" and stop.order_id:
                 if stop.order_id in self._background_mode_a_pending:
@@ -1321,7 +1386,7 @@ class TrainingEnvAdapter:
                         }
                     )
 
-        reward += delivery_reward + hard_failure_reward
+        event_reward += delivery_reward + hard_failure_reward
         if delivery_reward:
             reward_breakdown["delivery_bonus"] = delivery_reward
         if hard_failure_reward:
@@ -1369,10 +1434,10 @@ class TrainingEnvAdapter:
             for stop in truck_stops:
                 self._process_rendezvous_recovery(stop.node_id, t_next)
 
-        # 4. hard overdue + reservation timeout
+        # 4. hard overdue + reservation timeout（已在各自函数内写入 _agent_cost_accum）
         hard_overdue_reward += self._apply_hard_overdue_penalty(t_next)
         reservation_timeout_reward += self._process_reservation_timeouts(t_next)
-        reward += hard_overdue_reward + reservation_timeout_reward
+        event_reward += hard_overdue_reward + reservation_timeout_reward
         if hard_overdue_reward:
             reward_breakdown["hard_overdue"] = hard_overdue_reward
         if reservation_timeout_reward:
@@ -1411,8 +1476,13 @@ class TrainingEnvAdapter:
                         trigger_station_id=None,
                     )
 
+        # order_mgr.tick() 可能注入了新 Poisson 订单；唤醒因无单而"睡死"的 idle UAV。
+        self._wake_stranded_idle_drones()
+
         self._last_reward_breakdown = reward_breakdown
-        return reward
+        # 返回全局总奖励（per-dt + 事件），供测试和 breakdown 观察。
+        # step() 不使用此返回值，而是从 _agent_cost_accum 按 drone 取归因奖励。
+        return _global_per_dt + event_reward
 
     # ---------------------------------------------------------------------
     # Event processing
@@ -1492,7 +1562,7 @@ class TrainingEnvAdapter:
         raise RuntimeError(f"未知飞行段类型: {leg.kind}")
 
     def _process_rendezvous_recovery(self, node_id: str, t_now: float) -> None:
-        """处理“卡车到达某个 rendezvous 节点”时的回收配对。"""
+        """处理"卡车到达某个 rendezvous 节点"时的回收配对。"""
         truck = self._require_truck()
         recovered: list[str] = []
         for drone_id, state in self._drone_state.items():
@@ -1679,7 +1749,10 @@ class TrainingEnvAdapter:
             self._reservation_count[node_id] = current - 1
 
     def _process_reservation_timeouts(self, t_now: float) -> float:
-        """扫描所有 reservation timeout，并执行 5c 兜底转移。"""
+        """扫描所有 reservation timeout，并执行 5c 兜底转移。
+
+        reservation timeout 是 fallback 路径的一部分，归因给持有该 reservation 的无人机。
+        """
         reward = 0.0
         for drone_id, reservation in list(self._reservations.items()):
             timeout_cost = self._reservation_timeout_cost(drone_id, reservation, t_now)
@@ -1700,13 +1773,21 @@ class TrainingEnvAdapter:
             self._episode_reservation_timeout_count += 1
             self._episode_reservation_timeout_cost_sec += float(timeout_cost)
             reward += timeout_penalty
+            # 归因给持有该 reservation 的无人机
+            self._agent_cost_accum[drone_id] = (
+                self._agent_cost_accum.get(drone_id, 0.0) + timeout_penalty
+            )
             if self._drone_state.get(drone_id) in {
                 TrainingDroneState.RETURN_TO_RENDEZVOUS,
                 TrainingDroneState.WAITING_FOR_TRUCK,
                 TrainingDroneState.DELIVERED,
             }:
                 if not self._enter_fallback_recovery(drone_id):
-                    reward += self._mark_hard_failure(drone_id)
+                    hard_penalty = self._mark_hard_failure(drone_id)
+                    reward += hard_penalty
+                    self._agent_cost_accum[drone_id] = (
+                        self._agent_cost_accum.get(drone_id, 0.0) + hard_penalty
+                    )
         return reward
 
     def _reservation_timeout_cost(
@@ -1761,7 +1842,7 @@ class TrainingEnvAdapter:
         return None
 
     def _apply_hard_overdue_penalty(self, t_now: float) -> float:
-        """强制移除超时过久仍未送达的订单。"""
+        """强制移除超时过久仍未送达的订单，并将惩罚归因到对应无人机的累积器。"""
         reward = 0.0
         order_mgr = self._require_order_manager()
 
@@ -1775,6 +1856,7 @@ class TrainingEnvAdapter:
             order.update_status(TaskStatus.TIMEOUT)
             order_mgr.completed_orders.append(order)
             self._episode_hard_overdue_count += 1
+            # 未接单订单无 owner，惩罚仅进系统指标（不归因任何 drone）
             reward -= self._cfg.hard_overdue_penalty_sec
 
         assigned_remove = [
@@ -1784,7 +1866,14 @@ class TrainingEnvAdapter:
         ]
         for order_id in assigned_remove:
             self._episode_hard_overdue_count += 1
-            reward += self._force_remove_assigned_order(order_id, t_now)
+            # 在移除前先记录 owner，以便归因
+            owner = order_mgr.assigned_orders[order_id].assigned_vehicle_id
+            penalty = self._force_remove_assigned_order(order_id, t_now)
+            reward += penalty
+            if owner and owner in self._drone_state:
+                self._agent_cost_accum[owner] = (
+                    self._agent_cost_accum.get(owner, 0.0) + penalty
+                )
 
         return reward
 
@@ -1822,40 +1911,89 @@ class TrainingEnvAdapter:
         t_prev: float,
         t_next: float,
     ) -> tuple[float, dict[str, float]]:
-        """结算 Phase 5c 的持续型奖励项。"""
+        """结算 Phase 5c 的持续型奖励项，并将成本归因到各无人机的累积器。
+
+        返回值仍保留 (global_reward, breakdown) 供 _advance_to_event 记录系统指标，
+        但实际 PPO 奖励通过 _agent_cost_accum 按无人机归因，不再直接用 global_reward。
+        """
         if t_next <= t_prev + _TIME_EPS:
             return 0.0, {}
 
-        reward = 0.0
+        global_reward = 0.0
         breakdown: dict[str, float] = {}
         dt = t_next - t_prev
 
-        overdue_dt_total = 0.0
+        # ── T_overdue：已接单订单归因给 owner drone；未接单订单仅进系统指标 ──
+        assigned_overdue_dt = 0.0
+        unassigned_overdue_dt = 0.0
         for order in self._active_uav_orders():
-            overdue_dt_total += max(0.0, t_next - max(t_prev, float(order.deadline)))
-        self._episode_overdue_time_sec += overdue_dt_total
-        if overdue_dt_total > _TIME_EPS:
-            penalty = -self._cfg.lambda_overdue * overdue_dt_total
-            reward += penalty
-            breakdown["overdue"] = penalty
+            overdue_dt = max(0.0, t_next - max(t_prev, float(order.deadline)))
+            if overdue_dt <= _TIME_EPS:
+                continue
+            owner = order.assigned_vehicle_id
+            if owner and owner in self._drone_state:
+                # 已接单：归因给 owner drone
+                penalty = -self._cfg.lambda_overdue * overdue_dt
+                self._agent_cost_accum[owner] = (
+                    self._agent_cost_accum.get(owner, 0.0) + penalty
+                )
+                assigned_overdue_dt += overdue_dt
+            else:
+                # 未接单：仅进系统指标，不污染任何 drone 的 PPO reward
+                unassigned_overdue_dt += overdue_dt
 
+        total_overdue_dt = assigned_overdue_dt + unassigned_overdue_dt
+        self._episode_overdue_time_sec += total_overdue_dt
+        if total_overdue_dt > _TIME_EPS:
+            # breakdown 仍记录全局值，供 tensorboard 观察
+            global_penalty = -self._cfg.lambda_overdue * total_overdue_dt
+            global_reward += global_penalty
+            breakdown["overdue"] = global_penalty
+            if unassigned_overdue_dt > _TIME_EPS:
+                breakdown["overdue_unassigned"] = (
+                    -self._cfg.lambda_overdue * unassigned_overdue_dt
+                )
+
+        # ── T_wait / T_idle / T_queue / T_fallback：按状态归因给对应无人机 ──
         wait_dt_total = 0.0
         idle_wait_dt_total = 0.0
         queue_dt_total = 0.0
         fallback_dt_total = 0.0
+
         for drone_id, state in self._drone_state.items():
             if state == TrainingDroneState.WAITING_FOR_TRUCK:
+                # T_wait：等待卡车的无人机自己承担
+                penalty = -self._cfg.lambda_wait * dt
+                self._agent_cost_accum[drone_id] = (
+                    self._agent_cost_accum.get(drone_id, 0.0) + penalty
+                )
                 wait_dt_total += dt
             elif (
                 state == TrainingDroneState.ACTIVE_WAIT
                 and self._active_wait_resume.get(drone_id)
                 == TrainingDroneState.RIDING_WITH_TRUCK
             ):
+                # T_idle（riding_with_truck 路径）：显式 WAIT 的无人机自己承担
+                penalty = -self._cfg.wait_idle_penalty_coef * dt
+                self._agent_cost_accum[drone_id] = (
+                    self._agent_cost_accum.get(drone_id, 0.0) + penalty
+                )
                 idle_wait_dt_total += dt
             elif state == TrainingDroneState.QUEUEING_AT_HOST:
+                # T_queue：排队的无人机自己承担
+                penalty = -self._cfg.lambda_queue * dt
+                self._agent_cost_accum[drone_id] = (
+                    self._agent_cost_accum.get(drone_id, 0.0) + penalty
+                )
                 queue_dt_total += dt
             elif state == TrainingDroneState.FALLBACK_RECOVERY:
+                # T_fallback：fallback 的无人机自己承担
+                penalty = -self._cfg.lambda_miss * dt
+                self._agent_cost_accum[drone_id] = (
+                    self._agent_cost_accum.get(drone_id, 0.0) + penalty
+                )
                 fallback_dt_total += dt
+
         self._episode_wait_time_sec += wait_dt_total
         self._episode_idle_time_sec += idle_wait_dt_total
         self._episode_queue_time_sec += queue_dt_total
@@ -1863,22 +2001,22 @@ class TrainingEnvAdapter:
 
         if wait_dt_total > _TIME_EPS:
             penalty = -self._cfg.lambda_wait * wait_dt_total
-            reward += penalty
+            global_reward += penalty
             breakdown["wait"] = penalty
         if idle_wait_dt_total > _TIME_EPS:
             penalty = -self._cfg.wait_idle_penalty_coef * idle_wait_dt_total
-            reward += penalty
+            global_reward += penalty
             breakdown["idle"] = penalty
         if queue_dt_total > _TIME_EPS:
             penalty = -self._cfg.lambda_queue * queue_dt_total
-            reward += penalty
+            global_reward += penalty
             breakdown["queue"] = penalty
         if fallback_dt_total > _TIME_EPS:
             penalty = -self._cfg.lambda_miss * fallback_dt_total
-            reward += penalty
+            global_reward += penalty
             breakdown["fallback"] = penalty
 
-        return reward, breakdown
+        return global_reward, breakdown
 
     # ---------------------------------------------------------------------
     # Selection helpers
@@ -2435,6 +2573,19 @@ class TrainingEnvAdapter:
     # Decision queue helpers
     # ---------------------------------------------------------------------
 
+    def _wake_stranded_idle_drones(self) -> None:
+        """为既不在决策队列也不在 WAIT 中的 idle UAV 补入决策点。
+
+        idle UAV 在无授权订单时会被 _enqueue_decision 的早返回"睡死"——
+        既无队列条目也无 WAIT 占位。order_mgr.tick() 注入新单后调用此方法
+        可确保这些 UAV 被重新唤醒。
+        """
+        queued = {item.drone_id for item in self._decision_queue}
+        for drone_id, state in self._drone_state.items():
+            # ACTIVE_WAIT 的 UAV 已有 WAIT 占位，到期后会自行恢复，无需处理。
+            if state == TrainingDroneState.IDLE and drone_id not in queued:
+                self._enqueue_decision(drone_id, "order_arrival_wake", None)
+
     def _enqueue_initial_idle_decisions(self) -> None:
         """为 reset 后处于 idle 的 UAV 批量创建初始决策点。"""
         for drone_id, state in sorted(self._drone_state.items()):
@@ -2465,7 +2616,7 @@ class TrainingEnvAdapter:
         )
 
     def _resume_active_wait_for_idle_trigger(self) -> None:
-        """在“固定节点空闲触发”发生时恢复 idle 上的 WAIT 占位。"""
+        """在"固定节点空闲触发"发生时恢复 idle 上的 WAIT 占位。"""
         resumable = [
             drone_id
             for drone_id, state in self._active_wait_resume.items()
@@ -2477,7 +2628,7 @@ class TrainingEnvAdapter:
             self._enqueue_decision(drone_id, "wait_resume", None)
 
     def _resume_active_wait_for_station_trigger(self) -> None:
-        """在“卡车到站触发”发生时恢复 WAIT 占位。"""
+        """在"卡车到站触发"发生时恢复 WAIT 占位。"""
         resumable = list(self._active_wait_resume.items())
         for drone_id, state in resumable:
             self._active_wait_resume.pop(drone_id, None)
@@ -2611,7 +2762,7 @@ class TrainingEnvAdapter:
         patrol_k = min(len(stations), self._cfg.patrol_stations_per_loop)
 
         # 一旦决定进入 poisson 巡站补全路径，就持续追加到 upper horizon，
-        # 避免 episode 尾段再次出现“未来 backbone 耗尽”的契约破口。
+        # 避免 episode 尾段再次出现"未来 backbone 耗尽"的契约破口。
         while t_cursor < self._cfg.upper_horizon_sec:
             current_pos = _clone_position(depot.location)
             available = list(stations)
@@ -2745,7 +2896,7 @@ class TrainingEnvAdapter:
         drone_id: str,
         leg: FlightLeg,
     ) -> float | None:
-        """按当前飞行账本估算“在到达前耗尽电量”的最早时刻。"""
+        """按当前飞行账本估算"在到达前耗尽电量"的最早时刻。"""
         drone = self._require_entity_manager().drones[drone_id]
         if leg.energy_cost_j <= drone.battery_current + _TIME_EPS:
             return None
@@ -2755,7 +2906,7 @@ class TrainingEnvAdapter:
         failure_ratio = max(0.0, min(1.0, drone.battery_current / leg.energy_cost_j))
         failure_time = leg.start_time + (leg.arrival_time - leg.start_time) * failure_ratio
         # 若外部测试/调试在飞行中途手动改了电量，failure_time 可能已经落在当前时刻之前；
-        # 此时把失败事件钳到“当前推进区间的下一个瞬间”。
+        # 此时把失败事件钳到"当前推进区间的下一个瞬间"。
         return max(self._t_now + _TIME_EPS, failure_time)
 
     def _estimate_flight_time(

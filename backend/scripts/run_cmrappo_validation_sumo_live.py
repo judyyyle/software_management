@@ -106,6 +106,7 @@ def main(argv: list[str] | None = None) -> int:
         sumo_gui_bin=args.sumo_gui_bin or None,
         gui_step_sec=args.gui_step_sec,
         playback_speed=args.playback_speed,
+        follow_truck=False,
     )
 
     def _on_reset(env, _result) -> None:

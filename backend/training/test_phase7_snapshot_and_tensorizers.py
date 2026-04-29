@@ -14,9 +14,9 @@ import unittest
 import numpy as np
 
 from .critic_batch_builder import CriticBatchBuilder
-from .contracts import ResolvedActionIndices
+from .contracts import ResolvedActionIndices, TransitionSummary
 from .env_adapter import TrainingEnvAdapter
-from .observation_tensorizer import ObservationTensorizer
+from .observation_tensorizer import HISTORY_TOKEN_FIELDS, ObservationTensorizer
 from .rollout_buffer import RolloutBuffer, compute_gae
 
 
@@ -60,6 +60,189 @@ class TestPhase7SnapshotAndTensorizers(unittest.TestCase):
         self.assertEqual(batch.history_padding_mask.dtype, np.bool_)
         self.assertEqual(action_mask.root_branch_mask.shape, (2,))
         self.assertEqual(action_mask.mode_mask.shape[0], len(candidate_out.mode_mask))
+
+    def test_history_trigger_types_use_distinct_codes_for_runtime_resume_paths(self) -> None:
+        candidate_out = self.env.build_candidate_output(
+            self.decision,
+            last_seen_plan_version=self.decision.coarse_plan.plan_version,
+        )
+        trigger_field_idx = HISTORY_TOKEN_FIELDS.index("trigger_type_code_norm")
+        history = (
+            TransitionSummary(
+                event_time=1.0,
+                actor_drone_id=str(self.decision.deciding_drone_id),
+                actor_pos_x=0.0,
+                actor_pos_y=0.0,
+                actor_training_state_before="idle",
+                actor_training_state_after="idle",
+                actor_home_type="depot",
+                actor_payload_class="light",
+                trigger_type="initial_idle",
+                root_branch="WAIT",
+                dispatch_mode="NONE",
+                selected_recover_node_type="none",
+                has_selected_order=False,
+                selected_order_slot_rank=-1,
+                selected_order_deadline_slack_norm=0.0,
+                selected_eta_to_deliver_norm=0.0,
+                selected_rendezvous_margin_norm=0.0,
+                energy_ratio_before=1.0,
+                energy_ratio_after=1.0,
+                queue_after_norm=0.0,
+                plan_version_delta_at_event=0,
+                delivered=False,
+                rendezvous_success=False,
+                reservation_timeout=False,
+                fallback_started=False,
+                hard_failure=False,
+                queue_entered=False,
+                service_completed=False,
+            ),
+            TransitionSummary(
+                event_time=2.0,
+                actor_drone_id=str(self.decision.deciding_drone_id),
+                actor_pos_x=0.0,
+                actor_pos_y=0.0,
+                actor_training_state_before="idle",
+                actor_training_state_after="idle",
+                actor_home_type="depot",
+                actor_payload_class="light",
+                trigger_type="idle_ready",
+                root_branch="WAIT",
+                dispatch_mode="NONE",
+                selected_recover_node_type="none",
+                has_selected_order=False,
+                selected_order_slot_rank=-1,
+                selected_order_deadline_slack_norm=0.0,
+                selected_eta_to_deliver_norm=0.0,
+                selected_rendezvous_margin_norm=0.0,
+                energy_ratio_before=1.0,
+                energy_ratio_after=1.0,
+                queue_after_norm=0.0,
+                plan_version_delta_at_event=0,
+                delivered=False,
+                rendezvous_success=False,
+                reservation_timeout=False,
+                fallback_started=False,
+                hard_failure=False,
+                queue_entered=False,
+                service_completed=False,
+            ),
+            TransitionSummary(
+                event_time=3.0,
+                actor_drone_id=str(self.decision.deciding_drone_id),
+                actor_pos_x=0.0,
+                actor_pos_y=0.0,
+                actor_training_state_before="idle",
+                actor_training_state_after="idle",
+                actor_home_type="depot",
+                actor_payload_class="light",
+                trigger_type="wait_resume",
+                root_branch="WAIT",
+                dispatch_mode="NONE",
+                selected_recover_node_type="none",
+                has_selected_order=False,
+                selected_order_slot_rank=-1,
+                selected_order_deadline_slack_norm=0.0,
+                selected_eta_to_deliver_norm=0.0,
+                selected_rendezvous_margin_norm=0.0,
+                energy_ratio_before=1.0,
+                energy_ratio_after=1.0,
+                queue_after_norm=0.0,
+                plan_version_delta_at_event=0,
+                delivered=False,
+                rendezvous_success=False,
+                reservation_timeout=False,
+                fallback_started=False,
+                hard_failure=False,
+                queue_entered=False,
+                service_completed=False,
+            ),
+            TransitionSummary(
+                event_time=4.0,
+                actor_drone_id=str(self.decision.deciding_drone_id),
+                actor_pos_x=0.0,
+                actor_pos_y=0.0,
+                actor_training_state_before="idle",
+                actor_training_state_after="idle",
+                actor_home_type="depot",
+                actor_payload_class="light",
+                trigger_type="order_arrival_wake",
+                root_branch="WAIT",
+                dispatch_mode="NONE",
+                selected_recover_node_type="none",
+                has_selected_order=False,
+                selected_order_slot_rank=-1,
+                selected_order_deadline_slack_norm=0.0,
+                selected_eta_to_deliver_norm=0.0,
+                selected_rendezvous_margin_norm=0.0,
+                energy_ratio_before=1.0,
+                energy_ratio_after=1.0,
+                queue_after_norm=0.0,
+                plan_version_delta_at_event=0,
+                delivered=False,
+                rendezvous_success=False,
+                reservation_timeout=False,
+                fallback_started=False,
+                hard_failure=False,
+                queue_entered=False,
+                service_completed=False,
+            ),
+        )
+
+        batch = self.tensorizer.build(
+            decision_context=self.decision,
+            candidate_out=candidate_out,
+            transition_history=history,
+        )
+
+        trigger_codes = batch.history_tokens[-4:, trigger_field_idx]
+        self.assertEqual(len(set(float(item) for item in trigger_codes)), 4)
+
+    def test_history_build_raises_for_unknown_trigger_type(self) -> None:
+        candidate_out = self.env.build_candidate_output(
+            self.decision,
+            last_seen_plan_version=self.decision.coarse_plan.plan_version,
+        )
+        history = (
+            TransitionSummary(
+                event_time=1.0,
+                actor_drone_id=str(self.decision.deciding_drone_id),
+                actor_pos_x=0.0,
+                actor_pos_y=0.0,
+                actor_training_state_before="idle",
+                actor_training_state_after="idle",
+                actor_home_type="depot",
+                actor_payload_class="light",
+                trigger_type="unknown_trigger",
+                root_branch="WAIT",
+                dispatch_mode="NONE",
+                selected_recover_node_type="none",
+                has_selected_order=False,
+                selected_order_slot_rank=-1,
+                selected_order_deadline_slack_norm=0.0,
+                selected_eta_to_deliver_norm=0.0,
+                selected_rendezvous_margin_norm=0.0,
+                energy_ratio_before=1.0,
+                energy_ratio_after=1.0,
+                queue_after_norm=0.0,
+                plan_version_delta_at_event=0,
+                delivered=False,
+                rendezvous_success=False,
+                reservation_timeout=False,
+                fallback_started=False,
+                hard_failure=False,
+                queue_entered=False,
+                service_completed=False,
+            ),
+        )
+
+        with self.assertRaisesRegex(ValueError, "未知 trigger_type"):
+            self.tensorizer.build(
+                decision_context=self.decision,
+                candidate_out=candidate_out,
+                transition_history=history,
+            )
 
     def test_critic_batch_builder_respects_schema_capacity(self) -> None:
         schema = self.critic_builder.default_schema_meta
@@ -119,21 +302,33 @@ class TestPhase7SnapshotAndTensorizers(unittest.TestCase):
         buffer.finalize_transition(slot, reward=2.0, done=False)
 
         self.assertEqual(buffer.size, 1)
-        view = buffer.build_batch_view(last_value=0.5, gamma=0.99, gae_lambda=0.95)
+        view = buffer.build_batch_view()
         self.assertEqual(view.rewards.shape, (1,))
-        self.assertEqual(view.advantages.shape, (1,))
-        self.assertEqual(view.returns.shape, (1,))
+        self.assertEqual(view.dones.shape, (1,))
+        self.assertEqual(view.values.shape, (1,))
+        self.assertAlmostEqual(float(view.rewards[0]), 2.0, places=6)
+        self.assertFalse(bool(view.dones[0]))
+        self.assertAlmostEqual(float(view.values[0]), 1.0, places=6)
 
         advantages, returns = compute_gae(
-            rewards=np.asarray([2.0], dtype=np.float32),
-            dones=np.asarray([False], dtype=np.bool_),
-            values=np.asarray([1.0], dtype=np.float32),
+            rewards=view.rewards,
+            dones=view.dones,
+            values=view.values,
             last_value=0.5,
             gamma=0.99,
             gae_lambda=0.95,
         )
-        self.assertAlmostEqual(float(view.advantages[0]), float(advantages[0]), places=6)
-        self.assertAlmostEqual(float(view.returns[0]), float(returns[0]), places=6)
+        self.assertEqual(advantages.shape, (1,))
+        self.assertEqual(returns.shape, (1,))
+        self.assertAlmostEqual(float(advantages[0]), 1.495, places=6)
+        self.assertAlmostEqual(float(returns[0]), 2.495, places=6)
+
+    def test_poisson_env_exposes_actual_episode_order_source_seed(self) -> None:
+        self.assertEqual(self.env.current_episode_order_source_seed(), 20260424)
+
+        second_result = self.env.reset()
+        self.assertIsNotNone(second_result.decision_context)
+        self.assertEqual(self.env.current_episode_order_source_seed(), 20260425)
 
 
 if __name__ == "__main__":
