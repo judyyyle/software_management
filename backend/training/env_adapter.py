@@ -59,6 +59,7 @@ from .order_source_adapter import (
     configure_order_manager_for_source,
 )
 from .planner_bridge import PlannerBridge
+from .recovery_pool_selector import select_recovery_pool_for_order
 from .scene_loader import DEFAULT_CONFIG_PATH, TrainingSceneContext, load_default_scene
 
 
@@ -68,6 +69,11 @@ DroneId: TypeAlias = str
 
 _TIME_EPS = 1e-6
 _BACKBONE_DEPARTURE_EPS = 1e-6
+_MODE_C_REVALIDATION_REASON_KEYS = (
+    "energy_feasible",
+    "rendezvous_time_feasible",
+    "node_still_valid",
+)
 
 
 class TrainingDroneState(StrEnum):
@@ -243,6 +249,7 @@ class DispatchCommit:
 @dataclass(frozen=True)
 class DecisionTrigger:
     """内部决策队列中的一个待处理触发点。"""
+    decision_id: int
     drone_id: str
     trigger_type: str
     trigger_station_id: str | None = None
@@ -257,6 +264,7 @@ class _YamlConfig:
     allow_empty_backbone_route: bool
     max_wait_decision_gap_sec: float
     max_candidate_recovery_per_order: int
+    recovery_pool_future_scan_limit: int
     rendezvous_eta_safe_margin_sec: float
     reservation_enabled: bool
     reservation_alpha: float
@@ -324,6 +332,9 @@ class TrainingEnvAdapter:
         self._depot: Depot | None = None
         self._depot_id: str | None = None
         self._heavy_payload_capacity = self._resolve_heavy_payload_capacity()
+        self._recovery_pool_drone_cruise_speed = (
+            self._resolve_recovery_pool_drone_cruise_speed()
+        )
 
         self._t_now = 0.0
         self._reset_count = 0
@@ -347,6 +358,8 @@ class TrainingEnvAdapter:
         # 车载充换电完成时刻；到点后 charging_on_truck -> riding_with_truck。
         self._truck_charge_until: dict[DroneId, float] = {}
         self._decision_queue: list[DecisionTrigger] = []
+        self._next_decision_id = 0
+        self._last_exposed_decision_id: int | None = None
 
         # 只跟踪 truck_execution_route 中的 mode A 背景订单完成情况。
         self._background_mode_a_order_count = 0
@@ -371,6 +384,14 @@ class TrainingEnvAdapter:
         self._episode_wait_action_count = 0
         self._episode_dispatch_mode_b_count = 0
         self._episode_dispatch_mode_c_count = 0
+        self._episode_dispatch_decision_count = 0
+        self._episode_dispatch_decision_with_legal_mode_c_count = 0
+        self._episode_feasible_mode_c_recover_node_count_total = 0
+        self._episode_mode_c_success_count = 0
+        self._episode_mode_c_post_delivery_revalidation_fail_count = 0
+        self._episode_mode_c_post_delivery_revalidation_fail_reasons = {
+            key: 0 for key in _MODE_C_REVALIDATION_REASON_KEYS
+        }
         self._episode_wait_time_sec = 0.0
         self._episode_idle_time_sec = 0.0
         self._episode_queue_time_sec = 0.0
@@ -434,6 +455,8 @@ class TrainingEnvAdapter:
         self._reservation_count.clear()
         self._truck_charge_until.clear()
         self._decision_queue.clear()
+        self._next_decision_id = 0
+        self._last_exposed_decision_id = None
         self._active_wait_resume.clear()
         self._background_mode_a_order_count = 0
         self._background_mode_a_pending.clear()
@@ -455,6 +478,14 @@ class TrainingEnvAdapter:
         self._episode_wait_action_count = 0
         self._episode_dispatch_mode_b_count = 0
         self._episode_dispatch_mode_c_count = 0
+        self._episode_dispatch_decision_count = 0
+        self._episode_dispatch_decision_with_legal_mode_c_count = 0
+        self._episode_feasible_mode_c_recover_node_count_total = 0
+        self._episode_mode_c_success_count = 0
+        self._episode_mode_c_post_delivery_revalidation_fail_count = 0
+        self._episode_mode_c_post_delivery_revalidation_fail_reasons = {
+            key: 0 for key in _MODE_C_REVALIDATION_REASON_KEYS
+        }
         self._episode_wait_time_sec = 0.0
         self._episode_idle_time_sec = 0.0
         self._episode_queue_time_sec = 0.0
@@ -773,8 +804,29 @@ class TrainingEnvAdapter:
             "reservation_timeout_count": int(self._episode_reservation_timeout_count),
             "hard_overdue_count": int(self._episode_hard_overdue_count),
             "wait_action_count": int(self._episode_wait_action_count),
+            "dispatch_decision_count": int(self._episode_dispatch_decision_count),
+            "dispatch_decision_with_legal_mode_c_count": int(
+                self._episode_dispatch_decision_with_legal_mode_c_count
+            ),
             "dispatch_mode_b_count": int(self._episode_dispatch_mode_b_count),
             "dispatch_mode_c_count": int(self._episode_dispatch_mode_c_count),
+            "mode_c_selected_count": int(self._episode_dispatch_mode_c_count),
+            "mode_c_success_count": int(self._episode_mode_c_success_count),
+            "mode_c_post_delivery_revalidation_fail_count": int(
+                self._episode_mode_c_post_delivery_revalidation_fail_count
+            ),
+            "mode_c_post_delivery_revalidation_fail_reasons": dict(
+                self._episode_mode_c_post_delivery_revalidation_fail_reasons
+            ),
+            "feasible_mode_c_recover_node_count_total": int(
+                self._episode_feasible_mode_c_recover_node_count_total
+            ),
+            "avg_feasible_mode_c_nodes_per_dispatch_decision": (
+                float(self._episode_feasible_mode_c_recover_node_count_total)
+                / float(self._episode_dispatch_decision_count)
+                if self._episode_dispatch_decision_count > 0
+                else 0.0
+            ),
             "t_wait_sec": float(self._episode_wait_time_sec),
             "t_idle_sec": float(self._episode_idle_time_sec),
             "t_queue_sec": float(self._episode_queue_time_sec),
@@ -892,6 +944,7 @@ class TrainingEnvAdapter:
             for node_id in truck_backbone_route
             if node_id in self._require_entity_manager().stations
         )
+        node_states = self.build_runtime_state_view().node_states
 
         authorized_orders: list[str] = []
         order_priority_band: dict[str, int] = {}
@@ -930,7 +983,15 @@ class TrainingEnvAdapter:
             else:
                 policy_mode_mask[order_id] = frozenset({PolicyMode.B, PolicyMode.C})
                 # coarse plan 只暴露 recovery pool；最终动作合法性由 5b 运行时过滤负责。
-                recovery_pool[order_id] = truck_backbone_route[: self._cfg.max_candidate_recovery_per_order]
+                recovery_pool[order_id] = select_recovery_pool_for_order(
+                    order=order,
+                    truck_backbone_route=truck_backbone_route,
+                    truck_eta_map=truck_eta_map,
+                    node_states=node_states,
+                    max_candidates=self._cfg.max_candidate_recovery_per_order,
+                    future_scan_limit=self._cfg.recovery_pool_future_scan_limit,
+                    drone_cruise_speed=self._recovery_pool_drone_cruise_speed,
+                )
 
         node_charge_load_budget = {
             **{node_id: 0 for node_id in self._require_entity_manager().stations},
@@ -1294,6 +1355,7 @@ class TrainingEnvAdapter:
     ) -> EnvStepResult:
         """把当前内部状态封装成一次统一返回结果。"""
         decision_context = self.current_decision_context
+        self._record_exposed_decision_metrics(decision_context)
         runtime_state = self.build_runtime_state_view()
         merged_info = dict(info)
         if self._last_reward_breakdown:
@@ -1306,6 +1368,36 @@ class TrainingEnvAdapter:
             decision_context=decision_context,
             info=merged_info,
         )
+
+    def _record_exposed_decision_metrics(
+        self,
+        decision_context: DecisionContext | None,
+    ) -> None:
+        """对外暴露一次新决策点时，记录 dispatch / mode C 供给诊断指标。"""
+        if decision_context is None or not self._decision_queue:
+            return
+        trigger = self._decision_queue[0]
+        if trigger.decision_id == self._last_exposed_decision_id:
+            return
+        self._last_exposed_decision_id = trigger.decision_id
+
+        dispatch_actions = [
+            action
+            for action in decision_context.action_lookup
+            if isinstance(action, DispatchAction)
+        ]
+        if not dispatch_actions:
+            return
+
+        self._episode_dispatch_decision_count += 1
+        legal_mode_c_nodes = {
+            str(action.recover_node_id)
+            for action in dispatch_actions
+            if action.mode == PolicyMode.C and action.recover_node_id is not None
+        }
+        self._episode_feasible_mode_c_recover_node_count_total += len(legal_mode_c_nodes)
+        if legal_mode_c_nodes:
+            self._episode_dispatch_decision_with_legal_mode_c_count += 1
 
     # ---------------------------------------------------------------------
     # Event loop
@@ -1582,8 +1674,9 @@ class TrainingEnvAdapter:
             return
 
         selected_node = commit.selected_recover_node
+        checks = {key: False for key in _MODE_C_REVALIDATION_REASON_KEYS}
         if selected_node:
-            is_valid, _checks = self._revalidate_mode_c_recover_node(
+            is_valid, checks = self._revalidate_mode_c_recover_node(
                 drone_id=drone_id,
                 node_id=selected_node,
                 t_now=service_leg.finish_time,
@@ -1597,6 +1690,13 @@ class TrainingEnvAdapter:
                 start_time=service_leg.finish_time,
             )
             return
+
+        self._episode_mode_c_post_delivery_revalidation_fail_count += 1
+        for reason_key, passed in checks.items():
+            if not passed:
+                self._episode_mode_c_post_delivery_revalidation_fail_reasons[
+                    reason_key
+                ] += 1
 
         self._release_reservation(drone_id)
         if not self._enter_fallback_recovery(
@@ -1645,6 +1745,7 @@ class TrainingEnvAdapter:
         for drone_id in recovered:
             self._release_reservation(drone_id)
             self._drone_state[drone_id] = TrainingDroneState.CHARGING_ON_TRUCK
+            self._episode_mode_c_success_count += 1
             self._truck_charge_until[drone_id] = (
                 t_now + self._scene_solver_params().truck_drone_recover_time_s
             )
@@ -2727,11 +2828,13 @@ class TrainingEnvAdapter:
             return
         self._decision_queue.append(
             DecisionTrigger(
+                decision_id=self._next_decision_id,
                 drone_id=drone_id,
                 trigger_type=trigger_type,
                 trigger_station_id=trigger_station_id,
             )
         )
+        self._next_decision_id += 1
 
     def _resume_active_wait_for_idle_trigger(self) -> None:
         """在"固定节点空闲触发"发生时恢复 idle 上的 WAIT 占位。"""
@@ -2932,7 +3035,8 @@ class TrainingEnvAdapter:
             travel_time_back = current_pos.distance_2d(depot.location) / max(_TIME_EPS, truck.speed)
             t_cursor += travel_time_back
             seq += 1
-            # 巡站循环的 depot stop 只进入物理路线，不写入骨架缓存。
+            # depot 同样属于 future fixed node；若不写入骨架缓存，
+            # 则尾段会出现“物理路线仍在继续，但 coarse backbone 已耗尽”的语义裂缝。
             self._planned_route_stops.append(
                 PlannedStop(
                     seq=seq,
@@ -2942,6 +3046,13 @@ class TrainingEnvAdapter:
                     order_id=None,
                     arrival_time=t_cursor,
                     departure_time=t_cursor,
+                )
+            )
+            self._full_backbone_cache.append(
+                BackboneVisit(
+                    node_id=depot.depot_id,
+                    arrival_time=t_cursor,
+                    departure_time=t_cursor + _BACKBONE_DEPARTURE_EPS,
                 )
             )
 
@@ -3168,6 +3279,12 @@ class TrainingEnvAdapter:
 
         return float(load_drone_params().heavy.payload_capacity)
 
+    def _resolve_recovery_pool_drone_cruise_speed(self) -> float:
+        """读取 recovery-pool 粗筛评分使用的轻型无人机巡航速度。"""
+        from config.loader import load_drone_params
+
+        return float(load_drone_params().light.cruise_speed)
+
     def _is_action_allowed(
         self,
         action: EnvAction,
@@ -3217,6 +3334,22 @@ def _load_env_yaml(config_path: Path) -> _YamlConfig:
     reward = _require_mapping(raw, "reward")
     candidate = _require_mapping(raw, "candidate")
     reservation = _require_mapping(raw, "reservation")
+    max_candidate_recovery_per_order = int(
+        candidate["max_candidate_recovery_per_order"]
+    )
+    recovery_pool_future_scan_limit = int(
+        candidate.get(
+            "recovery_pool_future_scan_limit",
+            max_candidate_recovery_per_order,
+        )
+    )
+    if max_candidate_recovery_per_order <= 0:
+        raise ValueError("candidate.max_candidate_recovery_per_order 必须为正数")
+    if recovery_pool_future_scan_limit < max_candidate_recovery_per_order:
+        raise ValueError(
+            "candidate.recovery_pool_future_scan_limit 不能小于 "
+            "max_candidate_recovery_per_order"
+        )
 
     return _YamlConfig(
         upper_horizon_sec=float(planner["upper_horizon_sec"]),
@@ -3227,7 +3360,8 @@ def _load_env_yaml(config_path: Path) -> _YamlConfig:
         fallback_burst_window_sec=float(planner["fallback_burst_window_sec"]),
         coarse_new_order_trigger=int(planner["coarse_new_order_trigger"]),
         max_wait_decision_gap_sec=float(planner["max_wait_decision_gap_sec"]),
-        max_candidate_recovery_per_order=int(candidate["max_candidate_recovery_per_order"]),
+        max_candidate_recovery_per_order=max_candidate_recovery_per_order,
+        recovery_pool_future_scan_limit=recovery_pool_future_scan_limit,
         rendezvous_eta_safe_margin_sec=float(candidate["rendezvous_eta_safe_margin_sec"]),
         reservation_enabled=bool(reservation.get("enable", True)),
         reservation_alpha=float(reservation["alpha"]),

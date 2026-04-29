@@ -75,6 +75,24 @@ class TestTrainingEnvAdapterPhase5b(unittest.TestCase):
         env._require_order_manager().pending_orders[order.order_id] = order
         return order
 
+    def _inject_order_at_position(
+        self,
+        env: TrainingEnvAdapter,
+        *,
+        order_id: str,
+        position: Position3D,
+        payload_weight: float = 1.0,
+    ) -> Order:
+        order = Order(
+            order_id=order_id,
+            create_time=env._t_now,
+            deadline=env._t_now + 3600.0,
+            delivery_loc=Position3D(x=position.x, y=position.y, z=position.z),
+            payload_weight=payload_weight,
+        )
+        env._require_order_manager().pending_orders[order.order_id] = order
+        return order
+
     def test_mode_c_action_mask_filters_by_timestamp_and_energy(self) -> None:
         env, drone_id = self._reset_controlled_env()
         entity_mgr = env._require_entity_manager()
@@ -127,6 +145,51 @@ class TestTrainingEnvAdapterPhase5b(unittest.TestCase):
 
         self.assertIsNotNone(selected_host)
         self.assertEqual(selected_host.station_id, station.station_id)
+
+    def test_coarse_plan_recovery_pool_scans_future_backbone_then_selects_top_k(self) -> None:
+        env, _drone_id = self._reset_controlled_env()
+        entity_mgr = env._require_entity_manager()
+        station_ids = sorted(entity_mgr.stations)
+        self.assertGreaterEqual(len(station_ids), 5)
+
+        preferred_station_id = station_ids[4]
+        preferred_station = entity_mgr.stations[preferred_station_id]
+        order = self._inject_order_at_position(
+            env,
+            order_id="ORDER-P5B-RECOVERY-POOL-01",
+            position=preferred_station.location,
+        )
+
+        for station_id in station_ids[:4]:
+            station = entity_mgr.stations[station_id]
+            station.serving_drones = {
+                f"busy-{station_id}-{idx}": env._t_now + 600.0 + idx
+                for idx in range(station.parking_slots)
+            }
+            station.wait_queue = [f"wait-{station_id}"]
+
+        env._full_backbone_cache = [
+            BackboneVisit(
+                node_id=station_id,
+                arrival_time=env._t_now + 60.0 * (idx + 1),
+                departure_time=env._t_now + 60.0 * (idx + 1) + 1e-6,
+            )
+            for idx, station_id in enumerate(station_ids[:5])
+        ]
+
+        coarse_plan = env._build_coarse_plan_view(env._t_now)
+        recovery_nodes = coarse_plan.recovery_pool[order.order_id]
+
+        self.assertEqual(len(recovery_nodes), env._cfg.max_candidate_recovery_per_order)
+        self.assertIn(
+            preferred_station_id,
+            recovery_nodes,
+            "后续 backbone 上更优的 rendezvous 节点应能进入 recovery_pool",
+        )
+        self.assertNotEqual(
+            recovery_nodes,
+            tuple(station_ids[: env._cfg.max_candidate_recovery_per_order]),
+        )
 
     def test_post_delivery_revalidation_failure_enters_fallback(self) -> None:
         env, drone_id = self._reset_controlled_env()
@@ -190,6 +253,78 @@ class TestTrainingEnvAdapterPhase5b(unittest.TestCase):
         )
         self.assertIn(drone_id, env._fallback_leg)
         self.assertEqual(env._flight_legs[drone_id].kind, "fallback_recovery")
+        episode_snapshot = env.build_episode_metrics_snapshot()
+        self.assertEqual(
+            episode_snapshot["mode_c_post_delivery_revalidation_fail_count"],
+            1,
+        )
+        self.assertEqual(episode_snapshot["mode_c_success_count"], 0)
+        self.assertEqual(
+            episode_snapshot["mode_c_post_delivery_revalidation_fail_reasons"],
+            {
+                "energy_feasible": 1,
+                "rendezvous_time_feasible": 1,
+                "node_still_valid": 1,
+            },
+        )
+
+    def test_exposed_decision_metrics_count_dispatch_and_legal_mode_c_once(self) -> None:
+        env, drone_id = self._reset_controlled_env()
+        entity_mgr = env._require_entity_manager()
+        drone = entity_mgr.drones[drone_id]
+        station_ids = sorted(entity_mgr.stations)
+        self.assertGreaterEqual(len(station_ids), 2)
+
+        order = self._inject_order(env, drone_id=drone_id, order_id="ORDER-P5B-DIAG-01")
+        t_deliver = env._estimate_delivery_arrival_time(drone, order)
+        env._full_backbone_cache = [
+            BackboneVisit(
+                node_id=station_ids[0],
+                arrival_time=t_deliver + 1.0,
+                departure_time=t_deliver + 1.0 + 1e-6,
+            ),
+            BackboneVisit(
+                node_id=station_ids[1],
+                arrival_time=t_deliver + 600.0,
+                departure_time=t_deliver + 600.0 + 1e-6,
+            ),
+        ]
+        env._decision_queue.clear()
+        env._enqueue_decision(drone_id, "test_idle", None)
+        env._episode_dispatch_decision_count = 0
+        env._episode_dispatch_decision_with_legal_mode_c_count = 0
+        env._episode_feasible_mode_c_recover_node_count_total = 0
+        env._last_exposed_decision_id = None
+
+        first_result = env._build_step_result(reward=0.0, info={"event": "probe"})
+        self.assertIsNotNone(first_result.decision_context)
+        first_snapshot = env.build_episode_metrics_snapshot()
+        self.assertEqual(first_snapshot["dispatch_decision_count"], 1)
+        self.assertEqual(
+            first_snapshot["dispatch_decision_with_legal_mode_c_count"],
+            1,
+        )
+        self.assertEqual(
+            first_snapshot["feasible_mode_c_recover_node_count_total"],
+            1,
+        )
+        self.assertAlmostEqual(
+            first_snapshot["avg_feasible_mode_c_nodes_per_dispatch_decision"],
+            1.0,
+        )
+
+        second_result = env._build_step_result(reward=0.0, info={"event": "probe-again"})
+        self.assertIsNotNone(second_result.decision_context)
+        second_snapshot = env.build_episode_metrics_snapshot()
+        self.assertEqual(second_snapshot["dispatch_decision_count"], 1)
+        self.assertEqual(
+            second_snapshot["dispatch_decision_with_legal_mode_c_count"],
+            1,
+        )
+        self.assertEqual(
+            second_snapshot["feasible_mode_c_recover_node_count_total"],
+            1,
+        )
 
     def test_delivery_service_finishes_before_mode_b_return_leg_is_scheduled(self) -> None:
         env, drone_id = self._reset_controlled_env()

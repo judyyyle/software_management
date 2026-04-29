@@ -27,6 +27,7 @@ from .train_cmrappo import (
     _finalize_episode_metrics,
     _load_policy_config,
     _record_episode_step,
+    _record_terminal_episode_rewards,
     _require_torch,
     _reset_recurrent_state_for_failed_drones,
     _resolve_device,
@@ -254,6 +255,11 @@ def run_policy_episode(
         _record_episode_step(episode_acc, reward=float(step_result.reward))
         result = step_result
 
+    terminal_reward_by_drone = env.consume_terminal_agent_costs()
+    _record_terminal_episode_rewards(
+        accumulator=episode_acc,
+        terminal_reward_by_drone=terminal_reward_by_drone,
+    )
     return {
         "episode_metrics": _finalize_episode_metrics(
             accumulator=episode_acc,

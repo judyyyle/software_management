@@ -176,6 +176,62 @@ class TestPhase6Integration(unittest.TestCase):
         self.assertIn(station_2.station_id, env._active_launch_stations)
         self.assertNotIn(station_1.station_id, env._active_launch_stations)
 
+    def test_planner_bridge_recovery_pool_scans_future_backbone_then_selects_top_k(self) -> None:
+        env, _drone_id = self._reset_controlled_env()
+        entity_mgr = env._require_entity_manager()
+        station_ids = sorted(entity_mgr.stations)
+        self.assertGreaterEqual(len(station_ids), 5)
+
+        preferred_station_id = station_ids[4]
+        preferred_station = entity_mgr.stations[preferred_station_id]
+        order = self._inject_order_at(
+            env,
+            order_id="ORDER-P6-PLAN-RECOVERY-01",
+            position=preferred_station.location,
+        )
+
+        for station_id in station_ids[:4]:
+            station = entity_mgr.stations[station_id]
+            station.serving_drones = {
+                f"busy-{station_id}-{idx}": env._t_now + 600.0 + idx
+                for idx in range(station.parking_slots)
+            }
+            station.wait_queue = [f"wait-{station_id}"]
+
+        env._full_backbone_cache = [
+            BackboneVisit(
+                node_id=station_id,
+                arrival_time=env._t_now + 60.0 * (idx + 1),
+                departure_time=env._t_now + 60.0 * (idx + 1) + 1e-6,
+            )
+            for idx, station_id in enumerate(station_ids[:5])
+        ]
+
+        runtime_state = env.build_runtime_state_view()
+        env._planner_bridge.reset_episode()
+        coarse_plan = env._planner_bridge.maybe_replan(
+            runtime_state,
+            PlannerTriggerContext(
+                t_now=env._t_now,
+                backlog_new_orders=0,
+                fallback_count_in_window=0,
+                hard_failure_count_in_window=0,
+                route_drift_ratio=0.0,
+            ),
+        )
+        recovery_nodes = coarse_plan.recovery_pool[order.order_id]
+
+        self.assertEqual(len(recovery_nodes), env._cfg.max_candidate_recovery_per_order)
+        self.assertIn(
+            preferred_station_id,
+            recovery_nodes,
+            "PlannerBridge 应与 env 内联 coarse plan 一致，允许后续优质节点进入 recovery_pool",
+        )
+        self.assertNotEqual(
+            recovery_nodes,
+            tuple(station_ids[: env._cfg.max_candidate_recovery_per_order]),
+        )
+
     def test_poisson_planner_bridge_rejects_empty_backbone(self) -> None:
         env, _drone_id = self._reset_controlled_env()
         env._full_backbone_cache = []

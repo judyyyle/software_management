@@ -13,6 +13,7 @@ HiveLogix — Phase 7 PPO 训练主循环。
 
 from __future__ import annotations
 
+import copy
 import json
 import random
 import shutil
@@ -46,14 +47,19 @@ from .contracts import (
 from .critic_batch_builder import CriticBatchBuilder
 from .model import SharedPPOActorCritic
 from .observation_tensorizer import ObservationTensorizer
-from .order_source_adapter import OrderSourceMode, build_order_source, ensure_mode_allowed
+from .order_source_adapter import (
+    OrderSourceConfig,
+    OrderSourceMode,
+    build_order_source,
+    ensure_mode_allowed,
+)
 from .rollout_buffer import (
     RolloutTransition,
     build_batch_view_from_transitions,
     compute_gae,
 )
 from .scene_loader import DEFAULT_CONFIG_PATH, load_default_scene
-from .env_adapter import TrainingEnvAdapter
+from .env_adapter import TrainingDroneState, TrainingEnvAdapter
 
 
 try:  # pragma: no cover
@@ -81,6 +87,8 @@ class _TrainingConfig:
     clip_coef: float
     entropy_coef: float
     value_loss_coef: float
+    value_loss_type: str
+    value_huber_delta: float
     max_grad_norm: float
     normalize_advantage: bool
     target_kl: float
@@ -92,7 +100,6 @@ class _TrainingConfig:
     stochastic_eval_seeds: int
     early_stop_enabled: bool
     early_stop_min_evals: int
-    early_stop_benchmark_patience: int
     early_stop_stochastic_high_patience: int
     early_stop_value_loss_window: int
     early_stop_value_loss_min_delta: float
@@ -113,6 +120,9 @@ class _EvalConfig:
     benchmark_seed: int
     stochastic_seed_base: int
     stochastic_arrival_rates: tuple[tuple[str, float], ...]
+    c_sensitive_enabled: bool
+    c_sensitive_seed: int
+    c_sensitive_min_legal_mode_c_recovery_nodes: int
 
 
 @dataclass(frozen=True)
@@ -378,6 +388,7 @@ def train_cmrappo(
     eval_metrics_path = out_dir / "eval_metrics.jsonl"
     benchmark_report_path = out_dir / "benchmark_report.json"
     stochastic_report_path = out_dir / "stochastic_report.json"
+    c_sensitive_report_path = out_dir / "c_sensitive_report.json"
     policy_path = out_dir / "policy.pt"
     policy_last_path = out_dir / "policy_last.pt"
     policy_best_path = out_dir / "policy_best.pt"
@@ -414,9 +425,7 @@ def train_cmrappo(
     best_checkpoint: _BestCheckpointState | None = None
     latest_eval_report: dict[str, Any] | None = None
     eval_count = 0
-    best_benchmark_key: tuple[Any, ...] | None = None
     best_stochastic_high_key: tuple[Any, ...] | None = None
-    benchmark_no_improve_evals = 0
     stochastic_high_no_improve_evals = 0
     recent_eval_value_losses: deque[float] = deque(
         maxlen=train_cfg.early_stop_value_loss_window
@@ -588,6 +597,7 @@ def train_cmrappo(
                 global_decision_index=global_step,
                 decision_context_debug_snapshot=decision_context,
             )
+            terminal_reward_by_drone: dict[str, float] = {}
             if step_result.done:
                 _insert_finalized_transition_in_order(
                     rollout_backlog=rollout_backlog,
@@ -637,6 +647,10 @@ def train_cmrappo(
                 },
             )
             if step_result.done:
+                _record_terminal_episode_rewards(
+                    accumulator=episode_acc,
+                    terminal_reward_by_drone=terminal_reward_by_drone,
+                )
                 episode_metrics = _finalize_episode_metrics(
                     accumulator=episode_acc,
                     episode_snapshot=env.build_episode_metrics_snapshot(),
@@ -770,6 +784,15 @@ def train_cmrappo(
                     "update": update_idx,
                     "global_step": global_step,
                     "benchmark": _strip_episode_details(eval_report["benchmark"]),
+                    **(
+                        {
+                            "c_sensitive": _strip_episode_details(
+                                eval_report["c_sensitive"]
+                            )
+                        }
+                        if "c_sensitive" in eval_report
+                        else {}
+                    ),
                     "stochastic": {
                         name: _strip_episode_details(payload)
                         for name, payload in eval_report["stochastic"].items()
@@ -784,6 +807,11 @@ def train_cmrappo(
                 path=stochastic_report_path,
                 payload=eval_report["stochastic_report"],
             )
+            if "c_sensitive" in eval_report:
+                _write_json(
+                    path=c_sensitive_report_path,
+                    payload=eval_report["c_sensitive"],
+                )
             selection_key = _build_eval_selection_key(eval_report)
             if best_checkpoint is None or selection_key > best_checkpoint.selection_key:
                 _save_policy_checkpoint(
@@ -813,13 +841,6 @@ def train_cmrappo(
                     },
                 )
 
-            benchmark_key = _build_benchmark_improvement_key(eval_report)
-            if best_benchmark_key is None or benchmark_key > best_benchmark_key:
-                best_benchmark_key = benchmark_key
-                benchmark_no_improve_evals = 0
-            else:
-                benchmark_no_improve_evals += 1
-
             stochastic_high_key = _build_stochastic_high_improvement_key(eval_report)
             if best_stochastic_high_key is None or stochastic_high_key > best_stochastic_high_key:
                 best_stochastic_high_key = stochastic_high_key
@@ -831,14 +852,12 @@ def train_cmrappo(
             if _should_stop_early(
                 train_cfg=train_cfg,
                 eval_count=eval_count,
-                benchmark_no_improve_evals=benchmark_no_improve_evals,
                 stochastic_high_no_improve_evals=stochastic_high_no_improve_evals,
                 recent_eval_value_losses=tuple(recent_eval_value_losses),
             ):
                 stop_training_early = True
                 stop_reason = (
                     "early_stop:"
-                    f"benchmark_no_improve={benchmark_no_improve_evals},"
                     f"stochastic_high_no_improve={stochastic_high_no_improve_evals},"
                     f"recent_eval_value_losses={[round(value, 6) for value in recent_eval_value_losses]}"
                 )
@@ -892,6 +911,11 @@ def train_cmrappo(
             path=stochastic_report_path,
             payload=final_eval_report["stochastic_report"],
         )
+        if "c_sensitive" in final_eval_report:
+            _write_json(
+                path=c_sensitive_report_path,
+                payload=final_eval_report["c_sensitive"],
+            )
     meta_payload = _build_meta_payload(
         scene_ctx=scene_ctx,
         order_source=order_source,
@@ -927,6 +951,7 @@ def train_cmrappo(
         "eval_metrics_path": str(eval_metrics_path),
         "benchmark_report_path": str(benchmark_report_path),
         "stochastic_report_path": str(stochastic_report_path),
+        "c_sensitive_report_path": str(c_sensitive_report_path),
         "stopped_early": bool(stop_training_early),
         "stop_reason": stop_reason,
         "selected_policy_source": str(selected_checkpoint),
@@ -936,6 +961,19 @@ def train_cmrappo(
 def _record_episode_step(accumulator: _EpisodeAccumulator, *, reward: float) -> None:
     accumulator.decision_count += 1
     accumulator.total_reward += float(reward)
+
+
+def _record_terminal_episode_rewards(
+    *,
+    accumulator: _EpisodeAccumulator,
+    terminal_reward_by_drone: Mapping[str, float],
+) -> float:
+    """将 episode 结束时残留的尾部归因奖励补记回 episode total_reward。"""
+    terminal_reward_total = 0.0
+    for reward in terminal_reward_by_drone.values():
+        terminal_reward_total += float(reward)
+    accumulator.total_reward += terminal_reward_total
+    return terminal_reward_total
 
 
 def _finalize_episode_metrics(
@@ -961,6 +999,107 @@ def _finalize_episode_metrics(
     return payload
 
 
+def _build_c_sensitive_eval_order_source(
+    *,
+    scene_ctx: Any,
+    config_path: Path,
+    eval_cfg: _EvalConfig,
+) -> tuple[OrderSourceConfig, dict[str, Any]]:
+    """基于现有 env 语义筛出一个额外的 benchmark-like `C-sensitive` replay split。"""
+    full_benchmark_order_source = build_order_source(
+        scene_ctx,
+        mode=OrderSourceMode.BENCHMARK,
+        seed=eval_cfg.c_sensitive_seed,
+        overrides={"benchmark_use_dynamic_orders": True},
+        config_path=config_path,
+    )
+    analysis_order_source = build_order_source(
+        scene_ctx,
+        mode=OrderSourceMode.BENCHMARK,
+        seed=eval_cfg.c_sensitive_seed,
+        overrides={"benchmark_use_dynamic_orders": False},
+        config_path=config_path,
+    )
+    analysis_env = TrainingEnvAdapter(
+        scene_ctx=scene_ctx,
+        order_source=analysis_order_source,
+        config_path=config_path,
+    )
+    analysis_env.reset()
+    order_mgr = analysis_env._require_order_manager()
+    entity_mgr = analysis_env._require_entity_manager()
+    depot = analysis_env._require_depot()
+    depot_home_drone_id = next(
+        (
+            drone_id
+            for drone_id, state in analysis_env._drone_state.items()
+            if state == TrainingDroneState.IDLE
+        ),
+        None,
+    )
+    if depot_home_drone_id is None:
+        raise ValueError("C-sensitive eval 需要至少一架 depot-home idle UAV")
+    drone = entity_mgr.drones[depot_home_drone_id]
+
+    selected_order_ids: list[str] = []
+    candidate_count_by_order_id: dict[str, int] = {}
+    for dynamic_order in scene_ctx.dynamic_orders:
+        order_mgr.pending_orders.clear()
+        order_mgr.assigned_orders.clear()
+        order_mgr.completed_orders.clear()
+        analysis_env._t_now = float(dynamic_order.spawn_sim_s)
+        drone.current_loc = copy.deepcopy(depot.location)
+        drone.battery_current = float(drone.battery_max)
+        analysis_env._drone_state[depot_home_drone_id] = TrainingDroneState.IDLE
+
+        order = copy.deepcopy(dynamic_order.order)
+        order_mgr.pending_orders[order.order_id] = order
+        coarse_plan = analysis_env._build_coarse_plan_view(analysis_env._t_now)
+        legal_mode_c_nodes = analysis_env._iter_feasible_mode_c_recovery_nodes(
+            drone=drone,
+            order=order,
+            coarse_plan=coarse_plan,
+        )
+        if len(legal_mode_c_nodes) < eval_cfg.c_sensitive_min_legal_mode_c_recovery_nodes:
+            continue
+        if not analysis_env._has_mode_b_return_host(drone, order):
+            continue
+        selected_order_ids.append(order.order_id)
+        candidate_count_by_order_id[order.order_id] = len(legal_mode_c_nodes)
+
+    if not selected_order_ids:
+        raise ValueError(
+            "C-sensitive eval 没有筛出任何动态订单；"
+            "请检查默认场景或降低最小 legal mode C 候选数阈值"
+        )
+
+    normalized_dynamic_by_id = {
+        str(item["order_id"]): dict(item)
+        for item in full_benchmark_order_source.scheduled_dynamic_orders
+    }
+    selected_dynamic_orders = tuple(
+        dict(normalized_dynamic_by_id[order_id]) for order_id in selected_order_ids
+    )
+    return (
+        replace(
+            full_benchmark_order_source,
+            scheduled_dynamic_orders=selected_dynamic_orders,
+            seed=int(eval_cfg.c_sensitive_seed),
+        ),
+        {
+            "selected_dynamic_order_count": int(len(selected_order_ids)),
+            "selected_dynamic_order_ids": tuple(selected_order_ids),
+            "selected_dynamic_order_legal_mode_c_node_counts": dict(
+                candidate_count_by_order_id
+            ),
+            "c_sensitive_min_legal_mode_c_recovery_nodes": int(
+                eval_cfg.c_sensitive_min_legal_mode_c_recovery_nodes
+            ),
+            "selection_drone_id": str(depot_home_drone_id),
+        },
+    )
+
+
 def _run_periodic_evaluation(
     *,
     scene_ctx: Any,
@@ -981,6 +1120,7 @@ def _run_periodic_evaluation(
     model.eval()
     try:
         generated_at = datetime.now(timezone.utc).isoformat()
+        c_sensitive_report: dict[str, Any] | None = None
         # benchmark 当前是确定性 replay：固定订单流 + deterministic policy。
         # 因此重复跑多次不会提供额外信息，统一折叠为单次评估，并显式记录
         # configured 次数与 effective 次数，避免报表误导 postmortem。
@@ -1019,6 +1159,37 @@ def _run_periodic_evaluation(
                 "benchmark_deterministic_replay": True,
             },
         )
+        if eval_cfg.c_sensitive_enabled:
+            c_sensitive_order_source, c_sensitive_meta = _build_c_sensitive_eval_order_source(
+                scene_ctx=scene_ctx,
+                config_path=config_path,
+                eval_cfg=eval_cfg,
+            )
+            c_sensitive_episode = _evaluate_policy_episode(
+                scene_ctx=scene_ctx,
+                config_path=config_path,
+                order_source=c_sensitive_order_source,
+                model=model,
+                tensorizer=tensorizer,
+                critic_builder=critic_builder,
+                critic_schema=critic_schema,
+                policy_cfg=policy_cfg,
+                device=device,
+                eval_phase="c_sensitive",
+                episode_id=0,
+            )
+            c_sensitive_report = _summarize_episode_records(
+                split="c_sensitive",
+                order_source_mode=OrderSourceMode.BENCHMARK.value,
+                episodes=[c_sensitive_episode],
+                update_idx=update_idx,
+                global_step=global_step,
+                generated_at=generated_at,
+                extra={
+                    "c_sensitive_seed": int(eval_cfg.c_sensitive_seed),
+                    **c_sensitive_meta,
+                },
+            )
 
         stochastic_reports: dict[str, dict[str, Any]] = {}
         for band_name, arrival_rate in eval_cfg.stochastic_arrival_rates:
@@ -1060,7 +1231,7 @@ def _run_periodic_evaluation(
                 },
             )
 
-        return {
+        payload = {
             "benchmark": benchmark_report,
             "stochastic": stochastic_reports,
             "stochastic_report": {
@@ -1071,6 +1242,9 @@ def _run_periodic_evaluation(
                 "profiles": stochastic_reports,
             },
         }
+        if c_sensitive_report is not None:
+            payload["c_sensitive"] = c_sensitive_report
+        return payload
     finally:
         _restore_rng_state(rng_state)
         if was_training:
@@ -1172,6 +1346,11 @@ def _evaluate_policy_episode(
         _record_episode_step(episode_acc, reward=float(step_result.reward))
         result = step_result
 
+    terminal_reward_by_drone = env.consume_terminal_agent_costs()
+    _record_terminal_episode_rewards(
+        accumulator=episode_acc,
+        terminal_reward_by_drone=terminal_reward_by_drone,
+    )
     return _finalize_episode_metrics(
         accumulator=episode_acc,
         episode_snapshot=env.build_episode_metrics_snapshot(),
@@ -1197,6 +1376,30 @@ def _summarize_episode_records(
     mode_b_total = float(sum(float(item["dispatch_mode_b_count"]) for item in episodes))
     mode_c_total = float(sum(float(item["dispatch_mode_c_count"]) for item in episodes))
     dispatch_total = mode_b_total + mode_c_total
+    dispatch_decision_total = int(
+        sum(int(item.get("dispatch_decision_count", 0)) for item in episodes)
+    )
+    dispatch_decision_with_legal_mode_c_total = int(
+        sum(
+            int(item.get("dispatch_decision_with_legal_mode_c_count", 0))
+            for item in episodes
+        )
+    )
+    feasible_mode_c_recover_node_total = int(
+        sum(
+            int(item.get("feasible_mode_c_recover_node_count_total", 0))
+            for item in episodes
+        )
+    )
+    mode_c_revalidation_fail_reason_totals: dict[str, int] = {}
+    for item in episodes:
+        for reason_key, count in dict(
+            item.get("mode_c_post_delivery_revalidation_fail_reasons", {})
+        ).items():
+            mode_c_revalidation_fail_reason_totals[str(reason_key)] = (
+                mode_c_revalidation_fail_reason_totals.get(str(reason_key), 0)
+                + int(count)
+            )
     payload = {
         "generated_at": generated_at,
         "update": int(update_idx),
@@ -1222,6 +1425,33 @@ def _summarize_episode_records(
         ),
         "sum_hard_overdue_count": int(
             sum(int(item["hard_overdue_count"]) for item in episodes)
+        ),
+        "sum_dispatch_decision_count": int(dispatch_decision_total),
+        "sum_dispatch_decision_with_legal_mode_c_count": int(
+            dispatch_decision_with_legal_mode_c_total
+        ),
+        "sum_feasible_mode_c_recover_node_count_total": int(
+            feasible_mode_c_recover_node_total
+        ),
+        "avg_feasible_mode_c_nodes_per_dispatch_decision": (
+            float(feasible_mode_c_recover_node_total) / float(dispatch_decision_total)
+            if dispatch_decision_total > 0
+            else 0.0
+        ),
+        "sum_mode_c_selected_count": int(
+            sum(int(item.get("mode_c_selected_count", 0)) for item in episodes)
+        ),
+        "sum_mode_c_success_count": int(
+            sum(int(item.get("mode_c_success_count", 0)) for item in episodes)
+        ),
+        "sum_mode_c_post_delivery_revalidation_fail_count": int(
+            sum(
+                int(item.get("mode_c_post_delivery_revalidation_fail_count", 0))
+                for item in episodes
+            )
+        ),
+        "sum_mode_c_post_delivery_revalidation_fail_reasons": dict(
+            mode_c_revalidation_fail_reason_totals
         ),
         "sum_t_wait_sec": float(sum(float(item["t_wait_sec"]) for item in episodes)),
         "sum_t_idle_sec": float(sum(float(item["t_idle_sec"]) for item in episodes)),
@@ -1257,30 +1487,26 @@ def _count_done_reason(report: Mapping[str, Any], *, reason: str) -> int:
     return sum(1 for episode in episodes if str(episode.get("done_reason")) == str(reason))
 
 
-def _build_eval_selection_key(eval_report: Mapping[str, Any]) -> tuple[Any, ...]:
+def _build_benchmark_guardrail_key(eval_report: Mapping[str, Any]) -> tuple[Any, ...]:
     benchmark = dict(eval_report["benchmark"])
+    return (
+        -int(benchmark["sum_timeout_order_count"]),
+        int(_count_done_reason(benchmark, reason="all_orders_cleared")),
+    )
+
+
+def _build_eval_selection_key(eval_report: Mapping[str, Any]) -> tuple[Any, ...]:
     stochastic = dict(eval_report["stochastic"])
     stochastic_high = dict(stochastic["high"])
     stochastic_medium = dict(stochastic["medium"])
     return (
-        -int(benchmark["sum_timeout_order_count"]),
-        int(_count_done_reason(benchmark, reason="all_orders_cleared")),
+        *_build_benchmark_guardrail_key(eval_report),
         -int(stochastic_high["sum_timeout_order_count"]),
         float(stochastic_high["mean_total_reward"]),
-        float(stochastic_medium["mean_total_reward"]),
-        -float(benchmark["mean_episode_end_t_sec"]),
-        float(benchmark["mean_total_reward"]),
         -int(stochastic_high.get("sum_fallback_count", 0)),
-    )
-
-
-def _build_benchmark_improvement_key(eval_report: Mapping[str, Any]) -> tuple[Any, ...]:
-    benchmark = dict(eval_report["benchmark"])
-    return (
-        -int(benchmark["sum_timeout_order_count"]),
-        int(_count_done_reason(benchmark, reason="all_orders_cleared")),
-        -float(benchmark["mean_episode_end_t_sec"]),
-        float(benchmark["mean_total_reward"]),
+        float(stochastic_medium["mean_total_reward"]),
+        -int(stochastic_medium.get("sum_timeout_order_count", 0)),
+        -int(stochastic_medium.get("sum_fallback_count", 0)),
     )
 
 
@@ -1310,15 +1536,12 @@ def _should_stop_early(
     *,
     train_cfg: _TrainingConfig,
     eval_count: int,
-    benchmark_no_improve_evals: int,
     stochastic_high_no_improve_evals: int,
     recent_eval_value_losses: Sequence[float],
 ) -> bool:
     if not train_cfg.early_stop_enabled:
         return False
     if eval_count < train_cfg.early_stop_min_evals:
-        return False
-    if benchmark_no_improve_evals < train_cfg.early_stop_benchmark_patience:
         return False
     if stochastic_high_no_improve_evals < train_cfg.early_stop_stochastic_high_patience:
         return False
@@ -1328,6 +1551,29 @@ def _should_stop_early(
         recent_eval_value_losses=recent_eval_value_losses,
         min_delta=train_cfg.early_stop_value_loss_min_delta,
     )
+
+
+def _compute_value_loss_masked(
+    *,
+    values: Any,
+    returns: Any,
+    valid_mask: Any,
+    loss_type: str,
+    huber_delta: float,
+) -> Any:
+    normalized_loss_type = str(loss_type).strip().lower()
+    diff = values - returns
+    if normalized_loss_type == "mse":
+        per_timestep_loss = 0.5 * (diff ** 2)
+    elif normalized_loss_type == "huber":
+        abs_diff = torch.abs(diff)
+        delta = float(huber_delta)
+        quadratic = 0.5 * (diff ** 2)
+        linear = delta * (abs_diff - 0.5 * delta)
+        per_timestep_loss = torch.where(abs_diff <= delta, quadratic, linear)
+    else:
+        raise ValueError(f"未知 value_loss_type: {loss_type}")
+    return _masked_mean_tensor(per_timestep_loss, valid_mask)
 
 
 def _capture_rng_state() -> dict[str, Any]:
@@ -1567,9 +1813,12 @@ def _ppo_update(
                 torch.min(unclipped, clipped),
                 valid_mask_flat,
             )
-            value_loss = 0.5 * _masked_mean_tensor(
-                (values_flat - returns) ** 2,
-                valid_mask_flat,
+            value_loss = _compute_value_loss_masked(
+                values=values_flat,
+                returns=returns,
+                valid_mask=valid_mask_flat,
+                loss_type=train_cfg.value_loss_type,
+                huber_delta=train_cfg.value_huber_delta,
             )
             entropy_loss = _masked_mean_tensor(entropy, valid_mask_flat)
             approx_kl_t = _compute_masked_approx_kl(
@@ -2790,6 +3039,8 @@ def _load_training_config(config_path: Path) -> _TrainingConfig:
         clip_coef=float(training["clip_coef"]),
         entropy_coef=float(training["entropy_coef"]),
         value_loss_coef=float(training["value_loss_coef"]),
+        value_loss_type=str(training.get("value_loss_type", "mse")),
+        value_huber_delta=float(training.get("value_huber_delta", 1.0)),
         max_grad_norm=float(training["max_grad_norm"]),
         normalize_advantage=bool(training["normalize_advantage"]),
         target_kl=float(training["target_kl"]),
@@ -2801,9 +3052,6 @@ def _load_training_config(config_path: Path) -> _TrainingConfig:
         stochastic_eval_seeds=int(training["stochastic_eval_seeds"]),
         early_stop_enabled=bool(training.get("early_stop_enabled", False)),
         early_stop_min_evals=int(training.get("early_stop_min_evals", 1)),
-        early_stop_benchmark_patience=int(
-            training.get("early_stop_benchmark_patience", 3)
-        ),
         early_stop_stochastic_high_patience=int(
             training.get("early_stop_stochastic_high_patience", 5)
         ),
@@ -2844,14 +3092,17 @@ def _validate_training_config(cfg: _TrainingConfig) -> None:
         raise ValueError("stochastic_eval_seeds 必须为正数")
     if cfg.early_stop_min_evals <= 0:
         raise ValueError("early_stop_min_evals 必须为正数")
-    if cfg.early_stop_benchmark_patience <= 0:
-        raise ValueError("early_stop_benchmark_patience 必须为正数")
     if cfg.early_stop_stochastic_high_patience <= 0:
         raise ValueError("early_stop_stochastic_high_patience 必须为正数")
     if cfg.early_stop_value_loss_window <= 0:
         raise ValueError("early_stop_value_loss_window 必须为正数")
     if cfg.early_stop_value_loss_min_delta < 0.0:
         raise ValueError("early_stop_value_loss_min_delta 不能为负数")
+    normalized_value_loss_type = str(cfg.value_loss_type).strip().lower()
+    if normalized_value_loss_type not in {"mse", "huber"}:
+        raise ValueError("value_loss_type 仅支持 mse 或 huber")
+    if cfg.value_huber_delta <= 0.0:
+        raise ValueError("value_huber_delta 必须为正数")
     expected_target = cfg.sequence_minibatch_size * cfg.train_len
     if expected_target != cfg.target_minibatch_timesteps:
         raise ValueError(
@@ -2865,7 +3116,7 @@ def _load_eval_config(config_path: Path) -> _EvalConfig:
     raw = _load_yaml(config_path)
     data = raw["data"]
     stochastic_eval = data["stochastic_eval_arrival_rate_per_min"]
-    return _EvalConfig(
+    cfg = _EvalConfig(
         benchmark_seed=int(data["benchmark_eval_seed"]),
         stochastic_seed_base=int(data["stochastic_eval_seed_base"]),
         stochastic_arrival_rates=(
@@ -2873,7 +3124,17 @@ def _load_eval_config(config_path: Path) -> _EvalConfig:
             ("medium", float(stochastic_eval["medium"])),
             ("high", float(stochastic_eval["high"])),
         ),
+        c_sensitive_enabled=bool(data.get("c_sensitive_eval_enabled", True)),
+        c_sensitive_seed=int(
+            data.get("c_sensitive_eval_seed", data["benchmark_eval_seed"])
+        ),
+        c_sensitive_min_legal_mode_c_recovery_nodes=int(
+            data.get("c_sensitive_eval_min_legal_mode_c_recovery_nodes", 1)
+        ),
     )
+    if cfg.c_sensitive_min_legal_mode_c_recovery_nodes <= 0:
+        raise ValueError("c_sensitive_eval_min_legal_mode_c_recovery_nodes 必须为正数")
+    return cfg
 
 
 def _load_policy_config(config_path: Path) -> _PolicyConfig:
