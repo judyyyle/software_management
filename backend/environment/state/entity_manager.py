@@ -67,7 +67,10 @@ class EntityManager:
         self._metadata: dict[str, dict]       = {}
 
         runtime_cfg = load_solver_energy_params()
+        self.TRUCK_SERVICE_TIME_ORDER = runtime_cfg.truck_service_time_order_s
         self.DRONE_SERVICE_TIME_ORDER = runtime_cfg.drone_service_time_order_s
+        self.TRUCK_DRONE_LAUNCH_TIME = runtime_cfg.truck_drone_launch_time_s
+        self.TRUCK_DRONE_RECOVER_TIME = runtime_cfg.truck_drone_recover_time_s
         # 停靠触发容差：recovery/station 采用更宽容阈值，降低路网几何误差导致的漏触发。
         self.STOP_PROXIMITY_BASE_M = 15.0
         self.STOP_PROXIMITY_SPEED_FACTOR = 1.5
@@ -574,14 +577,14 @@ class EntityManager:
         truck._planned_route_cursor = cursor
 
     def _get_truck_wait_stop(self, truck: Truck, current_time: float) -> Optional[dict]:
-        """返回当前时刻卡车应等待的节点（customer/recovery），否则返回 None。"""
+        """返回当前时刻卡车应等待的节点（customer/recovery/station），否则返回 None。"""
         planned_stops = getattr(truck, "_planned_route_stops", None)
         if not planned_stops:
             return None
 
         for stop in planned_stops:
             node_type = stop.get("node_type", "")
-            if node_type not in {"customer", "recovery"}:
+            if node_type not in {"customer", "recovery", "station"}:
                 continue
             arrival = float(stop.get("arrival_time", float("inf")))
             departure = float(stop.get("departure_time", arrival))

@@ -163,7 +163,12 @@ class TestTrainingEnvAdapterPhase5b(unittest.TestCase):
                 node_id=recover_node_id,
                 arrival_time=max(0.0, deliver_leg.arrival_time - 1.0),
                 departure_time=deliver_leg.arrival_time + 120.0,
-            )
+            ),
+            BackboneVisit(
+                node_id=env._require_depot().depot_id,
+                arrival_time=deliver_leg.arrival_time + 600.0,
+                departure_time=deliver_leg.arrival_time + 600.0 + 1e-6,
+            ),
         ]
 
         reward = env._advance_to_event(deliver_leg.arrival_time)
@@ -171,10 +176,58 @@ class TestTrainingEnvAdapterPhase5b(unittest.TestCase):
         self.assertEqual(reward, env._cfg.R_delivery_bonus)
         self.assertEqual(
             env._drone_state[drone_id],
+            TrainingDroneState.DELIVERY_SERVICE,
+        )
+        self.assertIn(drone_id, env._delivery_service_legs)
+
+        service_finish_time = env._delivery_service_legs[drone_id].finish_time
+        reward = env._advance_to_event(service_finish_time)
+
+        self.assertEqual(reward, 0.0)
+        self.assertEqual(
+            env._drone_state[drone_id],
             TrainingDroneState.FALLBACK_RECOVERY,
         )
         self.assertIn(drone_id, env._fallback_leg)
         self.assertEqual(env._flight_legs[drone_id].kind, "fallback_recovery")
+
+    def test_delivery_service_finishes_before_mode_b_return_leg_is_scheduled(self) -> None:
+        env, drone_id = self._reset_controlled_env()
+        order = self._inject_order(env, drone_id=drone_id, order_id="ORDER-P5B-SVC-01")
+        env._enqueue_decision(drone_id, "test_idle", None)
+
+        trigger = env._decision_queue.pop(0)
+        env._apply_dispatch_action(
+            trigger,
+            DispatchAction(
+                order_id=order.order_id,
+                mode=PolicyMode.B,
+            ),
+        )
+        deliver_leg = env._flight_legs[drone_id]
+
+        env._advance_to_event(deliver_leg.arrival_time)
+
+        self.assertEqual(
+            env._drone_state[drone_id],
+            TrainingDroneState.DELIVERY_SERVICE,
+        )
+        self.assertIn(drone_id, env._delivery_service_legs)
+        self.assertNotIn(drone_id, env._flight_legs)
+
+        service_finish_time = env._delivery_service_legs[drone_id].finish_time
+        env._advance_to_event(service_finish_time)
+
+        self.assertEqual(
+            env._drone_state[drone_id],
+            TrainingDroneState.RETURN_TO_DEPOT
+            if env._flight_legs[drone_id].target_node_type == "depot"
+            else TrainingDroneState.RETURN_TO_STATION,
+        )
+        self.assertGreaterEqual(
+            env._flight_legs[drone_id].start_time,
+            service_finish_time - 1e-6,
+        )
 
     def test_fallback_reward_accumulates_during_recovery(self) -> None:
         env, drone_id = self._reset_controlled_env()

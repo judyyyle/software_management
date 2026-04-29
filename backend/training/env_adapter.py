@@ -75,6 +75,7 @@ class TrainingDroneState(StrEnum):
     # 训练侧状态覆盖层；不修改 core 层 DroneStatus。
     IDLE = "idle"
     FLYING_TO_DELIVER = "flying_to_deliver"
+    DELIVERY_SERVICE = "delivery_service"
     DELIVERED = "delivered"
     RETURN_TO_RENDEZVOUS = "return_to_rendezvous"
     WAITING_FOR_TRUCK = "waiting_for_truck"
@@ -222,6 +223,15 @@ class FlightLeg:
 
 
 @dataclass(frozen=True)
+class DeliveryServiceLeg:
+    """无人机送达客户后在客户点执行的显式服务停留。"""
+    order_id: str
+    start_time: float
+    finish_time: float
+    service_pos: Position3D
+
+
+@dataclass(frozen=True)
 class DispatchCommit:
     """记录某架无人机当前订单的 dispatch 承诺。"""
     order_id: str
@@ -328,6 +338,7 @@ class TrainingEnvAdapter:
         # idle 路径仍在 step(WAIT) 入口一次性结算；riding_with_truck 路径按真实 dt 累计 T_idle。
         self._active_wait_resume: dict[DroneId, TrainingDroneState] = {}
         self._flight_legs: dict[DroneId, FlightLeg] = {}
+        self._delivery_service_legs: dict[DroneId, DeliveryServiceLeg] = {}
         self._fallback_leg: dict[DroneId, FallbackLeg] = {}
         # 记录当前订单对应的 dispatch 承诺，供 delivered 后执行层继续转移。
         self._dispatch_commit: dict[DroneId, DispatchCommit] = {}
@@ -416,6 +427,7 @@ class TrainingEnvAdapter:
         self._t_now = 0.0
         self._planned_route_stop_i = 1
         self._flight_legs.clear()
+        self._delivery_service_legs.clear()
         self._fallback_leg.clear()
         self._dispatch_commit.clear()
         self._reservations.clear()
@@ -948,7 +960,7 @@ class TrainingEnvAdapter:
         return tuple(
             visit
             for visit in self._full_backbone_cache
-            if visit.departure_time > t_now
+            if visit.arrival_time > t_now + _TIME_EPS
         )
 
     def _dedup_backbone_visits(
@@ -1092,6 +1104,10 @@ class TrainingEnvAdapter:
             TrainingDroneState.AIRBORNE_ENERGY_FAILURE,
         }:
             return 0.0
+        if state == TrainingDroneState.DELIVERY_SERVICE:
+            service_leg = self._delivery_service_legs.get(drone_id)
+            if service_leg is not None:
+                return max(0.0, float(service_leg.finish_time) - t_now)
         if drone_id in self._flight_legs:
             return max(0.0, float(self._flight_legs[drone_id].arrival_time) - t_now)
         if state == TrainingDroneState.WAITING_FOR_TRUCK:
@@ -1231,13 +1247,17 @@ class TrainingEnvAdapter:
                 order=order,
                 recover_node_id=action.recover_node_id,
             )
-        # Phase 5 当前仍直接从当前物理位置起飞送货，不建模单独的 pickup / launch service 段。
+        launch_time = self._resolve_dispatch_launch_time(
+            drone_id=drone.drone_id,
+            trigger=trigger,
+        )
         self._schedule_flight_leg(
             drone_id=drone.drone_id,
             kind="deliver",
             target_pos=_clone_position(order.delivery_loc),
             payload=float(order.payload_weight),
             target_order_id=order.order_id,
+            start_time=launch_time,
         )
         self._drone_state[drone.drone_id] = TrainingDroneState.FLYING_TO_DELIVER
 
@@ -1338,6 +1358,7 @@ class TrainingEnvAdapter:
             )
             if drone_id not in failed_drones
         ]
+        delivery_service_ready = self._collect_delivery_service_events(t_next)
         truck_charge_ready = [
             drone_id
             for drone_id, done_time in list(self._truck_charge_until.items())
@@ -1368,6 +1389,8 @@ class TrainingEnvAdapter:
             self._agent_cost_accum[drone_id] = (
                 self._agent_cost_accum.get(drone_id, 0.0) + bonus
             )
+        for drone_id, service_leg in delivery_service_ready:
+            self._process_delivery_service_event(drone_id, service_leg)
         for stop in truck_stops:
             if stop.node_type == "customer" and stop.order_id:
                 if stop.order_id in self._background_mode_a_pending:
@@ -1507,34 +1530,80 @@ class TrainingEnvAdapter:
         order_mgr.completed_orders.append(order)
         self._episode_delivery_count += 1
         self._flight_legs.pop(drone_id, None)
+        self._drone_state[drone_id] = TrainingDroneState.DELIVERY_SERVICE
+
+        service_duration = float(self._scene_solver_params().drone_service_time_order_s)
+        if service_duration <= _TIME_EPS:
+            self._process_delivery_service_event(
+                drone_id,
+                DeliveryServiceLeg(
+                    order_id=commit.order_id,
+                    start_time=float(leg.arrival_time),
+                    finish_time=float(leg.arrival_time),
+                    service_pos=_clone_position(leg.target_pos),
+                ),
+            )
+            return self._cfg.R_delivery_bonus
+
+        self._delivery_service_legs[drone_id] = DeliveryServiceLeg(
+            order_id=commit.order_id,
+            start_time=float(leg.arrival_time),
+            finish_time=float(leg.arrival_time + service_duration),
+            service_pos=_clone_position(leg.target_pos),
+        )
+
+        return self._cfg.R_delivery_bonus
+
+    def _process_delivery_service_event(
+        self,
+        drone_id: str,
+        service_leg: DeliveryServiceLeg,
+    ) -> None:
+        """处理客户点 delivery service 结束后的后续转移。"""
+        self._delivery_service_legs.pop(drone_id, None)
+        drone = self._require_entity_manager().drones[drone_id]
+        commit = self._dispatch_commit[drone_id]
+        drone.current_loc = _clone_position(service_leg.service_pos)
         self._drone_state[drone_id] = TrainingDroneState.DELIVERED
 
         if commit.mode == PolicyMode.B:
             target = self._select_return_host_mode_b(
                 drone_id,
-                current_time=leg.arrival_time,
+                current_time=service_leg.finish_time,
             )
             if target is None:
-                return self._mark_hard_failure(drone_id)
-            self._schedule_return_to_host(drone_id, target)
-        else:
-            selected_node = commit.selected_recover_node
-            if selected_node:
-                is_valid, _checks = self._revalidate_mode_c_recover_node(
-                    drone_id=drone_id,
-                    node_id=selected_node,
-                    t_now=leg.arrival_time,
-                )
-            else:
-                is_valid = False
-            if is_valid:
-                self._schedule_return_to_rendezvous(drone_id, selected_node)
-            else:
-                self._release_reservation(drone_id)
-                if not self._enter_fallback_recovery(drone_id):
-                    return self._mark_hard_failure(drone_id)
+                self._mark_hard_failure(drone_id)
+                return
+            self._schedule_return_to_host(
+                drone_id,
+                target,
+                start_time=service_leg.finish_time,
+            )
+            return
 
-        return self._cfg.R_delivery_bonus
+        selected_node = commit.selected_recover_node
+        if selected_node:
+            is_valid, _checks = self._revalidate_mode_c_recover_node(
+                drone_id=drone_id,
+                node_id=selected_node,
+                t_now=service_leg.finish_time,
+            )
+        else:
+            is_valid = False
+        if is_valid:
+            self._schedule_return_to_rendezvous(
+                drone_id,
+                selected_node,
+                start_time=service_leg.finish_time,
+            )
+            return
+
+        self._release_reservation(drone_id)
+        if not self._enter_fallback_recovery(
+            drone_id,
+            start_time=service_leg.finish_time,
+        ):
+            self._mark_hard_failure(drone_id)
 
     def _process_non_delivery_arrival(self, drone_id: str, leg: FlightLeg) -> None:
         """处理除送达以外的飞行到达事件。"""
@@ -1602,6 +1671,7 @@ class TrainingEnvAdapter:
         kind: str,
         target_pos: Position3D,
         payload: float,
+        start_time: float | None = None,
         target_order_id: str | None = None,
         target_node_id: str | None = None,
         target_node_type: str | None = None,
@@ -1609,6 +1679,7 @@ class TrainingEnvAdapter:
         """为 UAV 写入一段新的飞行账本。"""
         entity_mgr = self._require_entity_manager()
         drone = entity_mgr.drones[drone_id]
+        effective_start_time = float(self._t_now if start_time is None else start_time)
         start_pos = _clone_position(drone.current_loc)
         energy_cost = self._estimate_energy_needed(
             drone=drone,
@@ -1623,8 +1694,8 @@ class TrainingEnvAdapter:
         )
         self._flight_legs[drone_id] = FlightLeg(
             kind=kind,
-            start_time=float(self._t_now),
-            arrival_time=float(self._t_now + flight_time),
+            start_time=effective_start_time,
+            arrival_time=float(effective_start_time + flight_time),
             start_pos=start_pos,
             target_pos=_clone_position(target_pos),
             order_id=target_order_id,
@@ -1633,9 +1704,16 @@ class TrainingEnvAdapter:
             energy_cost_j=energy_cost,
         )
 
-    def _schedule_return_to_host(self, drone_id: str, host: ChargingHost) -> None:
+    def _schedule_return_to_host(
+        self,
+        drone_id: str,
+        host: ChargingHost,
+        *,
+        start_time: float | None = None,
+    ) -> None:
         """为 mode B 或其他固定宿主返程写入飞行段。"""
         drone = self._require_entity_manager().drones[drone_id]
+        effective_start_time = float(self._t_now if start_time is None else start_time)
         if isinstance(host, Depot):
             kind = "return_to_depot"
             self._drone_state[drone_id] = TrainingDroneState.RETURN_TO_DEPOT
@@ -1652,26 +1730,40 @@ class TrainingEnvAdapter:
         self._schedule_flight_leg(
             drone_id=drone_id,
             kind=kind,
-            target_pos=_clone_position(host.get_location(self._t_now)),
+            target_pos=_clone_position(host.get_location(effective_start_time)),
             payload=0.0,
+            start_time=effective_start_time,
             target_node_id=node_id,
             target_node_type=node_type,
         )
 
-    def _schedule_return_to_rendezvous(self, drone_id: str, node_id: str) -> None:
+    def _schedule_return_to_rendezvous(
+        self,
+        drone_id: str,
+        node_id: str,
+        *,
+        start_time: float | None = None,
+    ) -> None:
         """为 mode C 的 rendezvous 返程写入飞行段。"""
         host = self._resolve_fixed_node(node_id)
+        effective_start_time = float(self._t_now if start_time is None else start_time)
         self._drone_state[drone_id] = TrainingDroneState.RETURN_TO_RENDEZVOUS
         self._schedule_flight_leg(
             drone_id=drone_id,
             kind="return_to_rendezvous",
-            target_pos=_clone_position(host.get_location(self._t_now)),
+            target_pos=_clone_position(host.get_location(effective_start_time)),
             payload=0.0,
+            start_time=effective_start_time,
             target_node_id=node_id,
             target_node_type=_node_type_of_host(host),
         )
 
-    def _enter_fallback_recovery(self, drone_id: str) -> bool:
+    def _enter_fallback_recovery(
+        self,
+        drone_id: str,
+        *,
+        start_time: float | None = None,
+    ) -> bool:
         """让 UAV 进入 fallback_recovery，并建立对应账本。
 
         返回值表示是否找到了可落地的兜底宿主。
@@ -1680,9 +1772,10 @@ class TrainingEnvAdapter:
         if host is None:
             return False
 
+        effective_start_time = float(self._t_now if start_time is None else start_time)
         drone = self._require_entity_manager().drones[drone_id]
-        target_pos = _clone_position(host.get_location(self._t_now))
-        arrival_time = self._t_now + self._estimate_flight_time(
+        target_pos = _clone_position(host.get_location(effective_start_time))
+        arrival_time = effective_start_time + self._estimate_flight_time(
             drone=drone,
             from_pos=drone.current_loc,
             to_pos=target_pos,
@@ -1694,12 +1787,13 @@ class TrainingEnvAdapter:
         )
         self._episode_fallback_count += 1
         self._drone_state[drone_id] = TrainingDroneState.FALLBACK_RECOVERY
-        self._fallback_event_times.append(float(self._t_now))
+        self._fallback_event_times.append(effective_start_time)
         self._schedule_flight_leg(
             drone_id=drone_id,
             kind="fallback_recovery",
             target_pos=target_pos,
             payload=0.0,
+            start_time=effective_start_time,
             target_node_id=_host_id(host),
             target_node_type=_node_type_of_host(host),
         )
@@ -1782,7 +1876,7 @@ class TrainingEnvAdapter:
                 TrainingDroneState.WAITING_FOR_TRUCK,
                 TrainingDroneState.DELIVERED,
             }:
-                if not self._enter_fallback_recovery(drone_id):
+                if not self._enter_fallback_recovery(drone_id, start_time=t_now):
                     hard_penalty = self._mark_hard_failure(drone_id)
                     reward += hard_penalty
                     self._agent_cost_accum[drone_id] = (
@@ -1896,11 +1990,12 @@ class TrainingEnvAdapter:
             if drone.carrying_order_id == order_id:
                 drone.release_order()
             self._flight_legs.pop(drone_id, None)
+            self._delivery_service_legs.pop(drone_id, None)
             self._release_reservation(drone_id)
             self._dispatch_commit.pop(drone_id, None)
             if self._drone_state.get(drone_id) != TrainingDroneState.AIRBORNE_ENERGY_FAILURE:
                 self._drone_state[drone_id] = TrainingDroneState.DELIVERED
-                if not self._enter_fallback_recovery(drone_id):
+                if not self._enter_fallback_recovery(drone_id, start_time=t_now):
                     return -self._cfg.hard_overdue_penalty_sec + self._mark_hard_failure(drone_id)
 
         return -self._cfg.hard_overdue_penalty_sec
@@ -2034,10 +2129,17 @@ class TrainingEnvAdapter:
 
     def _estimate_delivery_arrival_time(self, drone: Drone, order: Order) -> float:
         """估算当前时刻派送该订单的送达绝对时刻。"""
-        return self._t_now + self._estimate_flight_time(
+        return self._estimate_delivery_launch_time(drone.drone_id) + self._estimate_flight_time(
             drone=drone,
             from_pos=drone.current_loc,
             to_pos=order.delivery_loc,
+        )
+
+    def _estimate_delivery_finish_time(self, drone: Drone, order: Order) -> float:
+        """估算当前时刻派送该订单后完成 customer service 的绝对时刻。"""
+        return (
+            self._estimate_delivery_arrival_time(drone, order)
+            + float(self._scene_solver_params().drone_service_time_order_s)
         )
 
     def _estimate_energy_after_delivery(self, drone: Drone, order: Order) -> float:
@@ -2057,7 +2159,7 @@ class TrainingEnvAdapter:
         coarse_plan: CoarsePlanView,
     ) -> tuple[str, ...]:
         """返回当前订单在 5b 语义下合法的 mode C 回收节点。"""
-        t_deliver = self._estimate_delivery_arrival_time(drone, order)
+        t_deliver_finish = self._estimate_delivery_finish_time(drone, order)
         energy_after_delivery = self._estimate_energy_after_delivery(drone, order)
         if energy_after_delivery <= 0.0:
             return ()
@@ -2068,7 +2170,7 @@ class TrainingEnvAdapter:
                 drone=drone,
                 deliver_pos=order.delivery_loc,
                 recover_node_id=recover_node_id,
-                t_deliver=t_deliver,
+                t_deliver_finish=t_deliver_finish,
                 energy_after_delivery=energy_after_delivery,
                 coarse_plan=coarse_plan,
             ):
@@ -2081,18 +2183,18 @@ class TrainingEnvAdapter:
         drone: Drone,
         deliver_pos: Position3D,
         recover_node_id: str,
-        t_deliver: float,
+        t_deliver_finish: float,
         energy_after_delivery: float,
         coarse_plan: CoarsePlanView,
     ) -> bool:
         """按 5b 的时序与能量口径判定单个 mode C 回收点是否合法。"""
         t_arrive_truck = coarse_plan.truck_eta_map.get(recover_node_id)
-        if t_arrive_truck is None or t_arrive_truck <= t_deliver + _TIME_EPS:
+        if t_arrive_truck is None or t_arrive_truck <= t_deliver_finish + _TIME_EPS:
             return False
 
         host = self._resolve_fixed_node(recover_node_id)
-        recover_pos = host.get_location(t_deliver)
-        t_arrive_uav = t_deliver + self._estimate_flight_time(
+        recover_pos = host.get_location(t_deliver_finish)
+        t_arrive_uav = t_deliver_finish + self._estimate_flight_time(
             drone=drone,
             from_pos=deliver_pos,
             to_pos=recover_pos,
@@ -2123,7 +2225,7 @@ class TrainingEnvAdapter:
                 drone.drone_id,
                 from_pos=order.delivery_loc,
                 battery_current=energy_after_delivery,
-                current_time=self._estimate_delivery_arrival_time(drone, order),
+                current_time=self._estimate_delivery_finish_time(drone, order),
             )
             is not None
         )
@@ -2409,7 +2511,7 @@ class TrainingEnvAdapter:
         """把 truck / UAV 的物理位置同步到给定时刻。"""
         entity_mgr = self._require_entity_manager()
         truck = self._require_truck()
-        truck.current_loc = _clone_position(truck.get_location(t_now))
+        truck.current_loc = self._truck_position_at_time(t_now)
 
         for drone_id, state in self._drone_state.items():
             drone = entity_mgr.drones[drone_id]
@@ -2445,6 +2547,9 @@ class TrainingEnvAdapter:
 
         for leg in self._flight_legs.values():
             candidates.append(leg.arrival_time)
+
+        for service_leg in self._delivery_service_legs.values():
+            candidates.append(service_leg.finish_time)
 
         failure_time = self._next_airborne_failure_time()
         if math.isfinite(failure_time):
@@ -2531,6 +2636,19 @@ class TrainingEnvAdapter:
             stops.append(stop)
             self._planned_route_stop_i += 1
         return stops
+
+    def _collect_delivery_service_events(
+        self,
+        t_now: float,
+    ) -> list[tuple[str, DeliveryServiceLeg]]:
+        """收集在 `t_now` 前已完成的 delivery service 事件。"""
+        events: list[tuple[str, DeliveryServiceLeg]] = []
+        for drone_id, service_leg in list(self._delivery_service_legs.items()):
+            if service_leg.finish_time > t_now + _TIME_EPS:
+                continue
+            events.append((drone_id, service_leg))
+        events.sort(key=lambda item: (item[1].finish_time, item[0]))
+        return events
 
     # ---------------------------------------------------------------------
     # Charging / queue helpers
@@ -2758,8 +2876,12 @@ class TrainingEnvAdapter:
             return
 
         seq = self._planned_route_stops[-1].seq
-        t_cursor = last_stop.arrival_time
+        t_cursor = last_stop.departure_time
         patrol_k = min(len(stations), self._cfg.patrol_stations_per_loop)
+        station_hold_time = max(
+            float(self._scene_solver_params().truck_drone_launch_time_s),
+            float(self._scene_solver_params().truck_drone_recover_time_s),
+        )
 
         # 一旦决定进入 poisson 巡站补全路径，就持续追加到 upper horizon，
         # 避免 episode 尾段再次出现"未来 backbone 耗尽"的契约破口。
@@ -2786,6 +2908,7 @@ class TrainingEnvAdapter:
                 travel_time = current_pos.distance_2d(station.location) / max(_TIME_EPS, truck.speed)
                 t_cursor += travel_time
                 seq += 1
+                departure_time = t_cursor + station_hold_time
                 planned_stop = PlannedStop(
                     seq=seq,
                     node_type="station",
@@ -2793,17 +2916,18 @@ class TrainingEnvAdapter:
                     position=_clone_position(station.location),
                     order_id=None,
                     arrival_time=t_cursor,
-                    departure_time=t_cursor,
+                    departure_time=departure_time,
                 )
                 self._planned_route_stops.append(planned_stop)
                 self._full_backbone_cache.append(
                     BackboneVisit(
                         node_id=station.station_id,
                         arrival_time=t_cursor,
-                        departure_time=t_cursor + _BACKBONE_DEPARTURE_EPS,
+                        departure_time=departure_time + _BACKBONE_DEPARTURE_EPS,
                     )
                 )
                 current_pos = station.location
+                t_cursor = departure_time
 
             travel_time_back = current_pos.distance_2d(depot.location) / max(_TIME_EPS, truck.speed)
             t_cursor += travel_time_back
@@ -2859,6 +2983,7 @@ class TrainingEnvAdapter:
         truck = self._require_truck()
 
         self._flight_legs.pop(drone_id, None)
+        self._delivery_service_legs.pop(drone_id, None)
         self._fallback_leg.pop(drone_id, None)
         self._truck_charge_until.pop(drone_id, None)
         self._active_wait_resume.pop(drone_id, None)
@@ -2985,6 +3110,57 @@ class TrainingEnvAdapter:
         from config.loader import load_solver_energy_params
 
         return load_solver_energy_params()
+
+    def _resolve_dispatch_launch_time(
+        self,
+        *,
+        drone_id: str,
+        trigger: DecisionTrigger,
+    ) -> float:
+        """返回本次 dispatch 的真实起飞时刻。"""
+        if (
+            trigger.trigger_type == "truck_station_arrival"
+            and trigger.trigger_station_id
+            and self._drone_state.get(drone_id) == TrainingDroneState.RIDING_WITH_TRUCK
+        ):
+            return (
+                self._t_now
+                + float(self._scene_solver_params().truck_drone_launch_time_s)
+            )
+        return float(self._t_now)
+
+    def _estimate_delivery_launch_time(self, drone_id: str) -> float:
+        """估算当前状态下若立即 dispatch，其真实起飞时刻。"""
+        if self._drone_state.get(drone_id) == TrainingDroneState.RIDING_WITH_TRUCK:
+            return (
+                self._t_now
+                + float(self._scene_solver_params().truck_drone_launch_time_s)
+            )
+        return float(self._t_now)
+
+    def _truck_position_at_time(self, t_now: float) -> Position3D:
+        """按 planned stop 的 arrival/departure 窗口推演 truck 位置。"""
+        if not self._planned_route_stops:
+            return _clone_position(self._require_truck().current_loc)
+
+        first_stop = self._planned_route_stops[0]
+        if t_now <= first_stop.departure_time + _TIME_EPS:
+            return _clone_position(first_stop.position)
+
+        prev_stop = first_stop
+        for stop in self._planned_route_stops[1:]:
+            if t_now < stop.arrival_time - _TIME_EPS:
+                segment_dt = max(_TIME_EPS, stop.arrival_time - prev_stop.departure_time)
+                ratio = max(
+                    0.0,
+                    min(1.0, (t_now - prev_stop.departure_time) / segment_dt),
+                )
+                return prev_stop.position.interpolate(stop.position, ratio)
+            if t_now <= stop.departure_time + _TIME_EPS:
+                return _clone_position(stop.position)
+            prev_stop = stop
+
+        return _clone_position(self._planned_route_stops[-1].position)
 
     def _resolve_heavy_payload_capacity(self) -> float:
         """读取 heavy drone 的载重上限，供 coarse plan 做 mode A 边界判断。"""

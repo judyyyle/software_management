@@ -23,6 +23,8 @@ from .model import PolicyForwardOutput, SharedPPOActorCritic
 from .rollout_buffer import RolloutTransition, compute_gae
 from .train_cmrappo import (
     _advance_until_rollout_bootstraps_resolved_after_collection,
+    _build_benchmark_improvement_key,
+    _build_eval_selection_key,
     _build_sequence_minibatch,
     _compute_masked_approx_kl,
     _extract_attributed_step_reward_parts,
@@ -30,9 +32,12 @@ from .train_cmrappo import (
     _finalize_pending_transition_for_next_decision,
     _flush_terminal_pending_transitions,
     _insert_finalized_transition_in_order,
+    _latest_value_loss_shows_meaningful_decline,
     _materialize_recurrent_sequences,
     _ppo_update,
     _run_periodic_evaluation,
+    _should_stop_early,
+    _build_stochastic_high_improvement_key,
     _TrainingConfig,
     _resolve_device,
     _resolve_rollout_prefix_bootstrap_values,
@@ -201,6 +206,12 @@ class TestPhase7ModelRuntime(unittest.TestCase):
             eval_interval_updates=2,
             benchmark_eval_episodes=2,
             stochastic_eval_seeds=3,
+            early_stop_enabled=True,
+            early_stop_min_evals=3,
+            early_stop_benchmark_patience=2,
+            early_stop_stochastic_high_patience=3,
+            early_stop_value_loss_window=3,
+            early_stop_value_loss_min_delta=0.0,
             allowed_train_order_source_mode=("poisson",),
         )
 
@@ -1665,6 +1676,88 @@ class TestPhase7ModelRuntime(unittest.TestCase):
         self.assertEqual(compact["mean_total_reward"], 1.0)
         self.assertNotIn("episodes", compact)
 
+    def test_eval_selection_key_prioritizes_timeout_then_reward(self) -> None:
+        baseline = {
+            "benchmark": {
+                "sum_timeout_order_count": 0,
+                "mean_episode_end_t_sec": 900.0,
+                "mean_total_reward": -80.0,
+                "episodes": [{"done_reason": "all_orders_cleared"}],
+            },
+            "stochastic": {
+                "medium": {"mean_total_reward": 300.0},
+                "high": {
+                    "sum_timeout_order_count": 4,
+                    "mean_total_reward": 500.0,
+                    "sum_fallback_count": 0,
+                },
+            },
+        }
+        improved = {
+            "benchmark": {
+                "sum_timeout_order_count": 0,
+                "mean_episode_end_t_sec": 850.0,
+                "mean_total_reward": -70.0,
+                "episodes": [{"done_reason": "all_orders_cleared"}],
+            },
+            "stochastic": {
+                "medium": {"mean_total_reward": 320.0},
+                "high": {
+                    "sum_timeout_order_count": 2,
+                    "mean_total_reward": 450.0,
+                    "sum_fallback_count": 0,
+                },
+            },
+        }
+        self.assertGreater(
+            _build_eval_selection_key(improved),
+            _build_eval_selection_key(baseline),
+        )
+        self.assertGreater(
+            _build_benchmark_improvement_key(improved),
+            _build_benchmark_improvement_key(baseline),
+        )
+        self.assertGreater(
+            _build_stochastic_high_improvement_key(improved),
+            _build_stochastic_high_improvement_key(baseline),
+        )
+
+    def test_should_stop_early_requires_patience_and_no_new_value_loss_low(self) -> None:
+        cfg = self._build_training_config()
+        self.assertFalse(
+            _should_stop_early(
+                train_cfg=cfg,
+                eval_count=2,
+                benchmark_no_improve_evals=2,
+                stochastic_high_no_improve_evals=3,
+                recent_eval_value_losses=(10.0, 9.0, 8.0),
+            )
+        )
+        self.assertFalse(
+            _should_stop_early(
+                train_cfg=cfg,
+                eval_count=3,
+                benchmark_no_improve_evals=2,
+                stochastic_high_no_improve_evals=3,
+                recent_eval_value_losses=(10.0, 9.0, 8.0),
+            )
+        )
+        self.assertTrue(
+            _should_stop_early(
+                train_cfg=cfg,
+                eval_count=3,
+                benchmark_no_improve_evals=2,
+                stochastic_high_no_improve_evals=3,
+                recent_eval_value_losses=(10.0, 9.0, 9.5),
+            )
+        )
+        self.assertTrue(
+            _latest_value_loss_shows_meaningful_decline(
+                recent_eval_value_losses=(10.0, 9.0, 8.0),
+                min_delta=0.0,
+            )
+        )
+
     def test_validate_meta_payload_before_write_accepts_consistent_runtime_payload(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir_str:
             tmp_dir = Path(tmp_dir_str)
@@ -1755,7 +1848,7 @@ class TestPhase7ModelRuntime(unittest.TestCase):
                 metrics_path=metrics_path,
             )
 
-    def test_validate_meta_payload_before_write_rejects_incomplete_training(self) -> None:
+    def test_validate_meta_payload_before_write_rejects_mismatched_effective_timesteps(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir_str:
             tmp_dir = Path(tmp_dir_str)
             policy_path = tmp_dir / "policy.pt"
@@ -1827,7 +1920,7 @@ class TestPhase7ModelRuntime(unittest.TestCase):
                 "online_lock_params": {"locked_fields": [], "tunable_fields": []},
             }
 
-            with self.assertRaises(RuntimeError):
+            with self.assertRaises(ValueError):
                 _validate_meta_payload_before_write(
                     meta_payload=meta_payload,
                     scene_ctx=scene_ctx,
@@ -1840,6 +1933,91 @@ class TestPhase7ModelRuntime(unittest.TestCase):
                     config_snapshot_path=config_snapshot_path,
                     metrics_path=metrics_path,
                 )
+
+    def test_validate_meta_payload_before_write_accepts_early_stopped_training(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir_str:
+            tmp_dir = Path(tmp_dir_str)
+            policy_path = tmp_dir / "policy.pt"
+            policy_path.write_bytes(b"policy")
+            config_snapshot_path = tmp_dir / "training_config_snapshot.yaml"
+            config_snapshot_path.write_text("training: {}\n", encoding="utf-8")
+            metrics_path = tmp_dir / "train_metrics.jsonl"
+            metrics_path.write_text("{\"update\": 1}\n", encoding="utf-8")
+
+            scene_ctx = SimpleNamespace(scene_id="scene_a", scene_bundle_dir="/tmp/scene_bundle")
+            order_source = SimpleNamespace(
+                mode=SimpleNamespace(value="poisson"),
+                seed=1,
+                benchmark=SimpleNamespace(
+                    orders_json="o",
+                    orders_json_sha256="h",
+                    static_order_count=1,
+                    dynamic_order_count=1,
+                    benchmark_use_dynamic_orders=True,
+                ),
+                training_input_meta=SimpleNamespace(
+                    poisson_arrival_rate=1.0,
+                    poisson_weight_max_kg=10.0,
+                    order_window_min_min=20,
+                    order_window_max_min=60,
+                ),
+            )
+            critic_schema = SimpleNamespace(schema_hash="schema_hash_v1")
+            train_cfg = self._build_training_config()
+            meta_payload = {
+                "model_version": "cmrappo_test",
+                "trained_at": "2026-04-27T10:20:30+00:00",
+                "scene_id": "scene_a",
+                "scene_bundle_dir": "/tmp/scene_bundle",
+                "training_input": {
+                    "order_source_mode": "poisson",
+                    "benchmark": {
+                        "orders_json": "o",
+                        "orders_json_sha256": "h",
+                        "static_order_count": 1,
+                        "dynamic_order_count": 1,
+                        "benchmark_use_dynamic_orders": True,
+                    },
+                    "poisson_arrival_rate": 1.0,
+                    "poisson_weight_max_kg": 10.0,
+                    "order_window_min_min": 20,
+                    "order_window_max_min": 60,
+                    "poisson_seed": 1,
+                    "training_seed": 2026,
+                    "total_timesteps": 96,
+                },
+                "policy": {"encoder_type": "mlp"},
+                "action_space": {"type": "factorized"},
+                "candidate": {"max_candidate_orders": 32},
+                "planner": {"coarse_replan_interval_sec": 60.0},
+                "reward": {"lambda_wait": 1.0},
+                "critic_schema": {
+                    "name": "critic_tensor_v1",
+                    "schema_version": "v1",
+                    "schema_hash": "schema_hash_v1",
+                },
+                "shared_runtime_params_snapshot": {
+                    "source_config": "backend/config/drone_params.yaml",
+                    "light_drone": {"k1": 1.0},
+                    "heavy_drone": {"k1": 2.0},
+                    "solver_energy": {"lambda_time": 1.0},
+                },
+                "env_semantic_contract": {"fifo_queue_enabled": True},
+                "online_lock_params": {"locked_fields": [], "tunable_fields": []},
+            }
+
+            _validate_meta_payload_before_write(
+                meta_payload=meta_payload,
+                scene_ctx=scene_ctx,
+                order_source=order_source,
+                critic_schema=critic_schema,
+                train_cfg=train_cfg,
+                model_version="cmrappo_test",
+                global_step=96,
+                policy_path=policy_path,
+                config_snapshot_path=config_snapshot_path,
+                metrics_path=metrics_path,
+            )
 
 
 if __name__ == "__main__":

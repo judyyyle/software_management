@@ -43,6 +43,7 @@ if str(GEO_DIR) not in sys.path:
 
 from core.entities.order import Order
 from core.entities.primitives import Position3D
+from config.loader import load_drone_params, load_solver_energy_params
 from environment.geo.exporters.sumo_net_osm import (
     build_sumo_net_artifacts,
     write_sumo_net_artifacts,
@@ -51,24 +52,22 @@ from environment.geo.osm_service import build_road_graph, find_nearest_node, sho
 from training.scene_loader import DEFAULT_CONFIG_PATH, TrainingSceneContext, load_default_scene
 
 
-CUSTOMER_SERVICE_TIME_SEC = 0.0
 DEFAULT_OUTPUT_SUBDIR = Path("sumo") / "phase4_truck_route"
 SNAP_WARN_THRESHOLD_M = 60.0
 # 绕路代价低于此值视为"顺路"，无论数量多少都直接加入路线。
 STATION_ONROUTE_DETOUR_THRESHOLD_M = 100.0
 
-_DRONE_PARAMS_PATH = BACKEND_DIR / "config" / "drone_params.yaml"
-
-
-def _load_heavy_drone_payload_capacity() -> float:
-    import yaml
-    with open(_DRONE_PARAMS_PATH, encoding="utf-8") as f:
-        params = yaml.safe_load(f)
-    return float(params["heavy_drone"]["payload_capacity"])
+_DRONE_PARAMS = load_drone_params()
+_SOLVER_ENERGY_PARAMS = load_solver_energy_params()
+TRUCK_CUSTOMER_SERVICE_TIME_SEC = float(_SOLVER_ENERGY_PARAMS.truck_service_time_order_s)
+TRUCK_STATION_HOLD_TIME_SEC = max(
+    float(_SOLVER_ENERGY_PARAMS.truck_drone_launch_time_s),
+    float(_SOLVER_ENERGY_PARAMS.truck_drone_recover_time_s),
+)
 
 
 # 超过此重量的订单无人机无法配送，由卡车直送。
-HEAVY_DRONE_PAYLOAD_CAPACITY_KG: float = _load_heavy_drone_payload_capacity()
+HEAVY_DRONE_PAYLOAD_CAPACITY_KG: float = float(_DRONE_PARAMS.heavy.payload_capacity)
 
 
 @dataclass(frozen=True)
@@ -546,7 +545,7 @@ def _materialize_execution_route(
         segment_distance = _segment_distance_with_snap(prev_stop, cur_stop, path, road_nodes)
         travel_time = segment_distance / truck_speed
         arrival_time = route_stops[idx - 1].departure_time_sec + travel_time
-        departure_time = arrival_time + (CUSTOMER_SERVICE_TIME_SEC if cur_stop.node_type == "customer" else 0.0)
+        departure_time = arrival_time + _stop_service_time_sec(cur_stop.node_type)
 
         updated_cur = RouteStop(
             seq=cur_stop.seq,
@@ -587,6 +586,14 @@ def _materialize_execution_route(
         total_travel_time_sec=sum(segment.travel_time_sec for segment in segments),
         sumo_edge_sequence=tuple(sumo_edges),
     )
+
+
+def _stop_service_time_sec(node_type: str) -> float:
+    if node_type == "customer":
+        return TRUCK_CUSTOMER_SERVICE_TIME_SEC
+    if node_type == "station":
+        return TRUCK_STATION_HOLD_TIME_SEC
+    return 0.0
 
 
 def _find_nearest_node_cached(
@@ -898,7 +905,11 @@ def _write_sumocfg(
     execution_route: TruckExecutionRoute,
     output_path: Path,
 ) -> None:
-    end_time = max(3600, int(execution_route.total_travel_time_sec + 600))
+    route_finish_time_sec = max(
+        execution_route.total_travel_time_sec,
+        execution_route.stops[-1].departure_time_sec if execution_route.stops else 0.0,
+    )
+    end_time = max(3600, int(route_finish_time_sec + 600))
     lines = [
         '<?xml version="1.0" encoding="UTF-8"?>',
         '<configuration xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"',

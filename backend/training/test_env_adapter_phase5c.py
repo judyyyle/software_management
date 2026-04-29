@@ -134,7 +134,12 @@ class TestTrainingEnvAdapterPhase5c(unittest.TestCase):
                 node_id=recover_node_id,
                 arrival_time=t_deliver + 600.0,
                 departure_time=t_deliver + 600.0 + 1e-6,
-            )
+            ),
+            BackboneVisit(
+                node_id=env._require_depot().depot_id,
+                arrival_time=t_deliver + 1200.0,
+                departure_time=t_deliver + 1200.0 + 1e-6,
+            ),
         ]
         env._enqueue_decision(drone_id, "test_idle", None)
 
@@ -149,6 +154,8 @@ class TestTrainingEnvAdapterPhase5c(unittest.TestCase):
         )
         deliver_leg = env._flight_legs[drone_id]
         env._advance_to_event(deliver_leg.arrival_time)
+        service_finish_time = env._delivery_service_legs[drone_id].finish_time
+        env._advance_to_event(service_finish_time)
 
         reservation = env._reservations[drone_id]
         env._reservations[drone_id] = ReservationState(
@@ -211,7 +218,12 @@ class TestTrainingEnvAdapterPhase5c(unittest.TestCase):
         )
         self.assertEqual(result.info["wait_delta"], env._cfg.max_wait_decision_gap_sec)
         self.assertIsNotNone(result.decision_context)
-        self.assertEqual(result.decision_context.deciding_drone_id, drone_id)
+        self.assertTrue(
+            any(
+                trigger.drone_id == drone_id and trigger.trigger_type == "wait_resume"
+                for trigger in env._decision_queue
+            )
+        )
 
     def test_step_preserves_delayed_attribution_carry_in_before_current_window(self) -> None:
         env, drone_id = self._reset_controlled_env()

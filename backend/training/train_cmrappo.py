@@ -90,6 +90,12 @@ class _TrainingConfig:
     eval_interval_updates: int
     benchmark_eval_episodes: int
     stochastic_eval_seeds: int
+    early_stop_enabled: bool
+    early_stop_min_evals: int
+    early_stop_benchmark_patience: int
+    early_stop_stochastic_high_patience: int
+    early_stop_value_loss_window: int
+    early_stop_value_loss_min_delta: float
     allowed_train_order_source_mode: tuple[str, ...]
 
 
@@ -136,6 +142,15 @@ class _SequenceMiniBatch:
     lstm_state_in: Any | None
     sequence_count: int
     padded_timesteps: int
+
+
+@dataclass(frozen=True)
+class _BestCheckpointState:
+    path: Path
+    update_idx: int
+    global_step: int
+    selection_key: tuple[Any, ...]
+    eval_report: dict[str, Any]
 
 
 def _extract_attributed_step_reward_parts(*, step_result: Any) -> tuple[float, float]:
@@ -364,6 +379,8 @@ def train_cmrappo(
     benchmark_report_path = out_dir / "benchmark_report.json"
     stochastic_report_path = out_dir / "stochastic_report.json"
     policy_path = out_dir / "policy.pt"
+    policy_last_path = out_dir / "policy_last.pt"
+    policy_best_path = out_dir / "policy_best.pt"
     meta_path = out_dir / "meta.json"
     config_snapshot_path = out_dir / "training_config_snapshot.yaml"
     model_version = model_version or datetime.now(timezone.utc).strftime("cmrappo_%Y%m%dT%H%M%SZ")
@@ -394,6 +411,18 @@ def train_cmrappo(
     rollout_backlog: list[RolloutTransition] = []
     pending_transition_by_drone: dict[str, RolloutTransition] = {}
     successor_bootstrap_values: dict[tuple[int, str, int], float] = {}
+    best_checkpoint: _BestCheckpointState | None = None
+    latest_eval_report: dict[str, Any] | None = None
+    eval_count = 0
+    best_benchmark_key: tuple[Any, ...] | None = None
+    best_stochastic_high_key: tuple[Any, ...] | None = None
+    benchmark_no_improve_evals = 0
+    stochastic_high_no_improve_evals = 0
+    recent_eval_value_losses: deque[float] = deque(
+        maxlen=train_cfg.early_stop_value_loss_window
+    )
+    stop_training_early = False
+    stop_reason: str | None = None
     while (
         global_step < train_cfg.total_timesteps
         or rollout_backlog
@@ -711,6 +740,7 @@ def train_cmrappo(
                 **ppo_stats,
             },
         )
+        should_break_after_update = False
         if (
             train_cfg.eval_interval_updates > 0
             and (
@@ -732,6 +762,8 @@ def train_cmrappo(
                 update_idx=update_idx,
                 global_step=global_step,
             )
+            latest_eval_report = eval_report
+            eval_count += 1
             _append_metrics(
                 eval_metrics_path,
                 {
@@ -752,10 +784,78 @@ def train_cmrappo(
                 path=stochastic_report_path,
                 payload=eval_report["stochastic_report"],
             )
+            selection_key = _build_eval_selection_key(eval_report)
+            if best_checkpoint is None or selection_key > best_checkpoint.selection_key:
+                _save_policy_checkpoint(
+                    path=policy_best_path,
+                    model=model,
+                    optimizer=optimizer,
+                    critic_schema_hash=critic_schema.schema_hash,
+                    model_version=model_version,
+                    global_step=global_step,
+                    update_idx=update_idx,
+                )
+                best_checkpoint = _BestCheckpointState(
+                    path=policy_best_path,
+                    update_idx=update_idx,
+                    global_step=global_step,
+                    selection_key=selection_key,
+                    eval_report=eval_report,
+                )
+                _emit_event_hook(
+                    event_hook,
+                    "train_best_checkpoint_updated",
+                    {
+                        "update": update_idx,
+                        "global_step": global_step,
+                        "selection_key": list(selection_key),
+                        "path": str(policy_best_path),
+                    },
+                )
+
+            benchmark_key = _build_benchmark_improvement_key(eval_report)
+            if best_benchmark_key is None or benchmark_key > best_benchmark_key:
+                best_benchmark_key = benchmark_key
+                benchmark_no_improve_evals = 0
+            else:
+                benchmark_no_improve_evals += 1
+
+            stochastic_high_key = _build_stochastic_high_improvement_key(eval_report)
+            if best_stochastic_high_key is None or stochastic_high_key > best_stochastic_high_key:
+                best_stochastic_high_key = stochastic_high_key
+                stochastic_high_no_improve_evals = 0
+            else:
+                stochastic_high_no_improve_evals += 1
+
+            recent_eval_value_losses.append(float(ppo_stats["value_loss"]))
+            if _should_stop_early(
+                train_cfg=train_cfg,
+                eval_count=eval_count,
+                benchmark_no_improve_evals=benchmark_no_improve_evals,
+                stochastic_high_no_improve_evals=stochastic_high_no_improve_evals,
+                recent_eval_value_losses=tuple(recent_eval_value_losses),
+            ):
+                stop_training_early = True
+                stop_reason = (
+                    "early_stop:"
+                    f"benchmark_no_improve={benchmark_no_improve_evals},"
+                    f"stochastic_high_no_improve={stochastic_high_no_improve_evals},"
+                    f"recent_eval_value_losses={[round(value, 6) for value in recent_eval_value_losses]}"
+                )
+                should_break_after_update = True
+                _emit_event_hook(
+                    event_hook,
+                    "train_early_stop_triggered",
+                    {
+                        "update": update_idx,
+                        "global_step": global_step,
+                        "reason": stop_reason,
+                    },
+                )
 
         if update_idx % train_cfg.save_interval_updates == 0 or global_step >= train_cfg.total_timesteps:
             _save_policy_checkpoint(
-                path=policy_path,
+                path=policy_last_path,
                 model=model,
                 optimizer=optimizer,
                 critic_schema_hash=critic_schema.schema_hash,
@@ -763,9 +863,11 @@ def train_cmrappo(
                 global_step=global_step,
                 update_idx=update_idx,
             )
+        if should_break_after_update:
+            break
 
     _save_policy_checkpoint(
-        path=policy_path,
+        path=policy_last_path,
         model=model,
         optimizer=optimizer,
         critic_schema_hash=critic_schema.schema_hash,
@@ -773,12 +875,30 @@ def train_cmrappo(
         global_step=global_step,
         update_idx=update_idx,
     )
+    selected_checkpoint = best_checkpoint.path if best_checkpoint is not None else policy_last_path
+    if selected_checkpoint != policy_path:
+        shutil.copy2(selected_checkpoint, policy_path)
+    final_eval_report = (
+        best_checkpoint.eval_report
+        if best_checkpoint is not None
+        else latest_eval_report
+    )
+    if final_eval_report is not None:
+        _write_json(
+            path=benchmark_report_path,
+            payload=final_eval_report["benchmark"],
+        )
+        _write_json(
+            path=stochastic_report_path,
+            payload=final_eval_report["stochastic_report"],
+        )
     meta_payload = _build_meta_payload(
         scene_ctx=scene_ctx,
         order_source=order_source,
         critic_schema=critic_schema,
         config_path=Path(config_path),
         model_version=model_version,
+        effective_total_timesteps=global_step,
     )
     _validate_meta_payload_before_write(
         meta_payload=meta_payload,
@@ -799,12 +919,17 @@ def train_cmrappo(
         "global_step": global_step,
         "updates": update_idx,
         "policy_path": str(policy_path),
+        "policy_last_path": str(policy_last_path),
+        "policy_best_path": str(policy_best_path) if best_checkpoint is not None else None,
         "meta_path": str(meta_path),
         "metrics_path": str(metrics_path),
         "episode_metrics_path": str(episode_metrics_path),
         "eval_metrics_path": str(eval_metrics_path),
         "benchmark_report_path": str(benchmark_report_path),
         "stochastic_report_path": str(stochastic_report_path),
+        "stopped_early": bool(stop_training_early),
+        "stop_reason": stop_reason,
+        "selected_policy_source": str(selected_checkpoint),
     }
 
 
@@ -1123,6 +1248,86 @@ def _strip_episode_details(report: Mapping[str, Any]) -> dict[str, Any]:
     payload = dict(report)
     payload.pop("episodes", None)
     return payload
+
+
+def _count_done_reason(report: Mapping[str, Any], *, reason: str) -> int:
+    episodes = report.get("episodes", ())
+    if not isinstance(episodes, Sequence):
+        return 0
+    return sum(1 for episode in episodes if str(episode.get("done_reason")) == str(reason))
+
+
+def _build_eval_selection_key(eval_report: Mapping[str, Any]) -> tuple[Any, ...]:
+    benchmark = dict(eval_report["benchmark"])
+    stochastic = dict(eval_report["stochastic"])
+    stochastic_high = dict(stochastic["high"])
+    stochastic_medium = dict(stochastic["medium"])
+    return (
+        -int(benchmark["sum_timeout_order_count"]),
+        int(_count_done_reason(benchmark, reason="all_orders_cleared")),
+        -int(stochastic_high["sum_timeout_order_count"]),
+        float(stochastic_high["mean_total_reward"]),
+        float(stochastic_medium["mean_total_reward"]),
+        -float(benchmark["mean_episode_end_t_sec"]),
+        float(benchmark["mean_total_reward"]),
+        -int(stochastic_high.get("sum_fallback_count", 0)),
+    )
+
+
+def _build_benchmark_improvement_key(eval_report: Mapping[str, Any]) -> tuple[Any, ...]:
+    benchmark = dict(eval_report["benchmark"])
+    return (
+        -int(benchmark["sum_timeout_order_count"]),
+        int(_count_done_reason(benchmark, reason="all_orders_cleared")),
+        -float(benchmark["mean_episode_end_t_sec"]),
+        float(benchmark["mean_total_reward"]),
+    )
+
+
+def _build_stochastic_high_improvement_key(eval_report: Mapping[str, Any]) -> tuple[Any, ...]:
+    stochastic_high = dict(eval_report["stochastic"]["high"])
+    return (
+        -int(stochastic_high["sum_timeout_order_count"]),
+        float(stochastic_high["mean_total_reward"]),
+        -int(stochastic_high.get("sum_fallback_count", 0)),
+    )
+
+
+def _latest_value_loss_shows_meaningful_decline(
+    *,
+    recent_eval_value_losses: Sequence[float],
+    min_delta: float,
+) -> bool:
+    if len(recent_eval_value_losses) < 2:
+        return False
+    baseline = min(float(value) for value in recent_eval_value_losses[:-1])
+    latest = float(recent_eval_value_losses[-1])
+    target = baseline * (1.0 - float(min_delta))
+    return latest <= target
+
+
+def _should_stop_early(
+    *,
+    train_cfg: _TrainingConfig,
+    eval_count: int,
+    benchmark_no_improve_evals: int,
+    stochastic_high_no_improve_evals: int,
+    recent_eval_value_losses: Sequence[float],
+) -> bool:
+    if not train_cfg.early_stop_enabled:
+        return False
+    if eval_count < train_cfg.early_stop_min_evals:
+        return False
+    if benchmark_no_improve_evals < train_cfg.early_stop_benchmark_patience:
+        return False
+    if stochastic_high_no_improve_evals < train_cfg.early_stop_stochastic_high_patience:
+        return False
+    if len(recent_eval_value_losses) < train_cfg.early_stop_value_loss_window:
+        return False
+    return not _latest_value_loss_shows_meaningful_decline(
+        recent_eval_value_losses=recent_eval_value_losses,
+        min_delta=train_cfg.early_stop_value_loss_min_delta,
+    )
 
 
 def _capture_rng_state() -> dict[str, Any]:
@@ -2102,6 +2307,7 @@ def _build_meta_payload(
     critic_schema: CriticTensorSchemaMeta,
     config_path: Path,
     model_version: str,
+    effective_total_timesteps: int,
 ) -> dict[str, Any]:
     raw = _load_yaml(config_path)
     action_space = raw["action_space"]
@@ -2240,12 +2446,16 @@ def _build_meta_payload(
             ),
         ),
     )
+    training_input_meta = replace(
+        order_source.training_input_meta,
+        total_timesteps=int(effective_total_timesteps),
+    )
     run = TrainingRunMeta(
         model_version=model_version,
         trained_at=datetime.now(timezone.utc).isoformat(),
         scene_id=str(scene_ctx.scene_id),
         scene_bundle_dir=str(scene_ctx.scene_bundle_dir),
-        training_input=order_source.training_input_meta,
+        training_input=training_input_meta,
     )
     return build_meta_json_dict(meta, run)
 
@@ -2325,9 +2535,11 @@ def _validate_meta_payload_before_write(
     config_snapshot_path: Path,
     metrics_path: Path,
 ) -> None:
-    if global_step < train_cfg.total_timesteps:
+    if global_step <= 0:
+        raise RuntimeError(f"训练未产生任何有效 step，禁止写出 meta.json: global_step={global_step}")
+    if global_step > train_cfg.total_timesteps:
         raise RuntimeError(
-            "训练尚未达到 total_timesteps，禁止写出 meta.json: "
+            "训练步数超过配置 total_timesteps，禁止写出 meta.json: "
             f"global_step={global_step}, total_timesteps={train_cfg.total_timesteps}"
         )
     if not policy_path.is_file():
@@ -2399,7 +2611,7 @@ def _validate_meta_payload_before_write(
     _require_exact_int(
         name="training_input.total_timesteps",
         actual=training_input["total_timesteps"],
-        expected=train_cfg.total_timesteps,
+        expected=global_step,
     )
     _require_exact_int(
         name="training_input.poisson_seed",
@@ -2587,6 +2799,20 @@ def _load_training_config(config_path: Path) -> _TrainingConfig:
         eval_interval_updates=int(training["eval_interval_updates"]),
         benchmark_eval_episodes=int(training["benchmark_eval_episodes"]),
         stochastic_eval_seeds=int(training["stochastic_eval_seeds"]),
+        early_stop_enabled=bool(training.get("early_stop_enabled", False)),
+        early_stop_min_evals=int(training.get("early_stop_min_evals", 1)),
+        early_stop_benchmark_patience=int(
+            training.get("early_stop_benchmark_patience", 3)
+        ),
+        early_stop_stochastic_high_patience=int(
+            training.get("early_stop_stochastic_high_patience", 5)
+        ),
+        early_stop_value_loss_window=int(
+            training.get("early_stop_value_loss_window", 5)
+        ),
+        early_stop_value_loss_min_delta=float(
+            training.get("early_stop_value_loss_min_delta", 0.0)
+        ),
         allowed_train_order_source_mode=tuple(training["allowed_train_order_source_mode"]),
     )
     _validate_training_config(cfg)
@@ -2610,10 +2836,22 @@ def _validate_training_config(cfg: _TrainingConfig) -> None:
         raise ValueError("target_minibatch_timesteps 必须为正数")
     if cfg.eval_interval_updates < 0:
         raise ValueError("eval_interval_updates 不能为负数")
+    if cfg.early_stop_enabled and cfg.eval_interval_updates <= 0:
+        raise ValueError("early_stop_enabled=true 时 eval_interval_updates 必须为正数")
     if cfg.benchmark_eval_episodes <= 0:
         raise ValueError("benchmark_eval_episodes 必须为正数")
     if cfg.stochastic_eval_seeds <= 0:
         raise ValueError("stochastic_eval_seeds 必须为正数")
+    if cfg.early_stop_min_evals <= 0:
+        raise ValueError("early_stop_min_evals 必须为正数")
+    if cfg.early_stop_benchmark_patience <= 0:
+        raise ValueError("early_stop_benchmark_patience 必须为正数")
+    if cfg.early_stop_stochastic_high_patience <= 0:
+        raise ValueError("early_stop_stochastic_high_patience 必须为正数")
+    if cfg.early_stop_value_loss_window <= 0:
+        raise ValueError("early_stop_value_loss_window 必须为正数")
+    if cfg.early_stop_value_loss_min_delta < 0.0:
+        raise ValueError("early_stop_value_loss_min_delta 不能为负数")
     expected_target = cfg.sequence_minibatch_size * cfg.train_len
     if expected_target != cfg.target_minibatch_timesteps:
         raise ValueError(
