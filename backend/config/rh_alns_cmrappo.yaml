@@ -60,6 +60,14 @@ data:
   # benchmark 模式使用 fixed dynamic_orders 回放，作为 PPO 主验证订单。
   benchmark_use_dynamic_orders: true
   benchmark_replay_arrival_rate: 0.0
+  # 额外的 C-sensitive replay split：
+  #   - 仍然是 deterministic replay，不引入新的订单生成机制
+  #   - 从 orders.json.dynamic_orders 中筛出“对满电 depot-home UAV 在 spawn 时刻
+  #     存在合法 mode C 回收点”的动态单子集
+  #   - 作为独立 eval split 输出，用于 postmortem 观察 mode C 能力
+  c_sensitive_eval_enabled: true
+  c_sensitive_eval_seed: 20260426
+  c_sensitive_eval_min_legal_mode_c_recovery_nodes: 1
 
   # 训练主输入：泊松流。
   # 依据当前 benchmark 的 0.33~0.37 单/分钟强度，首轮取 0.35/min，
@@ -145,6 +153,10 @@ candidate:
   #   1 个 depot
   #   1 个最近安全 station
   max_candidate_recovery_per_order: 4
+
+  # recovery pool 不再只看骨架前 K 个点，而是先扫描更长 future backbone，
+  # 再按确定性 score 选出 top-K，避免“前 4 个点恰好都不合适”时过早裁掉更优 rendezvous。
+  recovery_pool_future_scan_limit: 8
 
   # `resolved_action_lookup` 展开规模的保护性预算，不是 PPO 主训练路径的 flat logits 维度；
   # 主训练路径张量 shape 由 max_candidate_orders / max_candidate_recovery_per_order 冻结。
@@ -276,7 +288,8 @@ training:
 
   # PPO 核心超参数。
   total_timesteps: 1500000
-  ppo_learning_rate: 0.0003
+  # Run06 critic 稳定化：先做保守步长下调，避免 value head 在高方差 target 上过激摆动。
+  ppo_learning_rate: 0.0002
   rollout_steps: 4096
   recurrent_ppo: true
   sequence_len: 16
@@ -292,9 +305,13 @@ training:
   clip_coef: 0.20
   # vf_clip_coef 已禁用：max(vl_unclipped, vl_clipped) 在 return 未归一化时
   # 始终选 clipped（更大的 loss），梯度方向错误，导致 value 收敛极慢。
-  # 直接使用 0.5*(V-R)^2，由 value_loss_coef 和 max_grad_norm 控制更新幅度。
+  # critic loss 当前改为显式可配置：
+  #   - huber：优先用于当前高方差 reward / return 场景
+  #   - mse：保留为回退选项
   entropy_coef: 0.03
-  value_loss_coef: 0.25
+  value_loss_coef: 0.10
+  value_loss_type: huber
+  value_huber_delta: 1.0
   max_grad_norm: 1.0
   normalize_advantage: true
   target_kl: 0.05
@@ -307,13 +324,13 @@ training:
   stochastic_eval_seeds: 5
   checkpoint_keep_last: 5
 
-  # Run04A：训练流程稳态版。
+  # Run05：checkpoint / early-stop 稳态版。
   # 目标：
-  #   1. 评估后保留 best checkpoint，而不是默认使用最后一个 checkpoint
-  #   2. 当 benchmark 与 stochastic_high 长时间无提升，且 value_loss 未出现新低时提前停训
+  #   1. best checkpoint 以 stochastic_high / stochastic_medium 为主排序目标
+  #   2. benchmark 仅作 guardrail：优先无 timeout 且 all_orders_cleared，不参与 patience
+  #   3. 当 stochastic_high 长时间无提升，且 value_loss 未出现新低时提前停训
   early_stop_enabled: true
   early_stop_min_evals: 8
-  early_stop_benchmark_patience: 3
   early_stop_stochastic_high_patience: 5
   early_stop_value_loss_window: 5
   early_stop_value_loss_min_delta: 0.0
