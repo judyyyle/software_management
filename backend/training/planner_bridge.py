@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
 
 from .contracts import CoarsePlanView, PlannerMode, PlannerTriggerContext, PolicyMode, RouteDriftRef
+from .recovery_pool_selector import select_recovery_pool_for_order
 from .scene_loader import DEFAULT_CONFIG_PATH
 
 
@@ -34,6 +35,7 @@ class _PlannerConfig:
     support_radius_km: float
     min_orders_to_trigger: int
     max_candidate_recovery_per_order: int
+    recovery_pool_future_scan_limit: int
     allow_empty_backbone_route: bool
 
 
@@ -53,6 +55,9 @@ class PlannerBridge:
             float(heavy_payload_capacity)
             if heavy_payload_capacity is not None
             else _load_heavy_payload_capacity()
+        )
+        self._recovery_pool_drone_cruise_speed = (
+            _load_recovery_pool_drone_cruise_speed()
         )
         self._runtime_allow_empty_backbone_route = bool(
             self._cfg.allow_empty_backbone_route
@@ -173,9 +178,15 @@ class PlannerBridge:
             planner_mode_cap[order_id] = frozenset({PlannerMode.B, PlannerMode.C})
             if truck_backbone_route:
                 policy_mode_mask[order_id] = frozenset({PolicyMode.B, PolicyMode.C})
-                recovery_pool[order_id] = truck_backbone_route[
-                    : self._cfg.max_candidate_recovery_per_order
-                ]
+                recovery_pool[order_id] = select_recovery_pool_for_order(
+                    order=order,
+                    truck_backbone_route=truck_backbone_route,
+                    truck_eta_map=truck_eta_map,
+                    node_states=runtime_state.node_states,
+                    max_candidates=self._cfg.max_candidate_recovery_per_order,
+                    future_scan_limit=self._cfg.recovery_pool_future_scan_limit,
+                    drone_cruise_speed=self._recovery_pool_drone_cruise_speed,
+                )
             else:
                 policy_mode_mask[order_id] = frozenset({PolicyMode.B})
                 recovery_pool[order_id] = ()
@@ -260,6 +271,22 @@ def _load_planner_config(config_path: Path) -> _PlannerConfig:
     raw = _load_yaml(config_path)
     planner = _require_mapping(raw, "planner")
     candidate = _require_mapping(raw, "candidate")
+    max_candidate_recovery_per_order = int(
+        candidate["max_candidate_recovery_per_order"]
+    )
+    recovery_pool_future_scan_limit = int(
+        candidate.get(
+            "recovery_pool_future_scan_limit",
+            max_candidate_recovery_per_order,
+        )
+    )
+    if max_candidate_recovery_per_order <= 0:
+        raise ValueError("candidate.max_candidate_recovery_per_order 必须为正数")
+    if recovery_pool_future_scan_limit < max_candidate_recovery_per_order:
+        raise ValueError(
+            "candidate.recovery_pool_future_scan_limit 不能小于 "
+            "max_candidate_recovery_per_order"
+        )
     return _PlannerConfig(
         coarse_replan_interval_sec=float(planner["coarse_replan_interval_sec"]),
         coarse_new_order_trigger=int(planner["coarse_new_order_trigger"]),
@@ -270,9 +297,8 @@ def _load_planner_config(config_path: Path) -> _PlannerConfig:
         upper_horizon_sec=float(planner["upper_horizon_sec"]),
         support_radius_km=float(planner["support_radius_km"]),
         min_orders_to_trigger=int(planner["min_orders_to_trigger"]),
-        max_candidate_recovery_per_order=int(
-            candidate["max_candidate_recovery_per_order"]
-        ),
+        max_candidate_recovery_per_order=max_candidate_recovery_per_order,
+        recovery_pool_future_scan_limit=recovery_pool_future_scan_limit,
         allow_empty_backbone_route=bool(
             planner.get("allow_empty_backbone_route", False)
         ),
@@ -283,6 +309,12 @@ def _load_heavy_payload_capacity() -> float:
     from config.loader import load_drone_params
 
     return float(load_drone_params().heavy.payload_capacity)
+
+
+def _load_recovery_pool_drone_cruise_speed() -> float:
+    from config.loader import load_drone_params
+
+    return float(load_drone_params().light.cruise_speed)
 
 
 def _load_yaml(config_path: Path) -> Mapping[str, Any]:

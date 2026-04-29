@@ -22,10 +22,12 @@ from .contracts import CriticBatch, FactorizedActionMask, ObservationBatch
 from .model import PolicyForwardOutput, SharedPPOActorCritic
 from .rollout_buffer import RolloutTransition, compute_gae
 from .train_cmrappo import (
+    _EpisodeAccumulator,
     _advance_until_rollout_bootstraps_resolved_after_collection,
-    _build_benchmark_improvement_key,
+    _build_benchmark_guardrail_key,
     _build_eval_selection_key,
     _build_sequence_minibatch,
+    _compute_value_loss_masked,
     _compute_masked_approx_kl,
     _extract_attributed_step_reward_parts,
     _finalize_episode_metrics,
@@ -35,6 +37,7 @@ from .train_cmrappo import (
     _latest_value_loss_shows_meaningful_decline,
     _materialize_recurrent_sequences,
     _ppo_update,
+    _record_terminal_episode_rewards,
     _run_periodic_evaluation,
     _should_stop_early,
     _build_stochastic_high_improvement_key,
@@ -197,6 +200,8 @@ class TestPhase7ModelRuntime(unittest.TestCase):
             clip_coef=0.2,
             entropy_coef=0.01,
             value_loss_coef=0.5,
+            value_loss_type="huber",
+            value_huber_delta=1.0,
             max_grad_norm=0.5,
             normalize_advantage=True,
             target_kl=0.02,
@@ -208,7 +213,6 @@ class TestPhase7ModelRuntime(unittest.TestCase):
             stochastic_eval_seeds=3,
             early_stop_enabled=True,
             early_stop_min_evals=3,
-            early_stop_benchmark_patience=2,
             early_stop_stochastic_high_patience=3,
             early_stop_value_loss_window=3,
             early_stop_value_loss_min_delta=0.0,
@@ -1390,6 +1394,29 @@ class TestPhase7ModelRuntime(unittest.TestCase):
         )
         self.assertAlmostEqual(float(approx_kl.item()), -0.25, places=6)
 
+    def test_compute_value_loss_masked_supports_mse_and_huber(self) -> None:
+        values = torch.as_tensor([3.0, 0.0], dtype=torch.float32)
+        returns = torch.as_tensor([1.0, 0.0], dtype=torch.float32)
+        valid_mask = torch.as_tensor([True, False], dtype=torch.bool)
+
+        mse_loss = _compute_value_loss_masked(
+            values=values,
+            returns=returns,
+            valid_mask=valid_mask,
+            loss_type="mse",
+            huber_delta=1.0,
+        )
+        huber_loss = _compute_value_loss_masked(
+            values=values,
+            returns=returns,
+            valid_mask=valid_mask,
+            loss_type="huber",
+            huber_delta=1.0,
+        )
+
+        self.assertAlmostEqual(float(mse_loss.item()), 2.0, places=6)
+        self.assertAlmostEqual(float(huber_loss.item()), 1.5, places=6)
+
     def test_ppo_update_skips_optimizer_step_when_target_kl_exceeded(self) -> None:
         train_cfg = self._build_training_config()
         train_cfg = _TrainingConfig(
@@ -1538,8 +1565,20 @@ class TestPhase7ModelRuntime(unittest.TestCase):
             "t_fallback_sec": 0.0,
             "t_overdue_sec": 0.0,
             "t_reservation_timeout_cost_sec": 0.0,
+            "dispatch_decision_count": 1,
+            "dispatch_decision_with_legal_mode_c_count": 0,
             "dispatch_mode_b_count": 1,
             "dispatch_mode_c_count": 0,
+            "mode_c_selected_count": 0,
+            "mode_c_success_count": 0,
+            "mode_c_post_delivery_revalidation_fail_count": 0,
+            "mode_c_post_delivery_revalidation_fail_reasons": {
+                "energy_feasible": 0,
+                "rendezvous_time_feasible": 0,
+                "node_still_valid": 0,
+            },
+            "feasible_mode_c_recover_node_count_total": 0,
+            "avg_feasible_mode_c_nodes_per_dispatch_decision": 0.0,
             "order_source_seed": 20260425,
         }
         fake_stochastic_episode = {
@@ -1589,6 +1628,9 @@ class TestPhase7ModelRuntime(unittest.TestCase):
                         benchmark_seed=20260425,
                         stochastic_seed_base=20260501,
                         stochastic_arrival_rates=(("low", 0.2), ("medium", 0.4), ("high", 0.6)),
+                        c_sensitive_enabled=False,
+                        c_sensitive_seed=20260426,
+                        c_sensitive_min_legal_mode_c_recovery_nodes=1,
                     ),
                     train_cfg=self._build_training_config(),
                     device=torch.device("cpu"),
@@ -1604,6 +1646,139 @@ class TestPhase7ModelRuntime(unittest.TestCase):
         self.assertEqual(eval_episode_mock.call_args_list[0].kwargs["episode_id"], 0)
         self.assertEqual(eval_episode_mock.call_count, 10)
         self.assertEqual(build_order_source_mock.call_args_list[0].kwargs["seed"], 20260425)
+
+    def test_run_periodic_evaluation_includes_c_sensitive_split_when_enabled(self) -> None:
+        fake_model = mock.Mock()
+        fake_model.training = True
+        fake_benchmark_episode = {
+            "total_reward": 10.0,
+            "episode_length_decisions": 5,
+            "episode_end_t_sec": 120.0,
+            "delivery_count": 2,
+            "on_time_rate": 1.0,
+            "timeout_order_count": 0,
+            "fallback_count": 0,
+            "hard_failure_count": 0,
+            "reservation_timeout_count": 0,
+            "hard_overdue_count": 0,
+            "dispatch_decision_count": 1,
+            "dispatch_decision_with_legal_mode_c_count": 1,
+            "dispatch_mode_b_count": 1,
+            "dispatch_mode_c_count": 1,
+            "mode_c_selected_count": 1,
+            "mode_c_success_count": 1,
+            "mode_c_post_delivery_revalidation_fail_count": 0,
+            "mode_c_post_delivery_revalidation_fail_reasons": {
+                "energy_feasible": 0,
+                "rendezvous_time_feasible": 0,
+                "node_still_valid": 0,
+            },
+            "feasible_mode_c_recover_node_count_total": 2,
+            "avg_feasible_mode_c_nodes_per_dispatch_decision": 2.0,
+            "t_wait_sec": 0.0,
+            "t_idle_sec": 0.0,
+            "t_queue_sec": 0.0,
+            "t_fallback_sec": 0.0,
+            "t_overdue_sec": 0.0,
+            "t_reservation_timeout_cost_sec": 0.0,
+            "order_source_seed": 20260425,
+        }
+        fake_stochastic_episode = {
+            **fake_benchmark_episode,
+            "dispatch_mode_b_count": 2,
+            "dispatch_mode_c_count": 0,
+            "mode_c_selected_count": 0,
+            "mode_c_success_count": 0,
+            "dispatch_decision_with_legal_mode_c_count": 0,
+            "feasible_mode_c_recover_node_count_total": 0,
+            "avg_feasible_mode_c_nodes_per_dispatch_decision": 0.0,
+            "order_source_seed": 20260501,
+        }
+        fake_c_sensitive_order_source = SimpleNamespace(
+            mode=SimpleNamespace(value="benchmark"),
+            seed=20260426,
+        )
+        with mock.patch(
+            "backend.training.train_cmrappo.build_order_source",
+            side_effect=[
+                SimpleNamespace(mode=SimpleNamespace(value="benchmark"), seed=20260425),
+                SimpleNamespace(mode=SimpleNamespace(value="poisson"), seed=20260501),
+                SimpleNamespace(mode=SimpleNamespace(value="poisson"), seed=20260502),
+                SimpleNamespace(mode=SimpleNamespace(value="poisson"), seed=20260503),
+                SimpleNamespace(mode=SimpleNamespace(value="poisson"), seed=20260501),
+                SimpleNamespace(mode=SimpleNamespace(value="poisson"), seed=20260502),
+                SimpleNamespace(mode=SimpleNamespace(value="poisson"), seed=20260503),
+                SimpleNamespace(mode=SimpleNamespace(value="poisson"), seed=20260501),
+                SimpleNamespace(mode=SimpleNamespace(value="poisson"), seed=20260502),
+                SimpleNamespace(mode=SimpleNamespace(value="poisson"), seed=20260503),
+            ],
+        ):
+            with mock.patch(
+                "backend.training.train_cmrappo._build_c_sensitive_eval_order_source",
+                return_value=(
+                    fake_c_sensitive_order_source,
+                    {
+                        "selected_dynamic_order_count": 2,
+                        "selected_dynamic_order_ids": ("DYN-01", "DYN-02"),
+                        "selected_dynamic_order_legal_mode_c_node_counts": {
+                            "DYN-01": 2,
+                            "DYN-02": 1,
+                        },
+                        "c_sensitive_min_legal_mode_c_recovery_nodes": 1,
+                        "selection_drone_id": "DRN-TEST-01",
+                    },
+                ),
+            ):
+                with mock.patch(
+                    "backend.training.train_cmrappo._evaluate_policy_episode",
+                    side_effect=[
+                        fake_benchmark_episode,
+                        fake_benchmark_episode,
+                        fake_stochastic_episode,
+                        fake_stochastic_episode,
+                        fake_stochastic_episode,
+                        fake_stochastic_episode,
+                        fake_stochastic_episode,
+                        fake_stochastic_episode,
+                        fake_stochastic_episode,
+                        fake_stochastic_episode,
+                        fake_stochastic_episode,
+                    ],
+                ) as eval_episode_mock:
+                    report = _run_periodic_evaluation(
+                        scene_ctx=SimpleNamespace(),
+                        config_path=Path("dummy.yaml"),
+                        model=fake_model,
+                        tensorizer=SimpleNamespace(),
+                        critic_builder=SimpleNamespace(),
+                        critic_schema=SimpleNamespace(),
+                        policy_cfg=SimpleNamespace(hist_len=6),
+                        eval_cfg=SimpleNamespace(
+                            benchmark_seed=20260425,
+                            stochastic_seed_base=20260501,
+                            stochastic_arrival_rates=(
+                                ("low", 0.2),
+                                ("medium", 0.4),
+                                ("high", 0.6),
+                            ),
+                            c_sensitive_enabled=True,
+                            c_sensitive_seed=20260426,
+                            c_sensitive_min_legal_mode_c_recovery_nodes=1,
+                        ),
+                        train_cfg=self._build_training_config(),
+                        device=torch.device("cpu"),
+                        update_idx=7,
+                        global_step=256,
+                    )
+
+        self.assertIn("c_sensitive", report)
+        self.assertEqual(report["c_sensitive"]["c_sensitive_seed"], 20260426)
+        self.assertEqual(report["c_sensitive"]["selected_dynamic_order_count"], 2)
+        self.assertEqual(
+            report["c_sensitive"]["selected_dynamic_order_ids"],
+            ("DYN-01", "DYN-02"),
+        )
+        self.assertEqual(eval_episode_mock.call_count, 11)
 
     def test_summarize_episode_records_aggregates_counts_and_ratios(self) -> None:
         report = _summarize_episode_records(
@@ -1621,6 +1796,8 @@ class TestPhase7ModelRuntime(unittest.TestCase):
                     "hard_failure_count": 0,
                     "reservation_timeout_count": 0,
                     "hard_overdue_count": 0,
+                    "dispatch_decision_count": 3,
+                    "dispatch_decision_with_legal_mode_c_count": 1,
                     "t_wait_sec": 3.0,
                     "t_idle_sec": 1.0,
                     "t_queue_sec": 2.0,
@@ -1629,6 +1806,15 @@ class TestPhase7ModelRuntime(unittest.TestCase):
                     "t_reservation_timeout_cost_sec": 0.0,
                     "dispatch_mode_b_count": 3,
                     "dispatch_mode_c_count": 1,
+                    "mode_c_selected_count": 1,
+                    "mode_c_success_count": 1,
+                    "mode_c_post_delivery_revalidation_fail_count": 0,
+                    "mode_c_post_delivery_revalidation_fail_reasons": {
+                        "energy_feasible": 0,
+                        "rendezvous_time_feasible": 0,
+                        "node_still_valid": 0,
+                    },
+                    "feasible_mode_c_recover_node_count_total": 2,
                 },
                 {
                     "total_reward": 14.0,
@@ -1641,6 +1827,8 @@ class TestPhase7ModelRuntime(unittest.TestCase):
                     "hard_failure_count": 1,
                     "reservation_timeout_count": 1,
                     "hard_overdue_count": 1,
+                    "dispatch_decision_count": 5,
+                    "dispatch_decision_with_legal_mode_c_count": 3,
                     "t_wait_sec": 5.0,
                     "t_idle_sec": 2.0,
                     "t_queue_sec": 1.0,
@@ -1649,6 +1837,15 @@ class TestPhase7ModelRuntime(unittest.TestCase):
                     "t_reservation_timeout_cost_sec": 8.0,
                     "dispatch_mode_b_count": 1,
                     "dispatch_mode_c_count": 3,
+                    "mode_c_selected_count": 3,
+                    "mode_c_success_count": 2,
+                    "mode_c_post_delivery_revalidation_fail_count": 2,
+                    "mode_c_post_delivery_revalidation_fail_reasons": {
+                        "energy_feasible": 1,
+                        "rendezvous_time_feasible": 2,
+                        "node_still_valid": 1,
+                    },
+                    "feasible_mode_c_recover_node_count_total": 7,
                 },
             ],
             update_idx=5,
@@ -1659,6 +1856,21 @@ class TestPhase7ModelRuntime(unittest.TestCase):
         self.assertEqual(report["sum_delivery_count"], 5)
         self.assertEqual(report["sum_fallback_count"], 3)
         self.assertEqual(report["sum_hard_failure_count"], 1)
+        self.assertEqual(report["sum_dispatch_decision_count"], 8)
+        self.assertEqual(report["sum_dispatch_decision_with_legal_mode_c_count"], 4)
+        self.assertEqual(report["sum_feasible_mode_c_recover_node_count_total"], 9)
+        self.assertAlmostEqual(report["avg_feasible_mode_c_nodes_per_dispatch_decision"], 1.125)
+        self.assertEqual(report["sum_mode_c_selected_count"], 4)
+        self.assertEqual(report["sum_mode_c_success_count"], 3)
+        self.assertEqual(report["sum_mode_c_post_delivery_revalidation_fail_count"], 2)
+        self.assertEqual(
+            report["sum_mode_c_post_delivery_revalidation_fail_reasons"],
+            {
+                "energy_feasible": 1,
+                "rendezvous_time_feasible": 2,
+                "node_still_valid": 1,
+            },
+        )
         self.assertAlmostEqual(report["mean_total_reward"], 12.0)
         self.assertAlmostEqual(report["mode_b_dispatch_ratio"], 0.5)
         self.assertAlmostEqual(report["mode_c_dispatch_ratio"], 0.5)
@@ -1676,7 +1888,7 @@ class TestPhase7ModelRuntime(unittest.TestCase):
         self.assertEqual(compact["mean_total_reward"], 1.0)
         self.assertNotIn("episodes", compact)
 
-    def test_eval_selection_key_prioritizes_timeout_then_reward(self) -> None:
+    def test_eval_selection_key_uses_benchmark_as_guardrail_and_stochastic_as_objective(self) -> None:
         baseline = {
             "benchmark": {
                 "sum_timeout_order_count": 0,
@@ -1693,11 +1905,11 @@ class TestPhase7ModelRuntime(unittest.TestCase):
                 },
             },
         }
-        improved = {
+        better_stochastic = {
             "benchmark": {
                 "sum_timeout_order_count": 0,
-                "mean_episode_end_t_sec": 850.0,
-                "mean_total_reward": -70.0,
+                "mean_episode_end_t_sec": 980.0,
+                "mean_total_reward": -140.0,
                 "episodes": [{"done_reason": "all_orders_cleared"}],
             },
             "stochastic": {
@@ -1709,26 +1921,45 @@ class TestPhase7ModelRuntime(unittest.TestCase):
                 },
             },
         }
+        benchmark_broken = {
+            "benchmark": {
+                "sum_timeout_order_count": 1,
+                "mean_episode_end_t_sec": 850.0,
+                "mean_total_reward": 10.0,
+                "episodes": [{"done_reason": "timeout"}],
+            },
+            "stochastic": {
+                "medium": {"mean_total_reward": 340.0},
+                "high": {
+                    "sum_timeout_order_count": 1,
+                    "mean_total_reward": 650.0,
+                    "sum_fallback_count": 0,
+                },
+            },
+        }
         self.assertGreater(
-            _build_eval_selection_key(improved),
+            _build_eval_selection_key(better_stochastic),
             _build_eval_selection_key(baseline),
         )
         self.assertGreater(
-            _build_benchmark_improvement_key(improved),
-            _build_benchmark_improvement_key(baseline),
+            _build_eval_selection_key(baseline),
+            _build_eval_selection_key(benchmark_broken),
+        )
+        self.assertEqual(
+            _build_benchmark_guardrail_key(better_stochastic),
+            _build_benchmark_guardrail_key(baseline),
         )
         self.assertGreater(
-            _build_stochastic_high_improvement_key(improved),
+            _build_stochastic_high_improvement_key(better_stochastic),
             _build_stochastic_high_improvement_key(baseline),
         )
 
-    def test_should_stop_early_requires_patience_and_no_new_value_loss_low(self) -> None:
+    def test_should_stop_early_depends_on_stochastic_patience_and_value_loss(self) -> None:
         cfg = self._build_training_config()
         self.assertFalse(
             _should_stop_early(
                 train_cfg=cfg,
                 eval_count=2,
-                benchmark_no_improve_evals=2,
                 stochastic_high_no_improve_evals=3,
                 recent_eval_value_losses=(10.0, 9.0, 8.0),
             )
@@ -1737,7 +1968,14 @@ class TestPhase7ModelRuntime(unittest.TestCase):
             _should_stop_early(
                 train_cfg=cfg,
                 eval_count=3,
-                benchmark_no_improve_evals=2,
+                stochastic_high_no_improve_evals=2,
+                recent_eval_value_losses=(10.0, 9.0, 9.5),
+            )
+        )
+        self.assertFalse(
+            _should_stop_early(
+                train_cfg=cfg,
+                eval_count=3,
                 stochastic_high_no_improve_evals=3,
                 recent_eval_value_losses=(10.0, 9.0, 8.0),
             )
@@ -1746,7 +1984,6 @@ class TestPhase7ModelRuntime(unittest.TestCase):
             _should_stop_early(
                 train_cfg=cfg,
                 eval_count=3,
-                benchmark_no_improve_evals=2,
                 stochastic_high_no_improve_evals=3,
                 recent_eval_value_losses=(10.0, 9.0, 9.5),
             )
@@ -1847,6 +2084,29 @@ class TestPhase7ModelRuntime(unittest.TestCase):
                 config_snapshot_path=config_snapshot_path,
                 metrics_path=metrics_path,
             )
+
+    def test_record_terminal_episode_rewards_closes_tail_reward_gap(self) -> None:
+        accumulator = _EpisodeAccumulator(
+            phase="benchmark",
+            episode_id=0,
+            order_source_mode="benchmark",
+            order_source_seed=20260425,
+            decision_count=16,
+            total_reward=-79.4354995,
+        )
+
+        terminal_reward_total = _record_terminal_episode_rewards(
+            accumulator=accumulator,
+            terminal_reward_by_drone={
+                "UAV-TEST-03": 100.0,
+                "UAV-TEST-10": 100.0,
+                "UAV-TEST-12": 100.0,
+            },
+        )
+
+        self.assertAlmostEqual(terminal_reward_total, 300.0)
+        self.assertEqual(accumulator.decision_count, 16)
+        self.assertAlmostEqual(accumulator.total_reward, 220.5645005)
 
     def test_validate_meta_payload_before_write_rejects_mismatched_effective_timesteps(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir_str:
