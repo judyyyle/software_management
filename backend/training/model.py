@@ -433,33 +433,75 @@ if torch is not None:  # pragma: no cover
             root_dist = torch.distributions.Categorical(logits=root_logits)
             root_idx = action_indices["root_branch_idx"]
             log_prob = root_dist.log_prob(root_idx)
+
+            # True joint entropy:
+            #   H(root)
+            #   + P(dispatch) * [ H(order)
+            #                   + E_o H(mode|o)
+            #                   + E_o P(mode=C|o) * H(recovery|o) ]
+            #
+            # 这里必须对 order 分布取期望，而不是沿用 action_indices["order_idx"]。
+            # 否则 WAIT 样本里被占位成 0 的 order_idx 会把 mode/recovery 熵错误地压到
+            # 第 0 个订单分支，导致其他订单分支几乎没有熵正则。
+            p_dispatch = root_dist.probs[:, 1]
             entropy = root_dist.entropy()
 
             dispatch_mask = root_idx == 1
-            if dispatch_mask.any():
-                order_logits = _masked_logits(policy_out.order_logits, order_mask)
-                order_dist = torch.distributions.Categorical(logits=order_logits)
-                order_idx = action_indices["order_idx"]
-                log_prob = log_prob + order_dist.log_prob(order_idx) * dispatch_mask
-                entropy = entropy + order_dist.entropy() * dispatch_mask
+            order_idx = action_indices["order_idx"]
+            order_logits, order_has_valid = _safe_masked_logits(
+                policy_out.order_logits,
+                order_mask,
+            )
+            order_dist = torch.distributions.Categorical(logits=order_logits)
+            log_prob = log_prob + order_dist.log_prob(order_idx) * (
+                dispatch_mask & order_has_valid
+            )
+            order_probs, order_entropy = _masked_categorical_probs_entropy(
+                policy_out.order_logits,
+                order_mask,
+            )
+            entropy = entropy + p_dispatch * order_entropy
 
-                mode_logits = policy_out.mode_logits[torch.arange(root_idx.size(0)), order_idx]
-                chosen_mode_mask = mode_mask[torch.arange(root_idx.size(0)), order_idx]
-                mode_logits = _masked_logits(mode_logits, chosen_mode_mask)
-                mode_dist = torch.distributions.Categorical(logits=mode_logits)
-                mode_idx = action_indices["mode_idx"]
-                log_prob = log_prob + mode_dist.log_prob(mode_idx) * dispatch_mask
-                entropy = entropy + mode_dist.entropy() * dispatch_mask
+            batch = root_idx.size(0)
+            mode_logits = policy_out.mode_logits[torch.arange(batch), order_idx]
+            chosen_mode_mask = mode_mask[torch.arange(batch), order_idx]
+            mode_logits, mode_has_valid = _safe_masked_logits(
+                mode_logits,
+                chosen_mode_mask,
+            )
+            mode_dist = torch.distributions.Categorical(logits=mode_logits)
+            mode_idx = action_indices["mode_idx"]
+            log_prob = log_prob + mode_dist.log_prob(mode_idx) * (
+                dispatch_mask & mode_has_valid
+            )
+            mode_probs, mode_entropy = _masked_categorical_probs_entropy(
+                policy_out.mode_logits,
+                mode_mask,
+            )
+            expected_mode_entropy = (order_probs * mode_entropy).sum(dim=-1)
+            entropy = entropy + p_dispatch * expected_mode_entropy
 
-                recovery_dispatch_mask = dispatch_mask & (mode_idx == 1)
-                if recovery_dispatch_mask.any():
-                    recovery_logits = policy_out.recovery_logits[torch.arange(root_idx.size(0)), order_idx]
-                    chosen_recovery_mask = recovery_mask[torch.arange(root_idx.size(0)), order_idx]
-                    recovery_logits = _masked_logits(recovery_logits, chosen_recovery_mask)
-                    recovery_dist = torch.distributions.Categorical(logits=recovery_logits)
-                    recovery_idx = action_indices["recovery_idx"]
-                    log_prob = log_prob + recovery_dist.log_prob(recovery_idx) * recovery_dispatch_mask
-                    entropy = entropy + recovery_dist.entropy() * recovery_dispatch_mask
+            recovery_logits = policy_out.recovery_logits[torch.arange(batch), order_idx]
+            chosen_recovery_mask = recovery_mask[torch.arange(batch), order_idx]
+            recovery_logits, recovery_has_valid = _safe_masked_logits(
+                recovery_logits,
+                chosen_recovery_mask,
+            )
+            recovery_dist = torch.distributions.Categorical(logits=recovery_logits)
+            recovery_idx = action_indices["recovery_idx"]
+            recovery_dispatch_mask = dispatch_mask & (mode_idx == 1)
+            log_prob = log_prob + recovery_dist.log_prob(recovery_idx) * (
+                recovery_dispatch_mask & recovery_has_valid
+            )
+            _recovery_probs, recovery_entropy = _masked_categorical_probs_entropy(
+                policy_out.recovery_logits,
+                recovery_mask,
+            )
+            p_recovery_mode = mode_probs[..., 1]
+            expected_recovery_entropy = (order_probs * p_recovery_mode * recovery_entropy).sum(
+                dim=-1
+            )
+            entropy = entropy + p_dispatch * expected_recovery_entropy
 
             return log_prob, entropy
 
@@ -523,6 +565,38 @@ if torch is not None:  # pragma: no cover
         if (~valid_mask).all():
             raise ValueError("masked_logits 收到全 False mask")
         return logits.masked_fill(~valid_mask, -1e9)
+
+
+    def _safe_masked_logits(logits: Tensor, valid_mask: Tensor) -> tuple[Tensor, Tensor]:
+        if logits.shape != valid_mask.shape:
+            raise ValueError(f"logits/mask shape 不一致: {logits.shape} vs {valid_mask.shape}")
+        has_valid = valid_mask.any(dim=-1, keepdim=True)
+        safe_logits = logits.masked_fill(~valid_mask, -1e9)
+        safe_logits = torch.where(has_valid, safe_logits, torch.zeros_like(safe_logits))
+        return safe_logits, has_valid.squeeze(-1)
+
+
+    def _masked_categorical_probs_entropy(
+        logits: Tensor,
+        valid_mask: Tensor,
+    ) -> tuple[Tensor, Tensor]:
+        if logits.shape != valid_mask.shape:
+            raise ValueError(f"logits/mask shape 不一致: {logits.shape} vs {valid_mask.shape}")
+
+        has_valid = valid_mask.any(dim=-1, keepdim=True)
+        safe_logits = logits.masked_fill(~valid_mask, -1e9)
+        safe_logits = torch.where(has_valid, safe_logits, torch.zeros_like(safe_logits))
+        probs = torch.softmax(safe_logits, dim=-1)
+        probs = torch.where(valid_mask, probs, torch.zeros_like(probs))
+        probs = torch.where(has_valid, probs, torch.zeros_like(probs))
+        log_probs = torch.log(probs.clamp_min(1e-12))
+        entropy = -(probs * log_probs).sum(dim=-1)
+        entropy = torch.where(
+            has_valid.squeeze(-1),
+            entropy,
+            torch.zeros_like(entropy),
+        )
+        return probs, entropy
 
 
     def _masked_mean(values: Tensor, valid_mask: Tensor, *, dim: int) -> Tensor:

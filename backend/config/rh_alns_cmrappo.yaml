@@ -290,7 +290,9 @@ training:
   gamma: 0.99
   gae_lambda: 0.95
   clip_coef: 0.20
-  vf_clip_coef: 0.20
+  # vf_clip_coef 已禁用：max(vl_unclipped, vl_clipped) 在 return 未归一化时
+  # 始终选 clipped（更大的 loss），梯度方向错误，导致 value 收敛极慢。
+  # 直接使用 0.5*(V-R)^2，由 value_loss_coef 和 max_grad_norm 控制更新幅度。
   entropy_coef: 0.03
   value_loss_coef: 0.25
   max_grad_norm: 1.0
