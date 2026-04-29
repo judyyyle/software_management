@@ -189,7 +189,7 @@ class TestTrainingEnvAdapterPhase5a(unittest.TestCase):
                 TrainingDroneState.QUEUEING_AT_HOST,
             )
 
-    def test_coarse_plan_keeps_node_at_arrival_boundary(self) -> None:
+    def test_coarse_plan_drops_node_once_truck_has_arrived(self) -> None:
         env = self._make_env()
         env.reset()
 
@@ -200,10 +200,12 @@ class TestTrainingEnvAdapterPhase5a(unittest.TestCase):
             BackboneVisit(node_id=depot_id, arrival_time=20.0, departure_time=20.0 + 1e-6),
         ]
 
-        # 文档要求按 departure_time 过滤，因此 arrival_time == t_now 时该站点仍应留在未来骨架里。
+        # 新语义要求 future backbone 按 truck arrival 过滤；
+        # arrival_time == t_now 时，该站点不再视作未来 recovery 节点。
         coarse_plan = env._build_coarse_plan_view(10.0)
-        self.assertIn(station_id, coarse_plan.truck_backbone_route)
-        self.assertIn(station_id, coarse_plan.launch_candidate_stations)
+        self.assertNotIn(station_id, coarse_plan.truck_backbone_route)
+        self.assertNotIn(station_id, coarse_plan.launch_candidate_stations)
+        self.assertIn(depot_id, coarse_plan.truck_backbone_route)
 
     def test_poisson_reset_appends_patrol_loop_when_phase4_route_returns_early(self) -> None:
         env = self._make_env()
@@ -226,6 +228,30 @@ class TestTrainingEnvAdapterPhase5a(unittest.TestCase):
         self.assertGreater(
             len(env._full_backbone_cache),
             len(raw_artifacts["backbone_cache"]),
+        )
+
+    def test_poisson_patrol_loop_station_stops_have_fixed_hold_window(self) -> None:
+        env = self._make_env()
+        raw_artifacts = env._load_phase4_artifacts()
+        raw_stop_count = len(raw_artifacts["planned_stops"])
+        env.reset()
+
+        appended_stops = env._planned_route_stops[raw_stop_count:]
+        appended_station_stops = [
+            stop for stop in appended_stops if stop.node_type == "station"
+        ]
+        self.assertTrue(appended_station_stops)
+
+        solver_params = env._scene_solver_params()
+        expected_hold = max(
+            solver_params.truck_drone_launch_time_s,
+            solver_params.truck_drone_recover_time_s,
+        )
+        first_station = appended_station_stops[0]
+        self.assertAlmostEqual(
+            first_station.departure_time - first_station.arrival_time,
+            expected_hold,
+            places=6,
         )
 
 

@@ -71,8 +71,13 @@ class DispatchDecisionEngine:
             self.solver.bind_order_manager(self.order_mgr)
 
         runtime_cfg = load_solver_energy_params()
+        self.TRUCK_SERVICE_TIME_ORDER = runtime_cfg.truck_service_time_order_s
         self.TRUCK_DRONE_LAUNCH_TIME = runtime_cfg.truck_drone_launch_time_s
         self.TRUCK_DRONE_RECOVER_TIME = runtime_cfg.truck_drone_recover_time_s
+        self.TRUCK_STATION_HOLD_TIME = max(
+            self.TRUCK_DRONE_LAUNCH_TIME,
+            self.TRUCK_DRONE_RECOVER_TIME,
+        )
         # truck 事件先于 drone 事件处理，同拍到站可能漏回收，增加保护缓冲。
         self.RECOVERY_EVENT_GUARD_S = 1.0
         self._truck_energy_wh_per_meter = runtime_cfg.truck_energy_wh_per_meter
@@ -819,8 +824,6 @@ class DispatchDecisionEngine:
             and alloc.vehicle_id == route.truck_id
             and alloc.recovery_station_id
         ]
-        if not related_allocs:
-            return
 
         allocs_by_recovery: dict[str, list["AllocationResult"]] = {}
         allocs_by_launch: dict[str, list["AllocationResult"]] = {}
@@ -936,8 +939,11 @@ class DispatchDecisionEngine:
         original_arrivals = [node.arrival_time for node in route.nodes]
         original_departures = [node.departure_time for node in route.nodes]
         base_services = [
-            max(0.0, dep - arr)
-            for arr, dep in zip(original_arrivals, original_departures)
+            self._resolve_truck_route_base_service_time(
+                node_type=node.node_type,
+                original_service_time=max(0.0, dep - arr),
+            )
+            for node, arr, dep in zip(route.nodes, original_arrivals, original_departures)
         ]
         travel_deltas = [0.0]
         for i in range(1, len(route.nodes)):
@@ -974,17 +980,9 @@ class DispatchDecisionEngine:
                 launch_ops = allocs_by_launch.get(node.node_id, [])
                 recovery_ops = allocs_by_recovery.get(node.node_id, [])
                 runtime_eta = runtime_recovery_eta.get(node.node_id)
+                service_time = base_services[i]
 
-                # 当前批次若未在该 recovery 节点产生任何 B_WAIT 放飞/回收动作，
-                # 保留原服务时长，避免历史锚点等待被误清零。
-                if not launch_ops and not recovery_ops and runtime_eta is None:
-                    service_time = base_services[i]
-                    departure = arrival + service_time
-                    node.arrival_time = arrival
-                    node.departure_time = departure
-                    continue
-
-                needed_departure = arrival
+                needed_departure = arrival + service_time
                 for alloc in recovery_ops:
                     launch_arrival = resolve_launch_arrival(alloc)
                     expected_recovery_time = launch_arrival + alloc.wait_duration + self.RECOVERY_EVENT_GUARD_S
@@ -994,7 +992,7 @@ class DispatchDecisionEngine:
                         needed_departure,
                         runtime_eta + self.TRUCK_DRONE_RECOVER_TIME + self.RECOVERY_EVENT_GUARD_S,
                     )
-                service_time = max(0.0, needed_departure - arrival)
+                service_time = max(service_time, needed_departure - arrival)
                 op_hold = 0.0
                 if launch_ops:
                     op_hold = max(op_hold, self.TRUCK_DRONE_LAUNCH_TIME)
@@ -1011,6 +1009,19 @@ class DispatchDecisionEngine:
             departure = arrival + service_time
             node.arrival_time = arrival
             node.departure_time = departure
+
+    def _resolve_truck_route_base_service_time(
+        self,
+        *,
+        node_type: str,
+        original_service_time: float,
+    ) -> float:
+        base_service_time = max(0.0, float(original_service_time))
+        if node_type == "customer":
+            return max(base_service_time, self.TRUCK_SERVICE_TIME_ORDER)
+        if node_type in {"station", "recovery"}:
+            return max(base_service_time, self.TRUCK_STATION_HOLD_TIME)
+        return base_service_time
 
     def _log_detailed_route(self, route: "TruckRoute", allocations: list["AllocationResult"]) -> None:
         """
