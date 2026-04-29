@@ -12,7 +12,7 @@ HiveLogix — Phase 7 rollout buffer.
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
-from typing import Any
+from typing import Any, Sequence
 
 import numpy as np
 
@@ -44,6 +44,7 @@ class RolloutTransition:
     actor_drone_id: str = ""
     recurrent_segment_id: int = 0
     local_decision_index: int = 0
+    global_decision_index: int = 0
     decision_context_debug_snapshot: Any | None = None
 
     @property
@@ -57,8 +58,6 @@ class RolloutBatchView:
     rewards: np.ndarray
     dones: np.ndarray
     values: np.ndarray
-    advantages: np.ndarray
-    returns: np.ndarray
 
 
 class RolloutBuffer:
@@ -96,6 +95,7 @@ class RolloutBuffer:
         actor_drone_id: str = "",
         recurrent_segment_id: int = 0,
         local_decision_index: int = 0,
+        global_decision_index: int = 0,
         decision_context_debug_snapshot: Any | None = None,
     ) -> int:
         if self.size >= self._capacity:
@@ -114,6 +114,7 @@ class RolloutBuffer:
                 actor_drone_id=str(actor_drone_id),
                 recurrent_segment_id=int(recurrent_segment_id),
                 local_decision_index=int(local_decision_index),
+                global_decision_index=int(global_decision_index),
                 decision_context_debug_snapshot=decision_context_debug_snapshot,
             )
         )
@@ -155,6 +156,7 @@ class RolloutBuffer:
         actor_drone_id: str = "",
         recurrent_segment_id: int = 0,
         local_decision_index: int = 0,
+        global_decision_index: int = 0,
         decision_context_debug_snapshot: Any | None = None,
     ) -> int:
         slot = self.begin_transition(
@@ -170,6 +172,7 @@ class RolloutBuffer:
             actor_drone_id=actor_drone_id,
             recurrent_segment_id=recurrent_segment_id,
             local_decision_index=local_decision_index,
+            global_decision_index=global_decision_index,
             decision_context_debug_snapshot=decision_context_debug_snapshot,
         )
         self.finalize_transition(
@@ -180,33 +183,8 @@ class RolloutBuffer:
         )
         return slot
 
-    def build_batch_view(
-        self,
-        *,
-        last_value: float,
-        gamma: float,
-        gae_lambda: float,
-    ) -> RolloutBatchView:
-        self.assert_all_finalized()
-        rewards = np.asarray([float(item.reward) for item in self._transitions], dtype=_FLOAT_DTYPE)
-        dones = np.asarray([bool(item.done) for item in self._transitions], dtype=np.bool_)
-        values = np.asarray([float(item.value_old) for item in self._transitions], dtype=_FLOAT_DTYPE)
-        advantages, returns = compute_gae(
-            rewards=rewards,
-            dones=dones,
-            values=values,
-            last_value=float(last_value),
-            gamma=float(gamma),
-            gae_lambda=float(gae_lambda),
-        )
-        return RolloutBatchView(
-            transitions=tuple(self._transitions),
-            rewards=rewards,
-            dones=dones,
-            values=values,
-            advantages=advantages,
-            returns=returns,
-        )
+    def build_batch_view(self) -> RolloutBatchView:
+        return build_batch_view_from_transitions(self._transitions)
 
     def assert_all_finalized(self) -> None:
         for idx, transition in enumerate(self._transitions):
@@ -243,7 +221,26 @@ def compute_gae(
     return advantages, returns
 
 
+def build_batch_view_from_transitions(
+    transitions: Sequence[RolloutTransition],
+) -> RolloutBatchView:
+    materialized = tuple(transitions)
+    for idx, transition in enumerate(materialized):
+        if not transition.is_finalized:
+            raise RuntimeError(f"rollout transition {idx} 尚未 finalize")
+    rewards = np.asarray([float(item.reward) for item in materialized], dtype=_FLOAT_DTYPE)
+    dones = np.asarray([bool(item.done) for item in materialized], dtype=np.bool_)
+    values = np.asarray([float(item.value_old) for item in materialized], dtype=_FLOAT_DTYPE)
+    return RolloutBatchView(
+        transitions=materialized,
+        rewards=rewards,
+        dones=dones,
+        values=values,
+    )
+
+
 __all__ = [
+    "build_batch_view_from_transitions",
     "RolloutBatchView",
     "RolloutBuffer",
     "RolloutTransition",

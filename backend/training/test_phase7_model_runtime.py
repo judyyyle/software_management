@@ -19,14 +19,23 @@ from unittest import mock
 import numpy as np
 
 from .contracts import CriticBatch, FactorizedActionMask, ObservationBatch
-from .model import SharedPPOActorCritic
-from .rollout_buffer import RolloutTransition
+from .model import PolicyForwardOutput, SharedPPOActorCritic
+from .rollout_buffer import RolloutTransition, compute_gae
 from .train_cmrappo import (
+    _advance_until_rollout_bootstraps_resolved_after_collection,
     _build_sequence_minibatch,
+    _compute_masked_approx_kl,
+    _extract_attributed_step_reward_parts,
     _finalize_episode_metrics,
+    _finalize_pending_transition_for_next_decision,
+    _flush_terminal_pending_transitions,
+    _insert_finalized_transition_in_order,
     _materialize_recurrent_sequences,
+    _ppo_update,
+    _run_periodic_evaluation,
     _TrainingConfig,
     _resolve_device,
+    _resolve_rollout_prefix_bootstrap_values,
     _set_training_seed,
     _strip_episode_details,
     _summarize_episode_records,
@@ -415,6 +424,124 @@ class TestPhase7ModelRuntime(unittest.TestCase):
         self.assertTrue(torch.allclose(hidden[:, 1, :], torch.full((1, 12), 1.5, dtype=torch.float32)))
         self.assertTrue(torch.allclose(cell[:, 1, :], torch.full((1, 12), -2.0, dtype=torch.float32)))
 
+    def test_evaluate_actions_entropy_uses_order_expectation_for_wait_samples(self) -> None:
+        device = torch.device("cpu")
+        model = self._build_model(device)
+        policy_out = PolicyForwardOutput(
+            root_branch_logits=torch.as_tensor([[0.0, 0.0]], dtype=torch.float32, device=device),
+            order_logits=torch.as_tensor([[0.0, 0.0, -1e9]], dtype=torch.float32, device=device),
+            mode_logits=torch.as_tensor(
+                [[[20.0, -20.0], [0.0, 0.0], [-1e9, -1e9]]],
+                dtype=torch.float32,
+                device=device,
+            ),
+            recovery_logits=torch.as_tensor(
+                [[[0.0, 0.0], [0.0, 0.0], [-1e9, -1e9]]],
+                dtype=torch.float32,
+                device=device,
+            ),
+            value=torch.as_tensor([0.0], dtype=torch.float32, device=device),
+        )
+        action_mask = FactorizedActionMask(
+            root_branch_mask=np.asarray([[True, True]], dtype=np.bool_),
+            order_mask=np.asarray([[True, True, False]], dtype=np.bool_),
+            mode_mask=np.asarray(
+                [[[True, True], [True, True], [False, False]]],
+                dtype=np.bool_,
+            ),
+            recovery_mask=np.asarray(
+                [[[True, True], [True, True], [False, False]]],
+                dtype=np.bool_,
+            ),
+        )
+        action_indices = {
+            "root_branch_idx": torch.as_tensor([0], dtype=torch.long, device=device),
+            "order_idx": torch.as_tensor([0], dtype=torch.long, device=device),
+            "mode_idx": torch.as_tensor([0], dtype=torch.long, device=device),
+            "recovery_idx": torch.as_tensor([0], dtype=torch.long, device=device),
+        }
+
+        _log_prob, entropy = model.evaluate_actions(
+            policy_out=policy_out,
+            action_mask=action_mask,
+            action_indices=action_indices,
+        )
+
+        ln2 = float(np.log(2.0))
+        expected_entropy = ln2 + 0.5 * (ln2 + 0.5 * ln2 + 0.25 * ln2)
+        self.assertAlmostEqual(float(entropy.item()), expected_entropy, places=6)
+
+    def test_evaluate_actions_accepts_wait_only_masks_in_batch(self) -> None:
+        device = torch.device("cpu")
+        model = self._build_model(device)
+        policy_out = PolicyForwardOutput(
+            root_branch_logits=torch.as_tensor(
+                [[0.0, 0.0], [0.0, -1e9]],
+                dtype=torch.float32,
+                device=device,
+            ),
+            order_logits=torch.as_tensor(
+                [[0.0, 0.0, -1e9], [0.0, 0.0, 0.0]],
+                dtype=torch.float32,
+                device=device,
+            ),
+            mode_logits=torch.as_tensor(
+                [
+                    [[0.0, 0.0], [0.0, -1e9], [-1e9, -1e9]],
+                    [[0.0, 0.0], [0.0, 0.0], [0.0, 0.0]],
+                ],
+                dtype=torch.float32,
+                device=device,
+            ),
+            recovery_logits=torch.as_tensor(
+                [
+                    [[0.0, 0.0], [0.0, -1e9], [-1e9, -1e9]],
+                    [[0.0, 0.0], [0.0, 0.0], [0.0, 0.0]],
+                ],
+                dtype=torch.float32,
+                device=device,
+            ),
+            value=torch.as_tensor([0.0, 0.0], dtype=torch.float32, device=device),
+        )
+        action_mask = FactorizedActionMask(
+            root_branch_mask=np.asarray([[True, True], [True, False]], dtype=np.bool_),
+            order_mask=np.asarray(
+                [[True, True, False], [False, False, False]],
+                dtype=np.bool_,
+            ),
+            mode_mask=np.asarray(
+                [
+                    [[True, True], [True, False], [False, False]],
+                    [[False, False], [False, False], [False, False]],
+                ],
+                dtype=np.bool_,
+            ),
+            recovery_mask=np.asarray(
+                [
+                    [[True, True], [True, False], [False, False]],
+                    [[False, False], [False, False], [False, False]],
+                ],
+                dtype=np.bool_,
+            ),
+        )
+        action_indices = {
+            "root_branch_idx": torch.as_tensor([1, 0], dtype=torch.long, device=device),
+            "order_idx": torch.as_tensor([0, 0], dtype=torch.long, device=device),
+            "mode_idx": torch.as_tensor([0, 0], dtype=torch.long, device=device),
+            "recovery_idx": torch.as_tensor([0, 0], dtype=torch.long, device=device),
+        }
+
+        log_prob, entropy = model.evaluate_actions(
+            policy_out=policy_out,
+            action_mask=action_mask,
+            action_indices=action_indices,
+        )
+
+        self.assertEqual(tuple(log_prob.shape), (2,))
+        self.assertEqual(tuple(entropy.shape), (2,))
+        self.assertTrue(torch.isfinite(log_prob).all().item())
+        self.assertTrue(torch.isfinite(entropy).all().item())
+
     def test_forward_accepts_batched_lstm_state(self) -> None:
         device = torch.device("cpu")
         model = self._build_model(device)
@@ -723,20 +850,45 @@ class TestPhase7ModelRuntime(unittest.TestCase):
         )
         batch_view = SimpleNamespace(
             transitions=transitions,
-            advantages=np.asarray([1.0, 2.0, 3.0], dtype=np.float32),
-            returns=np.asarray([1.5, 2.5, 3.5], dtype=np.float32),
             rewards=np.asarray([1.0, 0.5, 0.2], dtype=np.float32),
+            dones=np.asarray([False, False, True], dtype=np.bool_),
+            values=np.asarray([0.5, 0.4, 0.3], dtype=np.float32),
         )
 
         sequences = _materialize_recurrent_sequences(
             batch_view=batch_view,
             sequence_len=2,
+            gamma=0.99,
+            gae_lambda=0.95,
+            tail_bootstrap_values={
+                (0, "uav_2", 0): 0.25,
+            },
         )
         self.assertEqual(len(sequences), 2)
         self.assertEqual(sequences[0].sequence_id, (0, "uav_1", 0, 0))
         self.assertEqual(len(sequences[0].transitions), 2)
         self.assertEqual(sequences[1].sequence_id, (0, "uav_2", 0, 0))
         self.assertEqual(len(sequences[1].transitions), 1)
+        expected_uav1_adv, expected_uav1_ret = compute_gae(
+            rewards=np.asarray([1.0, 0.2], dtype=np.float32),
+            dones=np.asarray([False, True], dtype=np.bool_),
+            values=np.asarray([0.5, 0.3], dtype=np.float32),
+            last_value=0.0,
+            gamma=0.99,
+            gae_lambda=0.95,
+        )
+        expected_uav2_adv, expected_uav2_ret = compute_gae(
+            rewards=np.asarray([0.5], dtype=np.float32),
+            dones=np.asarray([False], dtype=np.bool_),
+            values=np.asarray([0.4], dtype=np.float32),
+            last_value=0.25,
+            gamma=0.99,
+            gae_lambda=0.95,
+        )
+        self.assertTrue(np.allclose(sequences[0].advantages, expected_uav1_adv))
+        self.assertTrue(np.allclose(sequences[0].returns, expected_uav1_ret))
+        self.assertTrue(np.allclose(sequences[1].advantages, expected_uav2_adv))
+        self.assertTrue(np.allclose(sequences[1].returns, expected_uav2_ret))
 
         minibatch = _build_sequence_minibatch(
             sequences=sequences,
@@ -751,6 +903,555 @@ class TestPhase7ModelRuntime(unittest.TestCase):
         self.assertFalse(bool(minibatch.valid_timestep_mask[1, 1].item()))
         self.assertEqual(minibatch.padded_timesteps, 1)
         self.assertEqual(int(minibatch.action_indices["root_branch_idx"][1, 1].item()), 0)
+
+    def test_extract_attributed_step_reward_parts_prefers_explicit_breakdown(self) -> None:
+        step_result = SimpleNamespace(
+            reward=-9.0,
+            info={
+                "reward_breakdown": {
+                    "attributed_carry_in": -3.0,
+                    "attributed_post_action": -2.5,
+                }
+            },
+        )
+        carry_in, post_action = _extract_attributed_step_reward_parts(step_result=step_result)
+        self.assertAlmostEqual(carry_in, -3.0, places=6)
+        self.assertAlmostEqual(post_action, -2.5, places=6)
+
+    def test_finalize_pending_transition_records_successor_bootstrap(self) -> None:
+        pending = {
+            "uav_1": RolloutTransition(
+                observation_batch=self._build_single_observation(),
+                critic_batch=self._build_single_critic_batch(),
+                action_mask=self._build_single_action_mask(),
+                action_indices=SimpleNamespace(
+                    root_branch_idx=0,
+                    order_idx=0,
+                    mode_idx=0,
+                    recovery_idx=0,
+                ),
+                log_prob_old=-0.1,
+                value_old=0.5,
+                reward=-1.25,
+                done=None,
+                critic_schema_hash="schema",
+                episode_id=3,
+                actor_drone_id="uav_1",
+                recurrent_segment_id=2,
+                local_decision_index=4,
+                global_decision_index=11,
+            )
+        }
+        backlog: list[RolloutTransition] = []
+        successor_bootstrap_values: dict[tuple[int, str, int], float] = {}
+
+        _finalize_pending_transition_for_next_decision(
+            pending_transition_by_drone=pending,
+            rollout_backlog=backlog,
+            successor_bootstrap_values=successor_bootstrap_values,
+            drone_id="uav_1",
+            carry_in_reward=-0.75,
+            next_value=1.75,
+        )
+
+        self.assertFalse(pending)
+        self.assertEqual(len(backlog), 1)
+        self.assertAlmostEqual(float(backlog[0].reward), -2.0, places=6)
+        self.assertFalse(bool(backlog[0].done))
+        self.assertEqual(successor_bootstrap_values, {(3, "uav_1", 2): 1.75})
+
+    def test_flush_terminal_pending_transitions_marks_done_and_preserves_order(self) -> None:
+        first = RolloutTransition(
+            observation_batch=self._build_single_observation(),
+            critic_batch=self._build_single_critic_batch(),
+            action_mask=self._build_single_action_mask(),
+            action_indices=SimpleNamespace(
+                root_branch_idx=0,
+                order_idx=0,
+                mode_idx=0,
+                recovery_idx=0,
+            ),
+            log_prob_old=-0.1,
+            value_old=0.5,
+            reward=1.0,
+            done=None,
+            critic_schema_hash="schema",
+            episode_id=0,
+            actor_drone_id="uav_1",
+            recurrent_segment_id=0,
+            local_decision_index=0,
+            global_decision_index=1,
+        )
+        second = RolloutTransition(
+            observation_batch=self._build_single_observation(),
+            critic_batch=self._build_single_critic_batch(),
+            action_mask=self._build_single_action_mask(),
+            action_indices=SimpleNamespace(
+                root_branch_idx=0,
+                order_idx=0,
+                mode_idx=0,
+                recovery_idx=0,
+            ),
+            log_prob_old=-0.2,
+            value_old=0.4,
+            reward=2.0,
+            done=None,
+            critic_schema_hash="schema",
+            episode_id=0,
+            actor_drone_id="uav_2",
+            recurrent_segment_id=0,
+            local_decision_index=0,
+            global_decision_index=3,
+        )
+        backlog = [
+            RolloutTransition(
+                observation_batch=self._build_single_observation(),
+                critic_batch=self._build_single_critic_batch(),
+                action_mask=self._build_single_action_mask(),
+                action_indices=SimpleNamespace(
+                    root_branch_idx=0,
+                    order_idx=0,
+                    mode_idx=0,
+                    recovery_idx=0,
+                ),
+                log_prob_old=-0.3,
+                value_old=0.3,
+                reward=0.0,
+                done=True,
+                critic_schema_hash="schema",
+                episode_id=0,
+                actor_drone_id="uav_0",
+                recurrent_segment_id=0,
+                local_decision_index=0,
+                global_decision_index=5,
+            )
+        ]
+        pending = {"uav_1": first, "uav_2": second}
+
+        _flush_terminal_pending_transitions(
+            pending_transition_by_drone=pending,
+            rollout_backlog=backlog,
+            terminal_reward_by_drone={"uav_2": -0.5},
+        )
+
+        self.assertFalse(pending)
+        self.assertEqual([item.actor_drone_id for item in backlog], ["uav_1", "uav_2", "uav_0"])
+        self.assertTrue(all(item.done for item in backlog[:2]))
+        self.assertAlmostEqual(float(backlog[0].reward), 1.0, places=6)
+        self.assertAlmostEqual(float(backlog[1].reward), 1.5, places=6)
+
+    def test_insert_finalized_transition_in_order_uses_global_decision_index(self) -> None:
+        backlog = [
+            RolloutTransition(
+                observation_batch=self._build_single_observation(),
+                critic_batch=self._build_single_critic_batch(),
+                action_mask=self._build_single_action_mask(),
+                action_indices=SimpleNamespace(
+                    root_branch_idx=0,
+                    order_idx=0,
+                    mode_idx=0,
+                    recovery_idx=0,
+                ),
+                log_prob_old=-0.1,
+                value_old=0.2,
+                reward=0.0,
+                done=True,
+                critic_schema_hash="schema",
+                episode_id=0,
+                actor_drone_id="uav_1",
+                recurrent_segment_id=0,
+                local_decision_index=0,
+                global_decision_index=2,
+            ),
+            RolloutTransition(
+                observation_batch=self._build_single_observation(),
+                critic_batch=self._build_single_critic_batch(),
+                action_mask=self._build_single_action_mask(),
+                action_indices=SimpleNamespace(
+                    root_branch_idx=0,
+                    order_idx=0,
+                    mode_idx=0,
+                    recovery_idx=0,
+                ),
+                log_prob_old=-0.1,
+                value_old=0.2,
+                reward=0.0,
+                done=True,
+                critic_schema_hash="schema",
+                episode_id=0,
+                actor_drone_id="uav_3",
+                recurrent_segment_id=0,
+                local_decision_index=0,
+                global_decision_index=6,
+            ),
+        ]
+
+        _insert_finalized_transition_in_order(
+            rollout_backlog=backlog,
+            transition=RolloutTransition(
+                observation_batch=self._build_single_observation(),
+                critic_batch=self._build_single_critic_batch(),
+                action_mask=self._build_single_action_mask(),
+                action_indices=SimpleNamespace(
+                    root_branch_idx=0,
+                    order_idx=0,
+                    mode_idx=0,
+                    recovery_idx=0,
+                ),
+                log_prob_old=-0.1,
+                value_old=0.2,
+                reward=0.0,
+                done=True,
+                critic_schema_hash="schema",
+                episode_id=0,
+                actor_drone_id="uav_2",
+                recurrent_segment_id=0,
+                local_decision_index=0,
+                global_decision_index=4,
+            ),
+        )
+
+        self.assertEqual(
+            [item.global_decision_index for item in backlog],
+            [2, 4, 6],
+        )
+
+    def test_resolve_rollout_prefix_bootstrap_values_reads_same_actor_successor(self) -> None:
+        transitions = (
+            SimpleNamespace(
+                episode_id=0,
+                actor_drone_id="uav_1",
+                recurrent_segment_id=0,
+                reward=1.0,
+                done=False,
+                value_old=0.5,
+            ),
+            SimpleNamespace(
+                episode_id=0,
+                actor_drone_id="uav_2",
+                recurrent_segment_id=0,
+                reward=0.5,
+                done=False,
+                value_old=0.4,
+            ),
+            SimpleNamespace(
+                episode_id=0,
+                actor_drone_id="uav_1",
+                recurrent_segment_id=0,
+                reward=0.2,
+                done=True,
+                value_old=0.3,
+            ),
+        )
+        bootstrap_values = _resolve_rollout_prefix_bootstrap_values(
+            transitions=transitions,
+            prefix_len=2,
+            boundary_bootstrap_values={},
+            current_runtime_state=SimpleNamespace(
+                drone_states={
+                    "uav_1": SimpleNamespace(training_state="idle"),
+                    "uav_2": SimpleNamespace(training_state="idle"),
+                }
+            ),
+            episode_terminated_at_boundary=False,
+        )
+        self.assertEqual(
+            bootstrap_values,
+            {
+                (0, "uav_1", 0): 0.3,
+                (0, "uav_2", 0): 0.0,
+            },
+        )
+
+    def test_resolve_rollout_prefix_bootstrap_values_uses_boundary_value_when_needed(self) -> None:
+        transitions = (
+            SimpleNamespace(
+                episode_id=0,
+                actor_drone_id="uav_1",
+                recurrent_segment_id=0,
+                reward=1.0,
+                done=False,
+                value_old=0.5,
+            ),
+            SimpleNamespace(
+                episode_id=0,
+                actor_drone_id="uav_2",
+                recurrent_segment_id=0,
+                reward=0.5,
+                done=False,
+                value_old=0.4,
+            ),
+        )
+        bootstrap_values = _resolve_rollout_prefix_bootstrap_values(
+            transitions=transitions,
+            prefix_len=2,
+            boundary_bootstrap_values={(0, "uav_2", 0): 0.25},
+            current_runtime_state=SimpleNamespace(
+                drone_states={
+                    "uav_1": SimpleNamespace(training_state="idle"),
+                    "uav_2": SimpleNamespace(training_state="idle"),
+                }
+            ),
+            episode_terminated_at_boundary=False,
+        )
+        self.assertIsNone(bootstrap_values)
+
+        bootstrap_values = _resolve_rollout_prefix_bootstrap_values(
+            transitions=transitions,
+            prefix_len=2,
+            boundary_bootstrap_values={
+                (0, "uav_1", 0): 0.35,
+                (0, "uav_2", 0): 0.25,
+            },
+            current_runtime_state=SimpleNamespace(
+                drone_states={
+                    "uav_1": SimpleNamespace(training_state="idle"),
+                    "uav_2": SimpleNamespace(training_state="idle"),
+                }
+            ),
+            episode_terminated_at_boundary=False,
+        )
+        self.assertEqual(
+            bootstrap_values,
+            {
+                (0, "uav_1", 0): 0.35,
+                (0, "uav_2", 0): 0.25,
+            },
+        )
+
+    def test_resolve_rollout_prefix_bootstrap_values_uses_zero_only_for_true_terminal_boundary(self) -> None:
+        transitions = (
+            SimpleNamespace(
+                episode_id=0,
+                actor_drone_id="uav_1",
+                recurrent_segment_id=0,
+                reward=1.0,
+                done=False,
+                value_old=0.5,
+            ),
+        )
+        bootstrap_values = _resolve_rollout_prefix_bootstrap_values(
+            transitions=transitions,
+            prefix_len=1,
+            boundary_bootstrap_values={},
+            current_runtime_state=SimpleNamespace(
+                drone_states={
+                    "uav_1": SimpleNamespace(training_state="idle"),
+                }
+            ),
+            episode_terminated_at_boundary=False,
+        )
+        self.assertIsNone(bootstrap_values)
+
+        bootstrap_values = _resolve_rollout_prefix_bootstrap_values(
+            transitions=transitions,
+            prefix_len=1,
+            boundary_bootstrap_values={},
+            current_runtime_state=SimpleNamespace(
+                drone_states={
+                    "uav_1": SimpleNamespace(training_state="idle"),
+                }
+            ),
+            episode_terminated_at_boundary=True,
+        )
+        self.assertEqual(bootstrap_values, {(0, "uav_1", 0): 0.0})
+
+    def test_advance_until_rollout_bootstraps_resolved_after_collection_probes_live_successor(self) -> None:
+        current_result = SimpleNamespace(
+            done=False,
+            runtime_state=SimpleNamespace(
+                t_now=10.0,
+                drone_states={
+                    "uav_1": SimpleNamespace(training_state="idle"),
+                    "uav_2": SimpleNamespace(training_state="idle"),
+                },
+            ),
+            decision_context=SimpleNamespace(
+                deciding_drone_id="uav_2",
+                coarse_plan=SimpleNamespace(plan_version=7),
+            ),
+        )
+        rollout_backlog = [
+            RolloutTransition(
+                observation_batch=self._build_single_observation(),
+                critic_batch=self._build_single_critic_batch(),
+                action_mask=self._build_single_action_mask(),
+                action_indices=SimpleNamespace(
+                    root_branch_idx=0,
+                    order_idx=0,
+                    mode_idx=0,
+                    recovery_idx=0,
+                ),
+                log_prob_old=-0.1,
+                value_old=0.5,
+                reward=1.0,
+                done=False,
+                critic_schema_hash="schema",
+                episode_id=0,
+                actor_drone_id="uav_1",
+                recurrent_segment_id=0,
+                local_decision_index=0,
+                global_decision_index=0,
+            )
+        ]
+        fake_policy_out = SimpleNamespace(value=torch.as_tensor([1.75], dtype=torch.float32))
+        fake_model = SimpleNamespace(
+            forward=mock.Mock(return_value=(fake_policy_out, None)),
+            sample_action=mock.Mock(
+                return_value=(
+                    {
+                        "root_branch_idx": 1,
+                        "order_idx": 0,
+                        "mode_idx": 0,
+                        "recovery_idx": None,
+                    },
+                    torch.as_tensor(0.0),
+                )
+            ),
+        )
+        fake_tensorizer = SimpleNamespace(
+            build=mock.Mock(return_value=SimpleNamespace()),
+            build_action_mask=mock.Mock(return_value=SimpleNamespace()),
+            build_transition_summary=mock.Mock(return_value=SimpleNamespace()),
+        )
+        fake_critic_builder = SimpleNamespace(build=mock.Mock(return_value=SimpleNamespace()))
+        fake_env = SimpleNamespace(
+            step=mock.Mock(
+                return_value=SimpleNamespace(
+                    done=False,
+                    runtime_state=SimpleNamespace(
+                        t_now=12.0,
+                        drone_states={
+                            "uav_1": SimpleNamespace(training_state="idle"),
+                            "uav_2": SimpleNamespace(training_state="idle"),
+                        },
+                    ),
+                    decision_context=SimpleNamespace(
+                        deciding_drone_id="uav_1",
+                        coarse_plan=SimpleNamespace(plan_version=8),
+                    ),
+                    info={"reward_breakdown": {}},
+                )
+            )
+        )
+        history_buffer = []
+        last_seen_plan_version_by_drone: dict[str, int] = {}
+        lstm_state_by_drone: dict[str, object] = {}
+        recurrent_segment_id_by_drone: dict[str, int] = {}
+        successor_bootstrap_values: dict[tuple[int, str, int], float] = {}
+
+        with mock.patch(
+            "backend.training.train_cmrappo._build_candidate_output",
+            return_value=SimpleNamespace(
+                resolved_action_lookup=SimpleNamespace(
+                    resolve=mock.Mock(return_value=SimpleNamespace())
+                )
+            ),
+        ):
+            result_after_probe = _advance_until_rollout_bootstraps_resolved_after_collection(
+                current_result=current_result,
+                episode_id=0,
+                env=fake_env,
+                model=fake_model,
+                tensorizer=fake_tensorizer,
+                critic_builder=fake_critic_builder,
+                critic_schema=SimpleNamespace(),
+                last_seen_plan_version_by_drone=last_seen_plan_version_by_drone,
+                history_buffer=history_buffer,
+                lstm_state_by_drone=lstm_state_by_drone,
+                recurrent_segment_id_by_drone=recurrent_segment_id_by_drone,
+                rollout_backlog=rollout_backlog,
+                successor_bootstrap_values=successor_bootstrap_values,
+            )
+
+        self.assertIs(result_after_probe, fake_env.step.return_value)
+        self.assertEqual(successor_bootstrap_values, {(0, "uav_2", 0): 1.75})
+        fake_env.step.assert_called_once()
+
+    def test_compute_masked_approx_kl_uses_signed_mean(self) -> None:
+        old_log_probs = torch.as_tensor([0.0, 0.0], dtype=torch.float32)
+        new_log_probs = torch.as_tensor([1.0, -0.5], dtype=torch.float32)
+        valid_mask = torch.as_tensor([True, True], dtype=torch.bool)
+        approx_kl = _compute_masked_approx_kl(
+            old_log_probs=old_log_probs,
+            new_log_probs=new_log_probs,
+            valid_mask=valid_mask,
+        )
+        self.assertAlmostEqual(float(approx_kl.item()), -0.25, places=6)
+
+    def test_ppo_update_skips_optimizer_step_when_target_kl_exceeded(self) -> None:
+        train_cfg = self._build_training_config()
+        train_cfg = _TrainingConfig(
+            **{
+                **train_cfg.__dict__,
+                "ppo_epochs": 1,
+                "sequence_minibatch_size": 1,
+                "normalize_advantage": False,
+                "target_kl": 0.1,
+            }
+        )
+        fake_sequence = SimpleNamespace(
+            valid_timestep_mask=np.asarray([True], dtype=np.bool_),
+            transitions=(SimpleNamespace(),),
+            advantages=np.asarray([1.0], dtype=np.float32),
+            returns=np.asarray([1.0], dtype=np.float32),
+        )
+        fake_minibatch = SimpleNamespace(
+            observation_batch=SimpleNamespace(),
+            critic_batch=SimpleNamespace(),
+            action_mask=SimpleNamespace(),
+            action_indices={},
+            old_log_probs=torch.as_tensor([[0.0]], dtype=torch.float32),
+            old_values=torch.as_tensor([[0.0]], dtype=torch.float32),
+            returns=torch.as_tensor([[1.0]], dtype=torch.float32),
+            advantages=torch.as_tensor([[1.0]], dtype=torch.float32),
+            valid_timestep_mask=torch.as_tensor([[True]], dtype=torch.bool),
+            lstm_state_in=None,
+            sequence_count=1,
+            padded_timesteps=0,
+        )
+        fake_policy_out = SimpleNamespace(value=torch.as_tensor([[1.0]], dtype=torch.float32))
+        fake_model = SimpleNamespace(
+            forward_sequence=mock.Mock(return_value=(fake_policy_out, None)),
+            evaluate_actions=mock.Mock(
+                return_value=(
+                    torch.as_tensor([-1.0], dtype=torch.float32),
+                    torch.as_tensor([0.2], dtype=torch.float32),
+                )
+            ),
+        )
+        fake_optimizer = mock.Mock()
+        batch_view = SimpleNamespace(rewards=np.asarray([0.0], dtype=np.float32))
+        with mock.patch(
+            "backend.training.train_cmrappo._materialize_recurrent_sequences",
+            return_value=[fake_sequence],
+        ):
+            with mock.patch(
+                "backend.training.train_cmrappo._build_sequence_minibatch",
+                return_value=fake_minibatch,
+            ):
+                with mock.patch(
+                    "backend.training.train_cmrappo._flatten_sequence_policy_output",
+                    return_value=SimpleNamespace(),
+                ):
+                    with mock.patch(
+                        "backend.training.train_cmrappo._flatten_sequence_action_mask",
+                        return_value=SimpleNamespace(),
+                    ):
+                        with mock.patch(
+                            "backend.training.train_cmrappo._flatten_sequence_action_indices",
+                            return_value={},
+                        ):
+                            stats = _ppo_update(
+                                model=fake_model,
+                                optimizer=fake_optimizer,
+                                batch_view=batch_view,
+                                train_cfg=train_cfg,
+                                device=torch.device("cpu"),
+                                tail_bootstrap_values={},
+                            )
+        fake_optimizer.step.assert_not_called()
+        self.assertAlmostEqual(float(stats["approx_kl"]), 1.0, places=6)
 
     def test_resolve_device_auto_prefers_mps_after_cuda(self) -> None:
         if not hasattr(torch.backends, "mps"):
@@ -804,6 +1505,94 @@ class TestPhase7ModelRuntime(unittest.TestCase):
         self.assertEqual(payload["delivery_count"], 4)
         self.assertEqual(payload["global_step_end"], 137)
         self.assertEqual(payload["update_end"], 4)
+
+    def test_run_periodic_evaluation_collapses_benchmark_to_single_effective_episode(self) -> None:
+        fake_model = mock.Mock()
+        fake_model.training = True
+        fake_order_source = SimpleNamespace(mode=SimpleNamespace(value="benchmark"), seed=20260425)
+        fake_benchmark_episode = {
+            "total_reward": 10.0,
+            "episode_length_decisions": 5,
+            "episode_end_t_sec": 120.0,
+            "delivery_count": 2,
+            "on_time_rate": 1.0,
+            "timeout_order_count": 0,
+            "fallback_count": 0,
+            "hard_failure_count": 0,
+            "reservation_timeout_count": 0,
+            "hard_overdue_count": 0,
+            "t_wait_sec": 0.0,
+            "t_idle_sec": 0.0,
+            "t_queue_sec": 0.0,
+            "t_fallback_sec": 0.0,
+            "t_overdue_sec": 0.0,
+            "t_reservation_timeout_cost_sec": 0.0,
+            "dispatch_mode_b_count": 1,
+            "dispatch_mode_c_count": 0,
+            "order_source_seed": 20260425,
+        }
+        fake_stochastic_episode = {
+            **fake_benchmark_episode,
+            "order_source_seed": 20260501,
+        }
+
+        with mock.patch(
+            "backend.training.train_cmrappo.build_order_source",
+            side_effect=[
+                fake_order_source,
+                SimpleNamespace(mode=SimpleNamespace(value="poisson"), seed=20260501),
+                SimpleNamespace(mode=SimpleNamespace(value="poisson"), seed=20260502),
+                SimpleNamespace(mode=SimpleNamespace(value="poisson"), seed=20260503),
+                SimpleNamespace(mode=SimpleNamespace(value="poisson"), seed=20260501),
+                SimpleNamespace(mode=SimpleNamespace(value="poisson"), seed=20260502),
+                SimpleNamespace(mode=SimpleNamespace(value="poisson"), seed=20260503),
+                SimpleNamespace(mode=SimpleNamespace(value="poisson"), seed=20260501),
+                SimpleNamespace(mode=SimpleNamespace(value="poisson"), seed=20260502),
+                SimpleNamespace(mode=SimpleNamespace(value="poisson"), seed=20260503),
+            ],
+        ) as build_order_source_mock:
+            with mock.patch(
+                "backend.training.train_cmrappo._evaluate_policy_episode",
+                side_effect=[
+                    fake_benchmark_episode,
+                    fake_stochastic_episode,
+                    fake_stochastic_episode,
+                    fake_stochastic_episode,
+                    fake_stochastic_episode,
+                    fake_stochastic_episode,
+                    fake_stochastic_episode,
+                    fake_stochastic_episode,
+                    fake_stochastic_episode,
+                    fake_stochastic_episode,
+                ],
+            ) as eval_episode_mock:
+                report = _run_periodic_evaluation(
+                    scene_ctx=SimpleNamespace(),
+                    config_path=Path("dummy.yaml"),
+                    model=fake_model,
+                    tensorizer=SimpleNamespace(),
+                    critic_builder=SimpleNamespace(),
+                    critic_schema=SimpleNamespace(),
+                    policy_cfg=SimpleNamespace(hist_len=6),
+                    eval_cfg=SimpleNamespace(
+                        benchmark_seed=20260425,
+                        stochastic_seed_base=20260501,
+                        stochastic_arrival_rates=(("low", 0.2), ("medium", 0.4), ("high", 0.6)),
+                    ),
+                    train_cfg=self._build_training_config(),
+                    device=torch.device("cpu"),
+                    update_idx=7,
+                    global_step=256,
+                )
+
+        self.assertEqual(report["benchmark"]["episode_count"], 1)
+        self.assertEqual(report["benchmark"]["benchmark_seed"], 20260425)
+        self.assertEqual(report["benchmark"]["benchmark_eval_episodes_configured"], 2)
+        self.assertEqual(report["benchmark"]["benchmark_effective_episode_count"], 1)
+        self.assertTrue(report["benchmark"]["benchmark_deterministic_replay"])
+        self.assertEqual(eval_episode_mock.call_args_list[0].kwargs["episode_id"], 0)
+        self.assertEqual(eval_episode_mock.call_count, 10)
+        self.assertEqual(build_order_source_mock.call_args_list[0].kwargs["seed"], 20260425)
 
     def test_summarize_episode_records_aggregates_counts_and_ratios(self) -> None:
         report = _summarize_episode_records(

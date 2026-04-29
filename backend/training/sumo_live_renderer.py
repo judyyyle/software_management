@@ -29,6 +29,10 @@ from training.scene_loader import DEFAULT_CONFIG_PATH, load_default_scene
 class RealtimeSumoEpisodeRenderer:
     """将训练/验证 episode 的订单与无人机状态叠加到 SUMO GUI。"""
 
+    _ORDER_RADIUS_ACTIVE = 72.0
+    _ORDER_RADIUS_INACTIVE = 56.0
+    _DRONE_RADIUS = 60.0
+
     def __init__(
         self,
         *,
@@ -37,6 +41,7 @@ class RealtimeSumoEpisodeRenderer:
         gui_step_sec: float = 5.0,
         playback_speed: float = 20.0,
         zoom: float = 900.0,
+        follow_truck: bool = True,
     ) -> None:
         if gui_step_sec <= 0:
             raise ValueError("gui_step_sec 必须为正数")
@@ -68,10 +73,13 @@ class RealtimeSumoEpisodeRenderer:
         offset_x, offset_y = net.getLocationOffset()
         self._offset_x = float(offset_x)
         self._offset_y = float(offset_y)
+        boundary = net.getBoundary()
+        self._net_boundary = tuple(float(value) for value in boundary)
 
         self._gui_step_sec = float(gui_step_sec)
         self._playback_speed = float(playback_speed)
         self._zoom = float(zoom)
+        self._follow_truck = bool(follow_truck)
         self._label = f"cmrappo-live-{os.getpid()}-{id(self)}"
         self._command = self._build_command()
         self._load_args = self._command[1:]
@@ -94,8 +102,7 @@ class RealtimeSumoEpisodeRenderer:
         self._view_id = self._resolve_view_id()
         if self._view_id is not None:
             try:
-                self._traci.gui.trackVehicle(self._view_id, self._truck_id)
-                self._traci.gui.setZoom(self._view_id, self._zoom)
+                self._configure_view()
             except Exception:
                 pass
         self._last_sim_time = 0.0
@@ -113,7 +120,6 @@ class RealtimeSumoEpisodeRenderer:
         target_time = max(0.0, float(snapshot.get("t_now", 0.0)))
         if target_time + 1e-6 < self._last_sim_time:
             self.reset_episode()
-        self._advance_to(target_time)
 
         current_decision = snapshot.get("current_decision") or {}
         deciding_drone_id = (
@@ -185,6 +191,21 @@ class RealtimeSumoEpisodeRenderer:
         view_ids = list(self._traci.gui.getIDList())
         return str(view_ids[0]) if view_ids else None
 
+    def _configure_view(self) -> None:
+        if self._view_id is None:
+            return
+        if self._follow_truck:
+            self._traci.gui.trackVehicle(self._view_id, self._truck_id)
+            self._traci.gui.setZoom(self._view_id, self._zoom)
+            return
+
+        xmin, ymin, xmax, ymax = self._net_boundary
+        try:
+            self._traci.gui.trackVehicle(self._view_id, "")
+        except Exception:
+            pass
+        self._traci.gui.setBoundary(self._view_id, xmin, ymin, xmax, ymax)
+
     def _advance_to(
         self,
         target_time: float,
@@ -222,16 +243,21 @@ class RealtimeSumoEpisodeRenderer:
             label = (
                 f"{order_id} | {status} | ddl={float(order.get('deadline', t_now)) - t_now:.0f}s"
             )
+            radius = (
+                self._ORDER_RADIUS_ACTIVE
+                if status in {"PENDING", "ASSIGNED"}
+                else self._ORDER_RADIUS_INACTIVE
+            )
             self._upsert_marker(
                 namespace="order",
                 object_id=order_id,
                 x=x,
                 y=y,
                 color=color,
-                radius=26.0 if status in {"PENDING", "ASSIGNED"} else 20.0,
+                radius=radius,
                 label=label,
                 shape_kind="circle",
-                poi_size=max(10.0, (26.0 if status in {"PENDING", "ASSIGNED"} else 20.0) * 0.9),
+                poi_size=max(16.0, radius * 0.9),
             )
 
         for stale_order_id in self._live_order_ids - active_ids:
@@ -270,10 +296,10 @@ class RealtimeSumoEpisodeRenderer:
                 x=x,
                 y=y,
                 color=color,
-                radius=18.0,
+                radius=self._DRONE_RADIUS,
                 label=label,
                 shape_kind="triangle",
-                poi_size=1.0,
+                poi_size=22.0,
             )
 
         for stale_drone_id in self._live_drone_ids - active_ids:

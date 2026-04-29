@@ -213,6 +213,60 @@ class TestTrainingEnvAdapterPhase5c(unittest.TestCase):
         self.assertIsNotNone(result.decision_context)
         self.assertEqual(result.decision_context.deciding_drone_id, drone_id)
 
+    def test_step_preserves_delayed_attribution_carry_in_before_current_window(self) -> None:
+        env, drone_id = self._reset_controlled_env()
+        env._planned_route_stop_i = len(env._planned_route_stops)
+        self._inject_order(env, drone_id=drone_id, order_id="ORDER-P5C-04-CARRY")
+        env._enqueue_decision(drone_id, "test_idle", None)
+
+        carried_reward = -7.5
+        env._agent_cost_accum[drone_id] = carried_reward
+
+        result = env.step(WAIT_ACTION)
+
+        expected_post_action = (
+            -env._cfg.wait_idle_penalty_coef * env._cfg.max_wait_decision_gap_sec
+        )
+        self.assertAlmostEqual(
+            result.reward,
+            carried_reward + expected_post_action,
+            places=6,
+        )
+        self.assertAlmostEqual(
+            result.info["reward_breakdown"]["attributed_carry_in"],
+            carried_reward,
+            places=6,
+        )
+        self.assertAlmostEqual(
+            result.info["reward_breakdown"]["attributed_post_action"],
+            expected_post_action,
+            places=6,
+        )
+        self.assertAlmostEqual(
+            result.info["reward_breakdown"]["attributed_total"],
+            carried_reward + expected_post_action,
+            places=6,
+        )
+        self.assertNotIn(drone_id, env._agent_cost_accum)
+
+    def test_consume_terminal_agent_costs_clears_tail_accumulator(self) -> None:
+        env, drone_id = self._reset_controlled_env()
+        other_drone_id = self._second_drone_id(env, drone_id)
+        env._agent_cost_accum[drone_id] = -3.5
+        env._agent_cost_accum[other_drone_id] = 1.25
+        env._t_now = env._cfg.upper_horizon_sec
+
+        pending = env.consume_terminal_agent_costs()
+
+        self.assertEqual(
+            pending,
+            {
+                drone_id: -3.5,
+                other_drone_id: 1.25,
+            },
+        )
+        self.assertFalse(env._agent_cost_accum)
+
     def test_no_authorized_orders_does_not_enqueue_decision(self) -> None:
         env, _drone_id = self._reset_controlled_env()
         env._decision_queue.clear()
@@ -221,6 +275,27 @@ class TestTrainingEnvAdapterPhase5c(unittest.TestCase):
 
         self.assertFalse(env._decision_queue)
         self.assertIsNone(env.current_decision_context)
+
+    def test_wake_stranded_idle_drones_requeues_idle_uavs_after_new_order_arrives(self) -> None:
+        env, drone_id = self._reset_controlled_env()
+        sleeping_drone_id = self._second_drone_id(env, drone_id)
+        env._decision_queue.clear()
+
+        env._enqueue_initial_idle_decisions()
+        self.assertFalse(env._decision_queue)
+
+        env._drone_state[sleeping_drone_id] = TrainingDroneState.ACTIVE_WAIT
+        env._active_wait_resume[sleeping_drone_id] = TrainingDroneState.IDLE
+        self._inject_order(env, drone_id=drone_id, order_id="ORDER-P5C-WAKE-01")
+
+        env._wake_stranded_idle_drones()
+
+        queued_ids = [item.drone_id for item in env._decision_queue]
+        queued_trigger_types = {item.trigger_type for item in env._decision_queue}
+        self.assertIn(drone_id, queued_ids)
+        self.assertNotIn(sleeping_drone_id, queued_ids)
+        self.assertEqual(queued_trigger_types, {"order_arrival_wake"})
+        self.assertIsNotNone(env.current_decision_context)
 
     def test_settle_per_dt_rewards_separates_wait_and_queue(self) -> None:
         env, drone_id = self._reset_controlled_env()

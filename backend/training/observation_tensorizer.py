@@ -58,6 +58,9 @@ _TRIGGER_TYPE_CODE: Mapping[str, int] = {
     "test_idle": 2,
     "riding_with_truck": 3,
     "truck_station_arrival": 4,
+    "idle_ready": 5,
+    "wait_resume": 6,
+    "order_arrival_wake": 7,
 }
 _ROOT_BRANCH_CODE: Mapping[str, int] = {"WAIT": 0, "DISPATCH": 1}
 _DISPATCH_MODE_CODE: Mapping[str, int] = {"NONE": 0, "B": 1, "C": 2}
@@ -254,6 +257,13 @@ class ObservationTensorizer:
         step_result: Any,
     ) -> TransitionSummary:
         actor_id = str(decision_context.deciding_drone_id)
+        trigger_type = str(decision_context.trigger_type)
+        self._code_norm(
+            _TRIGGER_TYPE_CODE,
+            trigger_type,
+            strict=True,
+            field_name="trigger_type",
+        )
         pre_drone = decision_context.runtime_state.drone_states[actor_id]
         post_drone = step_result.runtime_state.drone_states[actor_id]
         reward_breakdown = dict(step_result.info.get("reward_breakdown", {}))
@@ -314,7 +324,7 @@ class ObservationTensorizer:
             actor_training_state_after=str(post_drone.training_state),
             actor_home_type=str(pre_drone.home_type),
             actor_payload_class=_payload_class(float(pre_drone.payload_capacity)),
-            trigger_type=str(decision_context.trigger_type),
+            trigger_type=trigger_type,
             root_branch=root_branch,
             dispatch_mode=dispatch_mode,
             selected_recover_node_type=selected_recover_node_type,
@@ -498,7 +508,12 @@ class ObservationTensorizer:
                     self._code_norm(_TRAINING_STATE_CODE, item.actor_training_state_after),
                     self._code_norm(_HOME_TYPE_CODE, item.actor_home_type),
                     self._code_norm(_PAYLOAD_CLASS_CODE, item.actor_payload_class),
-                    self._code_norm(_TRIGGER_TYPE_CODE, item.trigger_type),
+                    self._code_norm(
+                        _TRIGGER_TYPE_CODE,
+                        item.trigger_type,
+                        strict=True,
+                        field_name="trigger_type",
+                    ),
                     self._code_norm(_ROOT_BRANCH_CODE, item.root_branch),
                     self._code_norm(_DISPATCH_MODE_CODE, item.dispatch_mode),
                     self._code_norm(_HOST_TYPE_CODE, item.selected_recover_node_type),
@@ -571,9 +586,17 @@ class ObservationTensorizer:
         return ObservationTensorizer._clip_signed(float(value) / 16.0, -1.0, 1.0)
 
     @staticmethod
-    def _code_norm(mapping: Mapping[str, int], value: str) -> float:
+    def _code_norm(
+        mapping: Mapping[str, int],
+        value: str,
+        *,
+        strict: bool = False,
+        field_name: str = "category",
+    ) -> float:
         if not mapping:
             return 0.0
+        if strict and value not in mapping:
+            raise ValueError(f"未知 {field_name}: {value}")
         denom = max(len(mapping) - 1, 1)
         return float(mapping.get(value, 0)) / float(denom)
 
