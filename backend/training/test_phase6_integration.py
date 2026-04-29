@@ -593,6 +593,11 @@ class TestPhase6Integration(unittest.TestCase):
                 arrival_time=120.0,
                 departure_time=120.0 + 1e-6,
             ),
+            BackboneVisit(
+                node_id=depot.depot_id,
+                arrival_time=180.0,
+                departure_time=180.0 + 1e-6,
+            ),
         ]
 
         self._inject_order_at(
@@ -605,6 +610,12 @@ class TestPhase6Integration(unittest.TestCase):
             ),
             deadline_offset=7200.0,
         )
+        for other_drone_id, state in list(env._drone_state.items()):
+            if other_drone_id == drone_id:
+                continue
+            if state == TrainingDroneState.IDLE:
+                env._drone_state[other_drone_id] = TrainingDroneState.ACTIVE_WAIT
+                env._active_wait_resume[other_drone_id] = TrainingDroneState.IDLE
 
         env._active_launch_stations = {station_2.station_id}
         env._enqueue_decision(
@@ -642,6 +653,89 @@ class TestPhase6Integration(unittest.TestCase):
                 for trigger in env._decision_queue
             )
         )
+
+    def test_candidate_builder_riding_trigger_applies_launch_delay_and_delivery_service(self) -> None:
+        env = self._make_env()
+        env.reset()
+
+        drone_id = self._first_riding_drone_id(env)
+        entity_mgr = env._require_entity_manager()
+        station_ids = sorted(entity_mgr.stations)
+        launch_station = entity_mgr.stations[station_ids[0]]
+        recover_station = entity_mgr.stations[station_ids[1]]
+        order = self._inject_order_at(
+            env,
+            order_id="ORDER-P6-LAUNCH-SVC-01",
+            position=Position3D(
+                x=launch_station.location.x + 10.0,
+                y=launch_station.location.y,
+                z=launch_station.location.z,
+            ),
+        )
+
+        runtime_state = env.build_runtime_state_view()
+        launch_time = (
+            runtime_state.t_now + env._scene_solver_params().truck_drone_launch_time_s
+        )
+        deliver_fly = env._estimate_flight_time(
+            drone=entity_mgr.drones[drone_id],
+            from_pos=launch_station.location,
+            to_pos=order.delivery_loc,
+        )
+        recover_fly = env._estimate_flight_time(
+            drone=entity_mgr.drones[drone_id],
+            from_pos=order.delivery_loc,
+            to_pos=recover_station.location,
+        )
+        truck_eta = (
+            launch_time
+            + deliver_fly
+            + recover_fly
+            + env._cfg.rendezvous_eta_safe_margin_sec
+            + env._scene_solver_params().drone_service_time_order_s
+            - 1.0
+        )
+        coarse_plan = env._build_coarse_plan_view(env._t_now)
+        custom_plan = replace(
+            coarse_plan,
+            truck_backbone_route=(launch_station.station_id, recover_station.station_id),
+            truck_eta_map={
+                launch_station.station_id: runtime_state.t_now,
+                recover_station.station_id: truck_eta,
+            },
+            authorized_orders=(order.order_id,),
+            order_priority_band={order.order_id: coarse_plan.order_priority_band[order.order_id]},
+            order_pre_score={order.order_id: coarse_plan.order_pre_score[order.order_id]},
+            planner_mode_cap={order.order_id: coarse_plan.planner_mode_cap[order.order_id]},
+            policy_mode_mask={order.order_id: frozenset({PolicyMode.B, PolicyMode.C})},
+            route_drift_ref={
+                launch_station.station_id: RouteDriftRef(
+                    eta_ref=runtime_state.t_now,
+                    route_index_ref=0,
+                ),
+                recover_station.station_id: RouteDriftRef(
+                    eta_ref=truck_eta,
+                    route_index_ref=1,
+                )
+            },
+            recovery_pool={
+                order.order_id: (recover_station.station_id,),
+            },
+            launch_candidate_stations=(launch_station.station_id,),
+        )
+
+        candidate_out = env._candidate_builder.build(
+            runtime_state=runtime_state,
+            coarse_plan=custom_plan,
+            deciding_drone_id=drone_id,
+            trigger_type="truck_station_arrival",
+            trigger_station_id=launch_station.station_id,
+            last_seen_plan_version=custom_plan.plan_version,
+        )
+
+        self.assertTrue(candidate_out.order_mask[0])
+        self.assertEqual(candidate_out.mode_mask[0], (True, False))
+        self.assertFalse(any(candidate_out.recovery_mask[0]))
 
 
 if __name__ == "__main__":

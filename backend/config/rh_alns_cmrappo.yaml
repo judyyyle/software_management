@@ -307,6 +307,17 @@ training:
   stochastic_eval_seeds: 5
   checkpoint_keep_last: 5
 
+  # Run04A：训练流程稳态版。
+  # 目标：
+  #   1. 评估后保留 best checkpoint，而不是默认使用最后一个 checkpoint
+  #   2. 当 benchmark 与 stochastic_high 长时间无提升，且 value_loss 未出现新低时提前停训
+  early_stop_enabled: true
+  early_stop_min_evals: 8
+  early_stop_benchmark_patience: 3
+  early_stop_stochastic_high_patience: 5
+  early_stop_value_loss_window: 5
+  early_stop_value_loss_min_delta: 0.0
+
   # 训练阶段强制只允许 poisson 订单源。
   allowed_train_order_source_mode:
     - poisson

@@ -21,6 +21,7 @@ from pathlib import Path
 from typing import Any, Mapping
 
 from core.entities.primitives import Position3D
+from config.loader import load_solver_energy_params
 
 from .actions import DispatchAction, WAIT_ACTION
 from .contracts import (
@@ -65,6 +66,9 @@ class CandidateBuilder:
         self._config_path = Path(config_path)
         self._cfg = _load_candidate_config(self._config_path)
         self._scene_ctx = scene_ctx or load_default_scene(config_path=self._config_path)
+        solver_params = load_solver_energy_params()
+        self._truck_drone_launch_time_s = float(solver_params.truck_drone_launch_time_s)
+        self._drone_service_time_order_s = float(solver_params.drone_service_time_order_s)
         self._safe_margin_j_by_drone = {
             drone_id: float(drone.safe_margin_j)
             for drone_id, drone in self._scene_ctx.entity_manager.drones.items()
@@ -91,6 +95,10 @@ class CandidateBuilder:
             trigger_type=trigger_type,
             trigger_station_id=trigger_station_id,
         )
+        effective_launch_time = self._resolve_effective_launch_time(
+            runtime_state=runtime_state,
+            trigger_type=trigger_type,
+        )
 
         actionable_orders: list[dict[str, Any]] = []
         for order_id in coarse_plan.authorized_orders:
@@ -103,10 +111,13 @@ class CandidateBuilder:
             if float(order.payload_weight) > float(drone_view.payload_capacity):
                 continue
 
-            t_deliver = runtime_state.t_now + _estimate_flight_time(
+            t_deliver_arrive = effective_launch_time + _estimate_flight_time(
                 drone_view=drone_view,
                 from_pos=launch_pos,
                 to_pos=order.delivery_loc,
+            )
+            t_deliver_finish = (
+                t_deliver_arrive + self._drone_service_time_order_s
             )
             energy_to_deliver = _estimate_energy_needed(
                 drone_view=drone_view,
@@ -124,6 +135,7 @@ class CandidateBuilder:
                     runtime_state=runtime_state,
                     drone_view=drone_view,
                     deliver_pos=order.delivery_loc,
+                    t_deliver_finish=t_deliver_finish,
                     battery_after_delivery=energy_after_delivery,
                 )
 
@@ -135,7 +147,7 @@ class CandidateBuilder:
                     drone_view=drone_view,
                     order=order,
                     deliver_pos=order.delivery_loc,
-                    t_deliver=t_deliver,
+                    t_deliver_finish=t_deliver_finish,
                     energy_after_delivery=energy_after_delivery,
                     trigger_type=trigger_type,
                     trigger_station_id=trigger_station_id,
@@ -326,6 +338,17 @@ class CandidateBuilder:
             return runtime_state.node_states[trigger_station_id].position
         return drone_view.current_loc
 
+    def _resolve_effective_launch_time(
+        self,
+        *,
+        runtime_state: Any,
+        trigger_type: str,
+    ) -> float:
+        effective_launch_time = float(runtime_state.t_now)
+        if _is_riding_with_truck_trigger(trigger_type):
+            effective_launch_time += self._truck_drone_launch_time_s
+        return effective_launch_time
+
     def _build_mode_c_candidates(
         self,
         *,
@@ -334,7 +357,7 @@ class CandidateBuilder:
         drone_view: Any,
         order: Any,
         deliver_pos: Position3D,
-        t_deliver: float,
+        t_deliver_finish: float,
         energy_after_delivery: float,
         trigger_type: str,
         trigger_station_id: str | None,
@@ -355,7 +378,7 @@ class CandidateBuilder:
             if node_state is None or t_arrive_truck is None:
                 continue
 
-            t_arrive_uav = t_deliver + _estimate_flight_time(
+            t_arrive_uav = t_deliver_finish + _estimate_flight_time(
                 drone_view=drone_view,
                 from_pos=deliver_pos,
                 to_pos=node_state.position,
@@ -426,6 +449,7 @@ class CandidateBuilder:
         runtime_state: Any,
         drone_view: Any,
         deliver_pos: Position3D,
+        t_deliver_finish: float,
         battery_after_delivery: float,
     ) -> dict[str, Any] | None:
         safe_margin = self._safe_margin_j_by_drone[drone_view.drone_id]
@@ -448,7 +472,7 @@ class CandidateBuilder:
             )
             queue_time_est = _predicted_queue_time_est(node_state)
             service_time = float(node_state.swap_time)
-            score = fly_time + queue_time_est + service_time
+            score = t_deliver_finish + fly_time + queue_time_est + service_time
             scored_hosts.append(
                 (
                     score,
