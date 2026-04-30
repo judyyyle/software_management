@@ -406,6 +406,7 @@ if torch is not None:  # pragma: no cover
             policy_out: PolicyForwardOutput,
             action_mask: Any,
             action_indices: dict[str, Tensor],
+            recovery_entropy_coef: float = 1.0,
         ) -> tuple[Tensor, Tensor]:
             device = policy_out.root_branch_logits.device
             root_mask = _ensure_batch_dim(
@@ -501,7 +502,10 @@ if torch is not None:  # pragma: no cover
             expected_recovery_entropy = (order_probs * p_recovery_mode * recovery_entropy).sum(
                 dim=-1
             )
-            entropy = entropy + p_dispatch * expected_recovery_entropy
+            entropy = (
+                entropy
+                + p_dispatch * float(recovery_entropy_coef) * expected_recovery_entropy
+            )
 
             return log_prob, entropy
 

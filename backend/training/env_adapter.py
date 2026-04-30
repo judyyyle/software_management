@@ -1296,6 +1296,10 @@ class TrainingEnvAdapter:
             if drone.drone_id in self._require_truck().docked_drones:
                 self._require_truck().docked_drones.remove(drone.drone_id)
 
+        launch_time = self._resolve_dispatch_launch_time(
+            drone_id=drone.drone_id,
+            trigger=trigger,
+        )
         self._dispatch_commit[drone.drone_id] = DispatchCommit(
             order_id=order.order_id,
             mode=action.mode,
@@ -1307,11 +1311,8 @@ class TrainingEnvAdapter:
                 drone_id=drone.drone_id,
                 order=order,
                 recover_node_id=action.recover_node_id,
+                launch_time=launch_time,
             )
-        launch_time = self._resolve_dispatch_launch_time(
-            drone_id=drone.drone_id,
-            trigger=trigger,
-        )
         self._schedule_flight_leg(
             drone_id=drone.drone_id,
             kind="deliver",
@@ -1906,6 +1907,7 @@ class TrainingEnvAdapter:
         drone_id: str,
         order: Order,
         recover_node_id: str,
+        launch_time: float | None = None,
     ) -> None:
         """为一次 mode C dispatch 建立 reservation。"""
         if not self._cfg.reservation_enabled:
@@ -1914,13 +1916,27 @@ class TrainingEnvAdapter:
         self._release_reservation(drone_id)
         drone = self._require_entity_manager().drones[drone_id]
         host = self._resolve_fixed_node(recover_node_id)
-        deliver_fly_time = self._estimate_flight_time(
+        effective_launch_time = float(self._t_now if launch_time is None else launch_time)
+        launch_delay = max(0.0, effective_launch_time - float(self._t_now))
+        delivery_fly_time = self._estimate_flight_time(
+            drone=drone,
+            from_pos=drone.current_loc,
+            to_pos=order.delivery_loc,
+        )
+        service_duration = float(self._scene_solver_params().drone_service_time_order_s)
+        recover_fly_time = self._estimate_flight_time(
             drone=drone,
             from_pos=order.delivery_loc,
-            to_pos=host.get_location(self._t_now),
+            to_pos=host.get_location(effective_launch_time),
+        )
+        total_eta_to_recovery = (
+            launch_delay
+            + delivery_fly_time
+            + service_duration
+            + recover_fly_time
         )
         tau_res = (
-            self._cfg.reservation_alpha * deliver_fly_time
+            self._cfg.reservation_alpha * total_eta_to_recovery
             + self._cfg.reservation_gamma * float(host.estimate_wait_time(self._t_now))
         )
         reservation = ReservationState(
@@ -1991,7 +2007,11 @@ class TrainingEnvAdapter:
         reservation: ReservationState,
         t_now: float,
     ) -> float | None:
-        """返回 reservation timeout 的违规量；无 timeout 时返回 None。"""
+        """返回 reservation timeout 的违规量；无 timeout 时返回 None。
+
+        返回非 None 表示 timeout，上层会释放 reservation 并触发 fallback。
+        返回 0.0 表示 timeout 但无额外惩罚（如卡车已离开）。
+        """
         if self._drone_state.get(drone_id) not in {
             TrainingDroneState.DELIVERED,
             TrainingDroneState.RETURN_TO_RENDEZVOUS,
@@ -2004,25 +2024,18 @@ class TrainingEnvAdapter:
         host_pos = host.get_location(t_now)
         coarse_plan = self._build_coarse_plan_view(t_now)
         t_arrive_truck = coarse_plan.truck_eta_map.get(reservation.recover_node)
-        effective_battery = self._effective_battery_current(drone_id, t_now)
-        energy_feasible = self._can_reach_from(
-            drone=drone,
-            from_pos=drone.current_loc,
-            to_pos=host_pos,
-            payload=0.0,
-            safe_margin=drone.safe_margin_j,
-            battery_current=effective_battery,
-        )
+
+        if t_now >= reservation.expires_at - _TIME_EPS:
+            return max(0.0, t_now - reservation.expires_at)
+        # 卡车已到站并离开（arrival_time <= t_now），rendezvous 不再可能。
+        # 0 penalty：非无人机过失，fallback 本身已有惩罚。
+        if t_arrive_truck is None:
+            return 0.0
         t_arrive_uav = t_now + self._estimate_flight_time(
             drone=drone,
             from_pos=drone.current_loc,
             to_pos=host_pos,
         )
-
-        if t_now >= reservation.expires_at - _TIME_EPS:
-            return max(0.0, t_now - reservation.expires_at)
-        if t_arrive_truck is None:
-            return 0.0
         if (
             t_arrive_uav + self._cfg.rendezvous_eta_safe_margin_sec
             > t_arrive_truck + _TIME_EPS
@@ -2032,8 +2045,15 @@ class TrainingEnvAdapter:
                 + self._cfg.rendezvous_eta_safe_margin_sec
                 - t_arrive_truck
             )
-        if not energy_feasible:
-            return 0.0
+        # 注意：不在此处做能量检查。
+        # RETURN_TO_RENDEZVOUS：飞行段已提交，energy_cost_j 在调度时锁定，
+        #   _effective_battery_current 与 _can_reach_from 数值一致，检查恒为 True，
+        #   若因浮点误差翻转会错误触发 fallback。
+        # WAITING_FOR_TRUCK：无人机已到达回收节点，距离为 0，检查恒为 True。
+        # DELIVERED：_process_delivery_service_event 在同帧更早执行，
+        #   无人机不会以 DELIVERED 状态到达此处。
+        # 能量可行性的正确检查点：_is_mode_c_recovery_feasible（调度时）
+        #   和 _revalidate_mode_c_recover_node（送达后）。
         return None
 
     def _apply_hard_overdue_penalty(self, t_now: float) -> float:

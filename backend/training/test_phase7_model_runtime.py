@@ -39,6 +39,8 @@ from .train_cmrappo import (
     _ppo_update,
     _record_terminal_episode_rewards,
     _run_periodic_evaluation,
+    _shape_pending_transition_reward_for_rendezvous,
+    _shape_post_action_reward_for_rendezvous,
     _should_stop_early,
     _build_stochastic_high_improvement_key,
     _TrainingConfig,
@@ -199,6 +201,8 @@ class TestPhase7ModelRuntime(unittest.TestCase):
             gae_lambda=0.95,
             clip_coef=0.2,
             entropy_coef=0.01,
+            recovery_entropy_coef=0.4,
+            rendezvous_bonus=0.2,
             value_loss_coef=0.5,
             value_loss_type="huber",
             value_huber_delta=1.0,
@@ -484,6 +488,54 @@ class TestPhase7ModelRuntime(unittest.TestCase):
 
         ln2 = float(np.log(2.0))
         expected_entropy = ln2 + 0.5 * (ln2 + 0.5 * ln2 + 0.25 * ln2)
+        self.assertAlmostEqual(float(entropy.item()), expected_entropy, places=6)
+
+    def test_evaluate_actions_scales_recovery_entropy_independently(self) -> None:
+        device = torch.device("cpu")
+        model = self._build_model(device)
+        policy_out = PolicyForwardOutput(
+            root_branch_logits=torch.as_tensor([[0.0, 0.0]], dtype=torch.float32, device=device),
+            order_logits=torch.as_tensor([[0.0, 0.0, -1e9]], dtype=torch.float32, device=device),
+            mode_logits=torch.as_tensor(
+                [[[20.0, -20.0], [0.0, 0.0], [-1e9, -1e9]]],
+                dtype=torch.float32,
+                device=device,
+            ),
+            recovery_logits=torch.as_tensor(
+                [[[0.0, 0.0], [0.0, 0.0], [-1e9, -1e9]]],
+                dtype=torch.float32,
+                device=device,
+            ),
+            value=torch.as_tensor([0.0], dtype=torch.float32, device=device),
+        )
+        action_mask = FactorizedActionMask(
+            root_branch_mask=np.asarray([[True, True]], dtype=np.bool_),
+            order_mask=np.asarray([[True, True, False]], dtype=np.bool_),
+            mode_mask=np.asarray(
+                [[[True, True], [True, True], [False, False]]],
+                dtype=np.bool_,
+            ),
+            recovery_mask=np.asarray(
+                [[[True, True], [True, True], [False, False]]],
+                dtype=np.bool_,
+            ),
+        )
+        action_indices = {
+            "root_branch_idx": torch.as_tensor([0], dtype=torch.long, device=device),
+            "order_idx": torch.as_tensor([0], dtype=torch.long, device=device),
+            "mode_idx": torch.as_tensor([0], dtype=torch.long, device=device),
+            "recovery_idx": torch.as_tensor([0], dtype=torch.long, device=device),
+        }
+
+        _log_prob, entropy = model.evaluate_actions(
+            policy_out=policy_out,
+            action_mask=action_mask,
+            action_indices=action_indices,
+            recovery_entropy_coef=0.4,
+        )
+
+        ln2 = float(np.log(2.0))
+        expected_entropy = ln2 + 0.5 * (ln2 + 0.5 * ln2 + 0.4 * 0.25 * ln2)
         self.assertAlmostEqual(float(entropy.item()), expected_entropy, places=6)
 
     def test_evaluate_actions_accepts_wait_only_masks_in_batch(self) -> None:
@@ -933,6 +985,55 @@ class TestPhase7ModelRuntime(unittest.TestCase):
         self.assertAlmostEqual(carry_in, -3.0, places=6)
         self.assertAlmostEqual(post_action, -2.5, places=6)
 
+    def test_shape_post_action_reward_for_rendezvous_adds_bonus_once_for_mode_c_success(self) -> None:
+        shaped_reward, bonus_applied = _shape_post_action_reward_for_rendezvous(
+            post_action_reward=-1.5,
+            action_indices=SimpleNamespace(
+                root_branch_idx=1,
+                order_idx=0,
+                mode_idx=1,
+                recovery_idx=0,
+            ),
+            transition_summary=SimpleNamespace(rendezvous_success=True),
+            rendezvous_bonus=0.2,
+        )
+
+        self.assertTrue(bonus_applied)
+        self.assertAlmostEqual(shaped_reward, -1.3, places=6)
+
+    def test_shape_pending_transition_reward_for_rendezvous_uses_success_state(self) -> None:
+        pending_transition = RolloutTransition(
+            observation_batch=self._build_single_observation(),
+            critic_batch=self._build_single_critic_batch(),
+            action_mask=self._build_single_action_mask(),
+            action_indices=SimpleNamespace(
+                root_branch_idx=1,
+                order_idx=0,
+                mode_idx=1,
+                recovery_idx=0,
+            ),
+            log_prob_old=-0.1,
+            value_old=0.5,
+            reward=-1.0,
+            done=None,
+            critic_schema_hash="schema",
+            actor_drone_id="uav_1",
+        )
+
+        shaped_reward, bonus_applied = _shape_pending_transition_reward_for_rendezvous(
+            pending_transition=pending_transition,
+            reward_so_far=-1.0,
+            runtime_state=SimpleNamespace(
+                drone_states={
+                    "uav_1": SimpleNamespace(training_state="riding_with_truck"),
+                }
+            ),
+            rendezvous_bonus=0.2,
+        )
+
+        self.assertTrue(bonus_applied)
+        self.assertAlmostEqual(shaped_reward, -0.8, places=6)
+
     def test_finalize_pending_transition_records_successor_bootstrap(self) -> None:
         pending = {
             "uav_1": RolloutTransition(
@@ -974,6 +1075,55 @@ class TestPhase7ModelRuntime(unittest.TestCase):
         self.assertAlmostEqual(float(backlog[0].reward), -2.0, places=6)
         self.assertFalse(bool(backlog[0].done))
         self.assertEqual(successor_bootstrap_values, {(3, "uav_1", 2): 1.75})
+
+    def test_finalize_pending_transition_applies_rendezvous_bonus_to_mode_c_pending(self) -> None:
+        pending = {
+            "uav_1": RolloutTransition(
+                observation_batch=self._build_single_observation(),
+                critic_batch=self._build_single_critic_batch(),
+                action_mask=self._build_single_action_mask(),
+                action_indices=SimpleNamespace(
+                    root_branch_idx=1,
+                    order_idx=0,
+                    mode_idx=1,
+                    recovery_idx=0,
+                ),
+                log_prob_old=-0.1,
+                value_old=0.5,
+                reward=-1.25,
+                done=None,
+                critic_schema_hash="schema",
+                episode_id=3,
+                actor_drone_id="uav_1",
+                recurrent_segment_id=2,
+                local_decision_index=4,
+                global_decision_index=11,
+            )
+        }
+        backlog: list[RolloutTransition] = []
+        successor_bootstrap_values: dict[tuple[int, str, int], float] = {}
+
+        _finalize_pending_transition_for_next_decision(
+            pending_transition_by_drone=pending,
+            rollout_backlog=backlog,
+            successor_bootstrap_values=successor_bootstrap_values,
+            drone_id="uav_1",
+            carry_in_reward=-0.75,
+            next_value=1.75,
+            decision_context=SimpleNamespace(
+                runtime_state=SimpleNamespace(
+                    drone_states={
+                        "uav_1": SimpleNamespace(training_state="charging_on_truck"),
+                    }
+                )
+            ),
+            rendezvous_bonus=0.2,
+        )
+
+        self.assertFalse(pending)
+        self.assertEqual(len(backlog), 1)
+        self.assertAlmostEqual(float(backlog[0].reward), -1.8, places=6)
+        self.assertTrue(bool(backlog[0].rendezvous_bonus_applied))
 
     def test_flush_terminal_pending_transitions_marks_done_and_preserves_order(self) -> None:
         first = RolloutTransition(
@@ -1488,6 +1638,10 @@ class TestPhase7ModelRuntime(unittest.TestCase):
                                 device=torch.device("cpu"),
                                 tail_bootstrap_values={},
                             )
+        self.assertEqual(
+            fake_model.evaluate_actions.call_args.kwargs["recovery_entropy_coef"],
+            train_cfg.recovery_entropy_coef,
+        )
         fake_optimizer.step.assert_not_called()
         self.assertAlmostEqual(float(stats["approx_kl"]), 1.0, places=6)
 
