@@ -108,9 +108,9 @@
       "home_depot_id": "DEP-TEST-01",
       "max_inventory": 30,
       "name": "卡车-01",
-      "parking_slots": 3,
+      "parking_slots": 9,
       "speed": 15,
-      "swap_time": 90,
+      "swap_time": 0,
       "truck_id": "TRK-TEST-01"
     }
   ],
