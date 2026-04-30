@@ -18,6 +18,7 @@ from core.entities.primitives import Position3D, TaskStatus
 from .contracts import PolicyMode
 from .env_adapter import (
     BackboneVisit,
+    DecisionTrigger,
     DispatchAction,
     ReservationState,
     TrainingDroneState,
@@ -41,6 +42,12 @@ class TestTrainingEnvAdapterPhase5c(unittest.TestCase):
             if drone_id != exclude:
                 return drone_id
         self.fail("默认场景中至少应有两架无人机")
+
+    def _first_riding_drone_id(self, env: TrainingEnvAdapter) -> str:
+        for drone_id, state in env._drone_state.items():
+            if state == TrainingDroneState.RIDING_WITH_TRUCK:
+                return drone_id
+        self.fail("默认场景中至少应有一架 truck-home 无人机处于 riding_with_truck")
 
     def _reset_controlled_env(self) -> tuple[TrainingEnvAdapter, str]:
         env = self._make_env()
@@ -120,6 +127,142 @@ class TestTrainingEnvAdapterPhase5c(unittest.TestCase):
         self.assertEqual(reservation.recover_node, recover_node_id)
         self.assertIn(recover_node_id, runtime_state.reservation_count)
         self.assertEqual(runtime_state.reservation_count[recover_node_id], 1)
+
+    def test_mode_c_reservation_expiry_covers_delivery_and_service_eta(self) -> None:
+        env, drone_id = self._reset_controlled_env()
+        entity_mgr = env._require_entity_manager()
+        drone = entity_mgr.drones[drone_id]
+        recover_node_id = sorted(entity_mgr.stations)[0]
+
+        order = self._inject_order(
+            env,
+            drone_id=drone_id,
+            order_id="ORDER-P5C-ETA-01",
+            offset_x=3000.0,
+        )
+        t_deliver = env._estimate_delivery_arrival_time(drone, order)
+        env._full_backbone_cache = [
+            BackboneVisit(
+                node_id=recover_node_id,
+                arrival_time=t_deliver + 900.0,
+                departure_time=t_deliver + 900.0 + 1e-6,
+            )
+        ]
+        env._enqueue_decision(drone_id, "test_idle", None)
+
+        trigger = env._decision_queue.pop(0)
+        env._apply_dispatch_action(
+            trigger,
+            DispatchAction(
+                order_id=order.order_id,
+                mode=PolicyMode.C,
+                recover_node_id=recover_node_id,
+            ),
+        )
+
+        reservation = env._reservations[drone_id]
+        host = env._resolve_fixed_node(recover_node_id)
+        expected_total_eta = (
+            env._estimate_flight_time(
+                drone=drone,
+                from_pos=drone.current_loc,
+                to_pos=order.delivery_loc,
+            )
+            + float(env._scene_solver_params().drone_service_time_order_s)
+            + env._estimate_flight_time(
+                drone=drone,
+                from_pos=order.delivery_loc,
+                to_pos=host.get_location(env._t_now),
+            )
+        )
+        expected_tau = (
+            env._cfg.reservation_alpha * expected_total_eta
+            + env._cfg.reservation_gamma * float(host.estimate_wait_time(env._t_now))
+        )
+
+        self.assertAlmostEqual(
+            reservation.expires_at,
+            env._t_now + expected_tau,
+            places=6,
+        )
+        self.assertGreater(
+            reservation.expires_at,
+            env._estimate_delivery_finish_time(drone, order),
+        )
+
+    def test_mode_c_reservation_expiry_includes_truck_launch_delay(self) -> None:
+        env = self._make_env()
+        env.reset()
+
+        order_mgr = env._require_order_manager()
+        order_mgr.pending_orders.clear()
+        order_mgr.assigned_orders.clear()
+        order_mgr.completed_orders.clear()
+        order_mgr._next_order_time = math.inf
+        order_mgr._scheduled_dynamic = []
+        order_mgr._scheduled_dynamic_i = 0
+        env._decision_queue.clear()
+        env._background_mode_a_pending.clear()
+
+        drone_id = self._first_riding_drone_id(env)
+        drone = env._require_entity_manager().drones[drone_id]
+        recover_node_id = sorted(env._require_entity_manager().stations)[0]
+        order = self._inject_order(
+            env,
+            drone_id=drone_id,
+            order_id="ORDER-P5C-ETA-TRUCK",
+            offset_x=1000.0,
+        )
+        env._full_backbone_cache = [
+            BackboneVisit(
+                node_id=recover_node_id,
+                arrival_time=env._t_now + 1200.0,
+                departure_time=env._t_now + 1200.0 + 1e-6,
+            )
+        ]
+
+        trigger = DecisionTrigger(
+            decision_id=0,
+            drone_id=drone_id,
+            trigger_type="truck_station_arrival",
+            trigger_station_id=recover_node_id,
+        )
+        env._apply_dispatch_action(
+            trigger,
+            DispatchAction(
+                order_id=order.order_id,
+                mode=PolicyMode.C,
+                recover_node_id=recover_node_id,
+            ),
+        )
+
+        reservation = env._reservations[drone_id]
+        host = env._resolve_fixed_node(recover_node_id)
+        launch_delay = float(env._scene_solver_params().truck_drone_launch_time_s)
+        expected_total_eta = (
+            launch_delay
+            + env._estimate_flight_time(
+                drone=drone,
+                from_pos=drone.current_loc,
+                to_pos=order.delivery_loc,
+            )
+            + float(env._scene_solver_params().drone_service_time_order_s)
+            + env._estimate_flight_time(
+                drone=drone,
+                from_pos=order.delivery_loc,
+                to_pos=host.get_location(env._t_now + launch_delay),
+            )
+        )
+        expected_tau = (
+            env._cfg.reservation_alpha * expected_total_eta
+            + env._cfg.reservation_gamma * float(host.estimate_wait_time(env._t_now))
+        )
+
+        self.assertAlmostEqual(
+            reservation.expires_at,
+            env._t_now + expected_tau,
+            places=6,
+        )
 
     def test_reservation_timeout_switches_to_fallback_after_delivery(self) -> None:
         env, drone_id = self._reset_controlled_env()

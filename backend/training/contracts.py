@@ -394,6 +394,11 @@ class OrderFeatures:
     best_mode_b_return_score: float
     best_mode_b_host_type: str
     best_mode_b_queue_time_est: float
+    has_mode_c_action: bool
+    best_mode_c_rendezvous_margin: float
+    best_mode_c_queue_time_est: float
+    best_mode_c_node_type: str
+    best_mode_c_truck_eta_remaining: float
     is_valid: bool
 
 
@@ -780,6 +785,7 @@ class RewardMeta:
     lambda_res_timeout: float
     lambda_overdue: float
     R_delivery_bonus: float
+    rendezvous_bonus: float
     max_overdue_sec: float
     hard_overdue_penalty_sec: float
     hard_failure_penalty_sec: float

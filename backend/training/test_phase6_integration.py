@@ -328,6 +328,25 @@ class TestPhase6Integration(unittest.TestCase):
         self.assertEqual(sum(candidate_out.recovery_mask[0]), 1)
         self.assertTrue(candidate_out.mode_mask[0][0], "mode B 应保留")
         self.assertTrue(candidate_out.mode_mask[0][1], "mode C 应保留")
+        order_feature = candidate_out.candidate_features.order_features[0]
+        recovery_feature = candidate_out.candidate_features.recovery_features[0][0]
+        self.assertTrue(order_feature.has_mode_c_action)
+        self.assertAlmostEqual(
+            order_feature.best_mode_c_rendezvous_margin,
+            recovery_feature.rendezvous_margin,
+        )
+        self.assertAlmostEqual(
+            order_feature.best_mode_c_queue_time_est,
+            recovery_feature.predicted_queue_time_est,
+        )
+        self.assertEqual(
+            order_feature.best_mode_c_node_type,
+            recovery_feature.recover_node_type,
+        )
+        self.assertAlmostEqual(
+            order_feature.best_mode_c_truck_eta_remaining,
+            recovery_feature.truck_eta - runtime_state.t_now,
+        )
 
         resolved_wait = candidate_out.resolved_action_lookup.resolve(root_branch_idx=0)
         resolved_mode_c = candidate_out.resolved_action_lookup.resolve(

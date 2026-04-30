@@ -1385,3 +1385,325 @@
 - 先把 `mode C` 的粗候选供给边界修正到更合理的位置
 
 这样后续关于 `mode C` 是否“真的学不会”的判断，才更有诊断价值。
+
+## 10.9 `run05_recovery_pool_scan` 结果记录（2026-04-29）
+
+在完成以下三项改动之后：
+
+1. 第一层：`mode C` 诊断指标
+2. 第二层：`C-sensitive eval split`
+3. 第四层：放宽 recovery pool 的构造方式
+
+当前已完成一轮新的训练验证：
+
+- `phase7_20260429_run05_recovery_pool_scan`
+
+本节记录这轮实验的客观结果，以及它对前文判断的影响。
+
+### 10.9.1 本次训练基本信息
+
+本轮训练输出目录为：
+
+- `backend/weights/rh_alns_cmrappo/phase7_20260429_run05_recovery_pool_scan`
+
+训练返回结果显示：
+
+1. `global_step = 819436`
+2. `updates = 200`
+3. `stopped_early = True`
+4. `stop_reason = early_stop:stochastic_high_no_improve=5,...`
+5. `selected_policy_source = policy_best.pt`
+
+这说明本轮不是因为训练报错中断，而是在当前 early-stop 规则下正常提前结束。
+
+### 10.9.2 本轮最重要的结论
+
+这次实验的最核心结论不是：
+
+- `mode C` 已经学会
+
+而是：
+
+1. `recovery_pool` 放宽后，`mode C` 的候选供给明显改善了
+2. critic 稳定化后的训练数值质量明显改善了
+3. 但最终评估策略依然稳定退化为 `B-only`
+
+也就是说，这一轮实验验证了：
+
+- “供给不足”确实是问题的一部分
+
+但同时也继续证明：
+
+- 仅靠放宽候选供给，还不足以让 `mode C` 真正被学起来
+
+### 10.9.3 recovery pool 放宽已明确生效
+
+从本轮评估产物看，新的 recovery pool 逻辑已经真正把更多合法 `mode C` 机会暴露给了策略。
+
+在 benchmark 上：
+
+1. `dispatch_decision_count = 4`
+2. `dispatch_decision_with_legal_mode_c_count = 4`
+3. `feasible_mode_c_recover_node_count_total = 10`
+4. `avg_feasible_mode_c_nodes_per_dispatch_decision = 2.5`
+
+也就是说：
+
+- 4 个 dispatch 决策点里，4 个都存在合法 `mode C`
+- 且每个决策点平均有 2.5 个合法 recovery 节点
+
+在 `C-sensitive` split 上结果完全相同：
+
+1. `dispatch_decision_count = 4`
+2. `dispatch_decision_with_legal_mode_c_count = 4`
+3. `feasible_mode_c_recover_node_count_total = 10`
+4. `avg_feasible_mode_c_nodes_per_dispatch_decision = 2.5`
+
+在 stochastic 上，合法 `mode C` 供给也已经不再稀缺：
+
+1. `low`
+   - `sum_dispatch_decision_count = 21`
+   - `sum_dispatch_decision_with_legal_mode_c_count = 19`
+   - `sum_feasible_mode_c_recover_node_count_total = 56`
+   - `avg_feasible_mode_c_nodes_per_dispatch_decision = 2.6667`
+
+2. `medium`
+   - `sum_dispatch_decision_count = 81`
+   - `sum_dispatch_decision_with_legal_mode_c_count = 57`
+   - `sum_feasible_mode_c_recover_node_count_total = 132`
+   - `avg_feasible_mode_c_nodes_per_dispatch_decision = 1.6296`
+
+3. `high`
+   - `sum_dispatch_decision_count = 93`
+   - `sum_dispatch_decision_with_legal_mode_c_count = 67`
+   - `sum_feasible_mode_c_recover_node_count_total = 159`
+   - `avg_feasible_mode_c_nodes_per_dispatch_decision = 1.7097`
+
+这部分结果已经足以说明：
+
+- `run05` 中，`mode C` 不是“没有机会”
+
+而是：
+
+- “机会已经出现，但策略仍然不愿意选”
+
+### 10.9.4 最终评估策略仍然是稳定的 `B-only`
+
+虽然合法 `mode C` 机会显著增加，但最终评估中 `mode C` 的使用率依然为零。
+
+本轮：
+
+1. benchmark
+   - `mode_c_dispatch_ratio = 0.0`
+   - `dispatch_mode_c_count = 0`
+
+2. `C-sensitive`
+   - `mode_c_dispatch_ratio = 0.0`
+   - `dispatch_mode_c_count = 0`
+
+3. stochastic `low / medium / high`
+   - `mode_c_dispatch_ratio = 0.0`
+   - `sum_mode_c_selected_count = 0`
+   - `sum_mode_c_success_count = 0`
+
+因此，这轮实验不能被解释为：
+
+- 放宽 recovery pool 后，策略已经开始稳定利用 `mode C`
+
+更准确的解释应当是：
+
+- 放宽 recovery pool 后，策略已经看得见更多 `mode C`，但它在当前目标下依然更偏好 `B`
+
+### 10.9.5 整体 reward 明显提升，但提升并不来自 `mode C`
+
+和 `run04` 相比，本轮总体 reward 明显更好：
+
+1. benchmark
+   - `mean_total_reward: -79.4355 -> 220.5645`
+
+2. stochastic low
+   - `mean_total_reward: -126.8844 -> 81.1156`
+
+3. stochastic medium
+   - `mean_total_reward: 366.3487 -> 516.0450`
+
+4. stochastic high
+   - `mean_total_reward: 614.8322 -> 950.1573`
+
+但因为最终评估里的：
+
+- `mode_c_dispatch_ratio` 仍然全部为 `0.0`
+
+所以这次 reward 提升不能归因为：
+
+- `mode C` 被学会了
+
+它更可能表示：
+
+1. critic 更稳定后，`B-only` 策略质量本身提升了
+2. 放宽 recovery pool 没有破坏整体主策略
+3. 新训练配置在当前任务上比 `run04` 更稳
+
+### 10.9.6 critic 稳定化第一步在本轮中是成功的
+
+从训练指标看，这轮 critic 数值稳定性相比 `run04` 有非常明显的改善。
+
+`run04`：
+
+1. `value_loss_mean ≈ 2174.51`
+2. `value_loss_max ≈ 61855.10`
+3. 最后 5 次 `value_loss` 仍在 `1397 ~ 2915` 区间
+
+`run05`：
+
+1. `value_loss_mean ≈ 34.74`
+2. `value_loss_max ≈ 97.53`
+3. 最后 5 次 `value_loss` 大致在 `30 ~ 70` 区间
+
+因此，这轮实验已经明确支持前文第三层的判断：
+
+- critic 稳定化第一步是有效的
+
+同时，本轮 early-stop 的触发原因也不是：
+
+- value loss 再次失控
+
+而是：
+
+- `stochastic_high` 连续 5 次无提升
+
+这意味着当前训练停止的主因，已经更接近“策略性能平台期”，而不是“critic 数值炸裂”。
+
+### 10.9.7 训练期确实更常接触 `mode C`，但这仍然不等于学会
+
+如果只看训练期 episode 指标，本轮策略比 `run04` 更常探索到 `mode C`。
+
+以训练期统计看：
+
+1. `run04`
+   - `mode_c_ratio_over_dispatches ≈ 1.93%`
+
+2. `run05`
+   - `mode_c_ratio_over_dispatches ≈ 3.21%`
+
+同时，`run05` 训练期累计：
+
+1. `dispatch_decision_count = 165901`
+2. `dispatch_decision_with_legal_mode_c_count = 116017`
+3. `feasible_mode_c_recover_node_count_total = 267348`
+4. `mode_c_selected_count = 5215`
+
+这说明训练采样层面已经明显更容易“碰到并尝试 `mode C`”。
+
+但是，成功质量非常弱：
+
+1. `mode_c_success_count = 6`
+2. `mode_c_post_delivery_revalidation_fail_count = 4`
+
+也就是说：
+
+- 训练中虽然比以前更常选到 `C`
+
+但这些 `C` 绝大多数并没有形成足够稳定的成功收益链条，因此没有被固化为最终评估策略。
+
+### 10.9.8 训练期副作用也上升了
+
+和 `run04` 相比，训练期的 fallback / reservation timeout 强度也有所上升。
+
+按 delivery 归一化后：
+
+1. `fallback_per_delivery`
+   - `run04 ≈ 1.997%`
+   - `run05 ≈ 3.264%`
+
+2. `reservation_timeout_per_delivery`
+   - `run04 ≈ 1.928%`
+   - `run05 ≈ 3.206%`
+
+这和前面的观察是吻合的：
+
+1. 候选供给变宽后，策略更容易探索 `mode C`
+2. 但高质量 `mode C` 仍然不足
+3. 因此训练中会多出一部分低质量 `C` 尝试及其副作用
+
+所以，这轮实验虽然没有把系统重新拉回 `run01` 那种严重失控状态，但它也说明：
+
+- 单纯扩大 `mode C` 机会，会带来更多探索噪声和失败成本
+
+### 10.9.9 当前 `C-sensitive eval split` 还不够“尖锐”
+
+本轮还暴露出另一个重要事实：
+
+- 当前 `C-sensitive` split 虽然已经筛出了 legal-`C` 订单，但它还没有形成足够强的“必须用 `C` 才更优”的评估压力
+
+当前 `C-sensitive` 选中了 5 个动态单：
+
+1. `DYN-BENCH-01: 4`
+2. `DYN-BENCH-02: 4`
+3. `DYN-BENCH-03: 3`
+4. `DYN-BENCH-04: 2`
+5. `DYN-BENCH-05: 1`
+
+这些数字表示：
+
+- 各订单在筛选时刻存在的合法 `mode C` recovery 节点数量
+
+但是最终 `C-sensitive` 的整体结果与 benchmark 几乎完全一致：
+
+1. 总 reward 一样
+2. `dispatch_mode_c_count = 0`
+3. `mode_c_dispatch_ratio = 0.0`
+
+这说明当前这版 `C-sensitive` 仍然更像：
+
+- “存在 legal `C` 机会的 replay 子集”
+
+而不是：
+
+- “若不用 `C` 就明显吃亏的强区分验证集”
+
+因此，第二层虽然已经落地，但它还需要继续强化，才能真正承担“验证 `mode C` 是否学会”的职责。
+
+### 10.9.10 本轮结果对问题定位的影响
+
+这轮 `run05` 非常有价值，因为它进一步压缩了问题空间。
+
+截至当前版本，可以更有把握地说：
+
+1. 问题已经不再主要是：
+   - `mode C` 根本没有候选机会
+
+2. 问题也不再主要是：
+   - critic 完全不稳定，导致任何长收益分支都学不动
+
+3. 当前更像是：
+   - `mode C` 在当前 reward / value / exploration 组合下，仍然没有形成足够强的相对优势
+
+因此，这轮实验把主问题更清楚地收敛到了：
+
+1. reward shaping / success signal 不足
+2. 长收益 credit assignment 仍然不够强
+3. `C-sensitive` 验证集还不够能区分 `B-only` 与 `C-capable`
+4. 必要时可能需要 imitation / warm start，而不是继续单纯扩候选池
+
+### 10.9.11 当前最合理的下一步
+
+基于这轮结果，后续最合理的顺序应当是：
+
+1. 先强化 `C-sensitive eval split`
+   - 让它真正变成“选 `C` 才明显更优”的验证集
+
+2. 再考虑对 `mode C` 成功完成 rendezvous 引入小而明确的成功 shaping
+   - 重点是奖励“成功完成 `C`”，而不是奖励“选了 `C`”
+
+3. 如果仍然学不起来，再考虑：
+   - imitation warm start
+   - 或专门针对 legal-`C` 决策点的探索/采样重加权
+
+不建议下一步继续单独做的事情是：
+
+- 继续只扩大 recovery pool，而不改变评估压力和成功 credit
+
+因为 `run05` 已经说明：
+
+- 仅靠把更多 `mode C` 候选暴露出来，不足以让最终策略学会稳定使用 `mode C`
