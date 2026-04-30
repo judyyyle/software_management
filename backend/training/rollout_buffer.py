@@ -46,6 +46,7 @@ class RolloutTransition:
     local_decision_index: int = 0
     global_decision_index: int = 0
     decision_context_debug_snapshot: Any | None = None
+    rendezvous_bonus_applied: bool = False
 
     @property
     def is_finalized(self) -> bool:

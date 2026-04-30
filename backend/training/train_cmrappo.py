@@ -86,6 +86,8 @@ class _TrainingConfig:
     gae_lambda: float
     clip_coef: float
     entropy_coef: float
+    recovery_entropy_coef: float
+    rendezvous_bonus: float
     value_loss_coef: float
     value_loss_type: str
     value_huber_delta: float
@@ -173,6 +175,59 @@ def _extract_attributed_step_reward_parts(*, step_result: Any) -> tuple[float, f
     return carry_in_reward, post_action_reward
 
 
+def _is_rendezvous_success_state(training_state: str) -> bool:
+    return str(training_state) in {"charging_on_truck", "riding_with_truck"}
+
+
+def _is_mode_c_action_indices(action_indices: Any) -> bool:
+    return (
+        int(getattr(action_indices, "root_branch_idx", 0)) == 1
+        and int(getattr(action_indices, "mode_idx", 0)) == 1
+    )
+
+
+def _shape_post_action_reward_for_rendezvous(
+    *,
+    post_action_reward: float,
+    action_indices: Any,
+    transition_summary: Any,
+    rendezvous_bonus: float,
+) -> tuple[float, bool]:
+    bonus = float(rendezvous_bonus)
+    if bonus <= 0.0:
+        return float(post_action_reward), False
+    if not _is_mode_c_action_indices(action_indices):
+        return float(post_action_reward), False
+    if not bool(getattr(transition_summary, "rendezvous_success", False)):
+        return float(post_action_reward), False
+    return float(post_action_reward) + bonus, True
+
+
+def _shape_pending_transition_reward_for_rendezvous(
+    *,
+    pending_transition: RolloutTransition,
+    reward_so_far: float,
+    runtime_state: Any | None,
+    rendezvous_bonus: float,
+) -> tuple[float, bool]:
+    bonus = float(rendezvous_bonus)
+    if bonus <= 0.0:
+        return float(reward_so_far), False
+    if bool(getattr(pending_transition, "rendezvous_bonus_applied", False)):
+        return float(reward_so_far), False
+    if not _is_mode_c_action_indices(pending_transition.action_indices):
+        return float(reward_so_far), False
+    if runtime_state is None:
+        return float(reward_so_far), False
+    drone_states = getattr(runtime_state, "drone_states", {})
+    drone_state = drone_states.get(str(pending_transition.actor_drone_id))
+    if drone_state is None:
+        return float(reward_so_far), False
+    if not _is_rendezvous_success_state(str(getattr(drone_state, "training_state", ""))):
+        return float(reward_so_far), False
+    return float(reward_so_far) + bonus, True
+
+
 def _insert_finalized_transition_in_order(
     *,
     rollout_backlog: list[RolloutTransition],
@@ -196,15 +251,31 @@ def _finalize_pending_transition_for_next_decision(
     drone_id: str,
     carry_in_reward: float,
     next_value: float,
+    decision_context: Any | None = None,
+    rendezvous_bonus: float = 0.0,
 ) -> None:
     pending = pending_transition_by_drone.pop(drone_id, None)
     if pending is None:
         return
     reward_so_far = 0.0 if pending.reward is None else float(pending.reward)
+    runtime_state = (
+        getattr(decision_context, "runtime_state", None)
+        if decision_context is not None
+        else None
+    )
+    reward_so_far, bonus_applied = _shape_pending_transition_reward_for_rendezvous(
+        pending_transition=pending,
+        reward_so_far=reward_so_far,
+        runtime_state=runtime_state,
+        rendezvous_bonus=rendezvous_bonus,
+    )
     finalized = replace(
         pending,
         reward=reward_so_far + float(carry_in_reward),
         done=False,
+        rendezvous_bonus_applied=(
+            bool(getattr(pending, "rendezvous_bonus_applied", False)) or bonus_applied
+        ),
     )
     _insert_finalized_transition_in_order(
         rollout_backlog=rollout_backlog,
@@ -223,13 +294,24 @@ def _flush_terminal_pending_transitions(
     pending_transition_by_drone: dict[str, RolloutTransition],
     rollout_backlog: list[RolloutTransition],
     terminal_reward_by_drone: Mapping[str, float],
+    runtime_state: Any | None = None,
+    rendezvous_bonus: float = 0.0,
 ) -> None:
     for drone_id, pending in tuple(pending_transition_by_drone.items()):
         reward_so_far = 0.0 if pending.reward is None else float(pending.reward)
+        reward_so_far, bonus_applied = _shape_pending_transition_reward_for_rendezvous(
+            pending_transition=pending,
+            reward_so_far=reward_so_far,
+            runtime_state=runtime_state,
+            rendezvous_bonus=rendezvous_bonus,
+        )
         finalized = replace(
             pending,
             reward=reward_so_far + float(terminal_reward_by_drone.get(drone_id, 0.0)),
             done=True,
+            rendezvous_bonus_applied=(
+                bool(getattr(pending, "rendezvous_bonus_applied", False)) or bonus_applied
+            ),
         )
         _insert_finalized_transition_in_order(
             rollout_backlog=rollout_backlog,
@@ -577,6 +659,20 @@ def train_cmrappo(
                 drone_id=drone_id,
                 carry_in_reward=carry_in_reward,
                 next_value=value_old,
+                decision_context=decision_context,
+                rendezvous_bonus=train_cfg.rendezvous_bonus,
+            )
+            transition_summary = tensorizer.build_transition_summary(
+                decision_context=decision_context,
+                candidate_out=candidate_out,
+                action_indices=action_indices,
+                step_result=step_result,
+            )
+            shaped_post_action_reward, bonus_applied = _shape_post_action_reward_for_rendezvous(
+                post_action_reward=post_action_reward,
+                action_indices=action_indices,
+                transition_summary=transition_summary,
+                rendezvous_bonus=train_cfg.rendezvous_bonus,
             )
             current_transition = RolloutTransition(
                 observation_batch=observation_batch,
@@ -586,7 +682,7 @@ def train_cmrappo(
                 log_prob_old=float(log_prob.detach().cpu().item()),
                 value_old=value_old,
                 critic_schema_hash=critic_schema.schema_hash,
-                reward=post_action_reward,
+                reward=shaped_post_action_reward,
                 done=True if step_result.done else None,
                 lstm_state_in=_detach_lstm_state(lstm_state=lstm_state_in),
                 lstm_state_out=_detach_lstm_state(lstm_state=next_lstm_state),
@@ -596,6 +692,7 @@ def train_cmrappo(
                 local_decision_index=local_decision_index,
                 global_decision_index=global_step,
                 decision_context_debug_snapshot=decision_context,
+                rendezvous_bonus_applied=bonus_applied,
             )
             terminal_reward_by_drone: dict[str, float] = {}
             if step_result.done:
@@ -608,17 +705,12 @@ def train_cmrappo(
                     pending_transition_by_drone=pending_transition_by_drone,
                     rollout_backlog=rollout_backlog,
                     terminal_reward_by_drone=terminal_reward_by_drone,
+                    runtime_state=step_result.runtime_state,
+                    rendezvous_bonus=train_cfg.rendezvous_bonus,
                 )
             else:
                 pending_transition_by_drone[drone_id] = current_transition
-            history_buffer.append(
-                tensorizer.build_transition_summary(
-                    decision_context=decision_context,
-                    candidate_out=candidate_out,
-                    action_indices=action_indices,
-                    step_result=step_result,
-                )
-            )
+            history_buffer.append(transition_summary)
             last_seen_plan_version_by_drone[decision_context.deciding_drone_id] = (
                 decision_context.coarse_plan.plan_version
             )
@@ -689,6 +781,7 @@ def train_cmrappo(
                 pending_transition_by_drone=pending_transition_by_drone,
                 rollout_backlog=rollout_backlog,
                 successor_bootstrap_values=successor_bootstrap_values,
+                train_cfg=train_cfg,
             )
         if global_step >= train_cfg.total_timesteps and rollout_backlog:
             current_result = _advance_until_rollout_bootstraps_resolved_after_collection(
@@ -1793,6 +1886,7 @@ def _ppo_update(
                 policy_out=flat_policy_out,
                 action_mask=flat_action_mask,
                 action_indices=flat_action_indices,
+                recovery_entropy_coef=train_cfg.recovery_entropy_coef,
             )
 
             old_log_probs = minibatch.old_log_probs.reshape(-1)
@@ -1904,6 +1998,7 @@ def _drain_pending_transitions_after_collection(
     pending_transition_by_drone: dict[str, RolloutTransition],
     rollout_backlog: list[RolloutTransition],
     successor_bootstrap_values: dict[tuple[int, str, int], float],
+    train_cfg: _TrainingConfig,
 ) -> Any:
     while pending_transition_by_drone:
         if current_result.done:
@@ -1912,6 +2007,8 @@ def _drain_pending_transitions_after_collection(
                 pending_transition_by_drone=pending_transition_by_drone,
                 rollout_backlog=rollout_backlog,
                 terminal_reward_by_drone=terminal_reward_by_drone,
+                runtime_state=current_result.runtime_state,
+                rendezvous_bonus=train_cfg.rendezvous_bonus,
             )
             return current_result
 
@@ -1967,6 +2064,8 @@ def _drain_pending_transitions_after_collection(
             drone_id=drone_id,
             carry_in_reward=carry_in_reward,
             next_value=value_old,
+            decision_context=decision_context,
+            rendezvous_bonus=train_cfg.rendezvous_bonus,
         )
         history_buffer.append(
             tensorizer.build_transition_summary(
@@ -2623,6 +2722,7 @@ def _build_meta_payload(
             lambda_res_timeout=float(reward["lambda_res_timeout"]),
             lambda_overdue=float(reward["lambda_overdue"]),
             R_delivery_bonus=float(reward["R_delivery_bonus"]),
+            rendezvous_bonus=float(reward.get("rendezvous_bonus", 0.0)),
             max_overdue_sec=float(reward["max_overdue_sec"]),
             hard_overdue_penalty_sec=float(reward["hard_overdue_penalty_sec"]),
             hard_failure_penalty_sec=float(reward["hard_failure_penalty_sec"]),
@@ -3007,6 +3107,7 @@ def _require_torch() -> None:
 def _load_training_config(config_path: Path) -> _TrainingConfig:
     raw = _load_yaml(config_path)
     training = raw["training"]
+    reward = raw["reward"]
     batch_size_alias = training.get("batch_size")
     target_minibatch_timesteps = training.get("target_minibatch_timesteps")
     if target_minibatch_timesteps is None and batch_size_alias is None:
@@ -3038,6 +3139,8 @@ def _load_training_config(config_path: Path) -> _TrainingConfig:
         gae_lambda=float(training["gae_lambda"]),
         clip_coef=float(training["clip_coef"]),
         entropy_coef=float(training["entropy_coef"]),
+        recovery_entropy_coef=float(training.get("recovery_entropy_coef", 1.0)),
+        rendezvous_bonus=float(reward.get("rendezvous_bonus", 0.0)),
         value_loss_coef=float(training["value_loss_coef"]),
         value_loss_type=str(training.get("value_loss_type", "mse")),
         value_huber_delta=float(training.get("value_huber_delta", 1.0)),
@@ -3103,6 +3206,8 @@ def _validate_training_config(cfg: _TrainingConfig) -> None:
         raise ValueError("value_loss_type 仅支持 mse 或 huber")
     if cfg.value_huber_delta <= 0.0:
         raise ValueError("value_huber_delta 必须为正数")
+    if cfg.rendezvous_bonus < 0.0:
+        raise ValueError("rendezvous_bonus 不能为负数")
     expected_target = cfg.sequence_minibatch_size * cfg.train_len
     if expected_target != cfg.target_minibatch_timesteps:
         raise ValueError(

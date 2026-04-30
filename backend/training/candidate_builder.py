@@ -152,6 +152,10 @@ class CandidateBuilder:
                     trigger_type=trigger_type,
                     trigger_station_id=trigger_station_id,
                 )
+            mode_c_summary = self._summarize_best_mode_c(
+                recovery_candidates=recovery_candidates,
+                t_now=float(runtime_state.t_now),
+            )
 
             if mode_b_summary is None and not recovery_candidates:
                 continue
@@ -177,6 +181,27 @@ class CandidateBuilder:
                 best_mode_b_queue_time_est=(
                     float(mode_b_summary["queue_time_est"])
                     if mode_b_summary is not None
+                    else 0.0
+                ),
+                has_mode_c_action=mode_c_summary is not None,
+                best_mode_c_rendezvous_margin=(
+                    float(mode_c_summary["rendezvous_margin"])
+                    if mode_c_summary is not None
+                    else 0.0
+                ),
+                best_mode_c_queue_time_est=(
+                    float(mode_c_summary["queue_time_est"])
+                    if mode_c_summary is not None
+                    else 0.0
+                ),
+                best_mode_c_node_type=(
+                    str(mode_c_summary["node_type"])
+                    if mode_c_summary is not None
+                    else ""
+                ),
+                best_mode_c_truck_eta_remaining=(
+                    float(mode_c_summary["truck_eta_remaining"])
+                    if mode_c_summary is not None
                     else 0.0
                 ),
                 is_valid=True,
@@ -428,6 +453,26 @@ class CandidateBuilder:
         )
         return tuple(candidates[: self._cfg.max_candidate_recovery_per_order])
 
+    def _summarize_best_mode_c(
+        self,
+        *,
+        recovery_candidates: tuple[RecoveryFeatures, ...],
+        t_now: float,
+    ) -> dict[str, Any] | None:
+        if not recovery_candidates:
+            return None
+
+        best_candidate = recovery_candidates[0]
+        return {
+            "rendezvous_margin": float(best_candidate.rendezvous_margin),
+            "queue_time_est": float(best_candidate.predicted_queue_time_est),
+            "node_type": str(best_candidate.recover_node_type),
+            "truck_eta_remaining": max(
+                0.0,
+                float(best_candidate.truck_eta) - float(t_now),
+            ),
+        }
+
     def _runtime_recovery_pool(
         self,
         *,
@@ -660,6 +705,11 @@ def _padding_order_feature() -> OrderFeatures:
         best_mode_b_return_score=0.0,
         best_mode_b_host_type="",
         best_mode_b_queue_time_est=0.0,
+        has_mode_c_action=False,
+        best_mode_c_rendezvous_margin=0.0,
+        best_mode_c_queue_time_est=0.0,
+        best_mode_c_node_type="",
+        best_mode_c_truck_eta_remaining=0.0,
         is_valid=False,
     )
 
