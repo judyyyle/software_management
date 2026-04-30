@@ -16,7 +16,11 @@ import numpy as np
 from .critic_batch_builder import CriticBatchBuilder
 from .contracts import ResolvedActionIndices, TransitionSummary
 from .env_adapter import TrainingEnvAdapter
-from .observation_tensorizer import HISTORY_TOKEN_FIELDS, ObservationTensorizer
+from .observation_tensorizer import (
+    HISTORY_TOKEN_FIELDS,
+    ORDER_TOKEN_FIELDS,
+    ObservationTensorizer,
+)
 from .rollout_buffer import RolloutBuffer, compute_gae
 
 
@@ -55,6 +59,7 @@ class TestPhase7SnapshotAndTensorizers(unittest.TestCase):
         action_mask = self.tensorizer.build_action_mask(candidate_out)
 
         self.assertEqual(batch.order_tokens.shape[0], len(candidate_out.order_mask))
+        self.assertEqual(batch.order_tokens.shape[1], len(ORDER_TOKEN_FIELDS))
         self.assertEqual(batch.recovery_tokens.shape[:2], batch.recovery_padding_mask.shape)
         self.assertEqual(batch.history_tokens.shape[0], self.tensorizer.history_length)
         self.assertEqual(batch.history_padding_mask.dtype, np.bool_)

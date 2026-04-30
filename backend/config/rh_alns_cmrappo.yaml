@@ -266,6 +266,8 @@ reward:
 
   # 正奖励仅保留送达奖励，避免 reward 结构过于混杂。
   R_delivery_bonus: 100
+  # Rendezvous 成功塑形奖励：仅用于训练侧奖励归因，给 mode C 提供早期正向探索信号。
+  rendezvous_bonus: 0.2
 
   # 超时强制移除与硬失败惩罚。
   max_overdue_sec: 600
@@ -309,6 +311,8 @@ training:
   #   - huber：优先用于当前高方差 reward / return 场景
   #   - mse：保留为回退选项
   entropy_coef: 0.03
+  # Recovery entropy 单独降权，避免 mode C 因多一层 recovery 选择而承受过强熵惩罚。
+  recovery_entropy_coef: 0.4
   value_loss_coef: 0.10
   value_loss_type: huber
   value_huber_delta: 1.0
