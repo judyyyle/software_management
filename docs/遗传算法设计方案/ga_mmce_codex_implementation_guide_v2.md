@@ -1185,9 +1185,9 @@ def _repair_rendezvous_if_needed(
 
 ## 9.1 目标
 
-新增 GA 专用物理评估器。
+新增 GA 专用物理评估器 `backend/solver/ga_mmce/physical_evaluator.py`。
 
-它的职责是：
+它只评估 GA 染色体已经指定的固定动作，不重新做任何贪心决策。
 
 ```text
 输入 GA 已经指定的：
@@ -1205,7 +1205,32 @@ def _repair_rendezvous_if_needed(
     需要追加的 drone route
 ```
 
-它不允许自动搜索最优起飞点或最优回收点。
+特别边界：
+
+```text
+允许复用 GreedyMMCE 的底层物理/工具函数：
+    _road_dist
+    _dist
+    _flight_energy
+    _uav_energy_wh
+    _truck_energy_wh
+    build_incremental_route_from_stops
+
+禁止调用任何会重新做贪心决策的函数：
+    dispatch
+    dispatch_incremental
+    dispatch_replan_current_state
+    _dispatch_impl
+    _allocate_order
+    _try_mode_b_with_waiting
+    _try_mode_b
+    _try_mode_c
+    _try_mode_a
+    _build_truck_route
+    _check_energy_feasible
+```
+
+`_check_energy_feasible` 禁止调用，因为它会在 recovery pool 中自动选择回收点。GA 需要的是“给定 recover_node_id 后只判断可不可行”。
 
 ## 9.2 新增文件
 
@@ -1251,77 +1276,29 @@ class GACandidate:
     truck_stops: list[dict[str, Any]] = field(default_factory=list)
     drone_route_fragment: Any | None = None
     allocation_fragment: Any | None = None
+
+    truck_final_node_id: str = ""
+    truck_final_time: float = 0.0
+    drone_final_node_id: str = ""
+    drone_final_time: float = 0.0
+    drone_energy_used: float = 0.0
+    drone_energy_after: float = 0.0
+    delivered_order_ids: list[str] = field(default_factory=list)
 ```
 
-## 9.4 PhysicalEvaluator 类骨架
+新增的 `*_final_*` 字段用于 Decoder 在 state copy 上逐单推进虚拟位置/时间，避免每个 candidate 都从真实初始状态重新评估。
+
+## 9.4 PhysicalEvaluator 已实现接口
 
 ```python
 class PhysicalEvaluator:
-    def __init__(self, entity_mgr, greedy_helper, config):
-        self.entity_mgr = entity_mgr
-        self.greedy = greedy_helper
-        self.config = config
+    def __init__(self, entity_mgr, greedy_helper, config): ...
 
-    def get_node_position(self, node_id: str):
-        if node_id in self.entity_mgr.depots:
-            return self.entity_mgr.depots[node_id].location
-        if node_id in self.entity_mgr.stations:
-            return self.entity_mgr.stations[node_id].location
-        raise KeyError(f"unknown depot/station node_id: {node_id}")
+    def get_node_position(self, node_id: str, state: Any | None = None): ...
+    def is_legal_rendezvous_node(self, node_id: str, state: Any | None = None) -> bool: ...
+    def validate_drone_for_mode(self, state, mode: str, drone_id: str) -> tuple[bool, str]: ...
 
-    def is_legal_rendezvous_node(self, node_id: str) -> bool:
-        return node_id in self.entity_mgr.depots or node_id in self.entity_mgr.stations
-
-    def check_fixed_recovery_energy(self, drone, launch_pos, delivery_pos, recover_pos, payload):
-        e1 = self.greedy._flight_energy(drone, launch_pos, delivery_pos, payload)
-        e2 = self.greedy._flight_energy(drone, delivery_pos, recover_pos, 0.0)
-        need = (e1 + e2) * self.greedy.ENERGY_SAFETY_FACTOR
-        if need > drone.battery_current:
-            return False, need, "energy_not_enough"
-        return True, need, ""
-```
-
-## 9.5 固定模式 A 评估
-
-```python
-    def evaluate_fixed_mode_a(self, state, order_id: str, truck_id: str) -> GACandidate:
-        order = state.orders[order_id] if hasattr(state, "orders") else self.entity_mgr.orders[order_id]
-        truck = self.entity_mgr.trucks.get(truck_id)
-        if truck is None:
-            return GACandidate(order_id, "A", False, reason="truck_not_found")
-
-        truck_pos = truck.get_location(state.current_time) if hasattr(state, "current_time") else truck.get_location(0.0)
-        dist = self.greedy._road_dist(truck_pos, order.delivery_loc)
-        energy = self.greedy._truck_energy_wh(dist)
-        speed = max(1e-6, float(getattr(truck, "speed", 0.0)))
-        arrival = (getattr(state, "current_time", 0.0) + dist / speed)
-        completion = arrival + self.greedy.SERVICE_TIME_CUSTOMER
-        lateness = max(0.0, completion - order.deadline)
-
-        candidate = GACandidate(
-            order_id=order_id,
-            mode="A",
-            feasible=True,
-            truck_id=truck_id,
-            completion_time=completion,
-            truck_distance=dist,
-            truck_energy=energy,
-            lateness=lateness,
-            truck_stops=[{
-                "node_id": order_id,
-                "node_type": "customer",
-                "position": order.delivery_loc,
-                "order_id": order_id,
-            }],
-        )
-        return self.score_candidate(candidate, order)
-```
-
-## 9.6 固定模式 B 评估
-
-固定模式 B 不允许自动选站点。
-
-```python
+    def evaluate_fixed_mode_a(self, state, order_id: str, truck_id: str) -> GACandidate: ...
     def evaluate_fixed_mode_b(
         self,
         state,
@@ -1330,201 +1307,246 @@ class PhysicalEvaluator:
         drone_id: str,
         launch_node_id: str,
         recover_node_id: str,
-    ) -> GACandidate:
-        order = state.orders[order_id] if hasattr(state, "orders") else self.entity_mgr.orders[order_id]
-        truck = self.entity_mgr.trucks.get(truck_id)
-        drone = self.entity_mgr.drones.get(drone_id)
+    ) -> GACandidate: ...
+    def evaluate_fixed_mode_c(self, state, order_id: str, drone_id: str, recover_node_id: str) -> GACandidate: ...
 
-        if truck is None:
-            return GACandidate(order_id, "B", False, reason="truck_not_found")
-        if drone is None:
-            return GACandidate(order_id, "B", False, reason="drone_not_found")
-        if not self.is_legal_rendezvous_node(launch_node_id):
-            return GACandidate(order_id, "B", False, reason="illegal_launch_node")
-        if not self.is_legal_rendezvous_node(recover_node_id):
-            return GACandidate(order_id, "B", False, reason="illegal_recover_node")
-        if order.payload_weight > drone.payload_capacity:
-            return GACandidate(order_id, "B", False, reason="payload_exceed")
-
-        launch_pos = self.get_node_position(launch_node_id)
-        recover_pos = self.get_node_position(recover_node_id)
-
-        ok, energy_need, reason = self.check_fixed_recovery_energy(
-            drone,
-            launch_pos,
-            order.delivery_loc,
-            recover_pos,
-            order.payload_weight,
-        )
-        if not ok:
-            return GACandidate(order_id, "B", False, reason=reason)
-
-        uav_dist_out = self.greedy._dist(launch_pos, order.delivery_loc)
-        uav_dist_back = self.greedy._dist(order.delivery_loc, recover_pos)
-        uav_distance = uav_dist_out + uav_dist_back
-        uav_energy = self.greedy._uav_energy_wh(drone, launch_pos, order.delivery_loc, order.payload_weight)
-        uav_energy += self.greedy._uav_energy_wh(drone, order.delivery_loc, recover_pos, 0.0)
-
-        truck_pos = truck.get_location(getattr(state, "current_time", 0.0))
-        truck_dist_to_launch = self.greedy._road_dist(truck_pos, launch_pos)
-        truck_dist_launch_to_recover = self.greedy._road_dist(launch_pos, recover_pos)
-        truck_distance = truck_dist_to_launch + truck_dist_launch_to_recover
-        truck_energy = self.greedy._truck_energy_wh(truck_distance)
-
-        current_time = getattr(state, "current_time", 0.0)
-        truck_speed = max(1e-6, float(getattr(truck, "speed", 0.0)))
-        launch_arrival_time = current_time + truck_dist_to_launch / truck_speed
-        launch_time = launch_arrival_time + self.greedy.TRUCK_DRONE_LAUNCH_TIME
-        delivery_time = launch_time + uav_dist_out / drone.cruise_speed + self.greedy.delivery_service_time
-        drone_recover_arrival = delivery_time + uav_dist_back / drone.cruise_speed
-        truck_recover_arrival = launch_arrival_time + truck_dist_launch_to_recover / truck_speed
-
-        truck_wait = max(0.0, drone_recover_arrival - truck_recover_arrival)
-        if truck_wait > self.config.truck_wait_max_s and not self.config.soft_rendezvous_violation:
-            return GACandidate(order_id, "B", False, reason="rendezvous_wait_timeout")
-
-        lateness = max(0.0, delivery_time - order.deadline)
-
-        candidate = GACandidate(
-            order_id=order_id,
-            mode="B",
-            feasible=True,
-            truck_id=truck_id,
-            drone_id=drone_id,
-            launch_node_id=launch_node_id,
-            recover_node_id=recover_node_id,
-            completion_time=delivery_time,
-            truck_distance=truck_distance,
-            uav_distance=uav_distance,
-            truck_energy=truck_energy,
-            uav_energy=uav_energy,
-            waiting_time=truck_wait,
-            lateness=lateness,
-            truck_stops=[
-                {
-                    "node_id": launch_node_id,
-                    "node_type": "recovery",
-                    "position": launch_pos,
-                    "order_id": "",
-                    "action": "launch",
-                },
-                {
-                    "node_id": recover_node_id,
-                    "node_type": "recovery",
-                    "position": recover_pos,
-                    "order_id": "",
-                    "action": "recover",
-                },
-            ],
-        )
-        return self.score_candidate(candidate, order)
+    def score_candidate(self, candidate: GACandidate, order: Any) -> GACandidate: ...
+    def apply_candidate(self, state, candidate: GACandidate) -> None: ...
 ```
 
-## 9.7 固定模式 C 评估
-
-```python
-    def evaluate_fixed_mode_c(
-        self,
-        state,
-        order_id: str,
-        drone_id: str,
-        recover_node_id: str,
-    ) -> GACandidate:
-        order = state.orders[order_id] if hasattr(state, "orders") else self.entity_mgr.orders[order_id]
-        drone = self.entity_mgr.drones.get(drone_id)
-        if drone is None:
-            return GACandidate(order_id, "C", False, reason="drone_not_found")
-        if order.payload_weight > drone.payload_capacity:
-            return GACandidate(order_id, "C", False, reason="payload_exceed")
-        if not self.is_legal_rendezvous_node(recover_node_id):
-            return GACandidate(order_id, "C", False, reason="illegal_recover_node")
-
-        depots = list(self.entity_mgr.depots.values())
-        if not depots:
-            return GACandidate(order_id, "C", False, reason="depot_not_found")
-        depot = depots[0]
-        recover_pos = self.get_node_position(recover_node_id)
-
-        ok, energy_need, reason = self.check_fixed_recovery_energy(
-            drone,
-            depot.location,
-            order.delivery_loc,
-            recover_pos,
-            order.payload_weight,
-        )
-        if not ok:
-            return GACandidate(order_id, "C", False, reason=reason)
-
-        dist_out = self.greedy._dist(depot.location, order.delivery_loc)
-        dist_back = self.greedy._dist(order.delivery_loc, recover_pos)
-        uav_distance = dist_out + dist_back
-        uav_energy = self.greedy._uav_energy_wh(drone, depot.location, order.delivery_loc, order.payload_weight)
-        uav_energy += self.greedy._uav_energy_wh(drone, order.delivery_loc, recover_pos, 0.0)
-
-        current_time = getattr(state, "current_time", 0.0)
-        delivery_time = current_time + dist_out / drone.cruise_speed + self.greedy.delivery_service_time
-        lateness = max(0.0, delivery_time - order.deadline)
-
-        candidate = GACandidate(
-            order_id=order_id,
-            mode="C",
-            feasible=True,
-            truck_id="",
-            drone_id=drone_id,
-            launch_node_id=depot.depot_id,
-            recover_node_id=recover_node_id,
-            completion_time=delivery_time,
-            uav_distance=uav_distance,
-            uav_energy=uav_energy,
-            lateness=lateness,
-            truck_stops=[],
-        )
-        return self.score_candidate(candidate, order)
-```
-
-## 9.8 评分函数
-
-```python
-    def score_candidate(self, candidate: GACandidate, order) -> GACandidate:
-        if not candidate.feasible:
-            candidate.score_total = self.config.big_m
-            return candidate
-
-        candidate.cost_dist = (
-            self.config.weight_truck_distance * candidate.truck_distance
-            + self.config.weight_uav_distance * candidate.uav_distance
-        )
-        candidate.cost_energy = self.config.weight_energy * (
-            candidate.truck_energy + candidate.uav_energy
-        )
-        candidate.cost_penalty = (
-            self.config.weight_delay * candidate.lateness
-            + self.config.weight_waiting * candidate.waiting_time
-        )
-        candidate.score_total = candidate.cost_dist + candidate.cost_energy + candidate.cost_penalty
-        return candidate
-```
-
-## 9.9 给 Codex 的提示词
+实现约定：
 
 ```text
-请新增 backend/solver/ga_mmce/physical_evaluator.py。
+state 应该是 Decoder 持有的 deepcopy，不是真实运行 state。
+评估函数优先读取 state 上的 orders/trucks/drones/depots/stations。
+若缺失，再回退到 entity_mgr。
+apply_candidate 只写 state copy 上的 _ga_position / _ga_time / _ga_energy / _ga_plan_fragments 等虚拟字段。
+```
+
+## 9.5 节点解析规则
+
+`get_node_position(node_id)` 必须兼容抽象仓库节点：
+
+```text
+node_id == "DEPOT"          -> 映射到实际唯一仓库
+node_id.startswith("DEPOT") -> 映射到匹配仓库；不存在则回退唯一仓库
+node_id.startswith("DEP-")  -> 映射到匹配仓库，例如 DEP-TEST-01
+station_id                  -> 从 state.stations / entity_mgr.stations 中读取
+```
+
+`is_legal_rendezvous_node(node_id)`：
+
+```text
+合法：
+    DEPOT
+    DEPOT*
+    DEP-*
+    已存在 depot_id
+    已存在 station_id
+
+非法：
+    客户点 order_id
+    任意非 depot/station 节点
+```
+
+## 9.6 无人机模式校验
+
+`validate_drone_for_mode(state, mode, drone_id)`：
+
+```text
+通用不可用条件：
+    drone 不存在
+    非 IDLE / 非 dispatchable
+    carrying_order_id 非空
+    waiting_recovery_station_id 非空
+    has_pending_route 为 True
+
+B 模式：
+    drone_id 必须在 truck.docked_drones 中，或已有 transport_truck_id。
+
+C 模式：
+    drone_id 不能在 truck.docked_drones 中。
+    drone.transport_truck_id 必须为空。
+    drone_id 必须在 depot.idle_drones 中。
+    drone.current_loc 必须在 depot.location 容差内。
+```
+
+动态重调度时不能只看 `home_type`。`home_type` 只表示静态归属，不等价于当前物理位置。
+
+## 9.7 固定模式 A 评估
+
+`evaluate_fixed_mode_a(state, order_id, truck_id)`：
+
+```text
+检查：
+    order 是否存在
+    truck 是否存在
+
+计算：
+    truck_start_pos = truck._ga_position 或 truck.get_location(current_time)
+    truck_start_time = truck._ga_time 或 state.current_time
+    dist = greedy._road_dist(truck_start_pos, order.delivery_loc)
+    arrival = truck_start_time + dist / truck.speed
+    completion = arrival + GreedyMMCE.SERVICE_TIME_CUSTOMER
+    lateness = max(0, completion - order.deadline)
+
+输出：
+    truck_stops 追加 customer stop
+    truck_final_node_id = order_id
+    truck_final_time = completion
+    delivered_order_ids = [order_id]
+```
+
+## 9.8 固定模式 B 评估
+
+`evaluate_fixed_mode_b(state, order_id, truck_id, drone_id, launch_node_id, recover_node_id)`：
+
+```text
+禁止自动搜索 station。
+必须使用 GA 给定的 launch_node_id 和 recover_node_id。
+```
+
+检查：
+
+```text
+order / truck / drone 是否存在
+B drone 当前是否在卡车上或 docked
+launch/recover 是否是合法协同节点
+payload 是否超过 drone.payload_capacity
+固定 launch -> delivery -> recover 的电量是否足够
+```
+
+时间计算要点：
+
+```text
+truck_dist_to_launch = road_dist(truck_start_pos, launch_pos)
+launch_arrival_time = truck_start_time + truck_dist_to_launch / truck.speed
+truck_depart_launch_time = launch_arrival_time + TRUCK_DRONE_LAUNCH_TIME
+
+truck_dist_launch_to_recover = road_dist(launch_pos, recover_pos)
+truck_recover_arrival = truck_depart_launch_time + truck_dist_launch_to_recover / truck.speed
+
+drone_launch_time = max(truck_depart_launch_time, drone_start_time)
+delivery_arrival = drone_launch_time + dist(launch_pos, order.delivery_loc) / drone.cruise_speed
+delivery_done = delivery_arrival + drone_service_time
+drone_recover_arrival = delivery_done + dist(order.delivery_loc, recover_pos) / drone.cruise_speed
+
+truck_wait = max(0, drone_recover_arrival - truck_recover_arrival)
+uav_wait = max(0, truck_recover_arrival - drone_recover_arrival)
+```
+
+注意：
+
+```text
+truck_recover_arrival 必须从 truck_depart_launch_time 计算，
+不能从 launch_arrival_time 直接计算，否则会漏掉起飞服务时间。
+```
+
+等待约束：
+
+```text
+如果 truck_wait > config.truck_wait_max_s：
+    soft_rendezvous_violation == False -> candidate infeasible
+    soft_rendezvous_violation == True  -> 作为 waiting_time 惩罚
+```
+
+输出：
+
+```text
+truck_stops = [launch stop, recover stop]
+drone_route_fragment = launch -> delivery -> recover
+truck_final_node_id = recover_node_id
+truck_final_time = max(truck_recover_arrival, drone_recover_arrival) + recover_time
+drone_final_node_id = recover_node_id
+drone_final_time = drone_recover_arrival + recover_time
+drone_energy_used / drone_energy_after
+delivered_order_ids = [order_id]
+```
+
+## 9.9 固定模式 C 评估
+
+`evaluate_fixed_mode_c(state, order_id, drone_id, recover_node_id)`：
+
+```text
+launch 固定为 depot。
+不生成 truck_stop。
+```
+
+检查：
+
+```text
+order / drone 是否存在
+C drone 当前是否在仓库 depot.idle_drones 中
+recover_node_id 是否合法
+如果 config.allow_depot_drone_recover_at_station == False：
+    recover_node_id 必须是 depot
+payload 是否超过 drone.payload_capacity
+固定 depot -> delivery -> recover 的电量是否足够
+```
+
+输出：
+
+```text
+drone_route_fragment = depot -> delivery -> recover
+drone_final_node_id = recover_node_id
+drone_final_time = recover_arrival
+drone_energy_used / drone_energy_after
+delivered_order_ids = [order_id]
+```
+
+## 9.10 评分与状态推进
+
+`score_candidate(candidate, order)`：
+
+```text
+只计算单个动作局部分数。
+最终 Individual fitness 由 Decoder 汇总所有 candidate 得到。
+
+score_total =
+    completion_time * weight_completion
+    + truck_distance * weight_truck_distance
+    + uav_distance * weight_uav_distance
+    + (truck_energy + uav_energy) * weight_energy
+    + lateness * weight_delay
+    + waiting_time * weight_waiting
+```
+
+`apply_candidate(state, candidate)`：
+
+```text
+只作用于 Decoder 的 state copy。
+更新 truck._ga_position / truck._ga_node_id / truck._ga_time。
+更新 drone._ga_position / drone._ga_node_id / drone._ga_time / drone._ga_energy。
+给 order 写入 _ga_completed / _ga_completion_time。
+向 state._ga_plan_fragments 追加 candidate。
+禁止污染真实运行 state。
+```
+
+## 9.11 给 Codex 的提示词
+
+```text
+请新增/修改 backend/solver/ga_mmce/physical_evaluator.py。
 
 实现：
-1. GACandidate dataclass。
-2. PhysicalEvaluator 类。
-3. get_node_position(node_id)。
-4. is_legal_rendezvous_node(node_id)。
-5. check_fixed_recovery_energy(...)
-   - 输入 launch_pos、delivery_pos、recover_pos。
-   - 只判断 GA 指定 recover_node 是否可行。
-   - 不允许自动搜索最近回收点。
-6. evaluate_fixed_mode_a(state, order_id, truck_id)。
-7. evaluate_fixed_mode_b(state, order_id, truck_id, drone_id, launch_node_id, recover_node_id)。
-8. evaluate_fixed_mode_c(state, order_id, drone_id, recover_node_id)。
+1. GACandidate dataclass，并包含状态推进字段：
+   - truck_final_node_id
+   - truck_final_time
+   - drone_final_node_id
+   - drone_final_time
+   - drone_energy_used
+   - drone_energy_after
+   - delivered_order_ids
+2. PhysicalEvaluator。
+3. get_node_position(node_id)，兼容 DEPOT / DEPOT* / DEP-*。
+4. is_legal_rendezvous_node(node_id)，只允许 depot/station。
+5. validate_drone_for_mode(state, mode, drone_id)。
+6. evaluate_fixed_mode_a(...)。
+7. evaluate_fixed_mode_b(...)，必须固定使用 launch_node_id/recover_node_id。
+8. evaluate_fixed_mode_c(...)，launch 固定 depot。
 9. score_candidate(candidate, order)。
+10. apply_candidate(state, candidate)。
 
-PhysicalEvaluator 可以复用 GreedyMMCE 的底层函数：
+允许复用：
 - _road_dist
 - _dist
 - _flight_energy
@@ -1532,7 +1554,7 @@ PhysicalEvaluator 可以复用 GreedyMMCE 的底层函数：
 - _truck_energy_wh
 - build_incremental_route_from_stops
 
-但禁止调用：
+禁止调用：
 - dispatch
 - dispatch_incremental
 - dispatch_replan_current_state
