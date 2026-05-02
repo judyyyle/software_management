@@ -54,6 +54,33 @@ class PhysicalEvaluator:
             return record.get(field_name, default)
         return getattr(record, field_name, default)
 
+    def _write_field(self, record: Any, field_name: str, value: Any) -> None:
+        if isinstance(record, dict):
+            record[field_name] = value
+        else:
+            setattr(record, field_name, value)
+
+    def _as_list(self, value: Any) -> list:
+        if value is None:
+            return []
+        if isinstance(value, list):
+            return list(value)
+        if isinstance(value, tuple | set):
+            return list(value)
+        return [value]
+
+    def _ga_list(self, record: Any, ga_field: str, fallback_field: str | None = None) -> list:
+        value = self._read_field(record, ga_field)
+        if value is not None:
+            return self._as_list(value)
+        if fallback_field is None:
+            return []
+        return self._as_list(self._read_field(record, fallback_field))
+
+    def _write_ga_list(self, record: Any, ga_field: str, values: list) -> None:
+        deduped = list(dict.fromkeys(values))
+        self._write_field(record, ga_field, deduped)
+
     def _mapping(self, state: Any, field_name: str) -> dict:
         value = self._read_field(state, field_name)
         if isinstance(value, dict):
@@ -79,6 +106,117 @@ class PhysicalEvaluator:
     def _is_depot_node_id(self, node_id: str) -> bool:
         normalized = str(node_id).strip().upper()
         return normalized == "DEPOT" or normalized.startswith("DEPOT") or normalized.startswith("DEP-")
+
+    def _node_host_type(self, state: Any, node_id: str) -> str:
+        if self._is_depot_node_id(node_id) or node_id in self._mapping(state, "depots"):
+            return "DEPOT"
+        if node_id in self._mapping(state, "stations"):
+            return "STATION"
+        return ""
+
+    def _find_depot_by_node_id(self, state: Any, node_id: str) -> tuple[str, Any]:
+        depots = self._mapping(state, "depots")
+        if node_id in depots:
+            return node_id, depots[node_id]
+        return self._first_depot(state)
+
+    def _find_station_by_node_id(self, state: Any, node_id: str) -> tuple[str, Any] | tuple[None, None]:
+        stations = self._mapping(state, "stations")
+        if node_id in stations:
+            return node_id, stations[node_id]
+        return None, None
+
+    def _truck_contains_drone(self, truck: Any, drone_id: str) -> bool:
+        return drone_id in self._ga_list(truck, "_ga_docked_drones", "docked_drones")
+
+    def _is_drone_on_ga_truck(self, state: Any, drone: Any, drone_id: str) -> bool:
+        host_type = self._read_field(drone, "_ga_host_type")
+        if host_type is not None:
+            return str(host_type).upper() == "TRUCK"
+        if self._read_field(drone, "_ga_transport_truck_id") is not None:
+            return bool(self._read_field(drone, "_ga_transport_truck_id"))
+        return any(self._truck_contains_drone(truck, drone_id) for truck in self._mapping(state, "trucks").values())
+
+    def _is_drone_at_ga_depot(self, state: Any, drone: Any, drone_id: str) -> bool:
+        host_type = self._read_field(drone, "_ga_host_type")
+        if host_type is not None:
+            return str(host_type).upper() == "DEPOT"
+        for _, depot in self._depot_items(state):
+            idle_drones = self._ga_list(depot, "_ga_idle_drones", "idle_drones")
+            if drone_id in idle_drones and self._distance_to_depot(drone, depot) <= 30.0:
+                return True
+        return False
+
+    def _remove_drone_from_ga_hosts(self, state: Any, drone_id: str) -> None:
+        for truck in self._mapping(state, "trucks").values():
+            drones = self._ga_list(truck, "_ga_docked_drones", "docked_drones")
+            self._write_ga_list(truck, "_ga_docked_drones", [uid for uid in drones if uid != drone_id])
+
+        for _, depot in self._depot_items(state):
+            drones = self._ga_list(depot, "_ga_idle_drones", "idle_drones")
+            self._write_ga_list(depot, "_ga_idle_drones", [uid for uid in drones if uid != drone_id])
+
+        for _, station in self._station_items(state):
+            idle_drones = self._ga_list(station, "_ga_idle_drones", "idle_drones")
+            waiting_drones = self._ga_list(station, "_ga_waiting_drones", "waiting_drones")
+            self._write_ga_list(station, "_ga_idle_drones", [uid for uid in idle_drones if uid != drone_id])
+            self._write_ga_list(station, "_ga_waiting_drones", [uid for uid in waiting_drones if uid != drone_id])
+            existing_queue_state = self._read_field(station, "_ga_queue_state")
+            queue_state = [
+                item
+                for item in self._as_list(existing_queue_state)
+                if self._read_field(item, "drone_id") != drone_id
+            ]
+            if existing_queue_state is not None:
+                self._write_field(station, "_ga_queue_state", queue_state)
+
+    def _append_station_queue_state(self, station: Any, drone_id: str, candidate: GACandidate) -> None:
+        queue_state = self._as_list(self._read_field(station, "_ga_queue_state"))
+        queue_state.append(
+            {
+                "drone_id": drone_id,
+                "order_id": candidate.order_id,
+                "recover_node_id": candidate.recover_node_id,
+                "available_time": candidate.drone_final_time,
+            }
+        )
+        self._write_field(station, "_ga_queue_state", queue_state)
+
+    def _set_drone_host(
+        self,
+        state: Any,
+        drone: Any,
+        drone_id: str,
+        host_type: str,
+        host_node_id: str,
+        truck_id: str | None = None,
+        candidate: GACandidate | None = None,
+    ) -> None:
+        host_type = host_type.upper()
+        self._remove_drone_from_ga_hosts(state, drone_id)
+        self._write_field(drone, "_ga_host_type", host_type)
+        self._write_field(drone, "_ga_host_node_id", host_node_id)
+        self._write_field(drone, "_ga_transport_truck_id", truck_id if host_type == "TRUCK" else None)
+        self._write_field(drone, "_ga_waiting_station_id", host_node_id if host_type == "STATION" else None)
+
+        if host_type == "TRUCK" and truck_id:
+            truck = self._mapping(state, "trucks").get(truck_id)
+            if truck is not None:
+                docked = self._ga_list(truck, "_ga_docked_drones", "docked_drones")
+                self._write_ga_list(truck, "_ga_docked_drones", docked + [drone_id])
+        elif host_type == "DEPOT":
+            _, depot = self._find_depot_by_node_id(state, host_node_id)
+            idle_drones = self._ga_list(depot, "_ga_idle_drones", "idle_drones")
+            self._write_ga_list(depot, "_ga_idle_drones", idle_drones + [drone_id])
+        elif host_type == "STATION":
+            _, station = self._find_station_by_node_id(state, host_node_id)
+            if station is not None:
+                waiting_drones = self._ga_list(station, "_ga_waiting_drones", "waiting_drones")
+                idle_drones = self._ga_list(station, "_ga_idle_drones", "idle_drones")
+                self._write_ga_list(station, "_ga_waiting_drones", waiting_drones + [drone_id])
+                self._write_ga_list(station, "_ga_idle_drones", idle_drones + [drone_id])
+                if candidate is not None:
+                    self._append_station_queue_state(station, drone_id, candidate)
 
     def _status_name(self, value: Any) -> str:
         if value is None:
@@ -182,23 +320,19 @@ class PhysicalEvaluator:
 
         mode = mode.upper()
         if mode == "B":
-            for truck in self._mapping(state, "trucks").values():
-                if drone_id in (self._read_field(truck, "docked_drones", []) or []):
-                    return True, ""
+            if self._is_drone_on_ga_truck(state, drone, drone_id):
+                return True, ""
             if self._read_field(drone, "transport_truck_id"):
                 return True, ""
             return False, "drone_not_on_truck"
 
         if mode == "C":
-            for truck in self._mapping(state, "trucks").values():
-                if drone_id in (self._read_field(truck, "docked_drones", []) or []):
-                    return False, "drone_on_truck"
+            if self._is_drone_on_ga_truck(state, drone, drone_id):
+                return False, "drone_on_truck"
             if self._read_field(drone, "transport_truck_id"):
                 return False, "drone_on_truck"
-            for _, depot in self._depot_items(state):
-                idle_drones = self._read_field(depot, "idle_drones", []) or []
-                if drone_id in idle_drones and self._distance_to_depot(drone, depot) <= 30.0:
-                    return True, ""
+            if self._is_drone_at_ga_depot(state, drone, drone_id):
+                return True, ""
             return False, "drone_not_at_depot"
 
         return False, f"unknown_mode:{mode}"
@@ -447,6 +581,7 @@ class PhysicalEvaluator:
         return self.score_candidate(candidate, order)
 
     def score_candidate(self, candidate: GACandidate, order: Any) -> GACandidate:
+        # This is a local action score. Decoder/fitness owns full Individual fitness aggregation.
         if not candidate.feasible:
             candidate.score_total = math.inf
             return candidate
@@ -471,6 +606,12 @@ class PhysicalEvaluator:
         return candidate
 
     def apply_candidate(self, state, candidate: GACandidate) -> None:
+        """Advance GA-only state on a decoded state copy.
+
+        The caller must pass a deepcopy/clone owned by the current Individual.
+        This method intentionally writes only _ga_* fields and does not mutate
+        canonical runtime fields such as current_loc, docked_drones, or idle_drones.
+        """
         if not candidate.feasible:
             return
 
@@ -484,27 +625,49 @@ class PhysicalEvaluator:
             if candidate.truck_stops:
                 final_pos = candidate.truck_stops[-1].get("position")
             if final_pos is not None:
-                setattr(truck, "_ga_position", final_pos)
-            setattr(truck, "_ga_node_id", candidate.truck_final_node_id)
-            setattr(truck, "_ga_time", candidate.truck_final_time)
+                self._write_field(truck, "_ga_position", final_pos)
+            self._write_field(truck, "_ga_node_id", candidate.truck_final_node_id)
+            self._write_field(truck, "_ga_time", candidate.truck_final_time)
 
         if candidate.drone_id and candidate.drone_id in drones:
             drone = drones[candidate.drone_id]
             if candidate.recover_node_id:
-                setattr(drone, "_ga_position", self.get_node_position(candidate.recover_node_id, state))
-            setattr(drone, "_ga_node_id", candidate.drone_final_node_id)
-            setattr(drone, "_ga_time", candidate.drone_final_time)
-            setattr(drone, "_ga_energy", max(0.0, candidate.drone_energy_after))
+                self._write_field(drone, "_ga_position", self.get_node_position(candidate.recover_node_id, state))
+            self._write_field(drone, "_ga_node_id", candidate.drone_final_node_id)
+            self._write_field(drone, "_ga_time", candidate.drone_final_time)
+            self._write_field(drone, "_ga_energy", max(0.0, candidate.drone_energy_after))
+            if candidate.mode == "B":
+                self._set_drone_host(
+                    state,
+                    drone,
+                    candidate.drone_id,
+                    "TRUCK",
+                    candidate.recover_node_id,
+                    truck_id=candidate.truck_id,
+                    candidate=candidate,
+                )
+            elif candidate.mode == "C":
+                recover_host_type = self._node_host_type(state, candidate.recover_node_id)
+                if recover_host_type in {"DEPOT", "STATION"}:
+                    self._set_drone_host(
+                        state,
+                        drone,
+                        candidate.drone_id,
+                        recover_host_type,
+                        candidate.recover_node_id,
+                        truck_id=None,
+                        candidate=candidate,
+                    )
 
         for order_id in candidate.delivered_order_ids:
             order = orders.get(order_id)
             if order is None:
                 continue
-            setattr(order, "_ga_completed", True)
-            setattr(order, "_ga_completion_time", candidate.completion_time)
+            self._write_field(order, "_ga_completed", True)
+            self._write_field(order, "_ga_completion_time", candidate.completion_time)
 
         fragments = self._read_field(state, "_ga_plan_fragments")
         if fragments is None:
             fragments = []
-            setattr(state, "_ga_plan_fragments", fragments)
+            self._write_field(state, "_ga_plan_fragments", fragments)
         fragments.append(candidate)
