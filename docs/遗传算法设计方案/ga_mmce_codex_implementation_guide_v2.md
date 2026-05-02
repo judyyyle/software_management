@@ -1697,6 +1697,14 @@ class GADecoder:
 
             self.evaluator.apply_candidate(state_copy, candidate)
 
+        closure_penalties = self._append_c_station_closure_stops(
+            state_copy,
+            truck_id,
+            truck_ordered_stops,
+        )
+        for name, value in closure_penalties.items():
+            penalties[name] = penalties.get(name, 0.0) + value
+
         truck_routes = self._build_truck_routes_by_given_order(
             state_copy,
             truck_id,
@@ -1713,7 +1721,7 @@ class GADecoder:
 
         return DecodeResult(
             plan=plan,
-            objective=total_score + self._penalty_cost(penalties),
+            objective=total_score,
             penalties=penalties,
             feasible=feasible,
         )
@@ -1756,6 +1764,77 @@ greedy.build_incremental_route_from_stops(
 
 这个函数按给定顺序构建 OSM 路径，不会像 `_build_truck_route` 那样最近邻重排。
 
+### 10.4.3 C 模式落站必须进入闭环修复阶段
+
+当 `config.allow_depot_drone_recover_at_station=True` 时，C 模式允许：
+
+```text
+DEPOT -> customer -> station
+```
+
+但这只表示“本单配送可结束在 station”，不表示无人机生命周期已经闭环。Decoder 必须在所有订单解码后进入 closure phase，处理这些等待在充换电站的 C 模式无人机。
+
+Decoder 必须明确处理以下状态：
+
+```text
+C recover = depot:
+    drone._ga_host_type = "DEPOT"
+    drone 加入 depot._ga_idle_drones
+    生命周期闭环
+
+C recover = station:
+    drone._ga_host_type = "STATION"
+    drone._ga_waiting_station_id = station_id
+    drone 加入 station._ga_waiting_drones
+    station._ga_queue_state 记录该无人机占用/等待事件
+    drone 不得在同一个 Individual 后续再次作为 C 模式仓库无人机使用
+    drone 不得进入本轮 depot_drone_ids
+    Decoder closure phase 必须决定是否追加卡车 pickup stop
+```
+
+推荐第一版采用确定性闭环修复，而不是让 Fitness 或 Greedy 重新决策：
+
+```text
+1. GA 解码阶段只处理 sequence + assignment + rendezvous 指定的订单动作。
+2. apply_candidate 将 C 落站无人机标记为 STATION 宿主，并写入 station queue。
+3. 所有订单解码完成后，Decoder 调用 _append_c_station_closure_stops(...)。
+4. _append_c_station_closure_stops 按确定性规则把 station pickup stop 追加到 truck_ordered_stops 末尾。
+5. 同一个 station 上等待的多个无人机合并成一个 pickup stop。
+6. pickup stop 必须标记为 repair/closure，不属于原始 GA 订单动作。
+7. pickup 后将无人机虚拟宿主改为 TRUCK，并加入 truck._ga_docked_drones。
+```
+
+pickup stop 建议结构：
+
+```python
+{
+    "node_id": station_id,
+    "node_type": "station",
+    "action": "closure_pickup_c_drone",
+    "source": "repair",
+    "drone_ids": ["UAV-TEST-03", "UAV-TEST-08"],
+}
+```
+
+确定性排序建议：
+
+```text
+优先级 1：按该 station 最早等待无人机的 _ga_time 升序。
+优先级 2：若时间相同，按 station_id 字典序。
+禁止：调用 greedy._build_truck_route 或任何会重排 stop 的贪心函数。
+```
+
+如果 `config.enable_repair=False`，Decoder 不应追加 pickup stop，而应保留开环状态并追加较大的 `final_return_penalty`。
+
+如果后续要让 GA 主动优化 C 落站回收顺序，有两种升级路径：
+
+```text
+方案 A：保留 Decoder repair，但把 station pickup 顺序做成局部搜索/repair operator。
+方案 B：扩展 Chromosome 3/4，让 GA 显式编码 C-station drone 的最终回收策略。
+```
+
+在这两种升级完成前，C 落站无人机不应视为免费可复用资源；要么被 closure pickup 接回，要么产生开环惩罚。
+
 ## 10.5 apply_candidate 状态更新原则
 
 `PhysicalEvaluator.apply_candidate(state_copy, candidate)` 应做最小必要更新。
@@ -1779,12 +1858,65 @@ C 模式：
     更新无人机位置、时间、电量；
     如果 recover 是 depot，则设置 drone._ga_host_type = "DEPOT"，并加入 depot._ga_idle_drones；
     如果 recover 是 station，则设置 drone._ga_host_type = "STATION"，并加入 station._ga_waiting_drones / station._ga_queue_state；
+    C 落站无人机不应在同一个 Individual 后续作为 C 仓库无人机复用；
     标记订单完成。
 ```
 
 所有更新都必须只写 `_ga_*` 字段；真实实体字段如 `current_loc`、`docked_drones`、`idle_drones` 不应被修改。
 
-## 10.6 给 Codex 的提示词
+## 10.6 闭环修复成本建议
+
+Decoder 负责生成闭环修复路线；Fitness 只负责对 Decoder 生成的方案打分。
+
+建议新增 Decoder 私有函数：
+
+```python
+def _append_c_station_closure_stops(
+    self,
+    state_copy,
+    truck_id: str,
+    truck_ordered_stops: list[dict],
+) -> dict[str, float]:
+    penalties: dict[str, float] = {}
+
+    waiting_by_station = self._collect_waiting_station_drones(state_copy)
+    if not waiting_by_station:
+        return penalties
+
+    if not self.config.enable_repair:
+        penalties["final_return_penalty"] = len(waiting_by_station) * self.config.weight_infeasible
+        return penalties
+
+    for station_id, drone_ids in self._sort_waiting_stations(waiting_by_station):
+        truck_ordered_stops.append({
+            "node_id": station_id,
+            "node_type": "station",
+            "action": "closure_pickup_c_drone",
+            "source": "repair",
+            "drone_ids": drone_ids,
+        })
+        penalties["repair_penalty"] = penalties.get("repair_penalty", 0.0) + self.config.repair_penalty_factor
+        penalties["station_queue_penalty"] = penalties.get("station_queue_penalty", 0.0) + len(drone_ids) * self.config.weight_waiting
+
+    return penalties
+```
+
+注意：
+
+```text
+repair_penalty:
+    表示这个 Individual 需要 Decoder 额外闭环修复，不是 GA 原生动作。
+
+station_queue_penalty:
+    表示无人机在 station 等待卡车接回的占用/等待成本。
+
+final_return_penalty:
+    仅在无法或不允许 closure pickup 时使用，表示方案仍有无人机未闭环。
+```
+
+闭环 pickup stop 被追加到 `truck_ordered_stops` 后，`build_incremental_route_from_stops(...)` 会自然把卡车去充换电站的路程计入最终路线。Fitness 不需要自己添加 station 位置，也不应该修改路线。
+
+## 10.7 给 Codex 的提示词
 
 ```text
 请新增/修改 backend/solver/ga_mmce/decoder.py。
@@ -1804,6 +1936,14 @@ C 模式：
 10. 构建卡车路线时调用 build_incremental_route_from_stops，而不是 _build_truck_route。
 11. 输出 DispatchPlan 结构必须兼容前端。
 12. 不可行时记录 penalty，不能静默跳过。
+13. 每个 Individual 必须使用 clone_state_for_decode(state) 的独立副本。
+14. individual.fitness/objective 必须聚合所有 candidate.score_total 与 lifecycle penalties。
+15. C 模式 recover 到 station 时，不允许静默把无人机重新加入 depot_drone_ids。
+16. C 模式 recover 到 station 时，应保留 station waiting/queue 状态。
+17. Decoder 第一版可以在所有订单动作之后追加 C 落站闭环 pickup stops。
+18. pickup stops 必须标记 source="repair" / action="closure_pickup_c_drone"。
+19. Decoder 结束时必须调用 _append_c_station_closure_stops(...) 或等价逻辑处理 C 落站闭环。
+20. Fitness 只计算已生成 plan 的分数，不负责新增闭环路线。
 ```
 
 ---
@@ -1812,7 +1952,18 @@ C 模式：
 
 ## 11.1 目标
 
-适应度统一在 `fitness.py` 中处理。
+`fitness.py` 只负责把 Decoder 已经生成的 `DecodeResult` 转成 GA 可比较的标量分数。
+
+重要边界：
+
+```text
+Fitness 不负责生成闭环修复路线。
+Fitness 不负责追加 C 落站 station pickup stop。
+Fitness 不修改 state_copy、plan、truck_ordered_stops、drone route。
+Fitness 只读取 DecodeResult.plan / penalties / objective / feasible 等结果并计算最终 individual.fitness。
+```
+
+C 模式无人机落到充换电站后的闭环路线，应该由 `decoder.py` 的 closure phase 生成；Fitness 只对这条已生成路线带来的距离、等待、repair penalty、未闭环 penalty 做计分。
 
 ## 11.2 新增文件
 
@@ -1820,40 +1971,134 @@ C 模式：
 backend/solver/ga_mmce/fitness.py
 ```
 
-## 11.3 推荐结构
+## 11.3 与 Decoder 的职责分工
 
-```python
-def compute_fitness(plan, penalties, config):
-    """
-    objective =
-        completion_cost
-        + delay_cost
-        + energy_cost
-        + waiting_cost
-        + infeasible_penalty
-    """
+```text
+PhysicalEvaluator:
+    评估单个固定动作。
+    产生 candidate.score_total。
+
+Decoder:
+    按 Individual 顺序解码全部订单。
+    在 state copy 上推进 _ga_* 状态。
+    追加 C 落站 closure pickup stops。
+    调用 build_incremental_route_from_stops 构建完整卡车路线。
+    输出 DecodeResult。
+
+Fitness:
+    不再改变路线。
+    不再执行 repair。
+    只汇总 DecodeResult 中的 score、penalties、plan metrics。
+    返回越小越好的 float。
 ```
 
-如果 `DecodeResult.objective` 已经包含候选评分，也可以只追加不可行惩罚。
+因此：
 
-## 11.4 给 Codex 的提示词
+```text
+闭环修复路线 = Decoder 负责生成
+闭环修复成本 = Fitness 负责计分
+```
+
+## 11.4 推荐结构
+
+```python
+from __future__ import annotations
+
+import math
+from typing import Any
+
+from .config import GAConfig
+
+
+def compute_fitness(decode_result: Any, config: GAConfig) -> float:
+    """
+    纯评分函数。
+
+    不生成 route。
+    不修改 plan。
+    不修改 state。
+    """
+
+    objective = float(getattr(decode_result, "objective", 0.0) or 0.0)
+    penalties = getattr(decode_result, "penalties", {}) or {}
+
+    penalty_cost = 0.0
+    for name, value in penalties.items():
+        value = float(value or 0.0)
+        if name == "repair_penalty":
+            penalty_cost += value
+        elif name == "station_queue_penalty":
+            penalty_cost += value
+        elif name == "final_return_penalty":
+            penalty_cost += value
+        elif name == "unserved_order_penalty":
+            penalty_cost += value
+        else:
+            penalty_cost += value * config.weight_infeasible
+
+    if not bool(getattr(decode_result, "feasible", False)):
+        penalty_cost += config.weight_infeasible
+
+    return objective + penalty_cost
+```
+
+如果 Decoder 已经把所有 penalty cost 都加入 `DecodeResult.objective`，则 `compute_fitness(...)` 必须避免重复计分。推荐做法是：
+
+```text
+DecodeResult.objective:
+    保存候选动作和闭环路线的基础成本。
+
+DecodeResult.penalties:
+    保存 penalty 明细和已经换算好的 penalty cost。
+
+compute_fitness:
+    objective + sum(penalties.values())
+```
+
+不要一边在 Decoder 中 `total_score += penalty`，一边在 Fitness 中再次乘权重，否则会双重惩罚。
+
+## 11.5 必须包含的惩罚项
+
+```text
+infeasible_penalty:
+    某个 candidate 不可行，或未知 gene。
+
+repair_penalty:
+    Decoder 为 C 落站无人机追加 closure pickup stop。
+
+station_queue_penalty:
+    C 无人机在充换电站等待卡车接回。
+
+final_return_penalty:
+    enable_repair=False 或闭环失败，导致无人机最终仍在 station。
+
+unserved_order_penalty:
+    Individual 中订单缺失、重复或最终未完成。
+```
+
+## 11.6 给 Codex 的提示词
 
 ```text
 请新增 backend/solver/ga_mmce/fitness.py。
 
-实现 compute_fitness(plan, penalties, config)。
+实现 compute_fitness(decode_result, config)。
 
 要求：
 1. fitness 越小越好。
-2. 至少包含：
-   - completion time cost
-   - delay penalty
-   - energy cost
-   - waiting penalty
-   - infeasible penalty
-3. 对缺失字段安全处理。
-4. 不要依赖 greedy 的完整 dispatch 结果。
-5. 返回 float。
+2. Fitness 是纯函数，不修改 plan/state/route。
+3. Fitness 不负责生成 C 落站闭环路线。
+4. C 落站闭环 pickup stops 必须由 decoder.py 生成。
+5. Fitness 需要计入：
+   - DecodeResult.objective
+   - infeasible_penalty
+   - repair_penalty
+   - station_queue_penalty
+   - final_return_penalty
+   - unserved_order_penalty
+6. 对缺失字段安全处理。
+7. 不要依赖 greedy 的完整 dispatch 结果。
+8. 返回 float。
+9. 避免重复计分：如果 Decoder 已经把 penalty cost 加入 objective，Fitness 不应再次乘权重。
 ```
 
 ---
@@ -1894,6 +2139,7 @@ from .adapters import (
 )
 from .config import GAConfig
 from .decoder import GADecoder
+from .fitness import compute_fitness
 from .operators import order_crossover, mutate, tournament_select
 from .physical_evaluator import PhysicalEvaluator
 from .population import initialize_population
@@ -2001,7 +2247,7 @@ class GAMMCESolver:
         # 若 solve() 中可拿到 context，也建议改为 validate_with_context(...)
         # 以检查 B/C 无人机池与 support_node_ids。
         result = self.decoder.decode(ind, state)
-        ind.fitness = result.objective
+        ind.fitness = compute_fitness(result, self.config)
         ind.decoded_plan = result.plan
         ind.penalties = result.penalties
 
