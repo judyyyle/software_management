@@ -447,7 +447,7 @@ validate() 必须检查：
 2. sequence 不重复；
 3. A 的 rendezvous 必须为 None；
 4. B_<uid> 的 rendezvous 必须包含 launch 和 recover；
-5. C_<uid> 的 launch 必须是 DEPOT 或 depot id，recover 必须存在；
+5. C_<uid> 的 launch 必须是 DEPOT ，recover 必须存在；
 6. 不允许未知 gene。
 
 同时实现：
@@ -461,174 +461,121 @@ validate() 必须检查：
 # 6. Step 3：实现三层染色体交叉、变异、选择算子
 
 ## 6.1 目标
+请新增/修改 backend/solver/ga_mmce/operators.py，并根据当前 chromosome.py 的实际实现适配三层染色体算子。
 
-实现：
+当前 chromosome.py 已经实现：
+- Individual(sequence, assignment, rendezvous)
+- Individual.validate()
+- Individual.validate_with_context(truck_drone_ids, depot_drone_ids, valid_drone_ids=None)
+- make_gene_pool_by_location(truck_drone_ids, depot_drone_ids)
+- make_node_pool(depot_ids, station_ids)
+- normalize_depot_id(depot_ids)
 
-```text
-1. sequence 的 OX 顺序交叉；
-2. assignment 按订单 ID 对齐继承；
-3. rendezvous 按订单 ID 对齐继承；
-4. sequence swap mutation；
-5. assignment mutation；
-6. rendezvous mutation；
-7. tournament selection。
-```
+重要设计约束：
+1. 当前采用版本 A 动态重调度策略。
+2. 每次重调度时，上游会根据当前物理状态重新生成 gene_pool。
+3. gene_pool 已经满足：
+   - A
+   - B_<truck_drone_id>
+   - C_<depot_drone_id>
+4. operators.py 不负责判断无人机是否在卡车或仓库。
+5. operators.py 不负责从实体状态中提取无人机池。
+6. operators.py 只从外部传入的 gene_pool 中随机采样 assignment。
+7. operators.py 只从外部传入的 support_node_ids 中随机采样 launch/recover。
+8. support_node_ids 由上游提前生成，通常等于 depot ids + station ids。
 
-## 6.2 新增文件
+请不要在 operators.py 中使用：
+- make_gene_pool(...)
+- make_gene_pool_by_location(...)
+- normalize_depot_id(...)
+- make_node_pool(...)
+- depot_ids 参数
+- station_ids 参数
 
-```text
-backend/solver/ga_mmce/operators.py
-```
+请实现以下函数：
 
-## 6.3 推荐代码
+1. make_random_rendezvous_for_gene(gene, support_node_ids, allow_c_recover_station=True)
 
-```python
-from __future__ import annotations
+函数规则：
+- gene == "A":
+    return None
 
-import copy
-import random
+- gene.startswith("B_"):
+    返回：
+    {
+        "launch": random.choice(support_node_ids),
+        "recover": random.choice(support_node_ids),
+    }
 
-from .chromosome import Individual, normalize_depot_id
+- gene.startswith("C_"):
+    launch 必须固定为 "DEPOT"。
+    如果 support_node_ids 中没有 "DEPOT"，但存在 depot id，例如 "depot-1" 或 "DEPOT-1"，则使用 support_node_ids 中第一个以 depot/DEPOT 开头的节点作为 launch。
+    如果 allow_c_recover_station=True:
+        recover 从 support_node_ids 中随机选择。
+    如果 allow_c_recover_station=False:
+        recover 只能从 depot 节点中随机选择。
+    返回：
+    {
+        "launch": depot_node,
+        "recover": selected_recover_node,
+    }
 
+- 对未知 gene 抛出 ValueError。
 
-def make_random_rendezvous_for_gene(
-    gene: str,
-    depot_ids: list[str],
-    station_ids: list[str],
-    allow_c_recover_station: bool = True,
-):
-    depot_id = normalize_depot_id(depot_ids)
-    legal_nodes = [depot_id] + list(station_ids)
+请额外实现一个辅助函数：
+    find_depot_node(support_node_ids)
 
-    if gene == "A":
-        return None
+规则：
+- 优先返回 "DEPOT"。
+- 否则返回第一个 str(node).upper().startswith("DEPOT") 或 str(node).lower().startswith("depot") 的节点。
+- 如果找不到 depot 节点，抛出 ValueError。
 
-    if gene.startswith("B_"):
-        return {
-            "launch": random.choice(legal_nodes),
-            "recover": random.choice(legal_nodes),
-        }
-
-    if gene.startswith("C_"):
-        recover_pool = legal_nodes if allow_c_recover_station else [depot_id]
-        return {
-            "launch": depot_id,
-            "recover": random.choice(recover_pool),
-        }
-
-    raise ValueError(f"unknown gene: {gene}")
-
-
-def order_crossover(p1: Individual, p2: Individual) -> tuple[Individual, Individual]:
-    n = len(p1.sequence)
-    if n <= 1:
-        return copy.deepcopy(p1), copy.deepcopy(p2)
-
-    a, b = sorted(random.sample(range(n), 2))
-
-    def build_child(base: Individual, donor: Individual) -> Individual:
-        child_seq = [None] * n
-        child_seq[a:b + 1] = base.sequence[a:b + 1]
-
-        donor_fill = [oid for oid in donor.sequence if oid not in child_seq]
-        fill_idx = 0
-        for i in range(n):
-            if child_seq[i] is None:
-                child_seq[i] = donor_fill[fill_idx]
-                fill_idx += 1
-
-        base_map = {
-            oid: (gene, rv)
-            for oid, gene, rv in zip(base.sequence, base.assignment, base.rendezvous)
-        }
-        donor_map = {
-            oid: (gene, rv)
-            for oid, gene, rv in zip(donor.sequence, donor.assignment, donor.rendezvous)
-        }
-
-        child_assignment = []
-        child_rendezvous = []
-        for oid in child_seq:
-            gene, rv = base_map[oid] if random.random() < 0.5 else donor_map[oid]
-            child_assignment.append(copy.deepcopy(gene))
-            child_rendezvous.append(copy.deepcopy(rv))
-
-        return Individual(
-            sequence=list(child_seq),
-            assignment=child_assignment,
-            rendezvous=child_rendezvous,
-        )
-
-    return build_child(p1, p2), build_child(p2, p1)
-
-
-def mutate(
-    ind: Individual,
-    gene_pool: list[str],
-    depot_ids: list[str],
-    station_ids: list[str],
-    p_seq: float,
-    p_assign: float,
-    p_rendezvous: float,
-    allow_c_recover_station: bool = True,
-) -> None:
-    n = len(ind.sequence)
-
-    # 1. 任务顺序交换变异
-    if n >= 2 and random.random() < p_seq:
-        i, j = random.sample(range(n), 2)
-        ind.sequence[i], ind.sequence[j] = ind.sequence[j], ind.sequence[i]
-        ind.assignment[i], ind.assignment[j] = ind.assignment[j], ind.assignment[i]
-        ind.rendezvous[i], ind.rendezvous[j] = ind.rendezvous[j], ind.rendezvous[i]
-
-    # 2. 模式/载具变异
-    for i in range(n):
-        if random.random() < p_assign:
-            new_gene = random.choice(gene_pool)
-            ind.assignment[i] = new_gene
-            ind.rendezvous[i] = make_random_rendezvous_for_gene(
-                new_gene,
-                depot_ids,
-                station_ids,
-                allow_c_recover_station,
-            )
-
-    # 3. 协同节点变异
-    for i in range(n):
-        if random.random() < p_rendezvous:
-            ind.rendezvous[i] = make_random_rendezvous_for_gene(
-                ind.assignment[i],
-                depot_ids,
-                station_ids,
-                allow_c_recover_station,
-            )
-
-
-def tournament_select(population: list[Individual], k: int) -> Individual:
-    candidates = random.sample(population, min(k, len(population)))
-    candidates.sort(key=lambda x: x.fitness)
-    return copy.deepcopy(candidates[0])
-```
-
-## 6.4 给 Codex 的提示词
-
-```text
-请新增/修改 backend/solver/ga_mmce/operators.py。
-
-实现：
-1. make_random_rendezvous_for_gene(...)
 2. order_crossover(p1, p2)
-3. mutate(...)
-4. tournament_select(...)
 
-关键要求：
-- sequence 使用 OX 交叉。
-- assignment 和 rendezvous 必须按订单 id 对齐继承。
+要求：
+- sequence 使用 OX 顺序交叉。
+- 交叉前调用 p1.validate() 和 p2.validate()。
+- 检查两个父代 sequence 长度一致。
+- 检查 set(p1.sequence) == set(p2.sequence)，否则抛出 ValueError。
+- assignment 和 rendezvous 必须按订单 ID 对齐继承。
 - 不能简单按下标复制 assignment/rendezvous。
-- sequence swap mutation 时，三条染色体对应位置必须一起交换。
-- assignment mutation 后，必须同步重建该订单的 rendezvous。
-- rendezvous mutation 只改变 launch/recover，不改变订单和载具。
-```
+- 对每个 child_seq 中的订单，从 base_map 或 donor_map 中以 0.5 概率继承该订单对应的 gene 和 rendezvous。
+- 返回两个 Individual。
+- 子代生成后调用 child.validate()。
+
+3. mutate(ind, gene_pool, support_node_ids, p_seq, p_assign, p_rendezvous, allow_c_recover_station=True)
+
+要求：
+- mutate 开始前调用 ind.validate()。
+- gene_pool 必须非空，且必须包含 "A"。
+- support_node_ids 必须非空。
+- sequence swap mutation：
+    - 当 random.random() < p_seq 且订单数 >= 2 时，随机交换两个位置。
+    - sequence、assignment、rendezvous 三条染色体对应位置必须一起交换。
+- assignment mutation：
+    - 对每个位置，如果 random.random() < p_assign：
+        - new_gene = random.choice(gene_pool)
+        - ind.assignment[i] = new_gene
+        - ind.rendezvous[i] = make_random_rendezvous_for_gene(new_gene, support_node_ids, allow_c_recover_station)
+    - assignment mutation 后必须同步重建该订单的 rendezvous。
+- rendezvous mutation：
+    - 对每个位置，如果 random.random() < p_rendezvous：
+        - 不改变 sequence[i]
+        - 不改变 assignment[i]
+        - 只重新生成 ind.rendezvous[i]
+        - 使用 make_random_rendezvous_for_gene(ind.assignment[i], support_node_ids, allow_c_recover_station)
+- mutate 结束后调用 ind.validate()。
+
+4. tournament_select(population, k)
+
+要求：
+- population 不能为空，否则抛出 ValueError。
+- 从 population 中随机采样 min(k, len(population)) 个个体。
+- 按 fitness 升序选择最优个体。
+- 返回该个体的 deepcopy。
+
+请保证 operators.py 不访问实体状态，不读取 truck/drone/station 对象。
+B/C 无人机归属约束由上游 gene_pool 和后续 validate_with_context / PhysicalEvaluator 保证。
 
 ---
 
