@@ -583,7 +583,33 @@ B/C 无人机归属约束由上游 gene_pool 和后续 validate_with_context / P
 
 ## 7.1 目标
 
-初始种群必须生成合法的三层染色体。
+初始种群必须生成合法的三层染色体，并与当前已实现的 `chromosome.py` / `operators.py` 接口保持一致。
+
+当前版本采用 **版本 A 动态重调度策略**：
+
+```text
+上游 adapter / solver 在每次重调度时根据当前物理状态生成：
+    order_ids
+    gene_pool
+    support_node_ids
+
+population.py 只消费这些简单列表，不访问 truck / drone / depot / station 实体对象。
+```
+
+其中：
+
+```text
+gene_pool:
+    已由上游根据当前位置生成，通常来自 make_gene_pool_by_location(...)
+    形如：
+        A
+        B_<truck_docked_drone_id>
+        C_<depot_ready_drone_id>
+
+support_node_ids:
+    已由上游生成，通常为 depot ids + station ids
+    用于随机生成 rendezvous 的 launch / recover
+```
 
 包括：
 
@@ -592,6 +618,18 @@ B/C 无人机归属约束由上游 gene_pool 和后续 validate_with_context / P
 2. 纯卡车解；
 3. greedy seed 转换而来的三层个体；
 4. OBL 反向学习个体。
+```
+
+重要边界：
+
+```text
+population.py 不负责判断无人机是否在卡车或仓库。
+population.py 不负责从实体状态中提取无人机池。
+population.py 不调用 make_gene_pool(...)。
+population.py 不调用 make_gene_pool_by_location(...)。
+population.py 不接收 depot_ids / station_ids 参数。
+population.py 只从外部传入的 gene_pool 中随机采样 assignment。
+population.py 只从外部传入的 support_node_ids 中随机采样 rendezvous。
 ```
 
 ## 7.2 新增文件
@@ -608,20 +646,36 @@ from __future__ import annotations
 import copy
 import random
 
-from .chromosome import Individual, make_gene_pool
+from .chromosome import Individual
 from .operators import make_random_rendezvous_for_gene
+
+
+def _check_inputs(
+    order_ids: list[str],
+    gene_pool: list[str],
+    support_node_ids: list[str],
+) -> None:
+    if len(set(order_ids)) != len(order_ids):
+        raise ValueError("order_ids contains duplicated order ids")
+    if not gene_pool:
+        raise ValueError("gene_pool must not be empty")
+    if "A" not in gene_pool:
+        raise ValueError('gene_pool must include "A"')
+    if not support_node_ids:
+        raise ValueError("support_node_ids must not be empty")
 
 
 def make_random_individual(
     order_ids: list[str],
     gene_pool: list[str],
-    depot_ids: list[str],
-    station_ids: list[str],
+    support_node_ids: list[str],
     allow_c_recover_station: bool = True,
 ) -> Individual:
+    _check_inputs(order_ids, gene_pool, support_node_ids)
+
     seq = list(order_ids)
     random.shuffle(seq)
-    assignment = []
+    assignment: list[str] = []
     rendezvous = []
 
     for _ in seq:
@@ -630,64 +684,79 @@ def make_random_individual(
         rendezvous.append(
             make_random_rendezvous_for_gene(
                 gene,
-                depot_ids,
-                station_ids,
+                support_node_ids,
                 allow_c_recover_station,
             )
         )
 
-    return Individual(seq, assignment, rendezvous)
+    ind = Individual(seq, assignment, rendezvous)
+    ind.validate()
+    return ind
 
 
 def make_truck_only_individual(order_ids: list[str]) -> Individual:
-    return Individual(
+    ind = Individual(
         sequence=list(order_ids),
         assignment=["A"] * len(order_ids),
         rendezvous=[None] * len(order_ids),
     )
+    ind.validate()
+    return ind
 
 
 def make_obl_individual(
     base: Individual,
     gene_pool: list[str],
-    depot_ids: list[str],
-    station_ids: list[str],
+    support_node_ids: list[str],
     allow_c_recover_station: bool = True,
 ) -> Individual:
+    base.validate()
+    _check_inputs(base.sequence, gene_pool, support_node_ids)
+
     seq = list(reversed(base.sequence))
-    assignment = []
+    assignment: list[str] = []
     rendezvous = []
 
     for gene in reversed(base.assignment):
-        if gene == "A":
-            new_gene = random.choice(gene_pool)
-        elif gene.startswith("B_"):
-            uid = gene.split("_", 1)[1]
-            new_gene = f"C_{uid}" if f"C_{uid}" in gene_pool else "A"
-        elif gene.startswith("C_"):
-            uid = gene.split("_", 1)[1]
-            new_gene = f"B_{uid}" if f"B_{uid}" in gene_pool else "A"
-        else:
-            new_gene = random.choice(gene_pool)
+        candidates = [candidate for candidate in gene_pool if candidate != gene]
+        new_gene = random.choice(candidates or gene_pool)
 
         assignment.append(new_gene)
         rendezvous.append(
             make_random_rendezvous_for_gene(
                 new_gene,
-                depot_ids,
-                station_ids,
+                support_node_ids,
                 allow_c_recover_station,
             )
         )
 
-    return Individual(seq, assignment, rendezvous)
+    ind = Individual(seq, assignment, rendezvous)
+    ind.validate()
+    return ind
+
+
+def _copy_seed_if_valid(
+    seed: Individual,
+    order_set: set[str],
+    gene_set: set[str],
+) -> Individual | None:
+    copied = copy.deepcopy(seed)
+    try:
+        copied.validate()
+    except ValueError:
+        return None
+
+    if set(copied.sequence) != order_set:
+        return None
+    if any(gene not in gene_set for gene in copied.assignment):
+        return None
+    return copied
 
 
 def initialize_population(
     order_ids: list[str],
-    drone_ids: list[str | int],
-    depot_ids: list[str],
-    station_ids: list[str],
+    gene_pool: list[str],
+    support_node_ids: list[str],
     pop_size: int,
     greedy_seed: Individual | None = None,
     warm_start: list[Individual] | None = None,
@@ -695,14 +764,24 @@ def initialize_population(
     use_obl_seed: bool = True,
     allow_c_recover_station: bool = True,
 ) -> list[Individual]:
-    gene_pool = make_gene_pool(drone_ids)
+    _check_inputs(order_ids, gene_pool, support_node_ids)
+    if pop_size <= 0:
+        return []
+
+    order_set = set(order_ids)
+    gene_set = set(gene_pool)
     population: list[Individual] = []
 
     if warm_start:
-        population.extend(copy.deepcopy(warm_start))
+        for seed in warm_start:
+            copied = _copy_seed_if_valid(seed, order_set, gene_set)
+            if copied is not None:
+                population.append(copied)
 
     if greedy_seed is not None:
-        population.append(copy.deepcopy(greedy_seed))
+        copied = _copy_seed_if_valid(greedy_seed, order_set, gene_set)
+        if copied is not None:
+            population.append(copied)
 
     if use_truck_only_seed:
         population.append(make_truck_only_individual(order_ids))
@@ -712,8 +791,7 @@ def initialize_population(
             make_obl_individual(
                 population[0],
                 gene_pool,
-                depot_ids,
-                station_ids,
+                support_node_ids,
                 allow_c_recover_station,
             )
         )
@@ -723,8 +801,7 @@ def initialize_population(
             make_random_individual(
                 order_ids,
                 gene_pool,
-                depot_ids,
-                station_ids,
+                support_node_ids,
                 allow_c_recover_station,
             )
         )
@@ -741,9 +818,13 @@ def initialize_population(
 1. 所有初始化个体都必须包含 sequence、assignment、rendezvous 三层。
 2. A 模式 rendezvous=None。
 3. B 模式随机生成 launch/recover。
-4. C 模式 launch 固定为 depot，recover 根据配置可为 depot 或 station。
+4. C 模式 rendezvous 通过 operators.make_random_rendezvous_for_gene(...) 生成，launch 固定为 DEPOT 或 support_node_ids 中第一个 depot 前缀节点，recover 根据配置可为 depot 或 station。
 5. initialize_population 支持 greedy_seed 和 warm_start。
-6. 不要访问真实环境状态，只使用传入的 order_ids、drone_ids、depot_ids、station_ids。
+6. initialize_population 参数使用 order_ids、gene_pool、support_node_ids，不再使用 drone_ids、depot_ids、station_ids。
+7. 不要访问真实环境状态，不读取 truck/drone/station/depot 对象。
+8. 不要调用 make_gene_pool(...)、make_gene_pool_by_location(...)、make_node_pool(...)、normalize_depot_id(...)。
+9. greedy_seed / warm_start 必须 deepcopy 后再加入种群，并且要 validate；若订单集合与当前 order_ids 不一致，或 assignment 不属于当前 gene_pool，则跳过。
+10. 所有新建个体返回前都必须调用 validate()。
 ```
 
 ---
