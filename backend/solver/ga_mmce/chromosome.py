@@ -9,6 +9,7 @@ Rendezvous = dict[str, str] | None
 
 _TRUCK_HOME_TYPES = {"TRUCK"}
 _DEPOT_HOME_TYPES = {"DEPOT"}
+_TEST_DRONE_ID_RE = re.compile(r"^UAV-TEST-(0[1-9]|1[0-2])$")
 
 
 @dataclass
@@ -35,15 +36,19 @@ class Individual:
                 if rv is not None:
                     raise ValueError("A mode must use rendezvous=None")
             elif gene.startswith("B_"):
+                _, drone_id = _split_assignment_gene(gene)
+                _validate_drone_id_format(drone_id)
                 if not isinstance(rv, dict):
                     raise ValueError("B mode must use rendezvous dict")
                 if not rv.get("launch") or not rv.get("recover"):
                     raise ValueError("B mode rendezvous must include launch and recover")
             elif gene.startswith("C_"):
+                _, drone_id = _split_assignment_gene(gene)
+                _validate_drone_id_format(drone_id)
                 if not isinstance(rv, dict):
                     raise ValueError("C mode must use rendezvous dict")
                 launch = str(rv.get("launch", ""))
-                if launch != "DEPOT" and not launch.upper().startswith("DEPOT"):
+                if not _is_depot_node_id(launch):
                     raise ValueError("C mode launch must be DEPOT/depot id")
                 if not rv.get("recover"):
                     raise ValueError("C mode rendezvous must include recover")
@@ -55,6 +60,7 @@ class Individual:
         truck_drone_ids: Iterable[str | int],
         depot_drone_ids: Iterable[str | int],
         valid_drone_ids: Iterable[str | int] | None = None,
+        support_node_ids: Iterable[str | int] | None = None,
     ) -> None:
         self.validate()
 
@@ -65,8 +71,13 @@ class Individual:
             if valid_drone_ids is not None
             else truck_set | depot_set
         )
+        support_set = (
+            _normalize_id_set(support_node_ids)
+            if support_node_ids is not None
+            else None
+        )
 
-        for gene in self.assignment:
+        for gene, rv in zip(self.assignment, self.rendezvous):
             if gene == "A":
                 continue
 
@@ -77,6 +88,14 @@ class Individual:
                 raise ValueError(f"B mode drone must be docked on truck: {drone_id}")
             if mode == "C" and drone_id not in depot_set:
                 raise ValueError(f"C mode drone must be ready at depot: {drone_id}")
+
+            if support_set is not None:
+                launch = _normalize_id(rv.get("launch", "")) if isinstance(rv, dict) else ""
+                recover = _normalize_id(rv.get("recover", "")) if isinstance(rv, dict) else ""
+                if launch not in support_set:
+                    raise ValueError(f"{gene} launch node is not in support_node_ids: {launch}")
+                if recover not in support_set:
+                    raise ValueError(f"{gene} recover node is not in support_node_ids: {recover}")
 
 
 def _coerce_home_type(value: Any) -> str:
@@ -108,6 +127,19 @@ def _split_assignment_gene(gene: str) -> tuple[str, str]:
     return mode, drone_id
 
 
+def _is_depot_node_id(node_id: str) -> bool:
+    normalized = str(node_id).strip().upper()
+    return normalized == "DEPOT" or normalized.startswith("DEPOT") or normalized.startswith("DEP-")
+
+
+def _validate_drone_id_format(drone_id: str) -> None:
+    if _TEST_DRONE_ID_RE.fullmatch(drone_id) is None:
+        raise ValueError(
+            "drone id must match UAV-TEST-01..UAV-TEST-12, "
+            f"got {drone_id!r}"
+        )
+
+
 def extract_drone_numeric_id(drone_id: str | int) -> int:
     if isinstance(drone_id, int):
         if drone_id < 1:
@@ -121,12 +153,11 @@ def extract_drone_numeric_id(drone_id: str | int) -> int:
 
 
 def make_gene_pool(drone_ids: list[str | int]) -> list[str]:
-    genes = ["A"]
-    for uid in drone_ids:
-        drone_id = _normalize_id(uid)
-        genes.append(f"B_{drone_id}")
-        genes.append(f"C_{drone_id}")
-    return genes
+    raise RuntimeError(
+        "make_gene_pool(drone_ids) is deprecated because it creates both B_ and C_ "
+        "genes for every drone. Use make_gene_pool_by_location(truck_drone_ids, "
+        "depot_drone_ids) with current physical state instead."
+    )
 
 
 def make_gene_pool_by_location(
@@ -153,6 +184,12 @@ def normalize_depot_id(depot_ids: list[str]) -> str:
 
 
 def make_location_gene(record: Any) -> str:
+    """Infer a static-location gene from config-like records.
+
+    Dynamic rescheduling should not rely on this helper alone. Build the gene
+    pool from current physical pools such as truck.docked_drones and depot-ready
+    drones, then call make_gene_pool_by_location(...).
+    """
     drone_id = _read_field(record, "drone_id")
     if drone_id is None:
         raise ValueError("drone record is missing drone_id")

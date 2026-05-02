@@ -412,11 +412,24 @@ class Individual:
 
 
 def make_gene_pool(drone_ids: list[str | int]) -> list[str]:
-    genes = ["A"]
-    for uid in drone_ids:
-        genes.append(f"B_{uid}")
-        genes.append(f"C_{uid}")
-    return genes
+    raise RuntimeError(
+        "make_gene_pool(drone_ids) is deprecated because it creates both B_ and C_ "
+        "genes for every drone. Use make_gene_pool_by_location(truck_drone_ids, "
+        "depot_drone_ids) with current physical state instead."
+    )
+
+
+def make_gene_pool_by_location(
+    truck_drone_ids: list[str | int],
+    depot_drone_ids: list[str | int],
+) -> list[str]:
+    truck_ids = [str(uid).strip() for uid in truck_drone_ids]
+    depot_ids = [str(uid).strip() for uid in depot_drone_ids]
+    overlap = set(truck_ids) & set(depot_ids)
+    if overlap:
+        raise ValueError(f"drone cannot be both truck-docked and depot-ready: {sorted(overlap)}")
+
+    return ["A"] + [f"B_{uid}" for uid in truck_ids] + [f"C_{uid}" for uid in depot_ids]
 
 
 def make_node_pool(depot_ids: list[str], station_ids: list[str]) -> list[str]:
@@ -448,10 +461,12 @@ validate() 必须检查：
 3. A 的 rendezvous 必须为 None；
 4. B_<uid> 的 rendezvous 必须包含 launch 和 recover；
 5. C_<uid> 的 launch 必须是 DEPOT ，recover 必须存在；
-6. 不允许未知 gene。
+6. B/C 的无人机 ID 必须匹配 `UAV-TEST-01` 到 `UAV-TEST-12`；
+7. 不允许未知 gene。
 
 同时实现：
-- make_gene_pool(drone_ids)
+- make_gene_pool_by_location(truck_drone_ids, depot_drone_ids)
+- make_gene_pool(drone_ids) 仅保留为废弃保护接口，调用时应抛错，防止每架无人机同时生成 B/C。
 - make_node_pool(depot_ids, station_ids)
 - normalize_depot_id(depot_ids)
 ```
@@ -466,7 +481,7 @@ validate() 必须检查：
 当前 chromosome.py 已经实现：
 - Individual(sequence, assignment, rendezvous)
 - Individual.validate()
-- Individual.validate_with_context(truck_drone_ids, depot_drone_ids, valid_drone_ids=None)
+- Individual.validate_with_context(truck_drone_ids, depot_drone_ids, valid_drone_ids=None, support_node_ids=None)
 - make_gene_pool_by_location(truck_drone_ids, depot_drone_ids)
 - make_node_pool(depot_ids, station_ids)
 - normalize_depot_id(depot_ids)
@@ -833,7 +848,60 @@ def initialize_population(
 
 ## 8.1 目标
 
-GA 模块不应该直接猜实体字段名。需要 adapter 把现有系统状态转换成 GA 需要的简单列表。
+GA 模块不应该直接猜实体字段名。需要 adapter 把现有系统状态转换成 GA 当前这一轮需要的简单上下文池。
+
+当前 `chromosome.py` 已经实现：
+
+```text
+Individual(sequence, assignment, rendezvous)
+Individual.validate()
+Individual.validate_with_context(
+    truck_drone_ids,
+    depot_drone_ids,
+    valid_drone_ids=None,
+    support_node_ids=None,
+)
+make_gene_pool_by_location(truck_drone_ids, depot_drone_ids)
+make_node_pool(depot_ids, station_ids)
+```
+
+因此 adapter 的职责不再是只返回 `drone_ids`。如果 adapter 只返回全量无人机 ID，再由 solver 调用旧 `make_gene_pool(drone_ids)`，就会重新产生错误基因：
+
+```text
+每架无人机同时拥有 B_<uid> 和 C_<uid>
+```
+
+这与当前物理约束冲突：
+
+```text
+B_<uid>：uid 必须是当前已经停在卡车平台上的无人机，例如 truck.docked_drones。
+C_<uid>：uid 必须是当前位于仓库且可从仓库起飞的无人机。
+```
+
+adapter 应该提供：
+
+```text
+1. 当前待优化订单集合 order_ids
+2. 当前可用于 B 模式的车载无人机集合 truck_drone_ids
+3. 当前可用于 C 模式的仓库无人机集合 depot_drone_ids
+4. 系统内全部无人机 ID all_drone_ids
+5. 仓库节点 ID depot_ids
+6. 充换电站节点 ID station_ids
+7. GA 可用 support_node_ids
+8. 当前重调度轮次可用 gene_pool
+9. 状态深拷贝
+10. greedy plan -> 三层 Individual 的转换
+```
+
+当前需要特别注意：
+
+```text
+make_gene_pool(drone_ids) 已废弃，不允许 solver.py 继续调用。
+solver.py 必须使用 make_gene_pool_by_location(truck_drone_ids, depot_drone_ids)。
+validate() 当前会检查 UAV-TEST-01 ~ UAV-TEST-12 格式。
+validate_with_context(...) 可额外检查 B/C 无人机池和 support_node_ids。
+make_location_gene(...) 只适合静态初始配置，不适合动态重调度时判断无人机真实位置。
+```
 
 ## 8.2 新增文件
 
@@ -844,12 +912,60 @@ backend/solver/ga_mmce/adapters.py
 ## 8.3 需要实现的函数
 
 ```python
+from __future__ import annotations
+
+import copy
+from dataclasses import dataclass
+from typing import Any, Iterable
+
+from .chromosome import (
+    Individual,
+    make_gene_pool_by_location,
+    make_node_pool,
+)
+from .operators import (
+    find_depot_node,
+    make_random_rendezvous_for_gene,
+)
+
+
+@dataclass
+class GAAdapterContext:
+    order_ids: list[str]
+    truck_drone_ids: list[str]
+    depot_drone_ids: list[str]
+    all_drone_ids: list[str]
+    depot_ids: list[str]
+    station_ids: list[str]
+    support_node_ids: list[str]
+    gene_pool: list[str]
+
+
 def extract_active_order_ids(state) -> list[str]:
     """返回需要进入 GA 的订单 ID，排除 completed / cancelled / locked。"""
 
 
-def extract_drone_ids(state) -> list[str]:
-    """返回可被 GA 分配的无人机 ID。"""
+def extract_truck_drone_ids(state) -> list[str]:
+    """
+    返回当前可用于 B 模式的无人机 ID。
+
+    典型来源：
+    - truck.docked_drones
+    - 且无人机当前未被 locked action / running route 占用
+    """
+
+
+def extract_depot_drone_ids(state) -> list[str]:
+    """
+    返回当前可用于 C 模式的无人机 ID。
+
+    判断不能只看 home_type。
+    应参考当前物理状态：无人机位于仓库、空闲、可从仓库起飞、未被 locked action 占用。
+    """
+
+
+def extract_all_drone_ids(state) -> list[str]:
+    """返回系统内全部无人机 ID，仅用于上下文校验和诊断。"""
 
 
 def extract_truck_ids(state) -> list[str]:
@@ -864,19 +980,86 @@ def extract_station_ids(state) -> list[str]:
     """返回充换电站 ID。"""
 
 
+def extract_support_node_ids(state) -> list[str]:
+    """返回 GA 可选协同节点，通常等于 depot ids + station ids。"""
+
+
+def build_ga_context(state) -> GAAdapterContext:
+    order_ids = extract_active_order_ids(state)
+    truck_drone_ids = extract_truck_drone_ids(state)
+    depot_drone_ids = extract_depot_drone_ids(state)
+    all_drone_ids = extract_all_drone_ids(state)
+    depot_ids = extract_depot_ids(state)
+    station_ids = extract_station_ids(state)
+    support_node_ids = make_node_pool(depot_ids, station_ids)
+    gene_pool = make_gene_pool_by_location(truck_drone_ids, depot_drone_ids)
+
+    return GAAdapterContext(
+        order_ids=order_ids,
+        truck_drone_ids=truck_drone_ids,
+        depot_drone_ids=depot_drone_ids,
+        all_drone_ids=all_drone_ids,
+        depot_ids=depot_ids,
+        station_ids=station_ids,
+        support_node_ids=support_node_ids,
+        gene_pool=gene_pool,
+    )
+
+
 def clone_state_for_decode(state):
     """返回 state 深拷贝，确保 decode 不污染真实环境。"""
 
 
-def greedy_plan_to_individual(greedy_plan, order_ids, drone_ids, depot_ids, station_ids):
+def greedy_plan_to_individual(
+    greedy_plan,
+    order_ids: list[str],
+    gene_pool: list[str],
+    support_node_ids: list[str],
+    allow_c_recover_station: bool = True,
+) -> Individual | None:
     """
     将 greedy plan 转换成三层 Individual。
     可从 AllocationResult 中读取：mode、drone_id、launch_station_id、recovery_station_id。
-    若字段缺失，则用合法随机 rendezvous 修复。
+    若字段缺失，则用 make_random_rendezvous_for_gene(...) 修复。
+
+    重要：
+    - 不允许生成 gene_pool 之外的 assignment。
+    - 如果 greedy 的无人机不在当前 gene_pool 中，该订单回退为 A。
     """
 ```
 
-## 8.4 greedy_plan_to_individual 规则
+## 8.4 上下文池提取规则
+
+```text
+extract_truck_drone_ids(state):
+    从 truck.docked_drones 提取当前已经停在卡车平台上的无人机。
+    若存在多辆卡车，则合并所有当前可参与 GA 的 truck.docked_drones。
+    排除正在执行 locked action、正在飞行、正在服务未完成订单的无人机。
+
+extract_depot_drone_ids(state):
+    从当前真实状态判断位于仓库且可起飞的无人机。
+    不能只看 home_type == DEPOT。
+    需要排除：
+        正在飞行
+        在充换电站
+        刚被卡车回收但尚未可用
+        正在换电
+        locked action 占用
+
+extract_all_drone_ids(state):
+    返回系统中的全部无人机 ID。
+    用于 Individual.validate_with_context(..., valid_drone_ids=all_drone_ids)。
+
+extract_support_node_ids(state):
+    support_node_ids = depot_ids + station_ids。
+    后续 operators.py 只从 support_node_ids 中随机生成 launch/recover。
+
+build_ga_context(state):
+    gene_pool = make_gene_pool_by_location(truck_drone_ids, depot_drone_ids)。
+    solver.py 和 population.py 都不应该再调用 make_gene_pool(drone_ids)。
+```
+
+## 8.5 greedy_plan_to_individual 规则
 
 ```text
 alloc.mode == "A":
@@ -885,39 +1068,115 @@ alloc.mode == "A":
 
 alloc.mode in ("B", "B_WAIT", "B_DYNAMIC"):
     assignment = f"B_{alloc.drone_id}"
-    rendezvous = {
-        "launch": alloc.launch_station_id or depot_id_or_best_guess,
-        "recover": alloc.recovery_station_id,
-    }
+    如果 assignment 不在当前 gene_pool 中：
+        assignment = "A"
+        rendezvous = None
+    否则：
+        rendezvous = {
+            "launch": alloc.launch_station_id or alloc.launch_node_id or fallback_support_node,
+            "recover": alloc.recovery_station_id or alloc.recover_node_id or fallback_support_node,
+        }
+        若 launch/recover 不在 support_node_ids 中，则用 make_random_rendezvous_for_gene(...) 修复。
 
 alloc.mode == "C":
     assignment = f"C_{alloc.drone_id}"
-    rendezvous = {
-        "launch": depot_id,
-        "recover": alloc.recovery_station_id or depot_id,
-    }
+    如果 assignment 不在当前 gene_pool 中：
+        assignment = "A"
+        rendezvous = None
+    否则：
+        depot_node = find_depot_node(support_node_ids)
+        rendezvous = {
+            "launch": depot_node,
+            "recover": alloc.recovery_station_id or alloc.recover_node_id or depot_node,
+        }
+        若 recover 不在 support_node_ids 中，则用 make_random_rendezvous_for_gene(...) 修复。
 ```
 
-## 8.5 给 Codex 的提示词
+推荐辅助逻辑：
+
+```python
+def _read_field(record: Any, field_name: str, default: Any = None) -> Any:
+    if isinstance(record, dict):
+        return record.get(field_name, default)
+    return getattr(record, field_name, default)
+
+
+def _iter_allocations(greedy_plan) -> Iterable[Any]:
+    if greedy_plan is None:
+        return []
+    if isinstance(greedy_plan, dict):
+        return greedy_plan.values()
+    if isinstance(greedy_plan, list):
+        return greedy_plan
+    for field_name in ("allocations", "results", "assignments"):
+        value = getattr(greedy_plan, field_name, None)
+        if value is not None:
+            return value.values() if isinstance(value, dict) else value
+    return []
+
+
+def _repair_rendezvous_if_needed(
+    gene: str,
+    rv: dict[str, str] | None,
+    support_node_ids: list[str],
+    allow_c_recover_station: bool,
+) -> dict[str, str] | None:
+    if gene == "A":
+        return None
+    if not isinstance(rv, dict):
+        return make_random_rendezvous_for_gene(
+            gene,
+            support_node_ids,
+            allow_c_recover_station,
+        )
+
+    support_set = {str(node) for node in support_node_ids}
+    if rv.get("launch") not in support_set or rv.get("recover") not in support_set:
+        return make_random_rendezvous_for_gene(
+            gene,
+            support_node_ids,
+            allow_c_recover_station,
+        )
+    return rv
+```
+
+## 8.6 给 Codex 的提示词
 
 ```text
 请新增/修改 backend/solver/ga_mmce/adapters.py。
 
 实现：
-1. extract_active_order_ids(state)
-2. extract_drone_ids(state)
-3. extract_truck_ids(state)
-4. extract_depot_ids(state)
-5. extract_station_ids(state)
-6. clone_state_for_decode(state)
-7. greedy_plan_to_individual(greedy_plan, order_ids, drone_ids, depot_ids, station_ids)
+1. GAAdapterContext dataclass。
+2. extract_active_order_ids(state)
+3. extract_truck_drone_ids(state)
+4. extract_depot_drone_ids(state)
+5. extract_all_drone_ids(state)
+6. extract_truck_ids(state)
+7. extract_depot_ids(state)
+8. extract_station_ids(state)
+9. extract_support_node_ids(state)
+10. build_ga_context(state)
+11. clone_state_for_decode(state)
+12. greedy_plan_to_individual(greedy_plan, order_ids, gene_pool, support_node_ids, allow_c_recover_station=True)
 
 要求：
 - 不要修改实体类。
 - clone_state_for_decode 优先使用 copy.deepcopy。
+- B 模式无人机池必须来自当前卡车平台上的无人机，例如 truck.docked_drones。
+- C 模式无人机池必须来自当前位于仓库且可从仓库起飞的无人机。
+- 不要只根据 home_type 推断动态重调度时的 B/C 池。
+- 不要返回单一 drone_ids 给 solver 生成 gene_pool。
+- solver.py 必须使用 context.gene_pool，不允许调用 make_gene_pool(drone_ids)。
+- support_node_ids 必须来自 depot ids + station ids。
 - greedy_plan_to_individual 必须返回三层 Individual。
-- 如果 greedy plan 中没有 launch_station_id，则用 depot 或最近合法站点作为 fallback。
-- 如果无法解析，则返回 None，并添加 TODO 注释。
+- greedy_plan_to_individual 不允许生成 gene_pool 之外的 assignment。
+- greedy_plan_to_individual 生成后必须调用 individual.validate()。
+- 若上下文池可用，也应调用 individual.validate_with_context(
+      truck_drone_ids,
+      depot_drone_ids,
+      valid_drone_ids=all_drone_ids,
+      support_node_ids=support_node_ids,
+  )。
 ```
 
 ---
@@ -1566,12 +1825,11 @@ backend/solver/ga_mmce/solver.py
 ## 12.2 核心职责
 
 ```text
-1. 从环境提取 active order ids；
-2. 提取 drone ids / depot ids / station ids / truck ids；
-3. 初始化三层种群；
-4. 可选使用 greedy seed，但 greedy seed 只用于初始化个体；
-5. 循环迭代；
-6. 返回最佳 DispatchPlan。
+1. 从 adapter 获取 GAAdapterContext；
+2. 使用 context.gene_pool 和 context.support_node_ids 初始化三层种群；
+3. 可选使用 greedy seed，但 greedy seed 只用于初始化个体；
+4. 循环迭代；
+5. 返回最佳 DispatchPlan。
 ```
 
 ## 12.3 推荐代码框架
@@ -1587,14 +1845,9 @@ import time
 from greedy_mmce import GreedyMMCE
 
 from .adapters import (
-    extract_active_order_ids,
-    extract_drone_ids,
-    extract_truck_ids,
-    extract_depot_ids,
-    extract_station_ids,
+    build_ga_context,
     greedy_plan_to_individual,
 )
-from .chromosome import make_gene_pool
 from .config import GAConfig
 from .decoder import GADecoder
 from .operators import order_crossover, mutate, tournament_select
@@ -1619,12 +1872,10 @@ class GAMMCESolver:
     def solve(self, state, warm_start=None):
         started = time.time()
 
-        order_ids = extract_active_order_ids(state)
-        drone_ids = extract_drone_ids(state)
-        truck_ids = extract_truck_ids(state)
-        depot_ids = extract_depot_ids(state)
-        station_ids = extract_station_ids(state)
-        gene_pool = make_gene_pool(drone_ids)
+        context = build_ga_context(state)
+        order_ids = context.order_ids
+        gene_pool = context.gene_pool
+        support_node_ids = context.support_node_ids
 
         if not order_ids:
             return self._empty_plan()
@@ -1636,16 +1887,15 @@ class GAMMCESolver:
             greedy_seed = greedy_plan_to_individual(
                 greedy_plan,
                 order_ids,
-                drone_ids,
-                depot_ids,
-                station_ids,
+                gene_pool,
+                support_node_ids,
+                allow_c_recover_station=self.config.allow_depot_drone_recover_at_station,
             )
 
         population = initialize_population(
             order_ids=order_ids,
-            drone_ids=drone_ids,
-            depot_ids=depot_ids,
-            station_ids=station_ids,
+            gene_pool=gene_pool,
+            support_node_ids=support_node_ids,
             pop_size=self.config.population_size,
             greedy_seed=greedy_seed,
             warm_start=warm_start,
@@ -1680,8 +1930,7 @@ class GAMMCESolver:
                     mutate(
                         child,
                         gene_pool=gene_pool,
-                        depot_ids=depot_ids,
-                        station_ids=station_ids,
+                        support_node_ids=support_node_ids,
                         p_seq=self.config.mutation_rate_sequence,
                         p_assign=self.config.mutation_rate_assignment,
                         p_rendezvous=self.config.mutation_rate_rendezvous,
@@ -1705,6 +1954,8 @@ class GAMMCESolver:
 
     def _evaluate_individual(self, ind, state):
         ind.validate()
+        # 若 solve() 中可拿到 context，也建议改为 validate_with_context(...)
+        # 以检查 B/C 无人机池与 support_node_ids。
         result = self.decoder.decode(ind, state)
         ind.fitness = result.objective
         ind.decoded_plan = result.plan

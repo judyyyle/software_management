@@ -6,13 +6,17 @@ import random
 from .chromosome import Individual, Rendezvous
 
 
+def _is_depot_node_id(node_id: str) -> bool:
+    normalized = str(node_id).strip().upper()
+    return normalized == "DEPOT" or normalized.startswith("DEPOT") or normalized.startswith("DEP-")
+
+
 def find_depot_node(support_node_ids: list[str]) -> str:
     if "DEPOT" in support_node_ids:
         return "DEPOT"
 
     for node in support_node_ids:
-        raw = str(node)
-        if raw.upper().startswith("DEPOT") or raw.lower().startswith("depot"):
+        if _is_depot_node_id(str(node)):
             return node
 
     raise ValueError("support_node_ids must include a depot node")
@@ -22,7 +26,7 @@ def _depot_nodes(support_node_ids: list[str]) -> list[str]:
     return [
         node
         for node in support_node_ids
-        if str(node).upper().startswith("DEPOT") or str(node).lower().startswith("depot")
+        if _is_depot_node_id(str(node))
     ]
 
 
