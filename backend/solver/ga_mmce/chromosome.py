@@ -42,7 +42,8 @@ class Individual:
             elif gene.startswith("C_"):
                 if not isinstance(rv, dict):
                     raise ValueError("C mode must use rendezvous dict")
-                if rv.get("launch") != "DEPOT" and not rv.get("launch", "").startswith("depot"):
+                launch = str(rv.get("launch", ""))
+                if launch != "DEPOT" and not launch.upper().startswith("DEPOT"):
                     raise ValueError("C mode launch must be DEPOT/depot id")
                 if not rv.get("recover"):
                     raise ValueError("C mode rendezvous must include recover")
