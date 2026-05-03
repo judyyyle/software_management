@@ -93,6 +93,16 @@ class _ClosureInfo:
     repaired: bool = False
 
 
+@dataclass
+class _RouteTruckProxy:
+    truck_id: str
+    speed: float
+    start_position: Any
+
+    def get_location(self, current_time: float) -> Any:
+        return self.start_position
+
+
 class GADecoder:
     """Decode a three-layer GA chromosome into a DispatchPlan-compatible plan.
 
@@ -114,6 +124,8 @@ class GADecoder:
 
         state_copy = clone_state_for_decode(state)
         truck_id = self._select_default_truck_id(state_copy, context)
+        initial_time = self._current_time(state_copy)
+        initial_truck_position = self._snapshot_truck_position(state_copy, truck_id, initial_time)
 
         penalties: dict[str, float] = {}
         penalty_counts: dict[str, int] = {}
@@ -167,13 +179,20 @@ class GADecoder:
         if "final_return_penalty" in closure_info.penalties:
             feasible = False
 
-        truck_routes = self._build_truck_routes_by_given_order(state_copy, truck_id, truck_ordered_stops)
+        truck_routes = self._build_truck_routes_by_given_order(
+            state_copy,
+            truck_id,
+            truck_ordered_stops,
+            initial_time,
+            initial_truck_position,
+        )
         drone_routes = self._group_drone_route_fragments(drone_route_fragments)
         metrics = self._collect_plan_metrics(
             truck_routes=truck_routes,
             truck_ordered_stops=truck_ordered_stops,
             drone_route_fragments=drone_route_fragments,
             candidates=candidates,
+            state=state_copy,
         )
         objective += metrics.get("closure_route_cost", 0.0)
 
@@ -330,6 +349,12 @@ class GADecoder:
         return [(station_id, sorted(drone_ids)) for station_id, drone_ids in sorted_items]
 
     def _mark_closure_pickup(self, state: Any, truck_id: str, station_id: str, drone_ids: list[str]) -> None:
+        """Close C-mode station recoveries at Individual end.
+
+        This terminal repair only marks lifecycle closure. It is not a hook for
+        reusing these drones later in the same decode pass, so drone _ga_time is
+        intentionally not advanced to the truck route arrival time here.
+        """
         drones = self._mapping(state, "drones")
         for drone_id in drone_ids:
             drone = drones.get(drone_id)
@@ -356,21 +381,31 @@ class GADecoder:
         state: Any,
         truck_id: str,
         truck_ordered_stops: list[dict[str, Any]],
+        initial_time: float,
+        initial_truck_position: Any,
     ) -> dict[str, TruckRoute]:
         trucks = self._mapping(state, "trucks")
         truck = trucks.get(truck_id)
         if truck is None:
             return {}
 
-        current_time = self._current_time(state)
         route_stops = [self._normalize_stop_for_route(state, stop) for stop in truck_ordered_stops]
-        route = self.evaluator.greedy.build_incremental_route_from_stops(
-            truck=truck,
-            ordered_stops=route_stops,
-            current_time=current_time,
-        )
+        route_truck = self._route_truck_proxy(truck, truck_id, initial_truck_position)
+        try:
+            route = self.evaluator.greedy.build_incremental_route_from_stops(
+                truck=route_truck,
+                ordered_stops=route_stops,
+                current_time=initial_time,
+            )
+        except Exception:
+            route = None
         if route is None:
-            route = self._build_direct_truck_route(truck, route_stops, current_time)
+            route = self._build_direct_truck_route(
+                route_truck,
+                route_stops,
+                initial_time,
+                initial_truck_position,
+            )
         return {truck_id: route}
 
     def _build_direct_truck_route(
@@ -378,9 +413,10 @@ class GADecoder:
         truck: Any,
         ordered_stops: list[dict[str, Any]],
         current_time: float,
+        initial_truck_position: Any,
     ) -> TruckRoute:
         route = TruckRoute(truck_id=self._read_field(truck, "truck_id", ""))
-        cur_pos = self._truck_start_position(truck, current_time)
+        cur_pos = initial_truck_position
         cur_time = current_time
         route.nodes.append(
             TruckRouteNode(
@@ -433,16 +469,25 @@ class GADecoder:
         truck_ordered_stops: list[dict[str, Any]],
         drone_route_fragments: list[Any],
         candidates: list[GACandidate],
+        state: Any,
     ) -> dict[str, float]:
         route_truck_distance = sum(float(route.total_distance or 0.0) for route in truck_routes.values())
         candidate_truck_distance = sum(float(candidate.truck_distance or 0.0) for candidate in candidates)
         closure_route_distance = max(0.0, route_truck_distance - candidate_truck_distance)
         closure_route_cost = closure_route_distance * float(self.config.weight_truck_distance)
 
+        closure_waiting_drone_count = 0.0
         closure_waiting_time = 0.0
         for stop in truck_ordered_stops:
             if stop.get("action") == "closure_pickup_c_drone":
-                closure_waiting_time += len(stop.get("drone_ids", []) or [])
+                drone_ids = stop.get("drone_ids", []) or []
+                closure_waiting_drone_count += len(drone_ids)
+                closure_waiting_time += self._closure_stop_waiting_time(
+                    state,
+                    truck_routes,
+                    stop,
+                    drone_ids,
+                )
 
         return {
             "candidate_count": float(len(candidates)),
@@ -452,8 +497,47 @@ class GADecoder:
             "candidate_truck_distance": candidate_truck_distance,
             "closure_route_distance": closure_route_distance,
             "closure_route_cost": closure_route_cost,
+            "closure_waiting_drone_count": closure_waiting_drone_count,
             "closure_waiting_time": closure_waiting_time,
         }
+
+    def _closure_stop_waiting_time(
+        self,
+        state: Any,
+        truck_routes: dict[str, TruckRoute],
+        stop: dict[str, Any],
+        drone_ids: list[str],
+    ) -> float:
+        truck_arrival = self._route_arrival_time_for_stop(truck_routes, stop)
+        if truck_arrival is None:
+            return 0.0
+
+        drones = self._mapping(state, "drones")
+        total_wait = 0.0
+        for drone_id in drone_ids:
+            drone = drones.get(str(drone_id))
+            if drone is None:
+                continue
+            drone_ready_time = float(self._read_field(drone, "_ga_time", truck_arrival) or truck_arrival)
+            total_wait += max(0.0, truck_arrival - drone_ready_time)
+        return total_wait
+
+    def _route_arrival_time_for_stop(
+        self,
+        truck_routes: dict[str, TruckRoute],
+        stop: dict[str, Any],
+    ) -> float | None:
+        node_id = str(stop.get("node_id", ""))
+        action = stop.get("action")
+        source = stop.get("source")
+        for route in truck_routes.values():
+            for node in route.nodes:
+                if node.node_id != node_id:
+                    continue
+                if action == "closure_pickup_c_drone" and source == "repair":
+                    return float(node.arrival_time)
+                return float(node.arrival_time)
+        return None
 
     def _build_dispatch_plan(
         self,
@@ -466,17 +550,20 @@ class GADecoder:
         feasible: bool,
         metrics: dict[str, float],
     ) -> DispatchPlan:
+        total_penalty_cost = sum(float(value) for value in penalties.values())
+        fitness_total = self._finite_or(objective + total_penalty_cost, self.config.big_m)
         summary = {
             "feasible": feasible,
             "objective": objective,
+            "fitness_total": fitness_total,
             "penalties": dict(penalties),
             "penalty_counts": dict(penalty_counts),
             "metrics": dict(metrics),
-            "total_penalty_cost": sum(float(value) for value in penalties.values()),
+            "total_penalty_cost": total_penalty_cost,
         }
         return DispatchPlan(
             allocations=allocations,
-            cost_total=objective,
+            cost_total=fitness_total,
             summary=summary,
             truck_routes=truck_routes,
             drone_routes=drone_routes,
@@ -555,6 +642,19 @@ class GADecoder:
         if trucks:
             return str(next(iter(trucks.keys())))
         raise ValueError("no truck available for GA decoding")
+
+    def _snapshot_truck_position(self, state: Any, truck_id: str, current_time: float) -> Any:
+        truck = self._mapping(state, "trucks").get(truck_id)
+        if truck is None:
+            return None
+        return self._truck_start_position(truck, current_time)
+
+    def _route_truck_proxy(self, truck: Any, truck_id: str, initial_truck_position: Any) -> _RouteTruckProxy:
+        return _RouteTruckProxy(
+            truck_id=truck_id,
+            speed=float(self._read_field(truck, "speed", 0.0) or 0.0),
+            start_position=initial_truck_position,
+        )
 
     def _copy_stops(self, stops: list[dict[str, Any]]) -> list[dict[str, Any]]:
         return [dict(stop) for stop in stops]
