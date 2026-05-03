@@ -84,6 +84,12 @@
                 🧠 贪心（增量）
               </button>
               <button class="sc-btn sc-btn--dispatch"
+                :class="{ 'sc-btn--dispatch-active': dispatchSolver === 'ga_mmce' }"
+                :disabled="!initDone || dispatchLoading"
+                @click="dispatchSolver = 'ga_mmce'">
+                🧬 遗传算法
+              </button>
+              <button class="sc-btn sc-btn--dispatch"
                 :class="{ 'sc-btn--dispatch-active': dispatchSolver === 'market' }"
                 :disabled="!initDone || dispatchLoading"
                 @click="dispatchSolver = 'market'">
@@ -228,13 +234,14 @@ const dispatchLoading = ref(false)
 const lastDispatchResult = ref<any>(null)
 const dispatchPlan = ref<DispatchPlan | null>(null)
 const totalEnergyCostWh = ref(0)
-type DispatchSolverName = 'greedy' | 'greedy_mmce' | 'greedy_mmce_bi' | 'market'
+type DispatchSolverName = 'greedy' | 'greedy_mmce' | 'greedy_mmce_bi' | 'ga_mmce' | 'market'
 const dispatchSolver = ref<DispatchSolverName>('greedy')
 
 function dispatchSolverLabel(solver: DispatchSolverName): string {
   if (solver === 'greedy') return '贪心（baseline）'
   if (solver === 'greedy_mmce') return '贪心（多模式）'
   if (solver === 'greedy_mmce_bi') return '贪心（增量）'
+  if (solver === 'ga_mmce') return '遗传算法'
   return '市场拍卖'
 }
 
