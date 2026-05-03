@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import copy
 from dataclasses import dataclass
+from types import SimpleNamespace
 from typing import Any, Iterable
 
 from .chromosome import Individual, make_gene_pool_by_location, make_node_pool
@@ -298,7 +299,128 @@ def build_ga_context(state) -> GAAdapterContext:
 
 
 def clone_state_for_decode(state):
-    return copy.deepcopy(state)
+    """Clone only the mutable planning surface needed by GA decoding.
+
+    Runtime entities contain locks (for example Truck._lock), so a full
+    deepcopy can fail with "cannot pickle _thread.RLock". GA only writes _ga_*
+    temporary fields and a small set of host lists/queues, so shallow-cloning
+    entities plus copying mutable containers is enough and keeps the real
+    runtime state clean.
+    """
+    state_copy = _clone_record_surface(state)
+
+    mgr = _entity_mgr(state)
+    mgr_copy = _clone_record_surface(mgr)
+
+    for field_name in ("depots", "stations", "trucks", "drones"):
+        mapping = _read_field(mgr, field_name, {}) or {}
+        if isinstance(mapping, dict):
+            setattr(mgr_copy, field_name, {
+                key: _clone_entity_surface(value)
+                for key, value in mapping.items()
+            })
+
+    direct_orders = _read_field(state, "orders")
+    if isinstance(direct_orders, dict):
+        cloned_orders = {
+            key: _clone_entity_surface(value)
+            for key, value in direct_orders.items()
+        }
+        setattr(state_copy, "orders", cloned_orders)
+    else:
+        orders = _read_field(mgr, "orders")
+        if isinstance(orders, dict):
+            setattr(mgr_copy, "orders", {
+                key: _clone_entity_surface(value)
+                for key, value in orders.items()
+            })
+
+    if _read_field(state, "entity_mgr") is not None:
+        setattr(state_copy, "entity_mgr", mgr_copy)
+    elif _read_field(state, "entity_manager") is not None:
+        setattr(state_copy, "entity_manager", mgr_copy)
+
+    return state_copy
+
+
+def _clone_record_surface(record: Any) -> Any:
+    if isinstance(record, dict):
+        return dict(record)
+    try:
+        return copy.copy(record)
+    except Exception:
+        return record
+
+
+def _clone_entity_surface(entity: Any) -> Any:
+    if isinstance(entity, dict):
+        return _clone_mapping_surface(entity)
+
+    if hasattr(entity, "__slots__") and not hasattr(entity, "__dict__"):
+        return _clone_slot_entity_surface(entity)
+
+    try:
+        cloned = copy.copy(entity)
+    except Exception:
+        return entity
+
+    for name, value in getattr(entity, "__dict__", {}).items():
+        if name.startswith("_ga_"):
+            continue
+        if isinstance(value, dict):
+            setattr(cloned, name, _clone_mapping_surface(value))
+        elif isinstance(value, list):
+            setattr(cloned, name, list(value))
+        elif isinstance(value, set):
+            setattr(cloned, name, set(value))
+        elif isinstance(value, tuple):
+            setattr(cloned, name, tuple(value))
+
+    return cloned
+
+
+def _clone_slot_entity_surface(entity: Any) -> Any:
+    data: dict[str, Any] = {}
+    for cls in type(entity).mro():
+        slots = getattr(cls, "__slots__", ())
+        if isinstance(slots, str):
+            slots = (slots,)
+        for name in slots:
+            if name.startswith("__"):
+                continue
+            try:
+                value = getattr(entity, name)
+            except AttributeError:
+                continue
+            if isinstance(value, dict):
+                data[name] = _clone_mapping_surface(value)
+            elif isinstance(value, list):
+                data[name] = list(value)
+            elif isinstance(value, set):
+                data[name] = set(value)
+            else:
+                data[name] = value
+
+    # Preserve common read-only properties that GA validators/evaluators read.
+    for property_name in ("status",):
+        if property_name not in data and hasattr(entity, property_name):
+            data[property_name] = getattr(entity, property_name)
+
+    return SimpleNamespace(**data)
+
+
+def _clone_mapping_surface(mapping: dict) -> dict:
+    cloned: dict = {}
+    for key, value in mapping.items():
+        if isinstance(value, dict):
+            cloned[key] = dict(value)
+        elif isinstance(value, list):
+            cloned[key] = list(value)
+        elif isinstance(value, set):
+            cloned[key] = set(value)
+        else:
+            cloned[key] = value
+    return cloned
 
 
 def _iter_allocations(greedy_plan) -> Iterable[Any]:
