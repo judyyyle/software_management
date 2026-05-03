@@ -85,6 +85,14 @@ class PhysicalEvaluator:
         value = self._read_field(state, field_name)
         if isinstance(value, dict):
             return value
+        state_mgr = (
+            self._read_field(state, "entity_mgr")
+            or self._read_field(state, "entity_manager")
+        )
+        if state_mgr is not None:
+            value = self._read_field(state_mgr, field_name)
+            if isinstance(value, dict):
+                return value
         fallback = self._read_field(self.entity_mgr, field_name, {})
         return fallback if isinstance(fallback, dict) else {}
 
