@@ -1,0 +1,627 @@
+from __future__ import annotations
+
+import math
+from dataclasses import dataclass, field
+from typing import Any
+
+from .adapters import GAAdapterContext, clone_state_for_decode
+from .chromosome import Individual
+from .config import GAConfig
+from .physical_evaluator import GACandidate, PhysicalEvaluator
+
+try:
+    from ..greedy_mmce import AllocationResult, DispatchPlan, DroneRoute, TruckRoute, TruckRouteNode
+except Exception:  # pragma: no cover - supports isolated GA unit tests without app sys.path.
+    try:
+        from greedy_mmce import AllocationResult, DispatchPlan, DroneRoute, TruckRoute, TruckRouteNode
+    except Exception:
+
+        @dataclass
+        class AllocationResult:
+            order_id: str
+            vehicle_id: str
+            mode: str
+            distance: float
+            feasible: bool
+            reason: str = ""
+            recovery_station_id: str = ""
+            drone_id: str = ""
+            launch_station_id: str = ""
+            launch_time: float = 0.0
+            wait_duration: float = 0.0
+            score_total: float = math.inf
+            cost_dist: float = 0.0
+            cost_energy: float = 0.0
+            cost_penalty: float = 0.0
+
+        @dataclass
+        class TruckRouteNode:
+            node_id: str
+            node_type: str
+            position: Any
+            arrival_time: float = 0.0
+            departure_time: float = 0.0
+            order_id: str = ""
+
+        @dataclass
+        class TruckRoute:
+            truck_id: str
+            nodes: list[TruckRouteNode] = field(default_factory=list)
+            total_distance: float = 0.0
+            charging_stop_ids: list[str] = field(default_factory=list)
+            geometry: list[Any] = field(default_factory=list)
+
+        @dataclass
+        class DroneRoute:
+            drone_id: str
+            order_id: str
+            path: list[Any] = field(default_factory=list)
+            mode: str = ""
+            launch_loc: Any = None
+            delivery_loc: Any = None
+            recovery_loc: Any = None
+
+        @dataclass
+        class DispatchPlan:
+            allocations: list[AllocationResult]
+            cost_total: float
+            summary: dict
+            truck_routes: dict[str, TruckRoute] = field(default_factory=dict)
+            drone_routes: dict[str, DroneRoute] = field(default_factory=dict)
+
+
+@dataclass
+class DecodeResult:
+    plan: Any
+    objective: float
+    # Values are already weighted costs. Counts are stored in penalty_counts.
+    penalties: dict[str, float]
+    penalty_counts: dict[str, int]
+    feasible: bool
+    candidates: list[GACandidate]
+    truck_ordered_stops: list[dict[str, Any]]
+    drone_route_fragments: list[Any]
+    unserved_order_ids: list[str]
+    repaired: bool
+    metrics: dict[str, float]
+
+
+@dataclass
+class _ClosureInfo:
+    penalties: dict[str, float] = field(default_factory=dict)
+    penalty_counts: dict[str, int] = field(default_factory=dict)
+    repaired: bool = False
+
+
+class GADecoder:
+    """Decode a three-layer GA chromosome into a DispatchPlan-compatible plan.
+
+    Decoder owns whole-individual aggregation and closure repair. Physical
+    feasibility of each fixed action remains in PhysicalEvaluator.
+    """
+
+    def __init__(self, config: GAConfig, evaluator: PhysicalEvaluator):
+        self.config = config
+        self.evaluator = evaluator
+
+    def decode(self, individual: Individual, state: Any, context: GAAdapterContext) -> DecodeResult:
+        individual.validate_with_context(
+            truck_drone_ids=context.truck_drone_ids,
+            depot_drone_ids=context.depot_drone_ids,
+            valid_drone_ids=context.all_drone_ids,
+            support_node_ids=context.support_node_ids,
+        )
+
+        state_copy = clone_state_for_decode(state)
+        truck_id = self._select_default_truck_id(state_copy, context)
+
+        penalties: dict[str, float] = {}
+        penalty_counts: dict[str, int] = {}
+        allocations: list[AllocationResult] = []
+        candidates: list[GACandidate] = []
+        drone_route_fragments: list[Any] = []
+        truck_ordered_stops: list[dict[str, Any]] = []
+        unserved_order_ids: list[str] = []
+        attempted_order_ids: set[str] = set()
+
+        objective = 0.0
+        feasible = True
+
+        for order_id, gene, rv in zip(individual.sequence, individual.assignment, individual.rendezvous):
+            attempted_order_ids.add(order_id)
+            candidate = self._evaluate_gene(state_copy, order_id, gene, rv, truck_id)
+
+            if candidate is None or not candidate.feasible:
+                feasible = False
+                reason = candidate.reason if candidate is not None and candidate.reason else "infeasible"
+                self._add_penalty_count(penalty_counts, reason, 1)
+                self._add_penalty_cost(penalties, "infeasible_penalty", self.config.weight_infeasible)
+                unserved_order_ids.append(order_id)
+                continue
+
+            candidates.append(candidate)
+            allocations.append(self._candidate_to_allocation_fragment(candidate))
+            truck_ordered_stops.extend(self._copy_stops(candidate.truck_stops))
+            if candidate.drone_route_fragment is not None:
+                drone_route_fragments.append(candidate.drone_route_fragment)
+
+            objective += self._finite_or(candidate.score_total, self.config.big_m)
+            self.evaluator.apply_candidate(state_copy, candidate)
+
+        missing_order_ids = sorted(set(context.order_ids) - attempted_order_ids)
+        if missing_order_ids:
+            feasible = False
+            unserved_order_ids.extend(missing_order_ids)
+            self._add_penalty_count(penalty_counts, "unserved_order_penalty", len(missing_order_ids))
+            self._add_penalty_cost(
+                penalties,
+                "unserved_order_penalty",
+                len(missing_order_ids) * self.config.weight_infeasible,
+            )
+
+        closure_info = self._append_c_station_closure_stops(state_copy, truck_id, truck_ordered_stops)
+        for name, value in closure_info.penalties.items():
+            self._add_penalty_cost(penalties, name, value)
+        for name, count in closure_info.penalty_counts.items():
+            self._add_penalty_count(penalty_counts, name, count)
+        if "final_return_penalty" in closure_info.penalties:
+            feasible = False
+
+        truck_routes = self._build_truck_routes_by_given_order(state_copy, truck_id, truck_ordered_stops)
+        drone_routes = self._group_drone_route_fragments(drone_route_fragments)
+        metrics = self._collect_plan_metrics(
+            truck_routes=truck_routes,
+            truck_ordered_stops=truck_ordered_stops,
+            drone_route_fragments=drone_route_fragments,
+            candidates=candidates,
+        )
+        objective += metrics.get("closure_route_cost", 0.0)
+
+        objective = self._finite_or(objective, self.config.big_m)
+        plan = self._build_dispatch_plan(
+            allocations=allocations,
+            truck_routes=truck_routes,
+            drone_routes=drone_routes,
+            objective=objective,
+            penalties=penalties,
+            penalty_counts=penalty_counts,
+            feasible=feasible,
+            metrics=metrics,
+        )
+
+        return DecodeResult(
+            plan=plan,
+            objective=objective,
+            penalties=penalties,
+            penalty_counts=penalty_counts,
+            feasible=feasible,
+            candidates=candidates,
+            truck_ordered_stops=truck_ordered_stops,
+            drone_route_fragments=drone_route_fragments,
+            unserved_order_ids=list(dict.fromkeys(unserved_order_ids)),
+            repaired=closure_info.repaired,
+            metrics=metrics,
+        )
+
+    def _evaluate_gene(
+        self,
+        state: Any,
+        order_id: str,
+        gene: str,
+        rv: dict[str, str] | None,
+        truck_id: str,
+    ) -> GACandidate | None:
+        if gene == "A":
+            return self.evaluator.evaluate_fixed_mode_a(state, order_id=order_id, truck_id=truck_id)
+
+        if gene.startswith("B_"):
+            if not isinstance(rv, dict):
+                return GACandidate(order_id=order_id, mode="B", feasible=False, reason="missing_rendezvous")
+            drone_id = gene.split("_", 1)[1]
+            return self.evaluator.evaluate_fixed_mode_b(
+                state,
+                order_id=order_id,
+                truck_id=truck_id,
+                drone_id=drone_id,
+                launch_node_id=rv["launch"],
+                recover_node_id=rv["recover"],
+            )
+
+        if gene.startswith("C_"):
+            if not isinstance(rv, dict):
+                return GACandidate(order_id=order_id, mode="C", feasible=False, reason="missing_rendezvous")
+            drone_id = gene.split("_", 1)[1]
+            return self.evaluator.evaluate_fixed_mode_c(
+                state,
+                order_id=order_id,
+                drone_id=drone_id,
+                recover_node_id=rv["recover"],
+            )
+
+        return GACandidate(order_id=order_id, mode="", feasible=False, reason=f"unknown_gene:{gene}")
+
+    def _append_c_station_closure_stops(
+        self,
+        state: Any,
+        truck_id: str,
+        truck_ordered_stops: list[dict[str, Any]],
+    ) -> _ClosureInfo:
+        waiting_by_station = self._collect_waiting_station_drones(state)
+        if not waiting_by_station:
+            return _ClosureInfo()
+
+        if not self.config.enable_repair:
+            return _ClosureInfo(
+                penalties={"final_return_penalty": len(waiting_by_station) * self.config.weight_infeasible},
+                penalty_counts={"final_return_penalty": sum(len(v) for v in waiting_by_station.values())},
+                repaired=False,
+            )
+
+        penalties: dict[str, float] = {}
+        penalty_counts: dict[str, int] = {}
+
+        for station_id, drone_ids in self._sort_waiting_stations(state, waiting_by_station):
+            station_pos = self.evaluator.get_node_position(station_id, state)
+            truck_ordered_stops.append(
+                {
+                    "node_id": station_id,
+                    "node_type": "station",
+                    "position": station_pos,
+                    "action": "closure_pickup_c_drone",
+                    "source": "repair",
+                    "drone_ids": drone_ids,
+                }
+            )
+            self._add_penalty_cost(penalties, "repair_penalty", self.config.repair_penalty_factor)
+            self._add_penalty_cost(
+                penalties,
+                "station_queue_penalty",
+                len(drone_ids) * self.config.weight_waiting,
+            )
+            self._add_penalty_count(penalty_counts, "repair_penalty", 1)
+            self._add_penalty_count(penalty_counts, "station_queue_penalty", len(drone_ids))
+            self._mark_closure_pickup(state, truck_id, station_id, drone_ids)
+
+        return _ClosureInfo(penalties=penalties, penalty_counts=penalty_counts, repaired=True)
+
+    def _collect_waiting_station_drones(self, state: Any) -> dict[str, list[str]]:
+        drones = self._mapping(state, "drones")
+        stations = self._mapping(state, "stations")
+        waiting_by_station: dict[str, list[str]] = {}
+
+        for station_id, station in stations.items():
+            for drone_id in self._as_list(self._read_field(station, "_ga_waiting_drones")):
+                if drone_id:
+                    waiting_by_station.setdefault(str(station_id), []).append(str(drone_id))
+
+        for drone_id, drone in drones.items():
+            if str(self._read_field(drone, "_ga_host_type", "")).upper() != "STATION":
+                continue
+            station_id = (
+                self._read_field(drone, "_ga_waiting_station_id")
+                or self._read_field(drone, "_ga_host_node_id")
+            )
+            if station_id:
+                waiting_by_station.setdefault(str(station_id), []).append(str(drone_id))
+
+        return {
+            station_id: list(dict.fromkeys(drone_ids))
+            for station_id, drone_ids in waiting_by_station.items()
+            if drone_ids
+        }
+
+    def _sort_waiting_stations(
+        self,
+        state: Any,
+        waiting_by_station: dict[str, list[str]],
+    ) -> list[tuple[str, list[str]]]:
+        drones = self._mapping(state, "drones")
+
+        def first_wait_time(item: tuple[str, list[str]]) -> tuple[float, str]:
+            station_id, drone_ids = item
+            times = [
+                float(self._read_field(drones.get(drone_id), "_ga_time", math.inf) or math.inf)
+                for drone_id in drone_ids
+                if drone_id in drones
+            ]
+            return (min(times) if times else math.inf, station_id)
+
+        sorted_items = sorted(waiting_by_station.items(), key=first_wait_time)
+        return [(station_id, sorted(drone_ids)) for station_id, drone_ids in sorted_items]
+
+    def _mark_closure_pickup(self, state: Any, truck_id: str, station_id: str, drone_ids: list[str]) -> None:
+        drones = self._mapping(state, "drones")
+        for drone_id in drone_ids:
+            drone = drones.get(drone_id)
+            if drone is None:
+                continue
+            if hasattr(self.evaluator, "_set_drone_host"):
+                self.evaluator._set_drone_host(  # noqa: SLF001 - GA internals share virtual state helpers.
+                    state,
+                    drone,
+                    drone_id,
+                    "TRUCK",
+                    station_id,
+                    truck_id=truck_id,
+                    candidate=None,
+                )
+            else:
+                self._write_field(drone, "_ga_host_type", "TRUCK")
+                self._write_field(drone, "_ga_host_node_id", station_id)
+                self._write_field(drone, "_ga_transport_truck_id", truck_id)
+                self._write_field(drone, "_ga_waiting_station_id", None)
+
+    def _build_truck_routes_by_given_order(
+        self,
+        state: Any,
+        truck_id: str,
+        truck_ordered_stops: list[dict[str, Any]],
+    ) -> dict[str, TruckRoute]:
+        trucks = self._mapping(state, "trucks")
+        truck = trucks.get(truck_id)
+        if truck is None:
+            return {}
+
+        current_time = self._current_time(state)
+        route_stops = [self._normalize_stop_for_route(state, stop) for stop in truck_ordered_stops]
+        route = self.evaluator.greedy.build_incremental_route_from_stops(
+            truck=truck,
+            ordered_stops=route_stops,
+            current_time=current_time,
+        )
+        if route is None:
+            route = self._build_direct_truck_route(truck, route_stops, current_time)
+        return {truck_id: route}
+
+    def _build_direct_truck_route(
+        self,
+        truck: Any,
+        ordered_stops: list[dict[str, Any]],
+        current_time: float,
+    ) -> TruckRoute:
+        route = TruckRoute(truck_id=self._read_field(truck, "truck_id", ""))
+        cur_pos = self._truck_start_position(truck, current_time)
+        cur_time = current_time
+        route.nodes.append(
+            TruckRouteNode(
+                node_id=f"{route.truck_id}_origin",
+                node_type="origin",
+                position=cur_pos,
+                arrival_time=current_time,
+                departure_time=current_time,
+            )
+        )
+        route.geometry.append(cur_pos)
+
+        speed = max(1e-6, float(self._read_field(truck, "speed", 0.0) or 0.0))
+        total_dist = 0.0
+        for stop in ordered_stops:
+            stop_pos = stop.get("position")
+            if stop_pos is None:
+                continue
+            dist = self._road_distance(cur_pos, stop_pos)
+            arrival = cur_time + dist / speed
+            service_time = max(
+                0.0,
+                float(stop.get("departure_time", arrival) or arrival)
+                - float(stop.get("arrival_time", arrival) or arrival),
+            )
+            departure = arrival + service_time
+            route.nodes.append(
+                TruckRouteNode(
+                    node_id=str(stop.get("node_id", "")),
+                    node_type=str(stop.get("node_type", "")),
+                    position=stop_pos,
+                    arrival_time=arrival,
+                    departure_time=departure,
+                    order_id=str(stop.get("order_id", "")),
+                )
+            )
+            if stop.get("node_type") == "station":
+                route.charging_stop_ids.append(str(stop.get("node_id", "")))
+            route.geometry.append(stop_pos)
+            total_dist += dist
+            cur_pos = stop_pos
+            cur_time = departure
+
+        route.total_distance = total_dist
+        return route
+
+    def _collect_plan_metrics(
+        self,
+        truck_routes: dict[str, TruckRoute],
+        truck_ordered_stops: list[dict[str, Any]],
+        drone_route_fragments: list[Any],
+        candidates: list[GACandidate],
+    ) -> dict[str, float]:
+        route_truck_distance = sum(float(route.total_distance or 0.0) for route in truck_routes.values())
+        candidate_truck_distance = sum(float(candidate.truck_distance or 0.0) for candidate in candidates)
+        closure_route_distance = max(0.0, route_truck_distance - candidate_truck_distance)
+        closure_route_cost = closure_route_distance * float(self.config.weight_truck_distance)
+
+        closure_waiting_time = 0.0
+        for stop in truck_ordered_stops:
+            if stop.get("action") == "closure_pickup_c_drone":
+                closure_waiting_time += len(stop.get("drone_ids", []) or [])
+
+        return {
+            "candidate_count": float(len(candidates)),
+            "truck_stop_count": float(len(truck_ordered_stops)),
+            "drone_route_fragment_count": float(len(drone_route_fragments)),
+            "route_truck_distance": route_truck_distance,
+            "candidate_truck_distance": candidate_truck_distance,
+            "closure_route_distance": closure_route_distance,
+            "closure_route_cost": closure_route_cost,
+            "closure_waiting_time": closure_waiting_time,
+        }
+
+    def _build_dispatch_plan(
+        self,
+        allocations: list[AllocationResult],
+        truck_routes: dict[str, TruckRoute],
+        drone_routes: dict[str, DroneRoute],
+        objective: float,
+        penalties: dict[str, float],
+        penalty_counts: dict[str, int],
+        feasible: bool,
+        metrics: dict[str, float],
+    ) -> DispatchPlan:
+        summary = {
+            "feasible": feasible,
+            "objective": objective,
+            "penalties": dict(penalties),
+            "penalty_counts": dict(penalty_counts),
+            "metrics": dict(metrics),
+            "total_penalty_cost": sum(float(value) for value in penalties.values()),
+        }
+        return DispatchPlan(
+            allocations=allocations,
+            cost_total=objective,
+            summary=summary,
+            truck_routes=truck_routes,
+            drone_routes=drone_routes,
+        )
+
+    def _candidate_to_allocation_fragment(self, candidate: GACandidate) -> AllocationResult:
+        return AllocationResult(
+            order_id=candidate.order_id,
+            vehicle_id=candidate.truck_id or candidate.launch_node_id or "DEPOT",
+            mode=candidate.mode,
+            distance=float(candidate.truck_distance or 0.0) + float(candidate.uav_distance or 0.0),
+            feasible=candidate.feasible,
+            reason=candidate.reason,
+            recovery_station_id=candidate.recover_node_id,
+            drone_id=candidate.drone_id,
+            launch_station_id=candidate.launch_node_id,
+            wait_duration=candidate.waiting_time,
+            score_total=candidate.score_total,
+            cost_dist=candidate.cost_dist,
+            cost_energy=candidate.cost_energy,
+            cost_penalty=candidate.cost_penalty,
+        )
+
+    def _group_drone_route_fragments(self, fragments: list[Any]) -> dict[str, DroneRoute]:
+        routes: dict[str, DroneRoute] = {}
+        for index, fragment in enumerate(fragments):
+            route = self._fragment_to_drone_route(fragment)
+            if route is None:
+                continue
+            # A drone may execute multiple tasks in one Individual; keep every route.
+            key = route.drone_id
+            if key in routes:
+                key = f"{route.drone_id}#{route.order_id or index}#{index}"
+            routes[key] = route
+        return routes
+
+    def _fragment_to_drone_route(self, fragment: Any) -> DroneRoute | None:
+        if isinstance(fragment, DroneRoute):
+            return fragment
+        if fragment is None:
+            return None
+
+        drone_id = str(self._read_field(fragment, "drone_id", "") or "")
+        order_id = str(self._read_field(fragment, "order_id", "") or "")
+        mode = str(self._read_field(fragment, "mode", "") or "")
+        path = list(self._read_field(fragment, "path", []) or [])
+        if not drone_id:
+            return None
+
+        launch_loc = path[0] if path else None
+        delivery_loc = path[1] if len(path) > 1 else launch_loc
+        recovery_loc = path[-1] if path else launch_loc
+        return DroneRoute(
+            drone_id=drone_id,
+            order_id=order_id,
+            path=path,
+            mode=mode,
+            launch_loc=launch_loc,
+            delivery_loc=delivery_loc,
+            recovery_loc=recovery_loc,
+        )
+
+    def _normalize_stop_for_route(self, state: Any, stop: dict[str, Any]) -> dict[str, Any]:
+        normalized = dict(stop)
+        node_id = str(normalized.get("node_id", ""))
+        if node_id in self._mapping(state, "stations"):
+            normalized["node_type"] = "station"
+        elif self._is_depot_node_id(state, node_id):
+            normalized["node_type"] = "depot"
+        return normalized
+
+    def _select_default_truck_id(self, state: Any, context: GAAdapterContext) -> str:
+        if context.truck_ids:
+            return context.truck_ids[0]
+        trucks = self._mapping(state, "trucks")
+        if trucks:
+            return str(next(iter(trucks.keys())))
+        raise ValueError("no truck available for GA decoding")
+
+    def _copy_stops(self, stops: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        return [dict(stop) for stop in stops]
+
+    def _read_field(self, record: Any, field_name: str, default: Any = None) -> Any:
+        if isinstance(record, dict):
+            return record.get(field_name, default)
+        return getattr(record, field_name, default)
+
+    def _write_field(self, record: Any, field_name: str, value: Any) -> None:
+        if isinstance(record, dict):
+            record[field_name] = value
+        else:
+            setattr(record, field_name, value)
+
+    def _as_list(self, value: Any) -> list[Any]:
+        if value is None:
+            return []
+        if isinstance(value, list):
+            return list(value)
+        if isinstance(value, tuple | set):
+            return list(value)
+        return [value]
+
+    def _mapping(self, state: Any, field_name: str) -> dict[str, Any]:
+        if hasattr(self.evaluator, "_mapping"):
+            return self.evaluator._mapping(state, field_name)  # noqa: SLF001 - shared GA adapter helper.
+        value = self._read_field(state, field_name)
+        if isinstance(value, dict):
+            return value
+        mgr = self._read_field(state, "entity_mgr") or self._read_field(state, "entity_manager") or state
+        value = self._read_field(mgr, field_name, {})
+        return value if isinstance(value, dict) else {}
+
+    def _current_time(self, state: Any) -> float:
+        if hasattr(self.evaluator, "_current_time"):
+            return float(self.evaluator._current_time(state))  # noqa: SLF001
+        return float(self._read_field(state, "current_time", 0.0) or 0.0)
+
+    def _truck_start_position(self, truck: Any, current_time: float) -> Any:
+        if hasattr(truck, "get_location"):
+            return truck.get_location(current_time)
+        return self._read_field(truck, "current_loc") or self._read_field(truck, "_ga_position")
+
+    def _road_distance(self, pos_a: Any, pos_b: Any) -> float:
+        try:
+            return float(self.evaluator.greedy._road_dist(pos_a, pos_b))
+        except Exception:
+            return float(self.evaluator.greedy._dist(pos_a, pos_b))
+
+    def _is_depot_node_id(self, state: Any, node_id: str) -> bool:
+        normalized = str(node_id).strip().upper()
+        return (
+            normalized == "DEPOT"
+            or normalized.startswith("DEPOT")
+            or normalized.startswith("DEP-")
+            or node_id in self._mapping(state, "depots")
+        )
+
+    def _add_penalty_cost(self, penalties: dict[str, float], name: str, value: float) -> None:
+        penalties[name] = penalties.get(name, 0.0) + float(value)
+
+    def _add_penalty_count(self, penalty_counts: dict[str, int], name: str, value: int) -> None:
+        penalty_counts[name] = penalty_counts.get(name, 0) + int(value)
+
+    def _finite_or(self, value: float, fallback: float) -> float:
+        value = float(value)
+        if math.isfinite(value):
+            return value
+        return float(fallback)
