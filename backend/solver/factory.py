@@ -11,6 +11,7 @@ from __future__ import annotations
 from typing import Any, Callable
 
 from solver.greedy_baseline import GreedyBaseline
+from solver.ga_mmce.solver import GAMMCESolver
 from solver.greedy_mmce import GreedyMMCE
 from solver.greedy_mmce_bi import GreedyMMCEBackboneInsertion
 from solver.market_based_solver import MarketBasedSolver
@@ -22,6 +23,8 @@ SolverBuilder = Callable[[Any], DispatchSolver]
 
 _SOLVER_BUILDERS: dict[str, SolverBuilder] = {
     "greedy": lambda entity_mgr: GreedyBaseline(entity_mgr),
+    "ga_mmce": lambda entity_mgr: GAMMCESolver(entity_mgr),
+    "genetic": lambda entity_mgr: GAMMCESolver(entity_mgr),
     "greedy_mmce": lambda entity_mgr: GreedyMMCE(entity_mgr),
     "greedy_mmce_bi": lambda entity_mgr: GreedyMMCEBackboneInsertion(entity_mgr),
     "mmce_backbone_insertion": lambda entity_mgr: GreedyMMCEBackboneInsertion(entity_mgr),

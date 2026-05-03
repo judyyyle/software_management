@@ -2219,6 +2219,43 @@ backend/solver/ga_mmce/solver.py
 5. 返回最佳 DispatchPlan。
 ```
 
+当前代码实现还需要补充以下边界：
+
+```text
+1. 对外必须兼容 DispatchSolver 协议：
+   - dispatch(pending_orders, current_time, bbox, scene_id=None)
+   - dispatch_incremental(new_orders, current_time, bbox, scene_id=None)
+   - dispatch_replan_current_state(replan_orders, current_time, bbox, scene_id=None)
+
+2. solve(...) 可以作为内部入口，但对外入口应先构造 GAStateView：
+   - entity_mgr
+   - orders
+   - current_time
+   - bbox
+   - scene_id
+
+3. Decoder 会调用 build_incremental_route_from_stops(...)。
+   因此 solver 在评估种群前应调用 GreedyMMCE._load_road_graph(bbox, scene_id)
+   预加载 OSM 路网。若路网加载失败，应记录 warning 并允许 Decoder fallback
+   到直接距离路线，而不是在 GA 主循环中崩溃。
+
+4. greedy seed 是 best-effort：
+   - 允许调用完整 greedy 生成初始种子；
+   - 但只能用于 greedy_plan_to_individual(...)；
+   - 失败时跳过 seed，不影响 GA 主流程；
+   - Decoder 阶段仍禁止调用 greedy dispatch。
+
+5. warm_start 应统一为 list[Individual]。
+   如果调用方没有显式传入 warm_start，可以尝试使用 last_best_individual。
+   initialize_population 会过滤订单集合或 gene_pool 不匹配的旧个体。
+
+6. evaluate_individual 应保存：
+   - ind.fitness = compute_fitness(result, config)
+   - ind.decoded_plan = result.plan
+   - ind.penalties = result.penalties
+   solver 额外可保存 last_best_decode_result 便于调试。
+```
+
 ## 12.3 推荐代码框架
 
 ```python
@@ -2228,8 +2265,10 @@ import copy
 import logging
 import random
 import time
+from dataclasses import dataclass
+from typing import Any
 
-from greedy_mmce import GreedyMMCE
+from solver.greedy_mmce import DispatchPlan, GreedyMMCE
 
 from .adapters import (
     build_ga_context,
@@ -2245,6 +2284,15 @@ from .population import initialize_population
 logger = logging.getLogger(__name__)
 
 
+@dataclass
+class GAStateView:
+    entity_mgr: Any
+    orders: dict[str, Any]
+    current_time: float
+    bbox: dict | None = None
+    scene_id: str | None = None
+
+
 class GAMMCESolver:
     def __init__(self, entity_mgr, config: GAConfig | None = None):
         self.entity_mgr = entity_mgr
@@ -2253,9 +2301,22 @@ class GAMMCESolver:
         self.evaluator = PhysicalEvaluator(entity_mgr, self.greedy_helper, self.config)
         self.decoder = GADecoder(self.config, self.evaluator)
         self.last_best_individual = None
+        self.last_best_decode_result = None
 
         if self.config.random_seed is not None:
             random.seed(self.config.random_seed)
+
+    def dispatch(self, pending_orders, current_time, bbox, scene_id=None):
+        state = GAStateView(self.entity_mgr, dict(pending_orders), current_time, bbox, scene_id)
+        return self.solve(state)
+
+    def dispatch_incremental(self, new_orders, current_time, bbox, scene_id=None):
+        state = GAStateView(self.entity_mgr, dict(new_orders), current_time, bbox, scene_id)
+        return self.solve(state)
+
+    def dispatch_replan_current_state(self, replan_orders, current_time, bbox, scene_id=None):
+        state = GAStateView(self.entity_mgr, dict(replan_orders), current_time, bbox, scene_id)
+        return self.solve(state)
 
     def solve(self, state, warm_start=None):
         started = time.time()
@@ -2267,6 +2328,8 @@ class GAMMCESolver:
 
         if not order_ids:
             return self._empty_plan()
+
+        self._prepare_distance_context(state)
 
         greedy_seed = None
         if self.config.use_greedy_seed:
@@ -2286,7 +2349,7 @@ class GAMMCESolver:
             support_node_ids=support_node_ids,
             pop_size=self.config.population_size,
             greedy_seed=greedy_seed,
-            warm_start=warm_start,
+            warm_start=self._normalize_warm_start(warm_start),
             use_truck_only_seed=self.config.use_truck_only_seed,
             use_obl_seed=self.config.use_obl_seed,
             allow_c_recover_station=self.config.allow_depot_drone_recover_at_station,
@@ -2334,6 +2397,7 @@ class GAMMCESolver:
         population.sort(key=lambda ind: ind.fitness)
         best = population[0]
         self.last_best_individual = copy.deepcopy(best)
+        self.last_best_decode_result = self._evaluate_individual(best, state, context)
         return best.decoded_plan
 
     def _evaluate_population(self, population, state, context):
@@ -2351,6 +2415,17 @@ class GAMMCESolver:
         ind.fitness = compute_fitness(result, self.config)
         ind.decoded_plan = result.plan
         ind.penalties = result.penalties
+        return result
+
+    def _prepare_distance_context(self, state):
+        bbox = getattr(state, "bbox", None)
+        if not bbox:
+            return
+        try:
+            self.greedy_helper._road_distance_memo.clear()
+            self.greedy_helper._load_road_graph(bbox, getattr(state, "scene_id", None))
+        except Exception as exc:
+            logger.warning("[GA-MMCE] OSM 路网预加载失败，Decoder 将 fallback 到直接距离: %s", exc)
 
     def _timeout(self, started):
         if self.config.max_runtime_seconds is None:
@@ -2360,12 +2435,24 @@ class GAMMCESolver:
     def _make_greedy_seed_plan(self, state):
         # 这里可以调用完整 greedy 生成 seed，但仅用于初始化 Individual。
         # 不能在 GA decoder 中调用 greedy。
-        return self.greedy_helper.dispatch_replan_current_state(
-            replan_orders=state.orders,
-            current_time=state.current_time,
-            bbox=state.bbox,
-            scene_id=getattr(state, "scene_id", None),
-        )
+        try:
+            return self.greedy_helper.dispatch_replan_current_state(
+                replan_orders=state.orders,
+                current_time=state.current_time,
+                bbox=state.bbox,
+                scene_id=getattr(state, "scene_id", None),
+            )
+        except Exception as exc:
+            logger.warning("[GA-MMCE] greedy seed 生成失败，跳过 seed: %s", exc)
+            return None
+
+    def _normalize_warm_start(self, warm_start):
+        seeds = []
+        if warm_start is None and self.last_best_individual is not None:
+            seeds.append(self.last_best_individual)
+        elif warm_start is not None:
+            seeds.extend(warm_start if isinstance(warm_start, list) else [warm_start])
+        return seeds
 
     def _log_generation(self, gen, population):
         if not self.config.verbose or gen % 10 != 0:
@@ -2383,7 +2470,6 @@ class GAMMCESolver:
         )
 
     def _empty_plan(self):
-        from greedy_mmce import DispatchPlan
         return DispatchPlan(
             allocations=[],
             cost_total=0.0,
@@ -2414,6 +2500,10 @@ class GAMMCESolver:
 5. mutation 必须同时支持 sequence、assignment、rendezvous。
 6. 保存 last_best_individual，用于动态重调度 warm start。
 7. 返回值必须兼容前端使用的 DispatchPlan。
+8. 对外实现 DispatchSolver 协议的 dispatch / dispatch_incremental / dispatch_replan_current_state。
+9. 在 GA 主循环前 best-effort 调用 _load_road_graph(bbox, scene_id)，供 Decoder 构建 OSM 增量路线。
+10. greedy seed 失败时跳过，不得中断 GA 主流程。
+11. _evaluate_individual 应返回 DecodeResult，并保存 ind.decoded_plan / ind.penalties / ind.fitness。
 ```
 
 ---
@@ -2437,24 +2527,36 @@ solver: ga_mmce
 ## 13.2 修改文件
 
 ```text
-backend/solver/decision_engine.py
-backend/config/loader.py
-backend/config/*.yaml
+backend/solver/factory.py
+frontend/src/stores/system.ts
+frontend/src/views/DispatchCenter/index.vue
+```
+
+当前项目的 `decision_engine.py` 已经通过 `factory.create_solver(...)` 动态创建求解器，
+因此 Step 10 第一版不需要直接修改 `decision_engine.py`。只要在 `factory.py`
+注册 `ga_mmce`，前端把 solver 名称传为 `"ga_mmce"`，后端就会创建
+`GAMMCESolver(entity_mgr)`。
+
+前端调度中心需要新增“遗传算法”按钮，并把 solver 类型扩展为：
+
+```ts
+'greedy' | 'greedy_mmce' | 'greedy_mmce_bi' | 'ga_mmce' | 'market'
 ```
 
 ## 13.3 给 Codex 的提示词
 
 ```text
-请修改 decision_engine.py 和配置加载逻辑，使系统支持 solver = "ga_mmce"。
+请修改 factory.py 和前端调度中心，使系统支持 solver = "ga_mmce"。
 
 要求：
 1. 原有 greedy_mmce 行为保持不变。
-2. 当配置 solver.name 或 solver.type 为 "ga_mmce" 时：
-   - 创建 GAMMCESolver(entity_mgr, GAConfig)
-   - 调用 solver.solve(state)
+2. 当 solver 名称为 "ga_mmce" 时：
+   - factory 创建 GAMMCESolver(entity_mgr)
+   - decision_engine 继续按 DispatchSolver 协议调用 dispatch / dispatch_incremental
 3. GA solver 的输出必须沿用现有前端可识别的 DispatchPlan 结构。
-4. 不要修改前端。
-5. 如果当前配置文件没有 solver 字段，请添加默认值，默认仍使用 greedy_mmce。
+4. 前端 DispatchCenter 新增“遗传算法”按钮，点击后传 solver="ga_mmce"。
+5. frontend/src/stores/system.ts 的 solver 联合类型需要包含 "ga_mmce"。
+6. 如果当前配置文件没有 solver 字段，默认仍保持原有 solver，不强制切换为 GA。
 ```
 
 ---

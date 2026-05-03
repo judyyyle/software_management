@@ -110,7 +110,7 @@
       "name": "卡车-01",
       "parking_slots": 9,
       "speed": 15,
-      "swap_time": 0,
+      "swap_time": 0.1,
       "truck_id": "TRK-TEST-01"
     }
   ],
