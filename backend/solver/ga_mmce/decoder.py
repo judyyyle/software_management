@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+from collections import Counter
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -84,6 +85,8 @@ class DecodeResult:
     unserved_order_ids: list[str]
     repaired: bool
     metrics: dict[str, float]
+    diagnostics: dict[str, Any] = field(default_factory=dict)
+    cost_breakdown: dict[str, float] = field(default_factory=dict)
 
 
 @dataclass
@@ -135,6 +138,7 @@ class GADecoder:
         truck_ordered_stops: list[dict[str, Any]] = []
         unserved_order_ids: list[str] = []
         attempted_order_ids: set[str] = set()
+        gene_attempts: list[dict[str, Any]] = []
 
         objective = 0.0
         feasible = True
@@ -142,6 +146,18 @@ class GADecoder:
         for order_id, gene, rv in zip(individual.sequence, individual.assignment, individual.rendezvous):
             attempted_order_ids.add(order_id)
             candidate = self._evaluate_gene(state_copy, order_id, gene, rv, truck_id)
+            requested_mode = self._gene_mode(gene)
+            gene_attempts.append(
+                {
+                    "order_id": order_id,
+                    "gene": gene,
+                    "requested_mode": requested_mode,
+                    "accepted_mode": candidate.mode if candidate is not None and candidate.feasible else "",
+                    "feasible": bool(candidate is not None and candidate.feasible),
+                    "reason": candidate.reason if candidate is not None else "evaluation_none",
+                    "score_total": candidate.score_total if candidate is not None else math.inf,
+                }
+            )
 
             if candidate is None or not candidate.feasible:
                 feasible = False
@@ -197,6 +213,13 @@ class GADecoder:
         objective += metrics.get("closure_route_cost", 0.0)
 
         objective = self._finite_or(objective, self.config.big_m)
+        diagnostics = self._collect_decode_diagnostics(gene_attempts, candidates, closure_info)
+        cost_breakdown = self._collect_cost_breakdown(
+            candidates=candidates,
+            metrics=metrics,
+            penalties=penalties,
+            fitness_total=objective + sum(float(value) for value in penalties.values()),
+        )
         plan = self._build_dispatch_plan(
             allocations=allocations,
             truck_routes=truck_routes,
@@ -206,6 +229,8 @@ class GADecoder:
             penalty_counts=penalty_counts,
             feasible=feasible,
             metrics=metrics,
+            cost_breakdown=cost_breakdown,
+            diagnostics=diagnostics,
         )
 
         return DecodeResult(
@@ -220,7 +245,111 @@ class GADecoder:
             unserved_order_ids=list(dict.fromkeys(unserved_order_ids)),
             repaired=closure_info.repaired,
             metrics=metrics,
+            diagnostics=diagnostics,
+            cost_breakdown=cost_breakdown,
         )
+
+    def _gene_mode(self, gene: str) -> str:
+        if gene == "A":
+            return "A"
+        if gene.startswith("B_"):
+            return "B"
+        if gene.startswith("C_"):
+            return "C"
+        return "?"
+
+    def _collect_decode_diagnostics(
+        self,
+        attempts: list[dict[str, Any]],
+        candidates: list[GACandidate],
+        closure_info: _ClosureInfo,
+    ) -> dict[str, Any]:
+        requested_counts = Counter(str(item.get("requested_mode", "?")) for item in attempts)
+        accepted_counts = Counter(candidate.mode for candidate in candidates)
+        failure_reasons: dict[str, dict[str, int]] = {"B": {}, "C": {}, "A": {}}
+        for item in attempts:
+            mode = str(item.get("requested_mode", "?"))
+            if bool(item.get("feasible")):
+                continue
+            reason = str(item.get("reason") or "infeasible")
+            failure_reasons.setdefault(mode, {})
+            failure_reasons[mode][reason] = failure_reasons[mode].get(reason, 0) + 1
+
+        b_scores = [
+            float(candidate.score_total)
+            for candidate in candidates
+            if candidate.mode == "B" and math.isfinite(float(candidate.score_total))
+        ]
+        b_orders = sorted(candidate.order_id for candidate in candidates if candidate.mode == "B")
+        return {
+            "requested_mode_counts": dict(requested_counts),
+            "accepted_mode_counts": dict(accepted_counts),
+            "failure_reasons": failure_reasons,
+            "b_decoded_success_count": int(accepted_counts.get("B", 0)),
+            "b_candidate_accepted_count": int(accepted_counts.get("B", 0)),
+            "b_infeasible_count": sum(failure_reasons.get("B", {}).values()),
+            "b_repaired_count": 0,
+            "b_failure_reasons": dict(failure_reasons.get("B", {})),
+            "best_B_candidate_score": min(b_scores) if b_scores else math.inf,
+            "avg_B_candidate_score": sum(b_scores) / len(b_scores) if b_scores else math.inf,
+            "orders_where_B_feasible": b_orders,
+            "c_decoded_success_count": int(accepted_counts.get("C", 0)),
+            "c_candidate_accepted_count": int(accepted_counts.get("C", 0)),
+            "c_infeasible_count": sum(failure_reasons.get("C", {}).values()),
+            "c_repaired_count": int(closure_info.penalty_counts.get("repair_penalty", 0)),
+            "c_failure_reasons": dict(failure_reasons.get("C", {})),
+        }
+
+    def _collect_cost_breakdown(
+        self,
+        candidates: list[GACandidate],
+        metrics: dict[str, float],
+        penalties: dict[str, float],
+        fitness_total: float,
+    ) -> dict[str, float]:
+        truck_distance_cost = sum(float(c.truck_distance or 0.0) for c in candidates) * float(self.config.weight_truck_distance)
+        uav_distance_cost = sum(float(c.uav_distance or 0.0) for c in candidates) * float(self.config.weight_uav_distance)
+        energy_cost = sum(float(c.cost_energy or 0.0) for c in candidates)
+        time_cost = sum(float(c.completion_time or 0.0) for c in candidates) * float(self.config.weight_completion)
+        waiting_cost = sum(float(c.waiting_time or 0.0) for c in candidates) * float(self.config.weight_waiting)
+        delay_cost = sum(float(c.lateness or 0.0) for c in candidates) * float(self.config.weight_delay)
+        closure_route_cost = float(metrics.get("closure_route_cost", 0.0) or 0.0)
+        repair_penalty = float(penalties.get("repair_penalty", 0.0) or 0.0)
+        station_queue_penalty = float(penalties.get("station_queue_penalty", 0.0) or 0.0)
+        unserved_penalty = float(penalties.get("unserved_order_penalty", 0.0) or 0.0)
+        infeasible_penalty = float(penalties.get("infeasible_penalty", 0.0) or 0.0)
+        final_return_penalty = float(penalties.get("final_return_penalty", 0.0) or 0.0)
+        total = (
+            truck_distance_cost
+            + uav_distance_cost
+            + energy_cost
+            + time_cost
+            + waiting_cost
+            + delay_cost
+            + closure_route_cost
+            + repair_penalty
+            + station_queue_penalty
+            + unserved_penalty
+            + infeasible_penalty
+            + final_return_penalty
+        )
+        residual = float(fitness_total) - total
+        return {
+            "truck_distance_cost": truck_distance_cost,
+            "uav_distance_cost": uav_distance_cost,
+            "energy_cost": energy_cost,
+            "time_cost": time_cost,
+            "waiting_cost": waiting_cost,
+            "delay_cost": delay_cost,
+            "closure_route_cost": closure_route_cost,
+            "repair_penalty": repair_penalty,
+            "station_queue_penalty": station_queue_penalty,
+            "unserved_penalty": unserved_penalty,
+            "infeasible_penalty": infeasible_penalty,
+            "final_return_penalty": final_return_penalty,
+            "residual_cost": residual,
+            "total_fitness": float(fitness_total),
+        }
 
     def _evaluate_gene(
         self,
@@ -549,6 +678,8 @@ class GADecoder:
         penalty_counts: dict[str, int],
         feasible: bool,
         metrics: dict[str, float],
+        cost_breakdown: dict[str, float],
+        diagnostics: dict[str, Any],
     ) -> DispatchPlan:
         total_penalty_cost = sum(float(value) for value in penalties.values())
         fitness_total = self._finite_or(objective + total_penalty_cost, self.config.big_m)
@@ -559,6 +690,8 @@ class GADecoder:
             "penalties": dict(penalties),
             "penalty_counts": dict(penalty_counts),
             "metrics": dict(metrics),
+            "cost_breakdown": dict(cost_breakdown),
+            "diagnostics": dict(diagnostics),
             "total_penalty_cost": total_penalty_cost,
         }
         return DispatchPlan(
