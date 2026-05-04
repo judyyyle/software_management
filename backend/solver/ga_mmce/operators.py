@@ -2,8 +2,27 @@ from __future__ import annotations
 
 import copy
 import random
+from dataclasses import dataclass, field
 
 from .chromosome import Individual, Rendezvous
+
+
+@dataclass
+class MutationStats:
+    assignment_mutations: int = 0
+    b_added: int = 0
+    b_removed: int = 0
+    by_transition: dict[str, int] = field(default_factory=dict)
+
+
+def gene_mode(gene: str) -> str:
+    if gene == "A":
+        return "A"
+    if gene.startswith("B_"):
+        return "B"
+    if gene.startswith("C_"):
+        return "C"
+    return "?"
 
 
 def _is_depot_node_id(node_id: str) -> bool:
@@ -135,7 +154,8 @@ def mutate(
     p_assign: float,
     p_rendezvous: float,
     allow_c_recover_station: bool = True,
-) -> None:
+    mode_probabilities: dict[str, float] | None = None,
+) -> MutationStats:
     ind.validate()
     if not gene_pool:
         raise ValueError("gene_pool must not be empty")
@@ -146,6 +166,8 @@ def mutate(
 
     n = len(ind.sequence)
 
+    stats = MutationStats()
+
     if n >= 2 and random.random() < p_seq:
         i, j = random.sample(range(n), 2)
         ind.sequence[i], ind.sequence[j] = ind.sequence[j], ind.sequence[i]
@@ -154,13 +176,24 @@ def mutate(
 
     for i in range(n):
         if random.random() < p_assign:
-            new_gene = random.choice(gene_pool)
+            old_gene = ind.assignment[i]
+            new_gene = choose_gene_by_mode(gene_pool, mode_probabilities)
             ind.assignment[i] = new_gene
             ind.rendezvous[i] = make_random_rendezvous_for_gene(
                 new_gene,
                 support_node_ids,
                 allow_c_recover_station,
             )
+            old_mode = gene_mode(old_gene)
+            new_mode = gene_mode(new_gene)
+            stats.assignment_mutations += 1
+            stats.by_transition[f"{old_mode}->{new_mode}"] = (
+                stats.by_transition.get(f"{old_mode}->{new_mode}", 0) + 1
+            )
+            if old_mode != "B" and new_mode == "B":
+                stats.b_added += 1
+            elif old_mode == "B" and new_mode != "B":
+                stats.b_removed += 1
 
     for i in range(n):
         if random.random() < p_rendezvous:
@@ -171,6 +204,32 @@ def mutate(
             )
 
     ind.validate()
+    return stats
+
+
+def choose_gene_by_mode(
+    gene_pool: list[str],
+    mode_probabilities: dict[str, float] | None = None,
+) -> str:
+    if not mode_probabilities:
+        return random.choice(gene_pool)
+
+    by_mode = {
+        "A": [gene for gene in gene_pool if gene == "A"],
+        "B": [gene for gene in gene_pool if gene.startswith("B_")],
+        "C": [gene for gene in gene_pool if gene.startswith("C_")],
+    }
+    available_modes = [
+        mode
+        for mode, genes in by_mode.items()
+        if genes and float(mode_probabilities.get(mode, 0.0) or 0.0) > 0.0
+    ]
+    if not available_modes:
+        return random.choice(gene_pool)
+
+    weights = [float(mode_probabilities.get(mode, 0.0) or 0.0) for mode in available_modes]
+    selected_mode = random.choices(available_modes, weights=weights, k=1)[0]
+    return random.choice(by_mode[selected_mode])
 
 
 def tournament_select(population: list[Individual], k: int) -> Individual:

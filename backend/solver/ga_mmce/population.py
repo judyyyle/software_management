@@ -4,7 +4,7 @@ import copy
 import random
 
 from .chromosome import Individual
-from .operators import make_random_rendezvous_for_gene
+from .operators import choose_gene_by_mode, make_random_rendezvous_for_gene
 
 
 def _check_inputs(
@@ -27,6 +27,7 @@ def make_random_individual(
     gene_pool: list[str],
     support_node_ids: list[str],
     allow_c_recover_station: bool = True,
+    mode_probabilities: dict[str, float] | None = None,
 ) -> Individual:
     _check_inputs(order_ids, gene_pool, support_node_ids)
 
@@ -36,7 +37,7 @@ def make_random_individual(
     rendezvous = []
 
     for _ in seq:
-        gene = random.choice(gene_pool)
+        gene = choose_gene_by_mode(gene_pool, mode_probabilities)
         assignment.append(gene)
         rendezvous.append(
             make_random_rendezvous_for_gene(
@@ -47,6 +48,27 @@ def make_random_individual(
         )
 
     ind = Individual(seq, assignment, rendezvous)
+    ind.validate()
+    return ind
+
+
+def make_single_b_seed_individual(
+    order_ids: list[str],
+    order_id: str,
+    b_gene: str,
+    rendezvous: dict[str, str],
+) -> Individual:
+    assignment = ["A"] * len(order_ids)
+    rvs = [None] * len(order_ids)
+    if order_id in order_ids:
+        idx = order_ids.index(order_id)
+        assignment[idx] = b_gene
+        rvs[idx] = dict(rendezvous)
+    ind = Individual(
+        sequence=list(order_ids),
+        assignment=assignment,
+        rendezvous=rvs,
+    )
     ind.validate()
     return ind
 
@@ -120,6 +142,9 @@ def initialize_population(
     use_truck_only_seed: bool = True,
     use_obl_seed: bool = True,
     allow_c_recover_station: bool = True,
+    use_balanced_initialization: bool = True,
+    b_seed_rendezvous_by_order: dict[str, tuple[str, dict[str, str]]] | None = None,
+    mutation_mode_probabilities: dict[str, float] | None = None,
 ) -> list[Individual]:
     _check_inputs(order_ids, gene_pool, support_node_ids)
     if pop_size <= 0:
@@ -153,6 +178,40 @@ def initialize_population(
             )
         )
 
+    if b_seed_rendezvous_by_order:
+        for order_id in order_ids:
+            seed_data = b_seed_rendezvous_by_order.get(order_id)
+            if seed_data is None:
+                continue
+            b_gene, rv = seed_data
+            if b_gene not in gene_set:
+                continue
+            population.append(make_single_b_seed_individual(order_ids, order_id, b_gene, rv))
+            if len(population) >= pop_size:
+                return population[:pop_size]
+
+    if use_balanced_initialization:
+        target = min(pop_size, max(len(population), int(pop_size * 0.8)))
+        recipes = [
+            {"A": 1.0, "B": 0.0, "C": 0.0},
+            {"A": 0.55, "B": 0.0, "C": 0.45},
+            {"A": 0.65, "B": 0.35, "C": 0.0},
+            {"A": 0.40, "B": 0.25, "C": 0.35},
+        ]
+        index = 0
+        while len(population) < target:
+            recipe = recipes[index % len(recipes)]
+            population.append(
+                make_random_individual(
+                    order_ids,
+                    gene_pool,
+                    support_node_ids,
+                    allow_c_recover_station,
+                    recipe,
+                )
+            )
+            index += 1
+
     while len(population) < pop_size:
         population.append(
             make_random_individual(
@@ -160,6 +219,7 @@ def initialize_population(
                 gene_pool,
                 support_node_ids,
                 allow_c_recover_station,
+                mutation_mode_probabilities,
             )
         )
 
