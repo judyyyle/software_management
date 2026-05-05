@@ -785,6 +785,7 @@ class RewardMeta:
     lambda_res_timeout: float
     lambda_overdue: float
     R_delivery_bonus: float
+    rendezvous_arrive_bonus: float
     rendezvous_bonus: float
     max_overdue_sec: float
     hard_overdue_penalty_sec: float

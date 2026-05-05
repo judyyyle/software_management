@@ -128,7 +128,7 @@ class TestTrainingEnvAdapterPhase5c(unittest.TestCase):
         self.assertIn(recover_node_id, runtime_state.reservation_count)
         self.assertEqual(runtime_state.reservation_count[recover_node_id], 1)
 
-    def test_mode_c_reservation_expiry_covers_delivery_and_service_eta(self) -> None:
+    def test_mode_c_reservation_expiry_tracks_truck_eta_baseline(self) -> None:
         env, drone_id = self._reset_controlled_env()
         entity_mgr = env._require_entity_manager()
         drone = entity_mgr.drones[drone_id]
@@ -162,21 +162,9 @@ class TestTrainingEnvAdapterPhase5c(unittest.TestCase):
 
         reservation = env._reservations[drone_id]
         host = env._resolve_fixed_node(recover_node_id)
-        expected_total_eta = (
-            env._estimate_flight_time(
-                drone=drone,
-                from_pos=drone.current_loc,
-                to_pos=order.delivery_loc,
-            )
-            + float(env._scene_solver_params().drone_service_time_order_s)
-            + env._estimate_flight_time(
-                drone=drone,
-                from_pos=order.delivery_loc,
-                to_pos=host.get_location(env._t_now),
-            )
-        )
+        t_arrive_truck = t_deliver + 900.0
         expected_tau = (
-            env._cfg.reservation_alpha * expected_total_eta
+            env._cfg.reservation_alpha * (t_arrive_truck - env._t_now)
             + env._cfg.reservation_gamma * float(host.estimate_wait_time(env._t_now))
         )
 
@@ -187,10 +175,10 @@ class TestTrainingEnvAdapterPhase5c(unittest.TestCase):
         )
         self.assertGreater(
             reservation.expires_at,
-            env._estimate_delivery_finish_time(drone, order),
+            t_arrive_truck,
         )
 
-    def test_mode_c_reservation_expiry_includes_truck_launch_delay(self) -> None:
+    def test_mode_c_reservation_expiry_uses_decision_to_truck_eta_for_riding_launch(self) -> None:
         env = self._make_env()
         env.reset()
 
@@ -205,7 +193,6 @@ class TestTrainingEnvAdapterPhase5c(unittest.TestCase):
         env._background_mode_a_pending.clear()
 
         drone_id = self._first_riding_drone_id(env)
-        drone = env._require_entity_manager().drones[drone_id]
         recover_node_id = sorted(env._require_entity_manager().stations)[0]
         order = self._inject_order(
             env,
@@ -238,23 +225,9 @@ class TestTrainingEnvAdapterPhase5c(unittest.TestCase):
 
         reservation = env._reservations[drone_id]
         host = env._resolve_fixed_node(recover_node_id)
-        launch_delay = float(env._scene_solver_params().truck_drone_launch_time_s)
-        expected_total_eta = (
-            launch_delay
-            + env._estimate_flight_time(
-                drone=drone,
-                from_pos=drone.current_loc,
-                to_pos=order.delivery_loc,
-            )
-            + float(env._scene_solver_params().drone_service_time_order_s)
-            + env._estimate_flight_time(
-                drone=drone,
-                from_pos=order.delivery_loc,
-                to_pos=host.get_location(env._t_now + launch_delay),
-            )
-        )
+        t_arrive_truck = env._t_now + 1200.0
         expected_tau = (
-            env._cfg.reservation_alpha * expected_total_eta
+            env._cfg.reservation_alpha * (t_arrive_truck - env._t_now)
             + env._cfg.reservation_gamma * float(host.estimate_wait_time(env._t_now))
         )
 
@@ -263,6 +236,41 @@ class TestTrainingEnvAdapterPhase5c(unittest.TestCase):
             env._t_now + expected_tau,
             places=6,
         )
+        self.assertGreater(reservation.expires_at, t_arrive_truck)
+
+    def test_mode_c_reservation_expiry_never_precedes_truck_arrival(self) -> None:
+        env, drone_id = self._reset_controlled_env()
+        entity_mgr = env._require_entity_manager()
+        recover_node_id = sorted(entity_mgr.stations)[0]
+
+        order = self._inject_order(
+            env,
+            drone_id=drone_id,
+            order_id="ORDER-P5C-ETA-TRUCK-GUARD",
+            offset_x=50.0,
+        )
+        t_arrive_truck = env._t_now + 1800.0
+        env._full_backbone_cache = [
+            BackboneVisit(
+                node_id=recover_node_id,
+                arrival_time=t_arrive_truck,
+                departure_time=t_arrive_truck + 1e-6,
+            )
+        ]
+        env._enqueue_decision(drone_id, "test_idle", None)
+
+        trigger = env._decision_queue.pop(0)
+        env._apply_dispatch_action(
+            trigger,
+            DispatchAction(
+                order_id=order.order_id,
+                mode=PolicyMode.C,
+                recover_node_id=recover_node_id,
+            ),
+        )
+
+        reservation = env._reservations[drone_id]
+        self.assertGreater(reservation.expires_at, t_arrive_truck)
 
     def test_reservation_timeout_switches_to_fallback_after_delivery(self) -> None:
         env, drone_id = self._reset_controlled_env()

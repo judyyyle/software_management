@@ -87,6 +87,7 @@ class _TrainingConfig:
     clip_coef: float
     entropy_coef: float
     recovery_entropy_coef: float
+    rendezvous_arrive_bonus: float
     rendezvous_bonus: float
     value_loss_coef: float
     value_loss_type: str
@@ -179,6 +180,14 @@ def _is_rendezvous_success_state(training_state: str) -> bool:
     return str(training_state) in {"charging_on_truck", "riding_with_truck"}
 
 
+def _is_rendezvous_arrival_state(training_state: str) -> bool:
+    return str(training_state) in {
+        "waiting_for_truck",
+        "charging_on_truck",
+        "riding_with_truck",
+    }
+
+
 def _is_mode_c_action_indices(action_indices: Any) -> bool:
     return (
         int(getattr(action_indices, "root_branch_idx", 0)) == 1
@@ -191,16 +200,34 @@ def _shape_post_action_reward_for_rendezvous(
     post_action_reward: float,
     action_indices: Any,
     transition_summary: Any,
+    rendezvous_arrive_bonus: float,
     rendezvous_bonus: float,
-) -> tuple[float, bool]:
-    bonus = float(rendezvous_bonus)
-    if bonus <= 0.0:
-        return float(post_action_reward), False
+) -> tuple[float, bool, bool]:
     if not _is_mode_c_action_indices(action_indices):
-        return float(post_action_reward), False
-    if not bool(getattr(transition_summary, "rendezvous_success", False)):
-        return float(post_action_reward), False
-    return float(post_action_reward) + bonus, True
+        return float(post_action_reward), False, False
+
+    shaped_reward = float(post_action_reward)
+    arrive_applied = False
+    success_applied = False
+    rendezvous_success = bool(getattr(transition_summary, "rendezvous_success", False))
+    training_state_after = str(
+        getattr(transition_summary, "actor_training_state_after", "")
+    )
+    rendezvous_arrived = (
+        rendezvous_success or _is_rendezvous_arrival_state(training_state_after)
+    )
+
+    arrive_bonus = float(rendezvous_arrive_bonus)
+    if rendezvous_arrived and arrive_bonus > 0.0:
+        shaped_reward += arrive_bonus
+        arrive_applied = True
+
+    success_bonus = float(rendezvous_bonus)
+    if rendezvous_success and success_bonus > 0.0:
+        shaped_reward += success_bonus
+        success_applied = True
+
+    return shaped_reward, arrive_applied, success_applied
 
 
 def _shape_pending_transition_reward_for_rendezvous(
@@ -208,24 +235,58 @@ def _shape_pending_transition_reward_for_rendezvous(
     pending_transition: RolloutTransition,
     reward_so_far: float,
     runtime_state: Any | None,
+    rendezvous_arrive_bonus: float,
     rendezvous_bonus: float,
-) -> tuple[float, bool]:
-    bonus = float(rendezvous_bonus)
-    if bonus <= 0.0:
-        return float(reward_so_far), False
-    if bool(getattr(pending_transition, "rendezvous_bonus_applied", False)):
-        return float(reward_so_far), False
+) -> tuple[float, bool, bool]:
     if not _is_mode_c_action_indices(pending_transition.action_indices):
-        return float(reward_so_far), False
+        return (
+            float(reward_so_far),
+            bool(getattr(pending_transition, "rendezvous_arrive_bonus_applied", False)),
+            bool(getattr(pending_transition, "rendezvous_success_bonus_applied", False)),
+        )
     if runtime_state is None:
-        return float(reward_so_far), False
+        return (
+            float(reward_so_far),
+            bool(getattr(pending_transition, "rendezvous_arrive_bonus_applied", False)),
+            bool(getattr(pending_transition, "rendezvous_success_bonus_applied", False)),
+        )
     drone_states = getattr(runtime_state, "drone_states", {})
     drone_state = drone_states.get(str(pending_transition.actor_drone_id))
     if drone_state is None:
-        return float(reward_so_far), False
-    if not _is_rendezvous_success_state(str(getattr(drone_state, "training_state", ""))):
-        return float(reward_so_far), False
-    return float(reward_so_far) + bonus, True
+        return (
+            float(reward_so_far),
+            bool(getattr(pending_transition, "rendezvous_arrive_bonus_applied", False)),
+            bool(getattr(pending_transition, "rendezvous_success_bonus_applied", False)),
+        )
+
+    shaped_reward = float(reward_so_far)
+    training_state = str(getattr(drone_state, "training_state", ""))
+    arrive_applied = bool(
+        getattr(pending_transition, "rendezvous_arrive_bonus_applied", False)
+    )
+    success_applied = bool(
+        getattr(pending_transition, "rendezvous_success_bonus_applied", False)
+    )
+
+    arrive_bonus = float(rendezvous_arrive_bonus)
+    if (
+        not arrive_applied
+        and arrive_bonus > 0.0
+        and _is_rendezvous_arrival_state(training_state)
+    ):
+        shaped_reward += arrive_bonus
+        arrive_applied = True
+
+    success_bonus = float(rendezvous_bonus)
+    if (
+        not success_applied
+        and success_bonus > 0.0
+        and _is_rendezvous_success_state(training_state)
+    ):
+        shaped_reward += success_bonus
+        success_applied = True
+
+    return shaped_reward, arrive_applied, success_applied
 
 
 def _insert_finalized_transition_in_order(
@@ -252,6 +313,7 @@ def _finalize_pending_transition_for_next_decision(
     carry_in_reward: float,
     next_value: float,
     decision_context: Any | None = None,
+    rendezvous_arrive_bonus: float = 0.0,
     rendezvous_bonus: float = 0.0,
 ) -> None:
     pending = pending_transition_by_drone.pop(drone_id, None)
@@ -263,19 +325,23 @@ def _finalize_pending_transition_for_next_decision(
         if decision_context is not None
         else None
     )
-    reward_so_far, bonus_applied = _shape_pending_transition_reward_for_rendezvous(
+    (
+        reward_so_far,
+        arrive_bonus_applied,
+        success_bonus_applied,
+    ) = _shape_pending_transition_reward_for_rendezvous(
         pending_transition=pending,
         reward_so_far=reward_so_far,
         runtime_state=runtime_state,
+        rendezvous_arrive_bonus=rendezvous_arrive_bonus,
         rendezvous_bonus=rendezvous_bonus,
     )
     finalized = replace(
         pending,
         reward=reward_so_far + float(carry_in_reward),
         done=False,
-        rendezvous_bonus_applied=(
-            bool(getattr(pending, "rendezvous_bonus_applied", False)) or bonus_applied
-        ),
+        rendezvous_arrive_bonus_applied=arrive_bonus_applied,
+        rendezvous_success_bonus_applied=success_bonus_applied,
     )
     _insert_finalized_transition_in_order(
         rollout_backlog=rollout_backlog,
@@ -295,23 +361,28 @@ def _flush_terminal_pending_transitions(
     rollout_backlog: list[RolloutTransition],
     terminal_reward_by_drone: Mapping[str, float],
     runtime_state: Any | None = None,
+    rendezvous_arrive_bonus: float = 0.0,
     rendezvous_bonus: float = 0.0,
 ) -> None:
     for drone_id, pending in tuple(pending_transition_by_drone.items()):
         reward_so_far = 0.0 if pending.reward is None else float(pending.reward)
-        reward_so_far, bonus_applied = _shape_pending_transition_reward_for_rendezvous(
+        (
+            reward_so_far,
+            arrive_bonus_applied,
+            success_bonus_applied,
+        ) = _shape_pending_transition_reward_for_rendezvous(
             pending_transition=pending,
             reward_so_far=reward_so_far,
             runtime_state=runtime_state,
+            rendezvous_arrive_bonus=rendezvous_arrive_bonus,
             rendezvous_bonus=rendezvous_bonus,
         )
         finalized = replace(
             pending,
             reward=reward_so_far + float(terminal_reward_by_drone.get(drone_id, 0.0)),
             done=True,
-            rendezvous_bonus_applied=(
-                bool(getattr(pending, "rendezvous_bonus_applied", False)) or bonus_applied
-            ),
+            rendezvous_arrive_bonus_applied=arrive_bonus_applied,
+            rendezvous_success_bonus_applied=success_bonus_applied,
         )
         _insert_finalized_transition_in_order(
             rollout_backlog=rollout_backlog,
@@ -660,6 +731,7 @@ def train_cmrappo(
                 carry_in_reward=carry_in_reward,
                 next_value=value_old,
                 decision_context=decision_context,
+                rendezvous_arrive_bonus=train_cfg.rendezvous_arrive_bonus,
                 rendezvous_bonus=train_cfg.rendezvous_bonus,
             )
             transition_summary = tensorizer.build_transition_summary(
@@ -668,10 +740,15 @@ def train_cmrappo(
                 action_indices=action_indices,
                 step_result=step_result,
             )
-            shaped_post_action_reward, bonus_applied = _shape_post_action_reward_for_rendezvous(
+            (
+                shaped_post_action_reward,
+                arrive_bonus_applied,
+                success_bonus_applied,
+            ) = _shape_post_action_reward_for_rendezvous(
                 post_action_reward=post_action_reward,
                 action_indices=action_indices,
                 transition_summary=transition_summary,
+                rendezvous_arrive_bonus=train_cfg.rendezvous_arrive_bonus,
                 rendezvous_bonus=train_cfg.rendezvous_bonus,
             )
             current_transition = RolloutTransition(
@@ -692,7 +769,8 @@ def train_cmrappo(
                 local_decision_index=local_decision_index,
                 global_decision_index=global_step,
                 decision_context_debug_snapshot=decision_context,
-                rendezvous_bonus_applied=bonus_applied,
+                rendezvous_arrive_bonus_applied=arrive_bonus_applied,
+                rendezvous_success_bonus_applied=success_bonus_applied,
             )
             terminal_reward_by_drone: dict[str, float] = {}
             if step_result.done:
@@ -706,6 +784,7 @@ def train_cmrappo(
                     rollout_backlog=rollout_backlog,
                     terminal_reward_by_drone=terminal_reward_by_drone,
                     runtime_state=step_result.runtime_state,
+                    rendezvous_arrive_bonus=train_cfg.rendezvous_arrive_bonus,
                     rendezvous_bonus=train_cfg.rendezvous_bonus,
                 )
             else:
@@ -2008,6 +2087,7 @@ def _drain_pending_transitions_after_collection(
                 rollout_backlog=rollout_backlog,
                 terminal_reward_by_drone=terminal_reward_by_drone,
                 runtime_state=current_result.runtime_state,
+                rendezvous_arrive_bonus=train_cfg.rendezvous_arrive_bonus,
                 rendezvous_bonus=train_cfg.rendezvous_bonus,
             )
             return current_result
@@ -2065,6 +2145,7 @@ def _drain_pending_transitions_after_collection(
             carry_in_reward=carry_in_reward,
             next_value=value_old,
             decision_context=decision_context,
+            rendezvous_arrive_bonus=train_cfg.rendezvous_arrive_bonus,
             rendezvous_bonus=train_cfg.rendezvous_bonus,
         )
         history_buffer.append(
@@ -2722,6 +2803,7 @@ def _build_meta_payload(
             lambda_res_timeout=float(reward["lambda_res_timeout"]),
             lambda_overdue=float(reward["lambda_overdue"]),
             R_delivery_bonus=float(reward["R_delivery_bonus"]),
+            rendezvous_arrive_bonus=float(reward.get("rendezvous_arrive_bonus", 0.0)),
             rendezvous_bonus=float(reward.get("rendezvous_bonus", 0.0)),
             max_overdue_sec=float(reward["max_overdue_sec"]),
             hard_overdue_penalty_sec=float(reward["hard_overdue_penalty_sec"]),
@@ -3140,6 +3222,7 @@ def _load_training_config(config_path: Path) -> _TrainingConfig:
         clip_coef=float(training["clip_coef"]),
         entropy_coef=float(training["entropy_coef"]),
         recovery_entropy_coef=float(training.get("recovery_entropy_coef", 1.0)),
+        rendezvous_arrive_bonus=float(reward.get("rendezvous_arrive_bonus", 0.0)),
         rendezvous_bonus=float(reward.get("rendezvous_bonus", 0.0)),
         value_loss_coef=float(training["value_loss_coef"]),
         value_loss_type=str(training.get("value_loss_type", "mse")),
@@ -3206,6 +3289,8 @@ def _validate_training_config(cfg: _TrainingConfig) -> None:
         raise ValueError("value_loss_type 仅支持 mse 或 huber")
     if cfg.value_huber_delta <= 0.0:
         raise ValueError("value_huber_delta 必须为正数")
+    if cfg.rendezvous_arrive_bonus < 0.0:
+        raise ValueError("rendezvous_arrive_bonus 不能为负数")
     if cfg.rendezvous_bonus < 0.0:
         raise ValueError("rendezvous_bonus 不能为负数")
     expected_target = cfg.sequence_minibatch_size * cfg.train_len
