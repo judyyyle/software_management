@@ -115,10 +115,10 @@ planner:
   # 卡车循环巡站参数（仅 poisson 训练模式生效）。
   # patrol_min_remaining_sec：卡车回仓后距 episode 结束的剩余时间低于此值时，
   #   不再追加巡站循环，避免生成极短的无意义路段。
-  # patrol_stations_per_loop：每次巡站循环选取的充换电站数量上限，
-  #   默认复用 phase4_min_future_fixed_nodes，保证每次循环后骨架节点数不低于该值。
+  # patrol_stations_per_loop：每次巡站循环选取的充换电站数量上限。
+  #   Run08 显式提高到 5，用更大的沿路站点覆盖率放大 mode C rendezvous 机会率。
   patrol_min_remaining_sec: 600
-  patrol_stations_per_loop: 3
+  patrol_stations_per_loop: 5
 
   # 可选退化开关：仅建议在 benchmark / hybrid 等不追加巡站循环的验证路径中显式开启。
   # 开启后，若卡车未来骨架自然耗尽，允许 `_build_coarse_plan_view()` 继续构造空骨架退化对象：
@@ -204,7 +204,7 @@ reservation:
   enable: true
   exclusive: false
 
-  # CCT 映射参数：tau_res = alpha * ETA + beta * history + gamma * queue
+  # CCT 映射参数：tau_res = alpha * (truck_eta - t_decision) + beta * history + gamma * queue
   alpha: 1.5
   beta: 1.2
   gamma: 0.3
@@ -266,8 +266,11 @@ reward:
 
   # 正奖励仅保留送达奖励，避免 reward 结构过于混杂。
   R_delivery_bonus: 100
-  # Rendezvous 成功塑形奖励：仅用于训练侧奖励归因，给 mode C 提供早期正向探索信号。
-  rendezvous_bonus: 0.2
+  # Rendezvous 分段塑形：
+  # 1. 到达 recover 节点时先给一个确定性小奖励，缩短 credit assignment 路径；
+  # 2. 真正被卡车回收上车时再给更大的成功奖励。
+  rendezvous_arrive_bonus: 2.0
+  rendezvous_bonus: 5.0
 
   # 超时强制移除与硬失败惩罚。
   max_overdue_sec: 600
@@ -310,7 +313,7 @@ training:
   # critic loss 当前改为显式可配置：
   #   - huber：优先用于当前高方差 reward / return 场景
   #   - mse：保留为回退选项
-  entropy_coef: 0.03
+  entropy_coef: 0.05
   # Recovery entropy 单独降权，避免 mode C 因多一层 recovery 选择而承受过强熵惩罚。
   recovery_entropy_coef: 0.4
   value_loss_coef: 0.10
@@ -335,9 +338,9 @@ training:
   #   3. 当 stochastic_high 长时间无提升，且 value_loss 未出现新低时提前停训
   early_stop_enabled: true
   early_stop_min_evals: 8
-  early_stop_stochastic_high_patience: 5
+  early_stop_stochastic_high_patience: 10
   early_stop_value_loss_window: 5
-  early_stop_value_loss_min_delta: 0.0
+  early_stop_value_loss_min_delta: 0.01
 
   # 训练阶段强制只允许 poisson 订单源。
   allowed_train_order_source_mode:

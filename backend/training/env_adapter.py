@@ -1309,9 +1309,7 @@ class TrainingEnvAdapter:
         if action.mode == PolicyMode.C and action.recover_node_id is not None:
             self._acquire_reservation(
                 drone_id=drone.drone_id,
-                order=order,
                 recover_node_id=action.recover_node_id,
-                launch_time=launch_time,
             )
         self._schedule_flight_leg(
             drone_id=drone.drone_id,
@@ -1905,38 +1903,24 @@ class TrainingEnvAdapter:
         self,
         *,
         drone_id: str,
-        order: Order,
         recover_node_id: str,
-        launch_time: float | None = None,
     ) -> None:
         """为一次 mode C dispatch 建立 reservation。"""
         if not self._cfg.reservation_enabled:
             return
 
         self._release_reservation(drone_id)
-        drone = self._require_entity_manager().drones[drone_id]
         host = self._resolve_fixed_node(recover_node_id)
-        effective_launch_time = float(self._t_now if launch_time is None else launch_time)
-        launch_delay = max(0.0, effective_launch_time - float(self._t_now))
-        delivery_fly_time = self._estimate_flight_time(
-            drone=drone,
-            from_pos=drone.current_loc,
-            to_pos=order.delivery_loc,
-        )
-        service_duration = float(self._scene_solver_params().drone_service_time_order_s)
-        recover_fly_time = self._estimate_flight_time(
-            drone=drone,
-            from_pos=order.delivery_loc,
-            to_pos=host.get_location(effective_launch_time),
-        )
-        total_eta_to_recovery = (
-            launch_delay
-            + delivery_fly_time
-            + service_duration
-            + recover_fly_time
-        )
+        coarse_plan = self._build_coarse_plan_view(self._t_now)
+        t_arrive_truck = coarse_plan.truck_eta_map.get(recover_node_id)
+        if t_arrive_truck is None:
+            raise RuntimeError(
+                "mode C reservation 缺少 recover node 的 truck ETA: "
+                f"{recover_node_id}"
+            )
+        truck_eta_to_recovery = max(0.0, float(t_arrive_truck) - float(self._t_now))
         tau_res = (
-            self._cfg.reservation_alpha * total_eta_to_recovery
+            self._cfg.reservation_alpha * truck_eta_to_recovery
             + self._cfg.reservation_gamma * float(host.estimate_wait_time(self._t_now))
         )
         reservation = ReservationState(

@@ -202,6 +202,7 @@ class TestPhase7ModelRuntime(unittest.TestCase):
             clip_coef=0.2,
             entropy_coef=0.01,
             recovery_entropy_coef=0.4,
+            rendezvous_arrive_bonus=2.0,
             rendezvous_bonus=0.2,
             value_loss_coef=0.5,
             value_loss_type="huber",
@@ -985,8 +986,12 @@ class TestPhase7ModelRuntime(unittest.TestCase):
         self.assertAlmostEqual(carry_in, -3.0, places=6)
         self.assertAlmostEqual(post_action, -2.5, places=6)
 
-    def test_shape_post_action_reward_for_rendezvous_adds_bonus_once_for_mode_c_success(self) -> None:
-        shaped_reward, bonus_applied = _shape_post_action_reward_for_rendezvous(
+    def test_shape_post_action_reward_for_rendezvous_adds_arrive_and_success_bonus(self) -> None:
+        (
+            shaped_reward,
+            arrive_bonus_applied,
+            success_bonus_applied,
+        ) = _shape_post_action_reward_for_rendezvous(
             post_action_reward=-1.5,
             action_indices=SimpleNamespace(
                 root_branch_idx=1,
@@ -995,11 +1000,38 @@ class TestPhase7ModelRuntime(unittest.TestCase):
                 recovery_idx=0,
             ),
             transition_summary=SimpleNamespace(rendezvous_success=True),
+            rendezvous_arrive_bonus=2.0,
             rendezvous_bonus=0.2,
         )
 
-        self.assertTrue(bonus_applied)
-        self.assertAlmostEqual(shaped_reward, -1.3, places=6)
+        self.assertTrue(arrive_bonus_applied)
+        self.assertTrue(success_bonus_applied)
+        self.assertAlmostEqual(shaped_reward, 0.7, places=6)
+
+    def test_shape_post_action_reward_for_rendezvous_adds_arrive_bonus_on_waiting_state(self) -> None:
+        (
+            shaped_reward,
+            arrive_bonus_applied,
+            success_bonus_applied,
+        ) = _shape_post_action_reward_for_rendezvous(
+            post_action_reward=-1.5,
+            action_indices=SimpleNamespace(
+                root_branch_idx=1,
+                order_idx=0,
+                mode_idx=1,
+                recovery_idx=0,
+            ),
+            transition_summary=SimpleNamespace(
+                rendezvous_success=False,
+                actor_training_state_after="waiting_for_truck",
+            ),
+            rendezvous_arrive_bonus=2.0,
+            rendezvous_bonus=5.0,
+        )
+
+        self.assertTrue(arrive_bonus_applied)
+        self.assertFalse(success_bonus_applied)
+        self.assertAlmostEqual(shaped_reward, 0.5, places=6)
 
     def test_shape_pending_transition_reward_for_rendezvous_uses_success_state(self) -> None:
         pending_transition = RolloutTransition(
@@ -1020,7 +1052,11 @@ class TestPhase7ModelRuntime(unittest.TestCase):
             actor_drone_id="uav_1",
         )
 
-        shaped_reward, bonus_applied = _shape_pending_transition_reward_for_rendezvous(
+        (
+            shaped_reward,
+            arrive_bonus_applied,
+            success_bonus_applied,
+        ) = _shape_pending_transition_reward_for_rendezvous(
             pending_transition=pending_transition,
             reward_so_far=-1.0,
             runtime_state=SimpleNamespace(
@@ -1028,11 +1064,52 @@ class TestPhase7ModelRuntime(unittest.TestCase):
                     "uav_1": SimpleNamespace(training_state="riding_with_truck"),
                 }
             ),
+            rendezvous_arrive_bonus=2.0,
             rendezvous_bonus=0.2,
         )
 
-        self.assertTrue(bonus_applied)
-        self.assertAlmostEqual(shaped_reward, -0.8, places=6)
+        self.assertTrue(arrive_bonus_applied)
+        self.assertTrue(success_bonus_applied)
+        self.assertAlmostEqual(shaped_reward, 1.2, places=6)
+
+    def test_shape_pending_transition_reward_for_rendezvous_adds_arrive_only_on_waiting_state(self) -> None:
+        pending_transition = RolloutTransition(
+            observation_batch=self._build_single_observation(),
+            critic_batch=self._build_single_critic_batch(),
+            action_mask=self._build_single_action_mask(),
+            action_indices=SimpleNamespace(
+                root_branch_idx=1,
+                order_idx=0,
+                mode_idx=1,
+                recovery_idx=0,
+            ),
+            log_prob_old=-0.1,
+            value_old=0.5,
+            reward=-1.0,
+            done=None,
+            critic_schema_hash="schema",
+            actor_drone_id="uav_1",
+        )
+
+        (
+            shaped_reward,
+            arrive_bonus_applied,
+            success_bonus_applied,
+        ) = _shape_pending_transition_reward_for_rendezvous(
+            pending_transition=pending_transition,
+            reward_so_far=-1.0,
+            runtime_state=SimpleNamespace(
+                drone_states={
+                    "uav_1": SimpleNamespace(training_state="waiting_for_truck"),
+                }
+            ),
+            rendezvous_arrive_bonus=2.0,
+            rendezvous_bonus=5.0,
+        )
+
+        self.assertTrue(arrive_bonus_applied)
+        self.assertFalse(success_bonus_applied)
+        self.assertAlmostEqual(shaped_reward, 1.0, places=6)
 
     def test_finalize_pending_transition_records_successor_bootstrap(self) -> None:
         pending = {
@@ -1117,13 +1194,15 @@ class TestPhase7ModelRuntime(unittest.TestCase):
                     }
                 )
             ),
+            rendezvous_arrive_bonus=2.0,
             rendezvous_bonus=0.2,
         )
 
         self.assertFalse(pending)
         self.assertEqual(len(backlog), 1)
-        self.assertAlmostEqual(float(backlog[0].reward), -1.8, places=6)
-        self.assertTrue(bool(backlog[0].rendezvous_bonus_applied))
+        self.assertAlmostEqual(float(backlog[0].reward), 0.2, places=6)
+        self.assertTrue(bool(backlog[0].rendezvous_arrive_bonus_applied))
+        self.assertTrue(bool(backlog[0].rendezvous_success_bonus_applied))
 
     def test_flush_terminal_pending_transitions_marks_done_and_preserves_order(self) -> None:
         first = RolloutTransition(
