@@ -47,8 +47,10 @@ scene:
   default_support_radius_km: 1.2
 
   # 训练阶段泊松订单的 deadline 生成窗口，需与 OrderManager._create_order 语义对齐。
-  order_window_min_min: 20
-  order_window_max_min: 60
+  # Run09 追加：先收紧到 15~40 分钟，给 mode B 制造适度时效压力，
+  # 但避免直接收得过紧导致大面积 timeout。
+  order_window_min_min: 15
+  order_window_max_min: 40
 
 data:
   # 统一订单源模式：
@@ -167,7 +169,9 @@ candidate:
   station_wait_threshold_sec: 240
 
   # rendezvous 与能量安全边际。
-  rendezvous_eta_safe_margin_sec: 15
+  # Run12: 15s 裕量是按 20m/s 巡航速度调的；Run11 的 10m/s 轻型机需要翻倍到 30s，
+  # 否则 mode C 在派单时看起来可行，送达后重验会系统性 miss 掉卡车 ETA。
+  rendezvous_eta_safe_margin_sec: 30
   energy_safe_margin_ratio: 0.10
 
   # 候选集排序和裁剪的稳定化开关。
@@ -257,8 +261,10 @@ policy:
 
 reward:
   # UAV-scope 主指标权重：仅评价无人机可配送订单。
-  lambda_wait: 0.25
-  wait_idle_penalty_coef: 0.25
+  # Run11: 显著降低等待惩罚权重，避免 mode C 因等待卡车被过度打压。
+  lambda_wait: 0.08
+  # Run12: 10m/s 机型下 0.25 会把低密度场景的安全等待几乎全部打成噪声。
+  wait_idle_penalty_coef: 0.10
   lambda_queue: 0.10
   lambda_miss: 0.15
   lambda_res_timeout: 0.10
@@ -269,8 +275,11 @@ reward:
   # Rendezvous 分段塑形：
   # 1. 到达 recover 节点时先给一个确定性小奖励，缩短 credit assignment 路径；
   # 2. 真正被卡车回收上车时再给更大的成功奖励。
-  rendezvous_arrive_bonus: 2.0
-  rendezvous_bonus: 5.0
+  # Run11: 在 Run10 基础上回补 mode C 的探索与成功激励，
+  # 但仍保持显著低于 Run09 的 reward scale。
+  rendezvous_arrive_bonus: 8.0
+  rendezvous_bonus: 20.0
+  mode_c_attempt_bonus: 5.0
 
   # 超时强制移除与硬失败惩罚。
   max_overdue_sec: 600
@@ -293,8 +302,8 @@ training:
 
   # PPO 核心超参数。
   total_timesteps: 1500000
-  # Run06 critic 稳定化：先做保守步长下调，避免 value head 在高方差 target 上过激摆动。
-  ppo_learning_rate: 0.0002
+  # Run11: 在保守区间内略微提速，避免 critic / actor 更新过慢。
+  ppo_learning_rate: 0.00008
   rollout_steps: 4096
   recurrent_ppo: true
   sequence_len: 16
@@ -313,12 +322,12 @@ training:
   # critic loss 当前改为显式可配置：
   #   - huber：优先用于当前高方差 reward / return 场景
   #   - mse：保留为回退选项
-  entropy_coef: 0.05
-  # Recovery entropy 单独降权，避免 mode C 因多一层 recovery 选择而承受过强熵惩罚。
-  recovery_entropy_coef: 0.4
-  value_loss_coef: 0.10
+  entropy_coef: 0.10
+  # Run12: recovery head 样本本就稀疏，不再额外降权；否则几乎总是塌到第一个候选节点。
+  recovery_entropy_coef: 1.0
+  value_loss_coef: 0.05
   value_loss_type: huber
-  value_huber_delta: 1.0
+  value_huber_delta: 5.0
   max_grad_norm: 1.0
   normalize_advantage: true
   target_kl: 0.05
@@ -338,9 +347,9 @@ training:
   #   3. 当 stochastic_high 长时间无提升，且 value_loss 未出现新低时提前停训
   early_stop_enabled: true
   early_stop_min_evals: 8
-  early_stop_stochastic_high_patience: 10
+  early_stop_stochastic_high_patience: 15
   early_stop_value_loss_window: 5
-  early_stop_value_loss_min_delta: 0.01
+  early_stop_value_loss_min_delta: 0.0
 
   # 训练阶段强制只允许 poisson 订单源。
   allowed_train_order_source_mode:

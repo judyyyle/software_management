@@ -204,6 +204,7 @@ class TestPhase7ModelRuntime(unittest.TestCase):
             recovery_entropy_coef=0.4,
             rendezvous_arrive_bonus=2.0,
             rendezvous_bonus=0.2,
+            mode_c_attempt_bonus=0.0,
             value_loss_coef=0.5,
             value_loss_type="huber",
             value_huber_delta=1.0,
@@ -1032,6 +1033,60 @@ class TestPhase7ModelRuntime(unittest.TestCase):
         self.assertTrue(arrive_bonus_applied)
         self.assertFalse(success_bonus_applied)
         self.assertAlmostEqual(shaped_reward, 0.5, places=6)
+
+    def test_shape_post_action_reward_for_rendezvous_adds_attempt_bonus_for_mode_c(self) -> None:
+        (
+            shaped_reward,
+            arrive_bonus_applied,
+            success_bonus_applied,
+        ) = _shape_post_action_reward_for_rendezvous(
+            post_action_reward=-1.5,
+            action_indices=SimpleNamespace(
+                root_branch_idx=1,
+                order_idx=0,
+                mode_idx=1,
+                recovery_idx=0,
+            ),
+            transition_summary=SimpleNamespace(
+                rendezvous_success=False,
+                actor_training_state_after="flying",
+            ),
+            rendezvous_arrive_bonus=4.0,
+            rendezvous_bonus=12.0,
+            mode_c_attempt_bonus=3.0,
+        )
+
+        self.assertFalse(arrive_bonus_applied)
+        self.assertFalse(success_bonus_applied)
+        self.assertAlmostEqual(shaped_reward, 1.5, places=6)
+
+    def test_shape_post_action_reward_for_rendezvous_does_not_add_attempt_bonus_for_non_mode_c(
+        self,
+    ) -> None:
+        (
+            shaped_reward,
+            arrive_bonus_applied,
+            success_bonus_applied,
+        ) = _shape_post_action_reward_for_rendezvous(
+            post_action_reward=-1.5,
+            action_indices=SimpleNamespace(
+                root_branch_idx=1,
+                order_idx=0,
+                mode_idx=0,
+                recovery_idx=0,
+            ),
+            transition_summary=SimpleNamespace(
+                rendezvous_success=False,
+                actor_training_state_after="flying",
+            ),
+            rendezvous_arrive_bonus=4.0,
+            rendezvous_bonus=12.0,
+            mode_c_attempt_bonus=3.0,
+        )
+
+        self.assertFalse(arrive_bonus_applied)
+        self.assertFalse(success_bonus_applied)
+        self.assertAlmostEqual(shaped_reward, -1.5, places=6)
 
     def test_shape_pending_transition_reward_for_rendezvous_uses_success_state(self) -> None:
         pending_transition = RolloutTransition(
