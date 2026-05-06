@@ -89,6 +89,7 @@ class _TrainingConfig:
     recovery_entropy_coef: float
     rendezvous_arrive_bonus: float
     rendezvous_bonus: float
+    mode_c_attempt_bonus: float
     value_loss_coef: float
     value_loss_type: str
     value_huber_delta: float
@@ -202,6 +203,7 @@ def _shape_post_action_reward_for_rendezvous(
     transition_summary: Any,
     rendezvous_arrive_bonus: float,
     rendezvous_bonus: float,
+    mode_c_attempt_bonus: float = 0.0,
 ) -> tuple[float, bool, bool]:
     if not _is_mode_c_action_indices(action_indices):
         return float(post_action_reward), False, False
@@ -209,6 +211,9 @@ def _shape_post_action_reward_for_rendezvous(
     shaped_reward = float(post_action_reward)
     arrive_applied = False
     success_applied = False
+    attempt_bonus = float(mode_c_attempt_bonus)
+    if attempt_bonus > 0.0:
+        shaped_reward += attempt_bonus
     rendezvous_success = bool(getattr(transition_summary, "rendezvous_success", False))
     training_state_after = str(
         getattr(transition_summary, "actor_training_state_after", "")
@@ -750,6 +755,7 @@ def train_cmrappo(
                 transition_summary=transition_summary,
                 rendezvous_arrive_bonus=train_cfg.rendezvous_arrive_bonus,
                 rendezvous_bonus=train_cfg.rendezvous_bonus,
+                mode_c_attempt_bonus=train_cfg.mode_c_attempt_bonus,
             )
             current_transition = RolloutTransition(
                 observation_batch=observation_batch,
@@ -2805,6 +2811,7 @@ def _build_meta_payload(
             R_delivery_bonus=float(reward["R_delivery_bonus"]),
             rendezvous_arrive_bonus=float(reward.get("rendezvous_arrive_bonus", 0.0)),
             rendezvous_bonus=float(reward.get("rendezvous_bonus", 0.0)),
+            mode_c_attempt_bonus=float(reward.get("mode_c_attempt_bonus", 0.0)),
             max_overdue_sec=float(reward["max_overdue_sec"]),
             hard_overdue_penalty_sec=float(reward["hard_overdue_penalty_sec"]),
             hard_failure_penalty_sec=float(reward["hard_failure_penalty_sec"]),
@@ -3224,6 +3231,7 @@ def _load_training_config(config_path: Path) -> _TrainingConfig:
         recovery_entropy_coef=float(training.get("recovery_entropy_coef", 1.0)),
         rendezvous_arrive_bonus=float(reward.get("rendezvous_arrive_bonus", 0.0)),
         rendezvous_bonus=float(reward.get("rendezvous_bonus", 0.0)),
+        mode_c_attempt_bonus=float(reward.get("mode_c_attempt_bonus", 0.0)),
         value_loss_coef=float(training["value_loss_coef"]),
         value_loss_type=str(training.get("value_loss_type", "mse")),
         value_huber_delta=float(training.get("value_huber_delta", 1.0)),
@@ -3293,6 +3301,8 @@ def _validate_training_config(cfg: _TrainingConfig) -> None:
         raise ValueError("rendezvous_arrive_bonus 不能为负数")
     if cfg.rendezvous_bonus < 0.0:
         raise ValueError("rendezvous_bonus 不能为负数")
+    if cfg.mode_c_attempt_bonus < 0.0:
+        raise ValueError("mode_c_attempt_bonus 不能为负数")
     expected_target = cfg.sequence_minibatch_size * cfg.train_len
     if expected_target != cfg.target_minibatch_timesteps:
         raise ValueError(

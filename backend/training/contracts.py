@@ -787,6 +787,7 @@ class RewardMeta:
     R_delivery_bonus: float
     rendezvous_arrive_bonus: float
     rendezvous_bonus: float
+    mode_c_attempt_bonus: float
     max_overdue_sec: float
     hard_overdue_penalty_sec: float
     hard_failure_penalty_sec: float
