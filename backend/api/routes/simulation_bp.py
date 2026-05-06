@@ -473,11 +473,15 @@ def _serialize_runtime_drone_route(
     delivery_loc = runtime_route.delivery_loc
     recovery_loc = runtime_route.recovery_loc
 
-    path = [
-        list(utm_to_wgs84(launch_loc.x, launch_loc.y)),
-        list(utm_to_wgs84(delivery_loc.x, delivery_loc.y)),
-        list(utm_to_wgs84(recovery_loc.x, recovery_loc.y)),
-    ]
+    runtime_path = getattr(runtime_route, "path", None) or []
+    if runtime_path:
+        path = [list(utm_to_wgs84(pos.x, pos.y)) for pos in runtime_path]
+    else:
+        path = [
+            list(utm_to_wgs84(launch_loc.x, launch_loc.y)),
+            list(utm_to_wgs84(delivery_loc.x, delivery_loc.y)),
+            list(utm_to_wgs84(recovery_loc.x, recovery_loc.y)),
+        ]
 
     if alloc.mode == "B_WAIT":
         launch_node_id = alloc.launch_station_id or alloc.vehicle_id
