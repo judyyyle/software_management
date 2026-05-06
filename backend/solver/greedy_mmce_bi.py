@@ -356,6 +356,8 @@ class GreedyMMCEBackboneInsertion(GreedyMMCE):
             )
 
         self._road_distance_memo.clear()
+        self._uav_path_distance_memo.clear()
+        self._activate_path_planner(scene_id)
         self._load_road_graph(bbox, scene_id)
         self._apply_fixed_initial_drone_loadout(current_time)
 
