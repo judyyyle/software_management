@@ -66,22 +66,10 @@
             <!-- 调度控制行 -->
             <div class="sc-action-row">
               <button class="sc-btn sc-btn--dispatch"
-                :class="{ 'sc-btn--dispatch-active': dispatchSolver === 'greedy' }"
-                :disabled="!initDone || dispatchLoading"
-                @click="dispatchSolver = 'greedy'">
-                🧠 贪心（baseline）
-              </button>
-              <button class="sc-btn sc-btn--dispatch"
-                :class="{ 'sc-btn--dispatch-active': dispatchSolver === 'greedy_mmce' }"
-                :disabled="!initDone || dispatchLoading"
-                @click="dispatchSolver = 'greedy_mmce'">
-                🧩 贪心（多模式）
-              </button>
-              <button class="sc-btn sc-btn--dispatch"
                 :class="{ 'sc-btn--dispatch-active': dispatchSolver === 'greedy_mmce_bi' }"
                 :disabled="!initDone || dispatchLoading"
                 @click="dispatchSolver = 'greedy_mmce_bi'">
-                🧠 贪心（增量）
+                🧩 贪心（增量）
               </button>
               <button class="sc-btn sc-btn--dispatch"
                 :class="{ 'sc-btn--dispatch-active': dispatchSolver === 'market' }"
@@ -229,7 +217,7 @@ const lastDispatchResult = ref<any>(null)
 const dispatchPlan = ref<DispatchPlan | null>(null)
 const totalEnergyCostWh = ref(0)
 type DispatchSolverName = 'greedy' | 'greedy_mmce' | 'greedy_mmce_bi' | 'market'
-const dispatchSolver = ref<DispatchSolverName>('greedy')
+const dispatchSolver = ref<DispatchSolverName>('greedy_mmce_bi')
 
 function dispatchSolverLabel(solver: DispatchSolverName): string {
   if (solver === 'greedy') return '贪心（baseline）'

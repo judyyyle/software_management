@@ -929,27 +929,31 @@ class GreedyMMCEBackboneInsertion(GreedyMMCE):
             seq = stops_by_truck.get(truck_id, [])
             start_pos = self._get_route_start_pos(truck, current_time, start_from_current_state)
             return_to_depot = True
-            base_len = self._sequence_distance(
-                truck,
-                seq,
-                current_time,
-                start_from_current_state,
-                return_to_depot,
-            )
+            
+            # NOTE: 我们需要计算按序到达各个站点的预期时间（含原有的停靠与等待时间），以便精准评估插入导致的迟到！
+            arrival_times_at_idx = [current_time]
+            cur_t = current_time
+            cur_pos = start_pos
+            speed = max(1.0, float(getattr(truck, "speed", 0.0)))
+            for stop in seq:
+                arr = cur_t + self._road_dist(cur_pos, stop.get("position", cur_pos)) / speed
+                # 若是已有站点可能规定了最小出发时间或服务时间
+                dep = max(arr, stop.get("departure_time", arr))
+                arr_with_service = max(arr + stop.get("service_time", 0.0), dep)
+                arrival_times_at_idx.append(arr)
+                cur_t = arr_with_service
+                cur_pos = stop.get("position", cur_pos)
 
             for idx in range(len(seq) + 1):
-                prev_pos = start_pos if idx == 0 else seq[idx - 1]["position"]
-
+                prev_pos = start_pos if idx == 0 else seq[idx - 1].get("position", start_pos)
+                
                 if idx < len(seq):
-                    next_pos = seq[idx]["position"]
+                    next_pos = seq[idx].get("position")
                     replaced = self._road_dist(prev_pos, next_pos)
                 else:
                     next_pos = None
                     base_anchor = self._terminal_anchor_pos(prev_pos)
-                    if base_anchor is None:
-                        replaced = 0.0
-                    else:
-                        replaced = self._road_dist(prev_pos, base_anchor)
+                    replaced = 0.0 if base_anchor is None else self._road_dist(prev_pos, base_anchor)
 
                 added = self._road_dist(prev_pos, order.delivery_loc)
                 if idx < len(seq) and next_pos is not None:
@@ -958,15 +962,19 @@ class GreedyMMCEBackboneInsertion(GreedyMMCE):
                     new_anchor = self._terminal_anchor_pos(order.delivery_loc)
                     if new_anchor is not None:
                         added += self._road_dist(order.delivery_loc, new_anchor)
+                
                 delta_dist = max(0.0, added - replaced)
 
-                speed = max(1e-6, float(getattr(truck, "speed", 0.0)))
-                delivery_time_est = current_time + (base_len + delta_dist) / speed + self.SERVICE_TIME_CUSTOMER
+                # 精确配送时间 = 该索引处原有到达时间 + 插入点路程耗时
+                dist_to_insert = self._road_dist(prev_pos, order.delivery_loc)
+                delivery_time_est = arrival_times_at_idx[idx] + dist_to_insert / speed + self.SERVICE_TIME_CUSTOMER
+
                 lateness = max(0.0, delivery_time_est - order.deadline)
                 cost_dist = self.C_DIST_ET * delta_dist
                 cost_energy = self.C_ENERGY_ET * self._truck_energy_wh(delta_dist)
                 cost_penalty = self.LAMBDA_TIME * order.penalty_rate * lateness
                 delta_score = cost_dist + cost_energy + cost_penalty
+
 
                 cand = _InsertionChoice(
                     truck_id=truck_id,
@@ -1230,6 +1238,20 @@ class GreedyMMCEBackboneInsertion(GreedyMMCE):
             return []
 
         speed = max(1e-6, float(getattr(truck, "speed", 0.0)))
+        
+        start_pos = self._get_route_start_pos(truck, current_time, start_from_current_state)
+        
+        # 计算按序到达各个站点的预期时间（含原有的停靠与等待时间）
+        arrival_times_at_idx = [current_time]
+        cur_t = current_time
+        cur_pos = start_pos
+        for stop in seq:
+            arr = cur_t + self._road_dist(cur_pos, stop.get("position", cur_pos)) / speed
+            dep = max(arr, stop.get("departure_time", arr))
+            cur_t = max(arr + stop.get("service_time", 0.0), dep)
+            arrival_times_at_idx.append(arr)
+            cur_pos = stop.get("position", cur_pos)
+
         route_ranked: list[tuple[float, float, float, _StationLaunchOption]] = []
         eta_ranked: list[tuple[float, float, float, _StationLaunchOption]] = []
         task_ranked: list[tuple[float, float, float, _StationLaunchOption]] = []
@@ -1251,7 +1273,13 @@ class GreedyMMCEBackboneInsertion(GreedyMMCE):
                 current_time,
                 start_from_current_state,
             )
-            launch_eta = launch_path_distance / speed
+            # 使用包含停靠与等待历史的精确时间
+            base_arr = arrival_times_at_idx[launch_idx]
+            prev_pos = self._get_route_start_pos(truck, current_time, start_from_current_state) if launch_idx == 0 else seq[launch_idx - 1].get("position", start_pos)
+            dist_to_insert = self._road_dist(prev_pos, station.location)
+            true_arrival_time = base_arr + dist_to_insert / speed
+            launch_eta = max(0.0, true_arrival_time - current_time)
+            
             task_dist = self._dist(order.delivery_loc, station.location)
             option = _StationLaunchOption(
                 station_id=station.station_id,
