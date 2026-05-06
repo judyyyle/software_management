@@ -152,7 +152,7 @@ class GreedyMMCE:
     C_DIST_UAV = 1.0
     C_ENERGY_ET = 1.0
     C_ENERGY_UAV = 1.0
-    LAMBDA_TIME = 100.0
+    LAMBDA_TIME = 10000.0
 
     # 能耗模型参数（用于评分）
     TRUCK_ENERGY_KWH_PER_KM = 0.75  # ET: 每公里耗电 [kWh/km]
