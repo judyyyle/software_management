@@ -105,9 +105,12 @@ class DispatchDecisionEngine:
         backend_dir = Path(__file__).resolve().parent.parent
         candidate_paths: list[Path] = []
         if scene_id:
+            candidate_paths.append(backend_dir / "test_data" / scene_id / "no_fly_zones.geojson")
             candidate_paths.append(backend_dir / "test_data" / scene_id / "buildings.geojson")
             if scene_id == "default_test_4x4km":
+                candidate_paths.append(backend_dir / "test_data" / "default_scene" / "no_fly_zones.geojson")
                 candidate_paths.append(backend_dir / "test_data" / "default_scene" / "buildings.geojson")
+        candidate_paths.append(backend_dir / "test_data" / "default_scene" / "no_fly_zones.geojson")
         candidate_paths.append(backend_dir / "test_data" / "default_scene" / "buildings.geojson")
 
         for path in candidate_paths:
@@ -116,7 +119,9 @@ class DispatchDecisionEngine:
             try:
                 with path.open("r", encoding="utf-8") as f:
                     data = json.load(f)
-                if isinstance(data, dict):
+                if isinstance(data, (dict, list)):
+                    num_features = len(data) if isinstance(data, list) else len(data.get("features", []))
+                    logger.info("[DispatchDecisionEngine] 已加载地图数据: %s (features=%d)", path.name, num_features)
                     return data
             except Exception:
                 logger.warning("[DispatchDecisionEngine] 建筑缓存读取失败: %s", path)
@@ -923,8 +928,6 @@ class DispatchDecisionEngine:
         direct_dist = launch_loc.distance_2d(delivery_loc) + delivery_loc.distance_2d(recovery_loc)
         path_dist = self._polyline_distance(polyline)
         has_detour = len(polyline) > 3 or path_dist > direct_dist + 1.0
-        if not has_detour:
-            return
 
         path_utm = [[round(p.x, 2), round(p.y, 2), round(p.z, 2)] for p in polyline]
         path_wgs84 = []
@@ -932,9 +935,12 @@ class DispatchDecisionEngine:
             lon, lat = p.to_wgs84()
             path_wgs84.append([round(lon, 6), round(lat, 6)])
 
+        log_prefix = "[DispatchDecisionEngine][UAV-AVOID]" if has_detour else "[DispatchDecisionEngine][UAV-DIRECT]"
+
         logger.info(
-            "[DispatchDecisionEngine][UAV-AVOID] %s order=%s drone=%s mode=%s points=%d path_dist=%.1f direct=%.1f "
+            "%s %s order=%s drone=%s mode=%s points=%d path_dist=%.1f direct=%.1f "
             "launch=(%.2f,%.2f) delivery=(%.2f,%.2f) recovery=(%.2f,%.2f) path_utm=%s path_wgs84=%s",
+            log_prefix,
             tag,
             alloc.order_id,
             alloc.drone_id,
