@@ -149,6 +149,7 @@ class GreedyMMCE:
     MAX_DETOUR_RATIO      = 1.3
     ENERGY_SAFETY_FACTOR  = 1.2
     DEPOT_LAUNCH_TOLERANCE_M = 30.0
+    UAV_CRUISE_ALTITUDE_M = 80.0   # 无人机巡航高度，用于路径规划避障
     
     # 新增参数：控制无人机在充电站等待的成本权衡
     WAIT_PENALTY_FACTOR   = 0.5    # 每秒等待时间的成本系数（相对于距离）
@@ -291,9 +292,12 @@ class GreedyMMCE:
         backend_dir = Path(__file__).resolve().parent.parent
         candidate_paths: list[Path] = []
         if scene_id:
+            candidate_paths.append(backend_dir / "test_data" / scene_id / "no_fly_zones.geojson")
             candidate_paths.append(backend_dir / "test_data" / scene_id / "buildings.geojson")
             if scene_id == "default_test_4x4km":
+                candidate_paths.append(backend_dir / "test_data" / "default_scene" / "no_fly_zones.geojson")
                 candidate_paths.append(backend_dir / "test_data" / "default_scene" / "buildings.geojson")
+        candidate_paths.append(backend_dir / "test_data" / "default_scene" / "no_fly_zones.geojson")
         candidate_paths.append(backend_dir / "test_data" / "default_scene" / "buildings.geojson")
 
         for path in candidate_paths:
@@ -302,7 +306,9 @@ class GreedyMMCE:
             try:
                 with path.open("r", encoding="utf-8") as f:
                     data = json.load(f)
-                if isinstance(data, dict):
+                if isinstance(data, (dict, list)):
+                    num_features = len(data) if isinstance(data, list) else len(data.get("features", []))
+                    logger.info("[GreedyMMCE] 已加载地图数据: %s (features=%d)", path.name, num_features)
                     return data
             except Exception:
                 logger.warning("[GreedyMMCE] 建筑缓存读取失败: %s", path)
@@ -829,8 +835,8 @@ class GreedyMMCE:
             else:
                 continue
 
-            dist_out = self._uav_path_distance(launch_loc, order_obj.delivery_loc)
-            dist_back = self._uav_path_distance(order_obj.delivery_loc, recovery_loc)
+            dist_out = self._uav_path_distance(launch_loc, order_obj.delivery_loc, altitude=self.UAV_CRUISE_ALTITUDE_M)
+            dist_back = self._uav_path_distance(order_obj.delivery_loc, recovery_loc, altitude=self.UAV_CRUISE_ALTITUDE_M)
             uav_distance_total += dist_out + dist_back
             uav_energy_total += self._uav_energy_wh(
                 drone, launch_loc, order_obj.delivery_loc, order_obj.payload_weight
@@ -1234,7 +1240,7 @@ class GreedyMMCE:
                 order_id=order.order_id,
                 vehicle_id=truck.truck_id,
                 mode="B",
-                distance=self._uav_path_distance(launch_loc, order.delivery_loc),
+                distance=self._uav_path_distance(launch_loc, order.delivery_loc, altitude=self.UAV_CRUISE_ALTITUDE_M),
                 feasible=True,
                 recovery_station_id=recovery_id,
                 drone_id=drone.drone_id,
@@ -1296,7 +1302,7 @@ class GreedyMMCE:
             order_id=order.order_id,
             vehicle_id=depot.depot_id,
             mode="C",
-            distance=self._uav_path_distance(depot.location, order.delivery_loc),
+            distance=self._uav_path_distance(depot.location, order.delivery_loc, altitude=self.UAV_CRUISE_ALTITUDE_M),
             feasible=True,
             recovery_station_id=depot.depot_id,
             drone_id=drone.drone_id,
@@ -1642,7 +1648,7 @@ class GreedyMMCE:
             energy_to_recovery = self._flight_energy(drone, delivery_loc, node_pos, 0.0)
             total = (energy_to_deliver + energy_to_recovery) * self.ENERGY_SAFETY_FACTOR
             if total <= drone.battery_current:
-                dist = self._uav_path_distance(delivery_loc, node_pos)
+                dist = self._uav_path_distance(delivery_loc, node_pos, altitude=self.UAV_CRUISE_ALTITUDE_M)
                 if node_id in self.entity_mgr.stations:
                     stations_candidates.append((node_id, dist))
                 elif node_id in self.entity_mgr.depots:
@@ -1653,7 +1659,7 @@ class GreedyMMCE:
             best_id = min(stations_candidates, key=lambda x: x[1])[0]
             logger.info(
                 "[GreedyMMCE] 回收点选择：充电站 %s（距离 %.0fm）",
-                best_id, self._uav_path_distance(delivery_loc, self.entity_mgr.stations[best_id].location)
+                best_id, self._uav_path_distance(delivery_loc, self.entity_mgr.stations[best_id].location, altitude=self.UAV_CRUISE_ALTITUDE_M)
             )
             return best_id
 
@@ -1662,7 +1668,7 @@ class GreedyMMCE:
             best_id = min(depots_candidates, key=lambda x: x[1])[0]
             logger.info(
                 "[GreedyMMCE] 回收点选择：仓库 %s（距离 %.0fm）",
-                best_id, self._uav_path_distance(delivery_loc, self.entity_mgr.depots[best_id].location)
+                best_id, self._uav_path_distance(delivery_loc, self.entity_mgr.depots[best_id].location, altitude=self.UAV_CRUISE_ALTITUDE_M)
             )
             return best_id
 
@@ -1682,7 +1688,7 @@ class GreedyMMCE:
           E = P(payload, v_cruise) × (distance / v_cruise)
           P = k1 × (m_empty + payload)^1.5 + k2 × v^3
         """
-        distance = self._uav_path_distance(from_pos, to_pos)
+        distance = self._uav_path_distance(from_pos, to_pos, altitude=self.UAV_CRUISE_ALTITUDE_M)
         if distance < 0.001:
             return 0.0
         flight_time = distance / drone.cruise_speed
@@ -1776,7 +1782,7 @@ class GreedyMMCE:
             # _flight_energy 内部已调用 drone.calculate_power(...)，与实体耗能口径一致。
             return self._flight_energy(drone, from_pos, to_pos, payload) / 3600.0
 
-        distance_km = self._uav_path_distance(from_pos, to_pos) / 1000.0
+        distance_km = self._uav_path_distance(from_pos, to_pos, altitude=self.UAV_CRUISE_ALTITUDE_M) / 1000.0
         total_mass = max(0.0, drone.empty_weight + max(0.0, payload))
         return self.UAV_ALPHA_WH_PER_KG_KM * total_mass * distance_km
 
@@ -1877,8 +1883,8 @@ class GreedyMMCE:
             if recovery is None:
                 return float("inf"), 0.0, 0.0, 0.0
 
-            dist_out = self._uav_path_distance(launch_loc, order.delivery_loc)
-            dist_back = self._uav_path_distance(order.delivery_loc, recovery.location)
+            dist_out = self._uav_path_distance(launch_loc, order.delivery_loc, altitude=self.UAV_CRUISE_ALTITUDE_M)
+            dist_back = self._uav_path_distance(order.delivery_loc, recovery.location, altitude=self.UAV_CRUISE_ALTITUDE_M)
             uav_distance = dist_out + dist_back
             uav_energy = self._uav_energy_wh(drone, launch_loc, order.delivery_loc, order.payload_weight)
             uav_energy += self._uav_energy_wh(drone, order.delivery_loc, recovery.location, 0.0)
@@ -1899,8 +1905,8 @@ class GreedyMMCE:
             depot = self.entity_mgr.depots.get(alloc.vehicle_id)
             if drone is None or depot is None or drone.cruise_speed <= 0:
                 return float("inf"), 0.0, 0.0, 0.0
-            dist_out = self._uav_path_distance(depot.location, order.delivery_loc)
-            dist_back = self._uav_path_distance(order.delivery_loc, depot.location)
+            dist_out = self._uav_path_distance(depot.location, order.delivery_loc, altitude=self.UAV_CRUISE_ALTITUDE_M)
+            dist_back = self._uav_path_distance(order.delivery_loc, depot.location, altitude=self.UAV_CRUISE_ALTITUDE_M)
             uav_distance = dist_out + dist_back
             uav_energy = self._uav_energy_wh(drone, depot.location, order.delivery_loc, order.payload_weight)
             uav_energy += self._uav_energy_wh(drone, order.delivery_loc, depot.location, 0.0)
@@ -1984,8 +1990,8 @@ class GreedyMMCE:
                 continue
 
             # 时间计算（这里的 wait_duration 暂设为 0，实际由卡车路径决定）
-            dist_out = self._uav_path_distance(launch_loc, delivery_loc)
-            dist_back = self._uav_path_distance(delivery_loc, recovery_loc)
+            dist_out = self._uav_path_distance(launch_loc, delivery_loc, altitude=self.UAV_CRUISE_ALTITUDE_M)
+            dist_back = self._uav_path_distance(delivery_loc, recovery_loc, altitude=self.UAV_CRUISE_ALTITUDE_M)
             total_distance = dist_out + dist_back
 
             # 估算飞行时间
