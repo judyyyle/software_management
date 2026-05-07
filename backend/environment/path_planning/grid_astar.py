@@ -155,6 +155,37 @@ def _create_occupancy_grid(
     return grid, min_x, min_y, width, height
 
 
+def _is_visible(p1: Point2D, p2: Point2D, obstacles: list[Polygon]) -> bool:
+    line = LineString([p1, p2])
+    for poly in obstacles:
+        if line.crosses(poly) or line.within(poly):
+            return False
+    return True
+
+
+def _smooth_path(
+    path: list[Point2D],
+    obstacles: list[Polygon],
+) -> list[Point2D]:
+    if len(path) <= 2:
+        return path
+
+    smoothed = [path[0]]
+    i = 0
+    while i < len(path) - 1:
+        farthest = i + 1
+        for j in range(i + 2, len(path)):
+            if _is_visible(path[i], path[j], obstacles):
+                farthest = j
+            else:
+                break
+        smoothed.append(path[farthest])
+        i = farthest
+        if i == len(path) - 1:
+            break
+    return smoothed
+
+
 def _grid_astar(
     grid: dict[tuple[int, int], bool],
     start_idx: tuple[int, int],
@@ -270,6 +301,14 @@ def plan_path(start: Point2D, goal: Point2D, obstacles: list[Polygon]) -> list[P
         path[0] = start
         path[-1] = goal
 
+    # 路径平滑
+    smoothed_path = _smooth_path(path, local_obstacles)
+    logger.info(
+        "[GridAStar] path smoothing: raw=%d smoothed=%d",
+        len(path),
+        len(smoothed_path)
+    )
+
     elapsed = time.time() - t0
-    logger.info("[VisibilityGraph] plan_path: computed path with %d waypoints, planning_time=%.3fs", len(path), elapsed)
-    return path
+    logger.info("[GridAStar] plan_path: computed path with %d waypoints, planning_time=%.3fs", len(smoothed_path), elapsed)
+    return smoothed_path
