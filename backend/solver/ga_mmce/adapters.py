@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import copy
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from types import SimpleNamespace
 from typing import Any, Iterable
 
@@ -23,6 +23,9 @@ class GAAdapterContext:
     station_ids: list[str]
     support_node_ids: list[str]
     gene_pool: list[str]
+    mode: str = "static"
+    fixed_tail_order_ids: list[str] = field(default_factory=list)
+    fixed_tail_gene_by_order: dict[str, tuple[str, dict[str, str] | None]] = field(default_factory=dict)
 
 
 def _read_field(record: Any, field_name: str, default: Any = None) -> Any:
@@ -185,10 +188,20 @@ def _has_enough_standby_energy(drone: Any) -> bool:
     return float(battery_current) > safe_margin
 
 
-def _drone_is_available(drone: Any, locked_ids: set[str]) -> bool:
+def _drone_is_available(drone: Any, locked_ids: set[str], current_time: float | None = None) -> bool:
     drone_id = str(_read_field(drone, "drone_id", "")).strip()
-    if not drone_id or drone_id in locked_ids:
+    force_available = bool(_read_field(drone, "_ga_force_available", False))
+    if not drone_id or (drone_id in locked_ids and not force_available):
         return False
+    available_time = _read_field(drone, "_ga_available_time", _read_field(drone, "available_time"))
+    if available_time is not None and current_time is not None and not force_available:
+        try:
+            if float(available_time) > float(current_time) + 1e-6:
+                return False
+        except (TypeError, ValueError):
+            pass
+    if force_available:
+        return _has_enough_standby_energy(drone)
     if not _drone_is_idle(drone):
         return False
     if not _has_enough_standby_energy(drone):
@@ -206,7 +219,9 @@ def _truck_docked_drone_ids(state: Any) -> list[str]:
     seen: set[str] = set()
     result: list[str] = []
     for truck in _as_values(_mapping(state, "trucks")):
-        for drone_id in _read_field(truck, "docked_drones", []) or []:
+        combined = list(_read_field(truck, "_ga_docked_drones", []) or [])
+        combined.extend(_read_field(truck, "docked_drones", []) or [])
+        for drone_id in combined:
             normalized = str(drone_id).strip()
             if normalized and normalized not in seen:
                 seen.add(normalized)
@@ -218,10 +233,11 @@ def extract_truck_drone_ids(state) -> list[str]:
     """Return currently truck-docked drones usable for B-mode genes."""
     drones = _mapping(state, "drones") or {}
     locked_ids = _locked_drone_ids(state)
+    now = _current_time(state)
     result: list[str] = []
     for drone_id in _truck_docked_drone_ids(state):
         drone = drones.get(drone_id) if isinstance(drones, dict) else None
-        if drone is None or not _drone_is_available(drone, locked_ids):
+        if drone is None or not _drone_is_available(drone, locked_ids, now):
             continue
         result.append(drone_id)
     return result
@@ -251,20 +267,24 @@ def extract_depot_drone_ids(state) -> list[str]:
     drones = _mapping(state, "drones") or {}
     truck_docked = set(_truck_docked_drone_ids(state))
     locked_ids = _locked_drone_ids(state)
+    now = _current_time(state)
     seen: set[str] = set()
     result: list[str] = []
 
-    for depot in _as_values(_mapping(state, "depots")):
-        for drone_id in _read_field(depot, "idle_drones", []) or []:
+    independent_nodes = list(_as_values(_mapping(state, "depots"))) + list(_as_values(_mapping(state, "stations")))
+    for node in independent_nodes:
+        idle_drones = list(_read_field(node, "_ga_idle_drones", []) or [])
+        idle_drones.extend(_read_field(node, "idle_drones", []) or [])
+        for drone_id in idle_drones:
             normalized = str(drone_id).strip()
             if not normalized or normalized in seen or normalized in truck_docked:
                 continue
             drone = drones.get(normalized) if isinstance(drones, dict) else None
-            if drone is None or not _drone_is_available(drone, locked_ids):
+            if drone is None or not _drone_is_available(drone, locked_ids, now):
                 continue
             if _read_field(drone, "transport_truck_id"):
                 continue
-            if not _is_at_depot(drone, depot):
+            if not _is_at_depot(drone, node):
                 continue
             seen.add(normalized)
             result.append(normalized)
@@ -326,7 +346,7 @@ def _configured_initial_layout_ids(
 
     for drone_id in truck_ids:
         drone = drones.get(drone_id)
-        if drone is None or not _drone_is_available(drone, locked_ids):
+        if drone is None or not _drone_is_available(drone, locked_ids, _current_time(state)):
             continue
         truck_result.append(drone_id)
         truck_set.add(drone_id)
@@ -335,7 +355,7 @@ def _configured_initial_layout_ids(
         if drone_id in truck_set:
             continue
         drone = drones.get(drone_id)
-        if drone is None or not _drone_is_available(drone, locked_ids):
+        if drone is None or not _drone_is_available(drone, locked_ids, _current_time(state)):
             continue
         depot_result.append(drone_id)
 
@@ -425,20 +445,68 @@ def apply_initial_drone_layout_overlay(
     return True
 
 
-def build_ga_context(state, config: Any | None = None) -> GAAdapterContext:
-    order_ids = extract_active_order_ids(state)
-    configured_layout = _configured_initial_layout_ids(state, config)
+def _context_mode(state: Any, mode: str | None) -> str:
+    raw = mode or _read_field(state, "_ga_context_mode", "static")
+    normalized = str(raw or "static").strip().lower()
+    return "dynamic" if normalized == "dynamic" else "static"
+
+
+def _fixed_tail_from_state(state: Any) -> tuple[list[str], dict[str, tuple[str, dict[str, str] | None]]]:
+    raw_tail = _read_field(state, "_ga_fixed_tail_order_ids", []) or []
+    tail_ids = _dedupe_preserve_order(raw_tail)
+    raw_gene_map = _read_field(state, "_ga_fixed_tail_gene_by_order", {}) or {}
+    gene_map: dict[str, tuple[str, dict[str, str] | None]] = {}
+    if isinstance(raw_gene_map, dict):
+        for order_id, value in raw_gene_map.items():
+            oid = str(order_id)
+            if isinstance(value, tuple) and len(value) == 2:
+                gene, rv = value
+            elif isinstance(value, dict):
+                gene = value.get("gene", "A")
+                rv = value.get("rendezvous")
+            else:
+                continue
+            gene_map[oid] = (str(gene), copy.deepcopy(rv))
+    return tail_ids, gene_map
+
+
+def make_gene_pool_for_state(
+    state: Any,
+    config: Any | None = None,
+    mode: str | None = None,
+) -> tuple[list[str], list[str], list[str]]:
+    resolved_mode = _context_mode(state, mode)
+    configured_layout = (
+        _configured_initial_layout_ids(state, config)
+        if resolved_mode == "static"
+        else None
+    )
     if configured_layout is None:
         truck_drone_ids = extract_truck_drone_ids(state)
         depot_drone_ids = extract_depot_drone_ids(state)
     else:
         truck_drone_ids, depot_drone_ids = configured_layout
+    return truck_drone_ids, depot_drone_ids, make_gene_pool_by_location(truck_drone_ids, depot_drone_ids)
+
+
+def build_ga_context(
+    state,
+    config: Any | None = None,
+    mode: str | None = None,
+) -> GAAdapterContext:
+    order_ids = extract_active_order_ids(state)
+    resolved_mode = _context_mode(state, mode)
+    truck_drone_ids, depot_drone_ids, gene_pool = make_gene_pool_for_state(
+        state,
+        config,
+        resolved_mode,
+    )
     all_drone_ids = extract_all_drone_ids(state)
     truck_ids = extract_truck_ids(state)
     depot_ids = extract_depot_ids(state)
     station_ids = extract_station_ids(state)
     support_node_ids = make_node_pool(depot_ids, station_ids)
-    gene_pool = make_gene_pool_by_location(truck_drone_ids, depot_drone_ids)
+    fixed_tail_order_ids, fixed_tail_gene_by_order = _fixed_tail_from_state(state)
 
     return GAAdapterContext(
         order_ids=order_ids,
@@ -450,6 +518,11 @@ def build_ga_context(state, config: Any | None = None) -> GAAdapterContext:
         station_ids=station_ids,
         support_node_ids=support_node_ids,
         gene_pool=gene_pool,
+        mode=resolved_mode,
+        fixed_tail_order_ids=[
+            order_id for order_id in fixed_tail_order_ids if order_id in set(order_ids)
+        ],
+        fixed_tail_gene_by_order=fixed_tail_gene_by_order,
     )
 
 
