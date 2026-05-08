@@ -10,7 +10,12 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from .adapters import build_ga_context, greedy_plan_to_individual
+from .adapters import (
+    apply_initial_drone_layout_overlay,
+    build_ga_context,
+    clone_state_for_decode,
+    greedy_plan_to_individual,
+)
 from .chromosome import Individual
 from .config import GAConfig
 from .diagnostics import write_evolution_csv, write_evolution_plots, write_mode_precheck_csv
@@ -143,7 +148,9 @@ class GAMMCESolver:
             "early_stop_reason": "",
         }
         self._b_precheck_by_order = {}
-        context = build_ga_context(state)
+        if dispatch_type == "full":
+            self._apply_initial_runtime_drone_layout(state)
+        context = build_ga_context(state, self.config)
         self._debug_run_start(state, context, dispatch_type)
 
         if not context.order_ids:
@@ -332,10 +339,13 @@ class GAMMCESolver:
 
         result: dict[str, tuple[str, dict[str, str]]] = {}
         self._debug_write("b_candidate_precheck_start")
+        evaluation_state = clone_state_for_decode(state)
+        apply_initial_drone_layout_overlay(evaluation_state, context, self.config)
+
         for order_id in context.order_ids:
-            a_candidate = self._evaluate_initial_mode_a(state, context, order_id)
-            b_candidate = self._best_initial_mode_b(state, context, order_id)
-            c_candidate = self._best_initial_mode_c(state, context, order_id)
+            a_candidate = self._evaluate_initial_mode_a(evaluation_state, context, order_id)
+            b_candidate = self._best_initial_mode_b(evaluation_state, context, order_id)
+            c_candidate = self._best_initial_mode_c(evaluation_state, context, order_id)
             self._b_precheck_by_order[order_id] = {
                 "payload": self._order_payload(state, order_id),
                 "A": self._candidate_debug_dict(a_candidate),
@@ -538,6 +548,111 @@ class GAMMCESolver:
             generation >= int(self.config.min_generations)
             and no_improvement_count >= patience
         )
+
+    def _apply_initial_runtime_drone_layout(self, state: Any) -> None:
+        """Synchronize the configured 9/3 initial drone layout to runtime entities."""
+        if not bool(getattr(self.config, "initial_drone_layout_enabled", False)):
+            return
+        current_time = float(getattr(state, "current_time", 0.0) or 0.0)
+        max_time = float(getattr(self.config, "initial_drone_layout_max_time_s", 0.0) or 0.0)
+        if current_time > max_time:
+            return
+
+        trucks = getattr(self.entity_mgr, "trucks", {}) or {}
+        depots = getattr(self.entity_mgr, "depots", {}) or {}
+        drones = getattr(self.entity_mgr, "drones", {}) or {}
+        if not trucks or not depots or not drones:
+            return
+
+        truck_id = next(iter(trucks.keys()))
+        depot_id = next(iter(depots.keys()))
+        truck = trucks.get(truck_id)
+        depot = depots.get(depot_id)
+        if truck is None or depot is None:
+            return
+
+        truck_drone_ids = self._existing_drone_ids(getattr(self.config, "initial_truck_drone_ids", ()), drones)
+        depot_drone_ids = self._existing_drone_ids(getattr(self.config, "initial_depot_drone_ids", ()), drones)
+        if not truck_drone_ids and not depot_drone_ids:
+            return
+
+        try:
+            from core.entities.primitives import SourceType
+        except Exception:
+            SourceType = None
+
+        truck_pool = set(truck_drone_ids)
+        depot_pool = set(depot_drone_ids)
+        managed_pool = truck_pool | depot_pool
+
+        if int(getattr(truck, "parking_slots", 0) or 0) < len(truck_drone_ids):
+            truck.parking_slots = len(truck_drone_ids)
+
+        for other_truck in trucks.values():
+            existing = [did for did in getattr(other_truck, "docked_drones", []) if did not in managed_pool]
+            setattr(other_truck, "docked_drones", existing)
+
+        for item in depots.values():
+            idle = [did for did in getattr(item, "idle_drones", []) if did not in truck_pool]
+            if item is depot:
+                idle.extend(did for did in depot_drone_ids if did not in idle)
+            else:
+                idle = [did for did in idle if did not in depot_pool]
+            setattr(item, "idle_drones", list(dict.fromkeys(idle)))
+
+        truck.docked_drones = list(truck_drone_ids)
+        truck_loc = truck.get_location(current_time) if hasattr(truck, "get_location") else getattr(truck, "current_loc", None)
+        depot_loc = getattr(depot, "location", None)
+
+        for drone_id in truck_drone_ids:
+            drone = drones.get(drone_id)
+            if drone is None:
+                continue
+            if SourceType is not None:
+                drone.home_type = SourceType.TRUCK
+            drone.home_id = truck_id
+            drone.transport_truck_id = truck_id
+            drone.waiting_recovery_station_id = ""
+            if truck_loc is not None and not self._drone_is_flying(drone):
+                drone.current_loc = truck_loc
+
+        for drone_id in depot_drone_ids:
+            drone = drones.get(drone_id)
+            if drone is None:
+                continue
+            if SourceType is not None:
+                drone.home_type = SourceType.DEPOT
+            drone.home_id = depot_id
+            drone.transport_truck_id = None
+            drone.waiting_recovery_station_id = ""
+            if depot_loc is not None and not self._drone_is_flying(drone):
+                drone.current_loc = depot_loc
+
+        logger.info(
+            "[GA-MMCE] 初始运行态无人机装载已同步: truck=%s drones=%s depot=%s drones=%s",
+            truck_id,
+            truck_drone_ids,
+            depot_id,
+            depot_drone_ids,
+        )
+
+    def _existing_drone_ids(self, configured_ids: Any, drones: dict[str, Any]) -> list[str]:
+        seen: set[str] = set()
+        result: list[str] = []
+        for drone_id in configured_ids or ():
+            normalized = str(drone_id).strip()
+            if normalized and normalized in drones and normalized not in seen:
+                seen.add(normalized)
+                result.append(normalized)
+        return result
+
+    def _drone_is_flying(self, drone: Any) -> bool:
+        status = getattr(drone, "status", None)
+        is_flying = getattr(status, "is_flying", None)
+        if is_flying is not None:
+            return bool(is_flying)
+        name = getattr(status, "value", status)
+        return str(name).upper() in {"FLYING", "FLYING_TO_PICKUP", "DELIVERING", "RETURNING_TO_DEPOT"}
 
     def _should_log_generation(self, generation: int) -> bool:
         interval = max(1, int(self.config.log_interval or 1))
