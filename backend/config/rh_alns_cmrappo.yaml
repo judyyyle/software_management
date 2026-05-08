@@ -169,9 +169,9 @@ candidate:
   station_wait_threshold_sec: 240
 
   # rendezvous 与能量安全边际。
-  # Run12: 15s 裕量是按 20m/s 巡航速度调的；Run11 的 10m/s 轻型机需要翻倍到 30s，
-  # 否则 mode C 在派单时看起来可行，送达后重验会系统性 miss 掉卡车 ETA。
-  rendezvous_eta_safe_margin_sec: 30
+  # Run14: 拆分 filter / execution 两个 margin，避免候选过滤与执行重验共用同一阈值。
+  rendezvous_filter_margin_sec: 30
+  rendezvous_execution_margin_sec: 10
   energy_safe_margin_ratio: 0.10
 
   # 候选集排序和裁剪的稳定化开关。
