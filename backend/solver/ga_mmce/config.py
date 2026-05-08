@@ -58,3 +58,24 @@ class GAConfig:
     soft_rendezvous_violation: bool = True
 
     truck_wait_max_s: float = 10.0
+
+    # GA 初始静态调度的虚拟装载状态：卡车出仓时携带 1-8、11 号无人机，
+    # 仓库保留 9、10、12 号无人机。该设置只影响 GA 内部 _ga_* 状态。
+    initial_drone_layout_enabled: bool = True
+    initial_drone_layout_max_time_s: float = 1e-6
+    initial_truck_drone_ids: tuple[str, ...] = (
+        "UAV-TEST-01",
+        "UAV-TEST-02",
+        "UAV-TEST-03",
+        "UAV-TEST-04",
+        "UAV-TEST-05",
+        "UAV-TEST-06",
+        "UAV-TEST-07",
+        "UAV-TEST-08",
+        "UAV-TEST-11",
+    )
+    initial_depot_drone_ids: tuple[str, ...] = (
+        "UAV-TEST-09",
+        "UAV-TEST-10",
+        "UAV-TEST-12",
+    )
