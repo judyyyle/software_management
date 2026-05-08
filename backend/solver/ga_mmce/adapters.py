@@ -31,6 +31,24 @@ def _read_field(record: Any, field_name: str, default: Any = None) -> Any:
     return getattr(record, field_name, default)
 
 
+def _write_field(record: Any, field_name: str, value: Any) -> None:
+    if isinstance(record, dict):
+        record[field_name] = value
+    else:
+        setattr(record, field_name, value)
+
+
+def _dedupe_preserve_order(values: Iterable[Any]) -> list[str]:
+    seen: set[str] = set()
+    result: list[str] = []
+    for value in values:
+        normalized = str(value).strip()
+        if normalized and normalized not in seen:
+            seen.add(normalized)
+            result.append(normalized)
+    return result
+
+
 def _status_name(value: Any) -> str:
     if value is None:
         return ""
@@ -53,6 +71,10 @@ def _as_keys_or_ids(value: Any, id_field: str) -> list[str]:
     if isinstance(value, dict):
         return [str(key) for key in value.keys()]
     return [str(_read_field(item, id_field, "")) for item in value if _read_field(item, id_field, "")]
+
+
+def _current_time(state: Any) -> float:
+    return float(_read_field(state, "current_time", 0.0) or 0.0)
 
 
 def _entity_mgr(state: Any) -> Any:
@@ -274,10 +296,143 @@ def extract_support_node_ids(state) -> list[str]:
     return make_node_pool(extract_depot_ids(state), extract_station_ids(state))
 
 
-def build_ga_context(state) -> GAAdapterContext:
+def _initial_layout_is_enabled(state: Any, config: Any | None) -> bool:
+    if config is None:
+        return False
+    if not bool(_read_field(config, "initial_drone_layout_enabled", False)):
+        return False
+    max_time = float(_read_field(config, "initial_drone_layout_max_time_s", 0.0) or 0.0)
+    return _current_time(state) <= max_time
+
+
+def _configured_initial_layout_ids(
+    state: Any,
+    config: Any | None,
+) -> tuple[list[str], list[str]] | None:
+    if not _initial_layout_is_enabled(state, config):
+        return None
+
+    drones = _mapping(state, "drones") or {}
+    if not isinstance(drones, dict):
+        return None
+
+    locked_ids = _locked_drone_ids(state)
+    truck_ids = _dedupe_preserve_order(_read_field(config, "initial_truck_drone_ids", ()))
+    depot_ids = _dedupe_preserve_order(_read_field(config, "initial_depot_drone_ids", ()))
+
+    truck_result: list[str] = []
+    depot_result: list[str] = []
+    truck_set: set[str] = set()
+
+    for drone_id in truck_ids:
+        drone = drones.get(drone_id)
+        if drone is None or not _drone_is_available(drone, locked_ids):
+            continue
+        truck_result.append(drone_id)
+        truck_set.add(drone_id)
+
+    for drone_id in depot_ids:
+        if drone_id in truck_set:
+            continue
+        drone = drones.get(drone_id)
+        if drone is None or not _drone_is_available(drone, locked_ids):
+            continue
+        depot_result.append(drone_id)
+
+    return truck_result, depot_result
+
+
+def _record_position(record: Any, state: Any) -> Any:
+    ga_position = _read_field(record, "_ga_position")
+    if ga_position is not None:
+        return ga_position
+    if hasattr(record, "get_location"):
+        try:
+            return record.get_location(_current_time(state))
+        except Exception:
+            pass
+    return _read_field(record, "current_loc") or _read_field(record, "location")
+
+
+def _write_ga_list(record: Any, field_name: str, values: Iterable[str]) -> None:
+    _write_field(record, field_name, _dedupe_preserve_order(values))
+
+
+def apply_initial_drone_layout_overlay(
+    state: Any,
+    context: GAAdapterContext,
+    config: Any | None,
+) -> bool:
+    """Apply the configured initial drone layout to a GA-owned state copy."""
+    if not _initial_layout_is_enabled(state, config):
+        return False
+    if not context.truck_ids or not context.depot_ids:
+        return False
+
+    trucks = _mapping(state, "trucks") or {}
+    depots = _mapping(state, "depots") or {}
+    drones = _mapping(state, "drones") or {}
+    if not isinstance(trucks, dict) or not isinstance(depots, dict) or not isinstance(drones, dict):
+        return False
+
+    truck_id = context.truck_ids[0]
+    depot_id = context.depot_ids[0]
+    truck = trucks.get(truck_id)
+    depot = depots.get(depot_id)
+    if truck is None or depot is None:
+        return False
+
+    truck_position = _record_position(truck, state) or _record_position(depot, state)
+    depot_position = _record_position(depot, state)
+    now = _current_time(state)
+
+    for item in trucks.values():
+        _write_ga_list(item, "_ga_docked_drones", [])
+    for item in depots.values():
+        _write_ga_list(item, "_ga_idle_drones", [])
+    for station in _as_values(_mapping(state, "stations")):
+        _write_ga_list(station, "_ga_idle_drones", [])
+        _write_ga_list(station, "_ga_waiting_drones", [])
+
+    for drone_id in context.truck_drone_ids:
+        drone = drones.get(drone_id)
+        if drone is None:
+            continue
+        _write_field(drone, "_ga_host_type", "TRUCK")
+        _write_field(drone, "_ga_host_node_id", depot_id)
+        _write_field(drone, "_ga_transport_truck_id", truck_id)
+        _write_field(drone, "_ga_waiting_station_id", None)
+        _write_field(drone, "_ga_position", truck_position)
+        _write_field(drone, "_ga_node_id", depot_id)
+        _write_field(drone, "_ga_time", now)
+        _write_field(drone, "_ga_energy", _read_field(drone, "battery_current", 0.0))
+
+    for drone_id in context.depot_drone_ids:
+        drone = drones.get(drone_id)
+        if drone is None:
+            continue
+        _write_field(drone, "_ga_host_type", "DEPOT")
+        _write_field(drone, "_ga_host_node_id", depot_id)
+        _write_field(drone, "_ga_transport_truck_id", None)
+        _write_field(drone, "_ga_waiting_station_id", None)
+        _write_field(drone, "_ga_position", depot_position)
+        _write_field(drone, "_ga_node_id", depot_id)
+        _write_field(drone, "_ga_time", now)
+        _write_field(drone, "_ga_energy", _read_field(drone, "battery_current", 0.0))
+
+    _write_ga_list(truck, "_ga_docked_drones", context.truck_drone_ids)
+    _write_ga_list(depot, "_ga_idle_drones", context.depot_drone_ids)
+    return True
+
+
+def build_ga_context(state, config: Any | None = None) -> GAAdapterContext:
     order_ids = extract_active_order_ids(state)
-    truck_drone_ids = extract_truck_drone_ids(state)
-    depot_drone_ids = extract_depot_drone_ids(state)
+    configured_layout = _configured_initial_layout_ids(state, config)
+    if configured_layout is None:
+        truck_drone_ids = extract_truck_drone_ids(state)
+        depot_drone_ids = extract_depot_drone_ids(state)
+    else:
+        truck_drone_ids, depot_drone_ids = configured_layout
     all_drone_ids = extract_all_drone_ids(state)
     truck_ids = extract_truck_ids(state)
     depot_ids = extract_depot_ids(state)
