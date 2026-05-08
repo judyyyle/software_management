@@ -118,9 +118,16 @@ def _copy_seed_if_valid(
     seed: Individual,
     order_set: set[str],
     gene_set: set[str],
+    fixed_tail_order_ids: list[str] | None = None,
+    fixed_tail_gene_by_order: dict[str, tuple[str, dict[str, str] | None]] | None = None,
 ) -> Individual | None:
     copied = copy.deepcopy(seed)
     try:
+        enforce_fixed_tail(
+            copied,
+            fixed_tail_order_ids or [],
+            fixed_tail_gene_by_order or {},
+        )
         copied.validate()
     except ValueError:
         return None
@@ -130,6 +137,43 @@ def _copy_seed_if_valid(
     if any(gene not in gene_set for gene in copied.assignment):
         return None
     return copied
+
+
+def enforce_fixed_tail(
+    ind: Individual,
+    fixed_tail_order_ids: list[str] | None = None,
+    fixed_tail_gene_by_order: dict[str, tuple[str, dict[str, str] | None]] | None = None,
+) -> Individual:
+    """Keep frozen future orders at the tail with their preserved genes."""
+    tail_ids = [str(order_id) for order_id in (fixed_tail_order_ids or [])]
+    if not tail_ids:
+        return ind
+
+    ind.validate()
+    tail_set = set(tail_ids)
+    gene_map = {
+        order_id: (gene, copy.deepcopy(rv))
+        for order_id, gene, rv in zip(ind.sequence, ind.assignment, ind.rendezvous)
+    }
+    for order_id, value in (fixed_tail_gene_by_order or {}).items():
+        gene, rv = value
+        gene_map[str(order_id)] = (str(gene), copy.deepcopy(rv))
+
+    head_ids = [order_id for order_id in ind.sequence if order_id not in tail_set]
+    existing_tail_ids = [order_id for order_id in tail_ids if order_id in set(ind.sequence)]
+    sequence = head_ids + existing_tail_ids
+    assignment: list[str] = []
+    rendezvous = []
+    for order_id in sequence:
+        gene, rv = gene_map.get(order_id, ("A", None))
+        assignment.append(gene)
+        rendezvous.append(copy.deepcopy(rv))
+
+    ind.sequence = sequence
+    ind.assignment = assignment
+    ind.rendezvous = rendezvous
+    ind.validate()
+    return ind
 
 
 def initialize_population(
@@ -145,6 +189,8 @@ def initialize_population(
     use_balanced_initialization: bool = True,
     b_seed_rendezvous_by_order: dict[str, tuple[str, dict[str, str]]] | None = None,
     mutation_mode_probabilities: dict[str, float] | None = None,
+    fixed_tail_order_ids: list[str] | None = None,
+    fixed_tail_gene_by_order: dict[str, tuple[str, dict[str, str] | None]] | None = None,
 ) -> list[Individual]:
     _check_inputs(order_ids, gene_pool, support_node_ids)
     if pop_size <= 0:
@@ -155,26 +201,54 @@ def initialize_population(
     population: list[Individual] = []
 
     if warm_start:
-        for seed in warm_start:
-            copied = _copy_seed_if_valid(seed, order_set, gene_set)
+        ranked_warm_starts = sorted(
+            list(warm_start),
+            key=lambda ind: float(getattr(ind, "fitness", float("inf"))),
+        )
+        for seed in ranked_warm_starts:
+            copied = _copy_seed_if_valid(
+                seed,
+                order_set,
+                gene_set,
+                fixed_tail_order_ids,
+                fixed_tail_gene_by_order,
+            )
             if copied is not None:
                 population.append(copied)
+            if len(population) >= pop_size:
+                return population[:pop_size]
 
     if greedy_seed is not None:
-        copied = _copy_seed_if_valid(greedy_seed, order_set, gene_set)
+        copied = _copy_seed_if_valid(
+            greedy_seed,
+            order_set,
+            gene_set,
+            fixed_tail_order_ids,
+            fixed_tail_gene_by_order,
+        )
         if copied is not None:
             population.append(copied)
 
     if use_truck_only_seed:
-        population.append(make_truck_only_individual(order_ids))
+        population.append(
+            enforce_fixed_tail(
+                make_truck_only_individual(order_ids),
+                fixed_tail_order_ids,
+                fixed_tail_gene_by_order,
+            )
+        )
 
     if use_obl_seed and population:
         population.append(
-            make_obl_individual(
-                population[0],
-                gene_pool,
-                support_node_ids,
-                allow_c_recover_station,
+            enforce_fixed_tail(
+                make_obl_individual(
+                    population[0],
+                    gene_pool,
+                    support_node_ids,
+                    allow_c_recover_station,
+                ),
+                fixed_tail_order_ids,
+                fixed_tail_gene_by_order,
             )
         )
 
@@ -186,7 +260,13 @@ def initialize_population(
             b_gene, rv = seed_data
             if b_gene not in gene_set:
                 continue
-            population.append(make_single_b_seed_individual(order_ids, order_id, b_gene, rv))
+            population.append(
+                enforce_fixed_tail(
+                    make_single_b_seed_individual(order_ids, order_id, b_gene, rv),
+                    fixed_tail_order_ids,
+                    fixed_tail_gene_by_order,
+                )
+            )
             if len(population) >= pop_size:
                 return population[:pop_size]
 
@@ -202,24 +282,32 @@ def initialize_population(
         while len(population) < target:
             recipe = recipes[index % len(recipes)]
             population.append(
-                make_random_individual(
-                    order_ids,
-                    gene_pool,
-                    support_node_ids,
-                    allow_c_recover_station,
-                    recipe,
+                enforce_fixed_tail(
+                    make_random_individual(
+                        order_ids,
+                        gene_pool,
+                        support_node_ids,
+                        allow_c_recover_station,
+                        recipe,
+                    ),
+                    fixed_tail_order_ids,
+                    fixed_tail_gene_by_order,
                 )
             )
             index += 1
 
     while len(population) < pop_size:
         population.append(
-            make_random_individual(
-                order_ids,
-                gene_pool,
-                support_node_ids,
-                allow_c_recover_station,
-                mutation_mode_probabilities,
+            enforce_fixed_tail(
+                make_random_individual(
+                    order_ids,
+                    gene_pool,
+                    support_node_ids,
+                    allow_c_recover_station,
+                    mutation_mode_probabilities,
+                ),
+                fixed_tail_order_ids,
+                fixed_tail_gene_by_order,
             )
         )
 

@@ -52,8 +52,15 @@ def _depot_nodes(support_node_ids: list[str]) -> list[str]:
 def make_random_rendezvous_for_gene(
     gene: str,
     support_node_ids: list[str],
+    station_ids: list[str] | bool | None = None,
     allow_c_recover_station: bool = True,
 ) -> Rendezvous:
+    if isinstance(station_ids, bool):
+        allow_c_recover_station = station_ids
+        station_ids = None
+    elif station_ids is not None:
+        support_node_ids = list(support_node_ids) + list(station_ids)
+
     if gene == "A":
         return None
 
