@@ -265,7 +265,8 @@ class _YamlConfig:
     max_wait_decision_gap_sec: float
     max_candidate_recovery_per_order: int
     recovery_pool_future_scan_limit: int
-    rendezvous_eta_safe_margin_sec: float
+    rendezvous_filter_margin_sec: float
+    rendezvous_execution_margin_sec: float
     reservation_enabled: bool
     reservation_alpha: float
     reservation_beta: float
@@ -2021,12 +2022,12 @@ class TrainingEnvAdapter:
             to_pos=host_pos,
         )
         if (
-            t_arrive_uav + self._cfg.rendezvous_eta_safe_margin_sec
+            t_arrive_uav + self._cfg.rendezvous_execution_margin_sec
             > t_arrive_truck + _TIME_EPS
         ):
             return (
                 t_arrive_uav
-                + self._cfg.rendezvous_eta_safe_margin_sec
+                + self._cfg.rendezvous_execution_margin_sec
                 - t_arrive_truck
             )
         # 注意：不在此处做能量检查。
@@ -2305,7 +2306,7 @@ class TrainingEnvAdapter:
             to_pos=recover_pos,
         )
         if (
-            t_arrive_uav + self._cfg.rendezvous_eta_safe_margin_sec
+            t_arrive_uav + self._cfg.rendezvous_filter_margin_sec
             > t_arrive_truck + _TIME_EPS
         ):
             return False
@@ -2435,7 +2436,7 @@ class TrainingEnvAdapter:
             to_pos=host_pos,
         )
         rendezvous_time_feasible = (
-            t_arrive_uav + self._cfg.rendezvous_eta_safe_margin_sec
+            t_arrive_uav + self._cfg.rendezvous_execution_margin_sec
             <= coarse_plan.truck_eta_map[node_id] + _TIME_EPS
         )
         checks = {
@@ -3366,7 +3367,21 @@ def _load_env_yaml(config_path: Path) -> _YamlConfig:
         max_wait_decision_gap_sec=float(planner["max_wait_decision_gap_sec"]),
         max_candidate_recovery_per_order=max_candidate_recovery_per_order,
         recovery_pool_future_scan_limit=recovery_pool_future_scan_limit,
-        rendezvous_eta_safe_margin_sec=float(candidate["rendezvous_eta_safe_margin_sec"]),
+        rendezvous_filter_margin_sec=float(
+            candidate.get(
+                "rendezvous_filter_margin_sec",
+                candidate.get("rendezvous_eta_safe_margin_sec"),
+            )
+        ),
+        rendezvous_execution_margin_sec=float(
+            candidate.get(
+                "rendezvous_execution_margin_sec",
+                candidate.get(
+                    "rendezvous_filter_margin_sec",
+                    candidate.get("rendezvous_eta_safe_margin_sec"),
+                ),
+            )
+        ),
         reservation_enabled=bool(reservation.get("enable", True)),
         reservation_alpha=float(reservation["alpha"]),
         reservation_beta=float(reservation["beta"]),

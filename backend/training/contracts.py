@@ -759,7 +759,8 @@ class CandidateMeta:
     max_candidate_recovery_per_order: int
     max_candidate_actions: int
     station_wait_threshold_sec: float
-    rendezvous_eta_safe_margin_sec: float
+    rendezvous_filter_margin_sec: float
+    rendezvous_execution_margin_sec: float
     energy_safe_margin_ratio: float
 
 

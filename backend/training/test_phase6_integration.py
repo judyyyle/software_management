@@ -766,7 +766,7 @@ class TestPhase6Integration(unittest.TestCase):
             launch_time
             + deliver_fly
             + recover_fly
-            + env._cfg.rendezvous_eta_safe_margin_sec
+            + env._cfg.rendezvous_execution_margin_sec
             + env._scene_solver_params().drone_service_time_order_s
             - 1.0
         )

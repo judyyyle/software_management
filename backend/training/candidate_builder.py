@@ -51,7 +51,7 @@ class _CandidateConfig:
     max_candidate_recovery_per_order: int
     max_candidate_actions: int
     station_wait_threshold_sec: float
-    rendezvous_eta_safe_margin_sec: float
+    rendezvous_filter_margin_sec: float
 
 
 class CandidateBuilder:
@@ -409,7 +409,7 @@ class CandidateBuilder:
                 to_pos=node_state.position,
             )
             rendezvous_margin = float(t_arrive_truck) - (
-                t_arrive_uav + self._cfg.rendezvous_eta_safe_margin_sec
+                t_arrive_uav + self._cfg.rendezvous_filter_margin_sec
             )
             if rendezvous_margin < -_TIME_EPS:
                 continue
@@ -741,8 +741,11 @@ def _load_candidate_config(config_path: Path) -> _CandidateConfig:
         ),
         max_candidate_actions=int(candidate["max_candidate_actions"]),
         station_wait_threshold_sec=float(candidate["station_wait_threshold_sec"]),
-        rendezvous_eta_safe_margin_sec=float(
-            candidate["rendezvous_eta_safe_margin_sec"]
+        rendezvous_filter_margin_sec=float(
+            candidate.get(
+                "rendezvous_filter_margin_sec",
+                candidate.get("rendezvous_eta_safe_margin_sec"),
+            )
         ),
     )
 
