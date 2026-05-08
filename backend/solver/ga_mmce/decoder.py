@@ -829,6 +829,9 @@ class GADecoder:
         return float(self._read_field(state, "current_time", 0.0) or 0.0)
 
     def _truck_start_position(self, truck: Any, current_time: float) -> Any:
+        ga_pos = self._read_field(truck, "_ga_position")
+        if ga_pos is not None:
+            return ga_pos
         if hasattr(truck, "get_location"):
             return truck.get_location(current_time)
         return self._read_field(truck, "current_loc") or self._read_field(truck, "_ga_position")

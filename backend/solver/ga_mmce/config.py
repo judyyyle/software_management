@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass, replace
+from typing import Any
 
 
 @dataclass
@@ -23,6 +24,10 @@ class GAConfig:
     use_obl_seed: bool = True
     use_balanced_initialization: bool = True
     use_b_seeded_initialization: bool = True
+    use_warm_start: bool = True
+    warm_start_mutations: int = 0
+    reopt_window_size: int | None = None
+    reopt_horizon_seconds: float | None = None
 
     mutation_mode_prob_a: float = 0.40
     mutation_mode_prob_b: float = 0.25
@@ -50,6 +55,7 @@ class GAConfig:
     save_evolution_csv: bool = True
     save_evolution_plots: bool = True
     b_candidate_precheck: bool = True
+    diagnostics_label: str = "static"
 
     # 是否允许 C 模式无人机送完后落在充换电站；若 False，则 C 必须回仓。
     allow_depot_drone_recover_at_station: bool = True
@@ -79,3 +85,61 @@ class GAConfig:
         "UAV-TEST-10",
         "UAV-TEST-12",
     )
+
+
+STATIC_GA_CONFIG: dict[str, Any] = {
+    "population_size": 80,
+    "max_generations": 120,
+    "min_generations": 80,
+    "early_stopping_patience": 40,
+    "improvement_tolerance": 1e-3,
+    "log_interval": 10,
+    "enable_csv": True,
+    "enable_png": True,
+    "use_warm_start": True,
+    "diagnostics_label": "static",
+}
+
+
+DYNAMIC_GA_CONFIG: dict[str, Any] = {
+    "population_size": 30,
+    "max_generations": 60,
+    "min_generations": 15,
+    "early_stopping_patience": 10,
+    "improvement_tolerance": 1e-6,
+    "log_interval": 5,
+    "time_budget_seconds": 3.0,
+    "enable_csv": True,
+    "enable_png": False,
+    "use_warm_start": True,
+    "warm_start_mutations": 10,
+    "reopt_window_size": 8,
+    "diagnostics_label": "dynamic",
+}
+
+
+_CONFIG_ALIASES = {
+    "max_generations": "generations",
+    "time_budget_seconds": "max_runtime_seconds",
+    "enable_csv": "save_evolution_csv",
+    "enable_png": "save_evolution_plots",
+}
+
+
+def make_ga_config(
+    overrides: GAConfig | dict[str, Any] | None = None,
+    base: GAConfig | None = None,
+) -> GAConfig:
+    """Return a GAConfig, accepting public dict aliases used by API callers."""
+    if overrides is None:
+        return replace(base) if base is not None else GAConfig()
+    if isinstance(overrides, GAConfig):
+        return replace(overrides)
+
+    values = asdict(base) if base is not None else asdict(GAConfig())
+    valid_fields = set(values)
+    for raw_key, value in dict(overrides).items():
+        key = _CONFIG_ALIASES.get(str(raw_key), str(raw_key))
+        if key in valid_fields:
+            values[key] = value
+    return GAConfig(**values)

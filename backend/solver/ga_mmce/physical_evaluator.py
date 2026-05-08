@@ -155,6 +155,37 @@ class PhysicalEvaluator:
                 return True
         return False
 
+    def _is_drone_at_ga_station(self, state: Any, drone: Any, drone_id: str) -> bool:
+        host_type = self._read_field(drone, "_ga_host_type")
+        if host_type is not None:
+            return str(host_type).upper() == "STATION"
+        for _, station in self._station_items(state):
+            idle_drones = self._ga_list(station, "_ga_idle_drones", "idle_drones")
+            if drone_id in idle_drones:
+                return True
+        return False
+
+    def _independent_launch_node(self, state: Any, drone: Any, drone_id: str) -> tuple[str, Any] | tuple[None, None]:
+        host_type = str(self._read_field(drone, "_ga_host_type", "") or "").upper()
+        host_node_id = str(self._read_field(drone, "_ga_host_node_id", "") or "")
+        if host_type in {"DEPOT", "STATION"} and host_node_id:
+            launch_pos = self.get_node_position(host_node_id, state)
+            if launch_pos is not None:
+                return host_node_id, launch_pos
+
+        for depot_id, depot in self._depot_items(state):
+            idle_drones = self._ga_list(depot, "_ga_idle_drones", "idle_drones")
+            if drone_id in idle_drones:
+                return depot_id, self._read_field(depot, "location")
+
+        for station_id, station in self._station_items(state):
+            idle_drones = self._ga_list(station, "_ga_idle_drones", "idle_drones")
+            if drone_id in idle_drones:
+                return station_id, self._read_field(station, "location")
+
+        depot_id, depot = self._first_depot(state)
+        return depot_id, self._read_field(depot, "location")
+
     def _remove_drone_from_ga_hosts(self, state: Any, drone_id: str) -> None:
         for truck in self._mapping(state, "trucks").values():
             drones = self._ga_list(truck, "_ga_docked_drones", "docked_drones")
@@ -234,12 +265,16 @@ class PhysicalEvaluator:
         return str(value).strip().upper()
 
     def _is_idle(self, entity: Any) -> bool:
+        if bool(self._read_field(entity, "_ga_force_available", False)):
+            return True
         status = self._read_field(entity, "status")
         if hasattr(status, "is_dispatchable"):
             return bool(status.is_dispatchable)
         return self._status_name(status) == "IDLE"
 
     def _has_pending_route(self, drone: Any) -> bool:
+        if bool(self._read_field(drone, "_ga_force_available", False)):
+            return False
         value = self._read_field(drone, "has_pending_route")
         if value is not None:
             return bool(value)
@@ -317,14 +352,16 @@ class PhysicalEvaluator:
         drone = drones.get(drone_id)
         if drone is None:
             return False, "drone_not_found"
-        if not self._is_idle(drone):
-            return False, "drone_not_idle"
-        if self._read_field(drone, "carrying_order_id"):
-            return False, "drone_busy"
-        if self._read_field(drone, "waiting_recovery_station_id"):
-            return False, "drone_waiting_recovery"
-        if self._has_pending_route(drone):
-            return False, "drone_has_pending_route"
+        force_available = bool(self._read_field(drone, "_ga_force_available", False))
+        if not force_available:
+            if not self._is_idle(drone):
+                return False, "drone_not_idle"
+            if self._read_field(drone, "carrying_order_id"):
+                return False, "drone_busy"
+            if self._read_field(drone, "waiting_recovery_station_id"):
+                return False, "drone_waiting_recovery"
+            if self._has_pending_route(drone):
+                return False, "drone_has_pending_route"
 
         mode = mode.upper()
         if mode == "B":
@@ -339,9 +376,9 @@ class PhysicalEvaluator:
                 return False, "drone_on_truck"
             if self._read_field(drone, "transport_truck_id"):
                 return False, "drone_on_truck"
-            if self._is_drone_at_ga_depot(state, drone, drone_id):
+            if self._is_drone_at_ga_depot(state, drone, drone_id) or self._is_drone_at_ga_station(state, drone, drone_id):
                 return True, ""
-            return False, "drone_not_at_depot"
+            return False, "drone_not_at_independent_node"
 
         return False, f"unknown_mode:{mode}"
 
@@ -541,8 +578,9 @@ class PhysicalEvaluator:
         if float(self._read_field(order, "payload_weight", 0.0) or 0.0) > float(self._read_field(drone, "payload_capacity", 0.0) or 0.0):
             return GACandidate(order_id, "C", False, drone_id=drone_id, reason="payload_exceed")
 
-        depot_node_id, depot = self._first_depot(state)
-        launch_pos = depot.location
+        launch_node_id, launch_pos = self._independent_launch_node(state, drone, drone_id)
+        if launch_node_id is None or launch_pos is None:
+            return GACandidate(order_id, "C", False, drone_id=drone_id, reason="missing_launch_node")
         recover_pos = self.get_node_position(recover_node_id, state)
         payload = float(self._read_field(order, "payload_weight", 0.0) or 0.0)
         ok, energy_need, reason = self._check_fixed_recovery_energy(drone, launch_pos, order.delivery_loc, recover_pos, payload)
@@ -563,7 +601,7 @@ class PhysicalEvaluator:
             mode="C",
             feasible=True,
             drone_id=drone_id,
-            launch_node_id=depot_node_id,
+            launch_node_id=launch_node_id,
             recover_node_id=recover_node_id,
             completion_time=delivery_done,
             uav_distance=uav_dist_out + uav_dist_back,

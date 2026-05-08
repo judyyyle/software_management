@@ -17,13 +17,13 @@ from .adapters import (
     greedy_plan_to_individual,
 )
 from .chromosome import Individual
-from .config import GAConfig
+from .config import GAConfig, make_ga_config
 from .diagnostics import write_evolution_csv, write_evolution_plots, write_mode_precheck_csv
 from .decoder import DispatchPlan, GADecoder
 from .fitness import compute_fitness
 from .operators import mutate, order_crossover, tournament_select
 from .physical_evaluator import PhysicalEvaluator
-from .population import initialize_population
+from .population import enforce_fixed_tail, initialize_population
 
 
 logger = logging.getLogger(__name__)
@@ -57,6 +57,10 @@ class GAMMCESolver:
         self._last_generation_seconds: float = 0.0
         self._early_stop_info: dict[str, Any] = {}
         self._b_precheck_by_order: dict[str, dict[str, Any]] = {}
+        self._active_time_budget_seconds: float | None = None
+        self._time_budget_hit: bool = False
+        self._actual_generations: int = 0
+        self._active_diagnostics_label: str = "static"
 
         if self.config.random_seed is not None:
             random.seed(self.config.random_seed)
@@ -91,7 +95,8 @@ class GAMMCESolver:
             bbox=bbox,
             scene_id=scene_id,
         )
-        return self.solve(state, dispatch_type="incremental")
+        setattr(state, "_ga_solver", self)
+        return self.reschedule_on_event(state, new_orders, current_time)
 
     def dispatch_replan_current_state(
         self,
@@ -107,7 +112,19 @@ class GAMMCESolver:
             bbox=bbox,
             scene_id=scene_id,
         )
-        return self.solve(state, dispatch_type="dynamic_replan")
+        setattr(state, "_ga_solver", self)
+        return self.reschedule_on_event(state, {}, current_time)
+
+    def reschedule_on_event(
+        self,
+        state: Any,
+        new_orders: dict[str, Any],
+        event_time: float,
+    ) -> DispatchPlan:
+        from .dynamic_rescheduler import reschedule_on_event
+
+        setattr(state, "_ga_solver", self)
+        return reschedule_on_event(state, new_orders, event_time)
 
     def should_replan_unfinished(self) -> bool:
         return True
@@ -134,13 +151,35 @@ class GAMMCESolver:
         self,
         state: Any,
         warm_start: Individual | list[Individual] | None = None,
+        config: GAConfig | dict[str, Any] | None = None,
+        time_budget_seconds: float | None = None,
         dispatch_type: str = "ga_mmce",
     ) -> DispatchPlan:
+        previous_config = self.config
+        previous_evaluator_config = self.evaluator.config
+        previous_decoder_config = self.decoder.config
+        if config is not None or time_budget_seconds is not None:
+            self.config = make_ga_config(config, base=self.config)
+            if time_budget_seconds is not None:
+                self.config.max_runtime_seconds = float(time_budget_seconds)
+            self.evaluator.config = self.config
+            self.decoder.config = self.config
+
         started = time.time()
         self._debug_eval_errors = {}
         self._evolution_rows = []
         self._mutation_stats = self._empty_mutation_stats()
         self._last_generation_seconds = 0.0
+        self._actual_generations = 0
+        self._time_budget_hit = False
+        self._active_time_budget_seconds = (
+            float(time_budget_seconds)
+            if time_budget_seconds is not None
+            else float(self.config.max_runtime_seconds)
+            if self.config.max_runtime_seconds is not None
+            else None
+        )
+        self._active_diagnostics_label = self._resolve_diagnostics_label(dispatch_type)
         self._early_stop_info = {
             "last_improvement_gen": -1,
             "no_improvement_count": 0,
@@ -150,29 +189,42 @@ class GAMMCESolver:
         self._b_precheck_by_order = {}
         if dispatch_type == "full":
             self._apply_initial_runtime_drone_layout(state)
-        context = build_ga_context(state, self.config)
+        context = build_ga_context(
+            state,
+            self.config,
+            mode="dynamic" if "dynamic" in str(dispatch_type) or "incremental" in str(dispatch_type) else "static",
+        )
         self._debug_run_start(state, context, dispatch_type)
 
         if not context.order_ids:
             plan = self._empty_plan(dispatch_type=dispatch_type)
+            self._attach_solve_result(plan, None, started)
             self._debug_run_end(plan, None, context, started)
+            self._restore_runtime_config(previous_config, previous_evaluator_config, previous_decoder_config)
             return plan
         if self.config.population_size <= 0:
             plan = self._empty_plan(dispatch_type=dispatch_type, reason="population_size_not_positive")
+            self._attach_solve_result(plan, None, started)
             self._debug_run_end(plan, None, context, started)
+            self._restore_runtime_config(previous_config, previous_evaluator_config, previous_decoder_config)
             return plan
 
         self._prepare_distance_context(state)
 
         greedy_seed = self._build_greedy_seed(state, context)
         b_seed_rendezvous_by_order = self._build_b_precheck_and_seed_data(state, context)
+        warm_start_seeds = self._prepare_warm_start_seeds(
+            self._normalize_warm_start(warm_start),
+            state,
+            context,
+        )
         population = initialize_population(
             order_ids=context.order_ids,
             gene_pool=context.gene_pool,
             support_node_ids=context.support_node_ids,
             pop_size=self.config.population_size,
             greedy_seed=greedy_seed,
-            warm_start=self._normalize_warm_start(warm_start),
+            warm_start=warm_start_seeds,
             use_truck_only_seed=self.config.use_truck_only_seed,
             use_obl_seed=self.config.use_obl_seed,
             allow_c_recover_station=self.config.allow_depot_drone_recover_at_station,
@@ -183,10 +235,14 @@ class GAMMCESolver:
                 else None
             ),
             mutation_mode_probabilities=self._mutation_mode_probabilities(),
+            fixed_tail_order_ids=context.fixed_tail_order_ids,
+            fixed_tail_gene_by_order=context.fixed_tail_gene_by_order,
         )
         if not population:
             plan = self._empty_plan(dispatch_type=dispatch_type, reason="population_init_failed")
+            self._attach_solve_result(plan, None, started)
             self._debug_run_end(plan, None, context, started)
+            self._restore_runtime_config(previous_config, previous_evaluator_config, previous_decoder_config)
             return plan
 
         self._evaluate_population(population, state, context)
@@ -200,10 +256,12 @@ class GAMMCESolver:
 
         for generation in range(self.config.generations):
             if self._timeout(started):
+                self._time_budget_hit = True
                 break
 
             final_population_needs_record = False
             final_generation_index = generation
+            self._actual_generations = max(self._actual_generations, generation + 1)
             generation_started = time.time()
             population.sort(key=lambda ind: ind.fitness)
             current_best = float(population[0].fitness)
@@ -255,6 +313,9 @@ class GAMMCESolver:
             new_population.extend(copy.deepcopy(population[:elite_n]))
 
             while len(new_population) < self.config.population_size:
+                if self._timeout(started):
+                    self._time_budget_hit = True
+                    break
                 p1 = tournament_select(population, self.config.tournament_k)
                 p2 = tournament_select(population, self.config.tournament_k)
 
@@ -274,16 +335,26 @@ class GAMMCESolver:
                         allow_c_recover_station=self.config.allow_depot_drone_recover_at_station,
                         mode_probabilities=self._mutation_mode_probabilities(),
                     )
+                    enforce_fixed_tail(
+                        child,
+                        context.fixed_tail_order_ids,
+                        context.fixed_tail_gene_by_order,
+                    )
                     self._accumulate_mutation_stats(mutation_stats)
                     self._evaluate_individual(child, state, context)
                     new_population.append(child)
                     if len(new_population) >= self.config.population_size:
                         break
 
+            if self._time_budget_hit and len(new_population) < self.config.population_size:
+                population.sort(key=lambda ind: ind.fitness)
+                new_population.extend(copy.deepcopy(population[: self.config.population_size - len(new_population)]))
             population = new_population
             self._last_generation_seconds = time.time() - generation_started
             final_population_needs_record = True
             final_generation_index = generation + 1
+            if self._time_budget_hit:
+                break
 
         if final_population_needs_record and population:
             population.sort(key=lambda ind: ind.fitness)
@@ -296,8 +367,10 @@ class GAMMCESolver:
         plan = best.decoded_plan or self._empty_plan(dispatch_type=dispatch_type, reason="best_has_no_plan")
         self._annotate_plan(plan, context, started, dispatch_type)
         plan.summary["b_mode_final_diag"] = self._build_b_final_summary(best)
+        self._attach_solve_result(plan, best, started)
         self._write_evolution_outputs()
         self._debug_run_end(plan, best, context, started)
+        self._restore_runtime_config(previous_config, previous_evaluator_config, previous_decoder_config)
         return plan
 
     def _evaluate_population(self, population: list[Individual], state: Any, context: Any) -> None:
@@ -522,16 +595,65 @@ class GAMMCESolver:
         self,
         warm_start: Individual | list[Individual] | None,
     ) -> list[Individual]:
+        if not bool(getattr(self.config, "use_warm_start", True)):
+            return []
         if warm_start is None:
             return [self.last_best_individual] if self.last_best_individual is not None else []
         if isinstance(warm_start, list):
-            return warm_start
+            return [seed for seed in warm_start if seed is not None]
         return [warm_start]
 
+    def _prepare_warm_start_seeds(
+        self,
+        warm_start: list[Individual],
+        state: Any,
+        context: Any,
+    ) -> list[Individual]:
+        if not warm_start:
+            return []
+
+        ranked: list[Individual] = []
+        for seed in warm_start:
+            copied = copy.deepcopy(seed)
+            try:
+                enforce_fixed_tail(
+                    copied,
+                    context.fixed_tail_order_ids,
+                    context.fixed_tail_gene_by_order,
+                )
+                if set(copied.sequence) != set(context.order_ids):
+                    continue
+                if any(gene not in set(context.gene_pool) for gene in copied.assignment):
+                    continue
+                self._evaluate_individual(copied, state, context)
+                ranked.append(copied)
+            except Exception:
+                continue
+        ranked.sort(key=lambda ind: float(getattr(ind, "fitness", float("inf"))))
+        return ranked
+
     def _timeout(self, started: float) -> bool:
-        if self.config.max_runtime_seconds is None:
+        budget = self._active_time_budget_seconds
+        if budget is None:
             return False
-        return time.time() - started >= self.config.max_runtime_seconds
+        return time.time() - started >= budget
+
+    def _restore_runtime_config(
+        self,
+        config: GAConfig,
+        evaluator_config: GAConfig,
+        decoder_config: GAConfig,
+    ) -> None:
+        self.config = config
+        self.evaluator.config = evaluator_config
+        self.decoder.config = decoder_config
+        self._active_time_budget_seconds = None
+
+    def _resolve_diagnostics_label(self, dispatch_type: str) -> str:
+        configured = str(getattr(self.config, "diagnostics_label", "") or "").strip().lower()
+        if configured in {"static", "dynamic"}:
+            return configured
+        return "dynamic" if "dynamic" in str(dispatch_type) or "incremental" in str(dispatch_type) else "static"
 
     def _mutation_mode_probabilities(self) -> dict[str, float]:
         return {
@@ -821,13 +943,15 @@ class GAMMCESolver:
         if not self.config.diagnostics_enabled:
             return
         log_dir = self._diagnostics_dir()
+        label = self._active_diagnostics_label or "static"
         try:
             if self.config.save_evolution_csv and self._evolution_rows:
-                write_evolution_csv(self._evolution_rows, log_dir / "ga_evolution_static.csv")
+                write_evolution_csv(self._evolution_rows, log_dir / f"ga_evolution_{label}.csv")
             if self.config.save_evolution_csv and self._b_precheck_by_order:
-                write_mode_precheck_csv(self._b_precheck_by_order, log_dir / "ga_mode_precheck_static.csv")
+                write_mode_precheck_csv(self._b_precheck_by_order, log_dir / f"ga_mode_precheck_{label}.csv")
             if self.config.save_evolution_plots:
-                write_evolution_plots(self._evolution_rows, log_dir)
+                plot_dir = log_dir if label == "static" else log_dir / label
+                write_evolution_plots(self._evolution_rows, plot_dir)
         except Exception as exc:
             self._debug_write(f"diagnostics_output_failed reason={exc}")
 
@@ -1054,9 +1178,13 @@ class GAMMCESolver:
             modes[allocation.mode] = modes.get(allocation.mode, 0) + 1
 
         summary = plan.summary
-        summary["ga_feasible"] = bool(summary.get("feasible", False))
         summary["total_orders"] = len(context.order_ids)
         summary["feasible"] = sum(1 for allocation in plan.allocations if allocation.feasible)
+        unserved_ids = summary.get("unserved_order_ids", []) or []
+        summary["ga_feasible"] = (
+            summary["feasible"] == summary["total_orders"]
+            and not unserved_ids
+        )
         summary["modes"] = modes
         summary["dispatch_type"] = dispatch_type
         summary["solver"] = "ga_mmce"
@@ -1071,6 +1199,47 @@ class GAMMCESolver:
         }
         summary["early_stopping"] = dict(self._early_stop_info)
         summary["b_candidate_precheck"] = dict(self._b_precheck_by_order)
+
+    def _attach_solve_result(
+        self,
+        plan: DispatchPlan,
+        best: Individual | None,
+        started: float,
+    ) -> None:
+        elapsed = time.time() - started
+        ga_feasible = bool(plan.summary.get("ga_feasible", plan.summary.get("feasible", False)))
+        if int(plan.summary.get("total_orders", 0) or 0) == 0 and not plan.summary.get("unserved_order_ids"):
+            ga_feasible = True
+        plan.summary["best_individual"] = self._individual_summary(best)
+        plan.summary["best_plan"] = "attached"
+        plan.summary["ga_feasible"] = ga_feasible
+        plan.summary["actual_generations"] = int(self._actual_generations)
+        plan.summary["elapsed_seconds"] = elapsed
+        plan.summary["early_stop_triggered"] = bool(self._early_stop_info.get("early_stop_triggered", False))
+        plan.summary["time_budget_hit"] = bool(self._time_budget_hit)
+        plan.summary.setdefault("fallback_used", False)
+
+        try:
+            setattr(plan, "best_individual", copy.deepcopy(best))
+            setattr(plan, "best_plan", plan)
+            setattr(plan, "ga_feasible", ga_feasible)
+            setattr(plan, "actual_generations", int(self._actual_generations))
+            setattr(plan, "elapsed_seconds", elapsed)
+            setattr(plan, "early_stop_triggered", bool(self._early_stop_info.get("early_stop_triggered", False)))
+            setattr(plan, "time_budget_hit", bool(self._time_budget_hit))
+            setattr(plan, "fallback_used", bool(plan.summary.get("fallback_used", False)))
+        except Exception:
+            pass
+
+    def _individual_summary(self, individual: Individual | None) -> dict[str, Any] | None:
+        if individual is None:
+            return None
+        return {
+            "sequence": list(individual.sequence),
+            "assignment": list(individual.assignment),
+            "rendezvous": copy.deepcopy(individual.rendezvous),
+            "fitness": float(getattr(individual, "fitness", math.inf)),
+        }
 
     def _empty_plan(self, dispatch_type: str = "ga_mmce", reason: str = "") -> DispatchPlan:
         summary = {
