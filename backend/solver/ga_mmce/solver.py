@@ -13,7 +13,7 @@ from typing import Any
 from .adapters import build_ga_context, greedy_plan_to_individual
 from .chromosome import Individual
 from .config import GAConfig
-from .diagnostics import write_evolution_csv, write_evolution_plots
+from .diagnostics import write_evolution_csv, write_evolution_plots, write_mode_precheck_csv
 from .decoder import DispatchPlan, GADecoder
 from .fitness import compute_fitness
 from .operators import mutate, order_crossover, tournament_select
@@ -288,6 +288,7 @@ class GAMMCESolver:
         self.last_best_decode_result = getattr(best, "decoded_result", None)
         plan = best.decoded_plan or self._empty_plan(dispatch_type=dispatch_type, reason="best_has_no_plan")
         self._annotate_plan(plan, context, started, dispatch_type)
+        plan.summary["b_mode_final_diag"] = self._build_b_final_summary(best)
         self._write_evolution_outputs()
         self._debug_run_end(plan, best, context, started)
         return plan
@@ -336,6 +337,7 @@ class GAMMCESolver:
             b_candidate = self._best_initial_mode_b(state, context, order_id)
             c_candidate = self._best_initial_mode_c(state, context, order_id)
             self._b_precheck_by_order[order_id] = {
+                "payload": self._order_payload(state, order_id),
                 "A": self._candidate_debug_dict(a_candidate),
                 "B": self._candidate_debug_dict(b_candidate),
                 "C": self._candidate_debug_dict(c_candidate),
@@ -357,6 +359,16 @@ class GAMMCESolver:
             )
         self._debug_write(f"b_candidate_precheck_seeded_orders={sorted(result)}")
         return result
+
+    def _order_payload(self, state: Any, order_id: str) -> float:
+        orders = self.evaluator._mapping(state, "orders") if hasattr(self.evaluator, "_mapping") else {}
+        order = orders.get(order_id) if isinstance(orders, dict) else None
+        if order is None:
+            return 0.0
+        try:
+            return float(self.evaluator._read_field(order, "payload_weight", 0.0) or 0.0)
+        except Exception:
+            return 0.0
 
     def _evaluate_initial_mode_a(self, state: Any, context: Any, order_id: str) -> Any | None:
         if not context.truck_ids:
@@ -441,6 +453,7 @@ class GAMMCESolver:
             "energy_cost": float(candidate.cost_energy or 0.0),
             "time_cost": float(candidate.completion_time or 0.0) * float(self.config.weight_completion),
             "sync_waiting_cost": float(candidate.waiting_time or 0.0) * float(self.config.weight_waiting),
+            "penalty_cost": float(candidate.cost_penalty or 0.0),
             "closure_cost": 0.0,
             "repair_penalty": 0.0,
             "station_queue_penalty": 0.0,
@@ -690,12 +703,14 @@ class GAMMCESolver:
         )
 
     def _write_evolution_outputs(self) -> None:
-        if not self.config.diagnostics_enabled or not self._evolution_rows:
+        if not self.config.diagnostics_enabled:
             return
         log_dir = self._diagnostics_dir()
         try:
-            if self.config.save_evolution_csv:
+            if self.config.save_evolution_csv and self._evolution_rows:
                 write_evolution_csv(self._evolution_rows, log_dir / "ga_evolution_static.csv")
+            if self.config.save_evolution_csv and self._b_precheck_by_order:
+                write_mode_precheck_csv(self._b_precheck_by_order, log_dir / "ga_mode_precheck_static.csv")
             if self.config.save_evolution_plots:
                 write_evolution_plots(self._evolution_rows, log_dir)
         except Exception as exc:
@@ -795,6 +810,106 @@ class GAMMCESolver:
         for key, value in getattr(mutation_stats, "by_transition", {}).items():
             bucket = self._mutation_stats["by_transition"]
             bucket[key] = bucket.get(key, 0) + int(value)
+
+    def _build_b_final_summary(self, best: Individual | None) -> dict[str, Any]:
+        best_mode_counts = Counter(self._gene_mode(gene) for gene in best.assignment) if best is not None else Counter()
+        b_failure_reasons: dict[str, int] = {}
+        total_b_gene_count = 0
+        total_b_success = 0
+        total_b_repaired = 0
+        total_b_infeasible = 0
+
+        for row in self._evolution_rows:
+            total_b_gene_count += int(row.get("B_count", 0) or 0)
+            total_b_success += int(row.get("b_success", 0) or 0)
+            total_b_repaired += int(row.get("b_repaired", 0) or 0)
+            total_b_infeasible += int(row.get("b_infeasible", 0) or 0)
+            self._merge_counts(b_failure_reasons, row.get("b_failure_reasons", {}))
+
+        feasible_orders = [
+            order_id
+            for order_id, row in sorted(self._b_precheck_by_order.items())
+            if bool((row.get("B") or {}).get("feasible", False))
+        ]
+        main_failure_reason = self._main_failure_reason(b_failure_reasons)
+        return {
+            "b_entered_population": total_b_gene_count > 0,
+            "b_decode_success_total": total_b_success,
+            "b_decode_success": total_b_success > 0,
+            "b_repaired_total": total_b_repaired,
+            "b_infeasible_total": total_b_infeasible,
+            "b_selected_in_best": int(best_mode_counts.get("B", 0)),
+            "b_failure_reasons": b_failure_reasons,
+            "main_failure_reason": main_failure_reason,
+            "b_feasible_orders": feasible_orders,
+            "b_feasible_order_costs": self._b_feasible_order_costs(feasible_orders),
+            "b_not_selected_reason": self._explain_b_not_selected(
+                selected_count=int(best_mode_counts.get("B", 0)),
+                entered=total_b_gene_count > 0,
+                decoded=total_b_success > 0,
+                feasible_orders=feasible_orders,
+                main_failure_reason=main_failure_reason,
+            ),
+        }
+
+    def _main_failure_reason(self, reasons: dict[str, int]) -> str:
+        if not reasons:
+            return ""
+        return max(reasons.items(), key=lambda item: item[1])[0]
+
+    def _b_feasible_order_costs(self, order_ids: list[str]) -> dict[str, dict[str, Any]]:
+        costs: dict[str, dict[str, Any]] = {}
+        for order_id in order_ids:
+            row = self._b_precheck_by_order.get(order_id, {})
+            costs[order_id] = {
+                "A_score": (row.get("A") or {}).get("total_score"),
+                "B_score": (row.get("B") or {}).get("total_score"),
+                "C_score": (row.get("C") or {}).get("total_score"),
+                "best_local_mode": self._best_local_mode_from_precheck(row),
+            }
+        return costs
+
+    def _best_local_mode_from_precheck(self, row: dict[str, Any]) -> str:
+        best_mode = ""
+        best_score = math.inf
+        for mode in ("A", "B", "C"):
+            data = row.get(mode) or {}
+            if not data.get("feasible"):
+                continue
+            try:
+                score = float(data.get("total_score", math.inf))
+            except (TypeError, ValueError):
+                continue
+            if math.isfinite(score) and score < best_score:
+                best_score = score
+                best_mode = mode
+        return best_mode
+
+    def _explain_b_not_selected(
+        self,
+        selected_count: int,
+        entered: bool,
+        decoded: bool,
+        feasible_orders: list[str],
+        main_failure_reason: str,
+    ) -> str:
+        if selected_count > 0:
+            return "B selected in best individual"
+        if not entered:
+            return "B never entered population"
+        if not decoded:
+            return f"B entered population but did not decode successfully; main failure={main_failure_reason or 'unknown'}"
+        if not feasible_orders:
+            return f"B decoded attempts were infeasible; main failure={main_failure_reason or 'unknown'}"
+        dominated = all(
+            self._best_local_mode_from_precheck(self._b_precheck_by_order.get(order_id, {})) != "B"
+            for order_id in feasible_orders
+        )
+        if dominated:
+            if main_failure_reason:
+                return f"B feasible on limited orders but dominated by A/C local cost; main infeasible reason={main_failure_reason}"
+            return "B feasible on limited orders but dominated by A/C local cost"
+        return "B feasible locally but not selected by global sequence fitness"
 
     def _log_generation(self, generation: int, population: list[Individual]) -> None:
         if not self.config.verbose or not self._should_log_generation(generation):
@@ -942,6 +1057,7 @@ class GAMMCESolver:
             f"plan_cost={float(plan.cost_total or 0.0):.3f} "
             f"summary={plan.summary}"
         )
+        self._debug_b_final_diag(plan.summary.get("b_mode_final_diag", {}))
         if best is not None:
             self._debug_write(f"best_sequence={best.sequence}")
             self._debug_write(f"best_assignment={best.assignment}")
@@ -964,6 +1080,25 @@ class GAMMCESolver:
         if self._debug_eval_errors:
             self._debug_write(f"evaluation_exceptions={self._debug_eval_errors}")
         self._debug_write("=" * 100)
+
+    def _debug_b_final_diag(self, summary: Any) -> None:
+        if not isinstance(summary, dict) or not summary:
+            return
+        self._debug_write(
+            "B_MODE_FINAL_DIAG: "
+            f"entered_population={summary.get('b_entered_population')} "
+            f"decode_success={summary.get('b_decode_success')} "
+            f"decode_success_total={summary.get('b_decode_success_total')} "
+            f"repaired_total={summary.get('b_repaired_total')} "
+            f"selected_in_best={summary.get('b_selected_in_best')} "
+            f"main_failure_reason={summary.get('main_failure_reason')} "
+            f"feasible_orders={summary.get('b_feasible_orders')} "
+            f"reason={summary.get('b_not_selected_reason')}"
+        )
+        self._debug_write(
+            "B_MODE_FINAL_DIAG_COSTS: "
+            f"b_feasible_order_costs={summary.get('b_feasible_order_costs')}"
+        )
 
     def _debug_write(self, message: str) -> None:
         timestamp = time.strftime("%Y-%m-%d %H:%M:%S")

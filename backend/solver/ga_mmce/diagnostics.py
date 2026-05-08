@@ -39,6 +39,35 @@ CSV_FIELDS = [
     "elapsed",
 ]
 
+MODE_PRECHECK_FIELDS = [
+    "order_id",
+    "payload",
+    "A_feasible",
+    "A_score",
+    "A_truck_dist",
+    "A_uav_dist",
+    "A_energy",
+    "A_time",
+    "A_penalty",
+    "B_feasible",
+    "B_score",
+    "B_truck_dist",
+    "B_uav_dist",
+    "B_energy",
+    "B_time",
+    "B_wait",
+    "B_launch",
+    "B_recover",
+    "B_failure_reason",
+    "C_feasible",
+    "C_best_score",
+    "C_best_drone",
+    "C_launch",
+    "C_recover",
+    "C_failure_reason",
+    "best_local_mode",
+]
+
 
 def write_evolution_csv(rows: list[dict[str, Any]], path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -49,6 +78,87 @@ def write_evolution_csv(rows: list[dict[str, Any]], path: Path) -> None:
         writer.writeheader()
         for row in rows:
             writer.writerow({field: row.get(field, "") for field in fields})
+
+
+def write_mode_precheck_csv(precheck_by_order: dict[str, dict[str, Any]], path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", newline="", encoding="utf-8") as fh:
+        writer = csv.DictWriter(fh, fieldnames=MODE_PRECHECK_FIELDS)
+        writer.writeheader()
+        for order_id in sorted(precheck_by_order):
+            row = _mode_precheck_row(order_id, precheck_by_order[order_id])
+            writer.writerow(row)
+
+
+def _mode_precheck_row(order_id: str, data: dict[str, Any]) -> dict[str, Any]:
+    a = _mode_data(data.get("A"))
+    b = _mode_data(data.get("B"))
+    c = _mode_data(data.get("C"))
+    return {
+        "order_id": order_id,
+        "payload": data.get("payload", ""),
+        "A_feasible": a["feasible"],
+        "A_score": a["score"],
+        "A_truck_dist": a["truck_dist"],
+        "A_uav_dist": a["uav_dist"],
+        "A_energy": a["energy"],
+        "A_time": a["time"],
+        "A_penalty": a["penalty"],
+        "B_feasible": b["feasible"],
+        "B_score": b["score"],
+        "B_truck_dist": b["truck_dist"],
+        "B_uav_dist": b["uav_dist"],
+        "B_energy": b["energy"],
+        "B_time": b["time"],
+        "B_wait": b["wait"],
+        "B_launch": b["launch"],
+        "B_recover": b["recover"],
+        "B_failure_reason": "" if b["feasible"] else b["reason"],
+        "C_feasible": c["feasible"],
+        "C_best_score": c["score"],
+        "C_best_drone": c["drone_id"],
+        "C_launch": c["launch"],
+        "C_recover": c["recover"],
+        "C_failure_reason": "" if c["feasible"] else c["reason"],
+        "best_local_mode": _best_local_mode({"A": a, "B": b, "C": c}),
+    }
+
+
+def _mode_data(value: Any) -> dict[str, Any]:
+    data = value if isinstance(value, dict) else {}
+    score = data.get("total_score", "")
+    if isinstance(score, float) and math.isinf(score):
+        score = ""
+    return {
+        "feasible": bool(data.get("feasible", False)),
+        "reason": data.get("reason", ""),
+        "score": score,
+        "truck_dist": data.get("truck_dist", ""),
+        "uav_dist": data.get("uav_dist", ""),
+        "energy": data.get("energy_cost", ""),
+        "time": data.get("time_cost", ""),
+        "wait": data.get("sync_waiting_cost", ""),
+        "penalty": data.get("penalty_cost", 0.0),
+        "launch": data.get("launch", ""),
+        "recover": data.get("recover", ""),
+        "drone_id": data.get("drone_id", ""),
+    }
+
+
+def _best_local_mode(modes: dict[str, dict[str, Any]]) -> str:
+    best_mode = ""
+    best_score = math.inf
+    for mode, data in modes.items():
+        if not data.get("feasible"):
+            continue
+        try:
+            score = float(data.get("score"))
+        except (TypeError, ValueError):
+            continue
+        if math.isfinite(score) and score < best_score:
+            best_score = score
+            best_mode = mode
+    return best_mode
 
 
 def write_evolution_plots(rows: list[dict[str, Any]], log_dir: Path) -> None:
