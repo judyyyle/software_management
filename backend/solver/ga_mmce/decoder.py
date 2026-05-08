@@ -5,7 +5,7 @@ from collections import Counter
 from dataclasses import dataclass, field
 from typing import Any
 
-from .adapters import GAAdapterContext, clone_state_for_decode
+from .adapters import GAAdapterContext, apply_initial_drone_layout_overlay, clone_state_for_decode
 from .chromosome import Individual
 from .config import GAConfig
 from .physical_evaluator import GACandidate, PhysicalEvaluator
@@ -126,6 +126,7 @@ class GADecoder:
         )
 
         state_copy = clone_state_for_decode(state)
+        apply_initial_drone_layout_overlay(state_copy, context, self.config)
         truck_id = self._select_default_truck_id(state_copy, context)
         initial_time = self._current_time(state_copy)
         initial_truck_position = self._snapshot_truck_position(state_copy, truck_id, initial_time)
