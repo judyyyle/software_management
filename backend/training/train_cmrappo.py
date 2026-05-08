@@ -2787,7 +2787,21 @@ def _build_meta_payload(
             max_candidate_recovery_per_order=int(candidate["max_candidate_recovery_per_order"]),
             max_candidate_actions=int(candidate["max_candidate_actions"]),
             station_wait_threshold_sec=float(candidate["station_wait_threshold_sec"]),
-            rendezvous_eta_safe_margin_sec=float(candidate["rendezvous_eta_safe_margin_sec"]),
+            rendezvous_filter_margin_sec=float(
+                candidate.get(
+                    "rendezvous_filter_margin_sec",
+                    candidate.get("rendezvous_eta_safe_margin_sec"),
+                )
+            ),
+            rendezvous_execution_margin_sec=float(
+                candidate.get(
+                    "rendezvous_execution_margin_sec",
+                    candidate.get(
+                        "rendezvous_filter_margin_sec",
+                        candidate.get("rendezvous_eta_safe_margin_sec"),
+                    ),
+                )
+            ),
             energy_safe_margin_ratio=float(candidate["energy_safe_margin_ratio"]),
         ),
         planner=PlannerMeta(
