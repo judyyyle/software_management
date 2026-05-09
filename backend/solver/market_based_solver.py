@@ -164,6 +164,12 @@ class MarketBasedSolver(GreedyMMCE):
     PATH_STITCH_TOLERANCE_M = 1.0  # 路径拼接坐标容差（米）
     AUCTION_COMPUTE_DELTA_T = 0.5  # 拍卖计算预估耗时（用于起点预测）
 
+    # ── 路径方向性与多维优化参数 ────────────────────────────────────
+    BACKTRACK_PENALTY_WEIGHT = 2.0       # 回头路惩罚权重（方向角越偏离前进方向，惩罚越高）
+    DETOUR_ENERGY_MULTIPLIER = 1.5       # 绕路能耗放大系数（反映频繁变向的额外损耗）
+    PATH_PROXIMITY_BONUS = 0.3           # 路径邻近度奖励权重（订单在卡车路径附近时减分）
+    TWO_OPT_MAX_ITERATIONS = 50          # 2-opt 局部搜索最大迭代次数
+
     def __init__(self, entity_mgr) -> None:
         super().__init__(entity_mgr)
         self._auction_bid_count = 0
@@ -171,6 +177,7 @@ class MarketBasedSolver(GreedyMMCE):
         self._anchor_preview_routes: dict[str, object] = {}
         self._active_contracts: list[RendezvousContract] = []
         self._contract_seq = 0
+        self._current_round_bdynamic_launches: list[tuple[str, str, float]] = []
         # 订单视图仅用于市场约束（不可撤销、清空校验等），由 DispatchDecisionEngine 注入，避免挂在 EntityManager 上。
         self._order_mgr: Any = None
 
@@ -332,12 +339,14 @@ class MarketBasedSolver(GreedyMMCE):
         """执行一轮市场拍卖调度（全量批次），并在 summary 中附加拍卖统计信息。"""
         self._auction_bid_count = 0
         self._auction_award_count = 0
+        self._current_round_bdynamic_launches.clear()
         self._anchor_preview_routes = {}
         self._expire_contracts(current_time)
         self._try_flexible_recovery(current_time)
         self._prepare_anchor_preview_routes(pending_orders, current_time, bbox, scene_id)
 
         plan = super().dispatch(pending_orders, current_time, bbox, scene_id=scene_id)
+        self._patch_missing_truck_routes(plan, current_time, bbox, scene_id, return_to_depot=True)
         self._recalculate_actual_plan_costs(plan, pending_orders, current_time)
         plan.summary["solver"] = "market"
         plan.summary["auction_stats"] = {
@@ -381,6 +390,7 @@ class MarketBasedSolver(GreedyMMCE):
         """
         self._auction_bid_count = 0
         self._auction_award_count = 0
+        self._current_round_bdynamic_launches.clear()
         self._expire_contracts(current_time)
         self._try_flexible_recovery(current_time)
 
@@ -399,7 +409,8 @@ class MarketBasedSolver(GreedyMMCE):
         if not self._anchor_preview_routes:
             self._prepare_anchor_preview_routes(filtered_orders, current_time, bbox, scene_id)
 
-        plan = super().dispatch(filtered_orders, current_time, bbox, scene_id=scene_id)
+        plan = super().dispatch_incremental(filtered_orders, current_time, bbox, scene_id=scene_id)
+        self._patch_missing_truck_routes(plan, current_time, bbox, scene_id, return_to_depot=False)
         self._recalculate_actual_plan_costs(plan, filtered_orders, current_time)
         plan.summary["solver"] = "market"
         plan.summary["dispatch_type"] = "incremental"
@@ -444,6 +455,61 @@ class MarketBasedSolver(GreedyMMCE):
     def get_active_contracts(self) -> list[RendezvousContract]:
         """返回当前契约列表，供编排层统一兑现。"""
         return self._active_contracts
+
+    def _patch_missing_truck_routes(
+        self,
+        plan: DispatchPlan,
+        current_time: float,
+        bbox: dict,
+        scene_id: str | None,
+        return_to_depot: bool,
+    ) -> None:
+        """补充生成只被分配了 B_DYNAMIC 任务导致被 GreedyMMCE 基类误跳过的卡车路线。"""
+        missing_truck_ids = set()
+        for truck in self.entity_mgr.trucks.values():
+            if truck.truck_id in plan.truck_routes:
+                continue
+            needs_routing = False
+            for v_id, s_id, _ in getattr(self, "_current_round_bdynamic_launches", []):
+                if v_id == truck.truck_id and s_id:
+                    needs_routing = True
+                    break
+            if not needs_routing:
+                for drone in self.entity_mgr.drones.values():
+                    if getattr(drone, "transport_truck_id", None) == truck.truck_id:
+                        if getattr(drone, "launch_station_id", ""):
+                            needs_routing = True
+                            break
+            if needs_routing:
+                missing_truck_ids.add(truck.truck_id)
+
+        if not missing_truck_ids:
+            return
+
+        road_graph, nodes = self._load_road_graph_for_market(bbox, scene_id)
+        if not road_graph or not nodes:
+            return
+
+        for truck_id in missing_truck_ids:
+            truck = self.entity_mgr.trucks.get(truck_id)
+            if not truck:
+                continue
+            try:
+                route = self._build_truck_route(
+                    truck=truck,
+                    orders=[],
+                    recovery_station_ids=[],
+                    current_time=current_time,
+                    road_graph=road_graph,
+                    nodes=nodes,
+                    recovery_station_wait_times=None,
+                    start_pos=truck.get_location(current_time),
+                    return_to_depot=return_to_depot,
+                )
+                plan.truck_routes[truck_id] = route
+                logger.info("[MarketBasedSolver] 已为被基类跳过的卡车 %s 补建 B_DYNAMIC/无人机 起飞路网", truck_id)
+            except Exception as exc:
+                logger.warning("[MarketBasedSolver] 补建卡车 %s 路网失败: %s", truck_id, exc)
 
     # ══════════════════════════════════════════════════════════════════════════
     # 成本重算（总体能耗公式不变）
@@ -700,69 +766,310 @@ class MarketBasedSolver(GreedyMMCE):
                     return True
         return False
 
+    # ══════════════════════════════════════════════════════════════════════════
+    # 路径方向性优化工具方法
+    # ══════════════════════════════════════════════════════════════════════════
+
+    def _find_best_insertion_for_truck(
+        self,
+        truck: "Truck",
+        new_order: "Order",
+        current_time: float,
+    ) -> tuple[bool, int, float]:
+        """在卡车已规划路径中搜索新订单的最优插入位置。
+
+        遍历计划停靠序列中所有可能的插入间隙，选择使绕路距离最小
+        且不违反任何已锁定契约时间窗的最优插入点。
+
+        Returns:
+            (is_feasible, best_insert_index, detour_time)
+            best_insert_index: 在 remaining_stops 中的插入位置索引
+                               （0 = 插在第一个剩余停靠前），-1 = 不可行
+        """
+        if truck.speed <= 0:
+            return False, -1, float("inf")
+
+        planned_stops = getattr(truck, "_planned_route_stops", None) or []
+        cursor = int(getattr(truck, "_planned_route_cursor", 0))
+        remaining = planned_stops[cursor:]
+        contracts = self._get_truck_contracts(truck.truck_id)
+        order_pos = new_order.delivery_loc
+        truck_loc = truck.get_location(current_time)
+
+        positions: list = [truck_loc]
+        arrival_times: list[float] = [current_time]
+        for stop in remaining:
+            pos = stop.get("position")
+            if pos is not None:
+                positions.append(pos)
+                arrival_times.append(float(stop.get("arrival_time", current_time)))
+
+        n = len(positions)
+
+        contract_deadlines: dict[int, float] = {}
+        for ci, stop in enumerate(remaining):
+            node_id = stop.get("node_id", "")
+            for c in contracts:
+                if c.anchor_id == node_id:
+                    contract_deadlines[ci + 1] = c.latest_departure
+
+        best_feasible = False
+        best_idx = -1
+        best_detour_time = float("inf")
+
+        for insert_after in range(n):
+            if insert_after < n - 1:
+                prev_pos = positions[insert_after]
+                next_pos = positions[insert_after + 1]
+                orig_dist = self._dist(prev_pos, next_pos)
+                new_dist = self._dist(prev_pos, order_pos) + self._dist(order_pos, next_pos)
+                detour_dist = max(0.0, new_dist - orig_dist)
+            else:
+                prev_pos = positions[-1]
+                detour_dist = self._dist(prev_pos, order_pos)
+
+            detour_time = detour_dist / truck.speed + self.SERVICE_TIME_CUSTOMER
+
+            feasible = True
+            for pos_idx, deadline in contract_deadlines.items():
+                if pos_idx > insert_after:
+                    shifted_arrival = arrival_times[pos_idx] + detour_time
+                    if shifted_arrival > deadline:
+                        feasible = False
+                        break
+
+            if not feasible:
+                continue
+
+            if n == 1 and contracts:
+                for c in contracts:
+                    anchor = (
+                        self.entity_mgr.stations.get(c.anchor_id)
+                        or self.entity_mgr.depots.get(c.anchor_id)
+                    )
+                    if anchor is None:
+                        continue
+                    dist_to_anchor = self._dist(order_pos, anchor.location)
+                    eta = current_time + detour_time + dist_to_anchor / truck.speed
+                    if eta > c.latest_departure:
+                        feasible = False
+                        break
+
+            if feasible and detour_time < best_detour_time:
+                best_feasible = True
+                best_idx = insert_after
+                best_detour_time = detour_time
+
+        return best_feasible, best_idx, best_detour_time
+
+    def _point_to_segment_distance(
+        self,
+        point: "Position3D",
+        seg_start: "Position3D",
+        seg_end: "Position3D",
+    ) -> float:
+        """计算点到线段的最短距离（2D 投影）。"""
+        dx = seg_end.x - seg_start.x
+        dy = seg_end.y - seg_start.y
+        seg_len_sq = dx * dx + dy * dy
+
+        if seg_len_sq < 1e-10:
+            return self._dist(point, seg_start)
+
+        t = max(0.0, min(1.0, (
+            (point.x - seg_start.x) * dx + (point.y - seg_start.y) * dy
+        ) / seg_len_sq))
+
+        from core.entities.primitives import Position3D as Pos3D
+        proj = Pos3D(x=seg_start.x + t * dx, y=seg_start.y + t * dy, z=0)
+        return self._dist(point, proj)
+
+    def _compute_backtrack_penalty(
+        self,
+        truck: "Truck",
+        order: "Order",
+        current_time: float,
+    ) -> float:
+        """计算新订单相对于卡车前进方向的回头路惩罚。
+
+        使用卡车当前前进方向向量与卡车→订单方向向量的夹角余弦判断：
+          cos > 0  → 订单在前进方向上，无惩罚
+          cos < 0  → 订单在卡车身后（回头路），惩罚与偏离程度和距离成正比
+        """
+        truck_loc = truck.get_location(current_time)
+
+        planned_stops = getattr(truck, "_planned_route_stops", None) or []
+        cursor = int(getattr(truck, "_planned_route_cursor", 0))
+        remaining = planned_stops[cursor:]
+
+        if not remaining:
+            return 0.0
+
+        next_pos = remaining[0].get("position")
+        if next_pos is None:
+            return 0.0
+
+        dx_fwd = next_pos.x - truck_loc.x
+        dy_fwd = next_pos.y - truck_loc.y
+        mag_fwd = math.sqrt(dx_fwd * dx_fwd + dy_fwd * dy_fwd)
+        if mag_fwd < 1.0:
+            return 0.0
+
+        dx_ord = order.delivery_loc.x - truck_loc.x
+        dy_ord = order.delivery_loc.y - truck_loc.y
+        mag_ord = math.sqrt(dx_ord * dx_ord + dy_ord * dy_ord)
+        if mag_ord < 1.0:
+            return 0.0
+
+        cos_angle = (dx_fwd * dx_ord + dy_fwd * dy_ord) / (mag_fwd * mag_ord)
+        cos_angle = max(-1.0, min(1.0, cos_angle))
+
+        if cos_angle >= 0:
+            return 0.0
+
+        backtrack_factor = abs(cos_angle)
+        distance = self._dist(truck_loc, order.delivery_loc)
+        return self.BACKTRACK_PENALTY_WEIGHT * backtrack_factor * distance
+
+    def _compute_path_proximity_bonus(
+        self,
+        truck: "Truck",
+        order: "Order",
+        current_time: float,
+    ) -> float:
+        """计算订单与卡车未来路径的邻近度奖励。
+
+        订单越靠近卡车计划路径线段，奖励越大（作为负成本参与评分）。
+        鼓励卡车 "顺路" 处理路径附近的订单，而非执行大范围迂回。
+        """
+        planned_stops = getattr(truck, "_planned_route_stops", None) or []
+        cursor = int(getattr(truck, "_planned_route_cursor", 0))
+        remaining = planned_stops[cursor:]
+
+        if not remaining:
+            return 0.0
+
+        order_pos = order.delivery_loc
+        min_dist = float("inf")
+        prev_pos = truck.get_location(current_time)
+
+        for stop in remaining:
+            stop_pos = stop.get("position")
+            if stop_pos is None:
+                continue
+            seg_dist = self._point_to_segment_distance(order_pos, prev_pos, stop_pos)
+            min_dist = min(min_dist, seg_dist)
+            prev_pos = stop_pos
+
+        if min_dist == float("inf"):
+            return 0.0
+
+        max_effective_range = 2000.0
+        if min_dist >= max_effective_range:
+            return 0.0
+
+        proximity_ratio = 1.0 - min(min_dist / max_effective_range, 1.0)
+        return self.PATH_PROXIMITY_BONUS * proximity_ratio * max_effective_range
+
+    def _optimize_route_2opt(self, route, locked_anchor_ids: set[str] | None = None):
+        """对 TruckRoute 的中间节点执行 2-opt 局部搜索，减少回头路。
+
+        约束：
+          - 首尾节点（仓库/origin）固定不可移动
+          - locked_anchor_ids 中的锚点节点位置固定不可交换
+        """
+        if locked_anchor_ids is None:
+            locked_anchor_ids = set()
+
+        nodes = route.nodes
+        n = len(nodes)
+        if n < 4:
+            return route
+
+        locked_indices = {0, n - 1}
+        for i, node in enumerate(nodes):
+            if node.node_id in locked_anchor_ids:
+                locked_indices.add(i)
+
+        improved = True
+        iterations = 0
+
+        while improved and iterations < self.TWO_OPT_MAX_ITERATIONS:
+            improved = False
+            iterations += 1
+
+            for i in range(1, n - 2):
+                if i in locked_indices:
+                    continue
+                for j in range(i + 1, n - 1):
+                    if j in locked_indices:
+                        continue
+
+                    has_locked = any(k in locked_indices for k in range(i, j + 1))
+                    if has_locked:
+                        continue
+
+                    d_old = (
+                        self._dist(nodes[i - 1].position, nodes[i].position)
+                        + self._dist(nodes[j].position, nodes[j + 1].position)
+                    )
+                    d_new = (
+                        self._dist(nodes[i - 1].position, nodes[j].position)
+                        + self._dist(nodes[i].position, nodes[j + 1].position)
+                    )
+
+                    if d_new < d_old - 1.0:
+                        nodes[i:j + 1] = list(reversed(nodes[i:j + 1]))
+                        improved = True
+
+        total_dist = 0.0
+        cur_time = nodes[0].arrival_time
+        speed = 0.0
+        for truck in self.entity_mgr.trucks.values():
+            if truck.truck_id == route.truck_id:
+                speed = truck.speed
+                break
+        if speed <= 0:
+            return route
+
+        for idx in range(1, len(nodes)):
+            seg_dist = self._dist(nodes[idx - 1].position, nodes[idx].position)
+            total_dist += seg_dist
+            arrive = cur_time + seg_dist / speed
+            nodes[idx].arrival_time = arrive
+            nodes[idx].departure_time = arrive
+            cur_time = arrive
+
+        route.total_distance = total_dist
+        route.geometry = [node.position for node in nodes]
+        return route
+
     def _validate_truck_insertion(
         self,
         truck: "Truck",
         new_order: "Order",
         current_time: float,
     ) -> bool:
-        """校验卡车接受新订单后，是否仍能满足所有已锁定契约的时间窗。
+        """校验卡车接受新订单后，是否存在至少一个合法插入位置满足所有契约时间窗。
 
-        校验逻辑（双重检验）：
-          1. 最短路径检验：卡车直接从当前位置到新订单再到各锚点的 ETA
-          2. 已有路线检验：考虑卡车已有的中间停靠点，计算最晚锚点 ETA
-        满足任一条 ETA > latest_departure 即判定不可行。
+        改进：不再假设新单只能在"当前位置"立即插入，而是搜索计划路径中
+        所有可能的插入间隙，只要任一间隙可行即返回 True。这允许 "顺路"
+        处理路径附近的订单而非要求立即绕路。
         """
         contracts = self._get_truck_contracts(truck.truck_id)
         if not contracts:
             return True
 
-        truck_loc = truck.get_location(current_time)
-        delivery_dist = self._dist(truck_loc, new_order.delivery_loc)
-        if truck.speed <= 0:
-            return False
-        detour_time = delivery_dist / truck.speed + self.SERVICE_TIME_CUSTOMER
-
-        for contract in contracts:
-            anchor = (
-                self.entity_mgr.stations.get(contract.anchor_id)
-                or self.entity_mgr.depots.get(contract.anchor_id)
+        feasible, best_idx, detour_time = self._find_best_insertion_for_truck(
+            truck, new_order, current_time
+        )
+        if not feasible:
+            logger.debug(
+                "[MarketBasedSolver] 卡车 %s 插单 %s 在所有位置均导致契约超时 "
+                "(最小绕路时间=%.1f)，该投标不可行",
+                truck.truck_id, new_order.order_id, detour_time,
             )
-            if anchor is None:
-                continue
-
-            # 检验 1：卡车绕路配送新单后到达锚点的 ETA
-            dist_to_anchor = self._dist(new_order.delivery_loc, anchor.location)
-            eta_at_anchor = current_time + detour_time + dist_to_anchor / truck.speed
-
-            if eta_at_anchor > contract.latest_departure:
-                logger.debug(
-                    "[MarketBasedSolver] 卡车 %s 插单 %s 导致契约 %s 超时 "
-                    "(eta=%.1f > deadline=%.1f)，该投标不可行",
-                    truck.truck_id, new_order.order_id, contract.contract_id,
-                    eta_at_anchor, contract.latest_departure,
-                )
-                return False
-
-            # 检验 2：考虑已有时刻表中的延迟传播
-            existing_stops = getattr(truck, "_planned_route_stops", None) or []
-            cursor = int(getattr(truck, "_planned_route_cursor", 0))
-            for stop in existing_stops[cursor:]:
-                if stop.get("node_id") == contract.anchor_id:
-                    original_arrival = float(stop.get("arrival_time", 0))
-                    shifted_arrival = original_arrival + detour_time
-                    if shifted_arrival > contract.latest_departure:
-                        logger.debug(
-                            "[MarketBasedSolver] 卡车 %s 插单 %s 导致已有停靠 %s 延迟 "
-                            "(原到达 %.1f + 绕路 %.1f = %.1f > deadline %.1f)",
-                            truck.truck_id, new_order.order_id, contract.anchor_id,
-                            original_arrival, detour_time, shifted_arrival,
-                            contract.latest_departure,
-                        )
-                        return False
-                    break
-
-        return True
+        return feasible
 
     def fulfill_contract(self, contract_id: str) -> None:
         """外部（仿真引擎/决策引擎）通知契约已兑现。"""
@@ -773,8 +1080,69 @@ class MarketBasedSolver(GreedyMMCE):
                 return
 
     # ══════════════════════════════════════════════════════════════════════════
-    # 锚点预览路线
+    # 锚点预览路线与卡车路线构建
     # ══════════════════════════════════════════════════════════════════════════
+
+    def _build_truck_route(
+        self,
+        truck: "Truck",
+        orders: list["Order"],
+        recovery_station_ids: list[str],
+        current_time: float,
+        road_graph: Any,
+        nodes: Any,
+        recovery_station_wait_times: dict[str, float] | None = None,
+        start_pos: "Position3D | None" = None,
+        return_to_depot: bool = True,
+    ):
+        """重写 _build_truck_route 以修复基类对 B_DYNAMIC 起飞站点的遗漏。"""
+        if recovery_station_wait_times is None:
+            recovery_station_wait_times = {}
+
+        # 1. 注入本轮新分配给该卡车的 B_DYNAMIC 起飞站点
+        added_stations = []
+        for v_id, s_id, wait_time in getattr(self, "_current_round_bdynamic_launches", []):
+            if v_id == truck.truck_id and s_id:
+                if s_id not in recovery_station_ids:
+                    recovery_station_ids.append(s_id)
+                    added_stations.append(s_id)
+                res_wait = recovery_station_wait_times.get(s_id, 0.0)
+                recovery_station_wait_times[s_id] = max(res_wait, wait_time)
+
+        # 2. 防御性补丁：将已锁定的活跃契约的停靠锚点强制补充进 recovery 列表，防止部分重排逻辑漏掉
+        for contract in self._get_truck_contracts(truck.truck_id):
+            if contract.anchor_id and contract.anchor_id not in recovery_station_ids:
+                recovery_station_ids.append(contract.anchor_id)
+                added_stations.append(contract.anchor_id)
+            if contract.launch_anchor_id and contract.launch_anchor_id not in recovery_station_ids:
+                recovery_station_ids.append(contract.launch_anchor_id)
+                added_stations.append(contract.launch_anchor_id)
+
+        # 3. 防防御性补丁 2：检查当前挂载在本车上尚未起飞的无人机目标站（补偿跨批次 B_DYNAMIC 任务）
+        for drone in self.entity_mgr.drones.values():
+            if getattr(drone, "transport_truck_id", None) == truck.truck_id:
+                s_id = getattr(drone, "launch_station_id", "")
+                if s_id and s_id not in recovery_station_ids:
+                    recovery_station_ids.append(s_id)
+                    added_stations.append(s_id)
+
+        if added_stations:
+            logger.debug(
+                "[MarketBasedSolver] 为卡车 %s 补充路径必须途径站点(B_DYNAMIC起飞站/契约锚点): %s",
+                truck.truck_id, added_stations
+            )
+
+        return super()._build_truck_route(
+            truck=truck,
+            orders=orders,
+            recovery_station_ids=recovery_station_ids,
+            current_time=current_time,
+            road_graph=road_graph,
+            nodes=nodes,
+            recovery_station_wait_times=recovery_station_wait_times,
+            start_pos=start_pos,
+            return_to_depot=return_to_depot,
+        )
 
     def _prepare_anchor_preview_routes(
         self,
@@ -842,6 +1210,16 @@ class MarketBasedSolver(GreedyMMCE):
                 )
                 continue
 
+            locked_ids = set(contract_stations)
+            old_dist = preview_route.total_distance
+            preview_route = self._optimize_route_2opt(preview_route, locked_ids)
+            if preview_route.total_distance < old_dist - 1.0:
+                logger.info(
+                    "[MarketBasedSolver] 卡车 %s 2-opt 优化：%.0f m → %.0f m (节省 %.0f m)",
+                    truck.truck_id, old_dist, preview_route.total_distance,
+                    old_dist - preview_route.total_distance,
+                )
+
             self._anchor_preview_routes[truck.truck_id] = preview_route
             logger.info(
                 "[MarketBasedSolver] 卡车 %s 主干预览路线已生成：%d 节点，经停锚点 %s",
@@ -890,6 +1268,7 @@ class MarketBasedSolver(GreedyMMCE):
         order: "Order",
         current_time: float,
         allocated_drones: set[str],
+        truck_last_pos: dict[str, "Position3D"] = None,
     ) -> AllocationResult:
         """
         对单个订单执行单任务拍卖。
@@ -905,7 +1284,7 @@ class MarketBasedSolver(GreedyMMCE):
         drone_diag: dict = {}
 
         if self._must_assign_to_truck(order):
-            forced_truck_bid = self._best_truck_bid(order, current_time)
+            forced_truck_bid = self._best_truck_bid(order, current_time, truck_last_pos)
             if forced_truck_bid is not None:
                 forced_truck_bid.reason = "订单超出无人机载重能力，强制由卡车执行"
                 self._auction_bid_count += 1
@@ -932,7 +1311,7 @@ class MarketBasedSolver(GreedyMMCE):
                 reason="订单超重且无可用卡车",
             )
 
-        truck_bid = self._best_truck_bid(order, current_time)
+        truck_bid = self._best_truck_bid(order, current_time, truck_last_pos)
         if truck_bid is not None:
             bids.append(truck_bid)
 
@@ -979,6 +1358,10 @@ class MarketBasedSolver(GreedyMMCE):
         # 把当前中标无人机记录进屏蔽列表，不依赖父类greedy_mmce，避免B_DYNAMIC在父类漏判导致一机多单
         if best.feasible and best.drone_id and best.mode != "A":
             allocated_drones.add(best.drone_id)
+            if best.mode == "B_DYNAMIC" and best.launch_station_id:
+                self._current_round_bdynamic_launches.append(
+                    (best.vehicle_id, best.launch_station_id, self.TRUCK_DRONE_LAUNCH_TIME)
+                )
 
         return best
 
@@ -1370,12 +1753,15 @@ class MarketBasedSolver(GreedyMMCE):
         if not self._validate_truck_insertion(truck, order, current_time):
             return False
 
-        truck_loc = truck.get_location(current_time)
         if truck.speed <= 0:
             return False
 
-        detour_dist = self._dist(truck_loc, order.delivery_loc)
-        detour_time = detour_dist / truck.speed + self.SERVICE_TIME_CUSTOMER
+        _, _, detour_time = self._find_best_insertion_for_truck(truck, order, current_time)
+        if not math.isfinite(detour_time):
+            detour_time = (
+                self._dist(truck.get_location(current_time), order.delivery_loc)
+                / truck.speed + self.SERVICE_TIME_CUSTOMER
+            )
 
         for drone in self.entity_mgr.drones.values():
             if getattr(drone, "transport_truck_id", None) != truck.truck_id:
@@ -1416,6 +1802,7 @@ class MarketBasedSolver(GreedyMMCE):
         self,
         order: "Order",
         current_time: float,
+        truck_last_pos: dict[str, "Position3D"] = None,
     ) -> AllocationResult | None:
         """卡车作为竞标者，对订单提交模式 A 的最低价投标（需通过契约+舰队安全校验）。"""
         trucks = list(self.entity_mgr.trucks.values())
@@ -1433,7 +1820,7 @@ class MarketBasedSolver(GreedyMMCE):
                 distance=self._dist(truck.get_location(current_time), order.delivery_loc),
                 feasible=True,
             )
-            scored = self._score_standard_bid(bid, order, current_time)
+            scored = self._score_standard_bid(bid, order, current_time, truck_last_pos)
             if scored is None:
                 continue
             if best_bid is None or scored.score_total < best_bid.score_total:
@@ -1492,9 +1879,9 @@ class MarketBasedSolver(GreedyMMCE):
         bids: list[AllocationResult] = []
 
         for truck in self.entity_mgr.trucks.values():
-            if not self._validate_truck_insertion(truck, order, current_time):
-                continue
-
+            # B_WAIT / B 模式下卡车不需要绕路到客户，不应使用 _validate_truck_insertion
+            # （该校验假设卡车去客户地址，会导致误拒合法的 UAV 协同投标）。
+            # 锚点时间可行性已由 _build_anchor_bid 内的 sync 校验覆盖。
             anchors = self._build_anchor_timetable(truck, current_time)
             if not anchors:
                 continue
@@ -1742,9 +2129,17 @@ class MarketBasedSolver(GreedyMMCE):
                 if not self.should_truck_return_to_depot(truck_id):
                     logger.warning(
                         "[MarketBasedSolver][Closure] 卡车 %s 计划提前返回仓库，"
-                        "但仍有活跃任务/契约未完成，不应生成回仓信号",
+                        "但仍有活跃任务/契约未完成，正在移除回仓信号",
                         truck_id,
                     )
+                    # 移除最后一个 _return 节点
+                    route.nodes.pop()
+                    if plan.allocations:  # 尝试将卡车的总距离等还原一下（粗略）
+                        route.total_distance = sum(
+                            route.geometry[i - 1].distance_2d(route.geometry[i])
+                            for i in range(1, len(route.geometry))
+                            # 但完整的卡车几何路径不好裁剪，我们简单处理：后续逻辑由 decision engine 控制物理轨迹
+                        )
 
     def _estimate_relay_remaining_energy(self, drone, relay_origin) -> float:
         """估算无人机到达串联起点时的剩余电量。"""
@@ -2158,13 +2553,19 @@ class MarketBasedSolver(GreedyMMCE):
         alloc: AllocationResult,
         order: "Order",
         current_time: float,
+        truck_last_pos: dict[str, "Position3D"] = None,
     ) -> AllocationResult | None:
         """
-        统一复用贪心基线中的目标函数打分。
+        统一复用贪心基线中的目标函数打分，叠加多维方向性感知评分。
 
         对市场算法中的 B / B_WAIT，卡车主干路线属于既定基础设施成本，
         因此仅将"额外引入的边际卡车成本"计入协同任务评分，而不再把
         "卡车当前位置 -> 起飞锚点"的整段主干路径全量重复计费。
+
+        Mode A 投标叠加：
+          - 回头路惩罚：偏离卡车前进方向的订单得分被提升
+          - 最优插入绕路能耗放大：频繁变向带来的额外机械损耗
+          - 路径邻近度奖励：顺路订单的减分激励
         """
         if alloc.mode in ("B", "B_WAIT"):
             score_total, cost_dist, cost_energy, cost_penalty = self._score_market_b_bid(
@@ -2176,8 +2577,30 @@ class MarketBasedSolver(GreedyMMCE):
             )
         else:
             score_total, cost_dist, cost_energy, cost_penalty = self._score_allocation(
-                alloc, order, current_time
+                alloc, order, current_time, truck_last_pos or {}
             )
+
+            if alloc.mode == "A" and math.isfinite(score_total):
+                truck = self.entity_mgr.trucks.get(alloc.vehicle_id)
+                if truck is not None:
+                    cost_backtrack = self._compute_backtrack_penalty(truck, order, current_time)
+
+                    _, _, detour_time = self._find_best_insertion_for_truck(
+                        truck, order, current_time
+                    )
+                    if math.isfinite(detour_time) and truck.speed > 0:
+                        detour_dist = detour_time * truck.speed
+                        cost_detour_energy = (
+                            self.C_ENERGY_ET
+                            * self._truck_energy_wh(detour_dist)
+                            * (self.DETOUR_ENERGY_MULTIPLIER - 1.0)
+                        )
+                    else:
+                        cost_detour_energy = 0.0
+
+                    path_bonus = self._compute_path_proximity_bonus(truck, order, current_time)
+                    score_total += cost_backtrack + cost_detour_energy - path_bonus
+
         if not math.isfinite(score_total):
             return None
         alloc.score_total = score_total
@@ -2277,7 +2700,29 @@ class MarketBasedSolver(GreedyMMCE):
                 risk_ratio = 1.0 - min(margin / self.T_MAX_WAIT, 1.0)
                 cost_risk = self.DEADLINE_RISK_WEIGHT * risk_ratio * (cost_dist + cost_energy)
 
-        score_total = cost_dist + cost_energy + cost_penalty + cost_wait + cost_risk
+        # ── 回头路惩罚（方向性约束）──────────────────────────────
+        cost_backtrack = 0.0
+        if truck is not None:
+            cost_backtrack = self._compute_backtrack_penalty(truck, order, current_time)
+
+        # ── 绕路能耗放大（频繁变向的额外机械损耗）──────────────────
+        cost_detour_energy = 0.0
+        if truck is not None and truck_distance > 0:
+            cost_detour_energy = (
+                self.C_ENERGY_ET
+                * self._truck_energy_wh(truck_distance)
+                * (self.DETOUR_ENERGY_MULTIPLIER - 1.0)
+            )
+
+        # ── 路径邻近度奖励（顺路减分）──────────────────────────────
+        path_bonus = 0.0
+        if truck is not None:
+            path_bonus = self._compute_path_proximity_bonus(truck, order, current_time)
+
+        score_total = (
+            cost_dist + cost_energy + cost_penalty + cost_wait + cost_risk
+            + cost_backtrack + cost_detour_energy - path_bonus
+        )
         return score_total, cost_dist, cost_energy, cost_penalty
 
     def _score_b_dynamic_bid(

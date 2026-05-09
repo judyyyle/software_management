@@ -57,11 +57,13 @@
           已选区域：<span style="color:#7ec8e3;font-weight:600">{{ selSizeText }}</span>
         </div>
         <table class="coord-table">
-          <tr><td>↙ 西南角 (SW)</td><td>{{ coords.sw }}</td></tr>
-          <tr><td>↗ 东北角 (NE)</td><td>{{ coords.ne }}</td></tr>
-          <tr><td>↙ 西北角 (NW)</td><td>{{ coords.nw }}</td></tr>
-          <tr><td>↗ 东南角 (SE)</td><td>{{ coords.se }}</td></tr>
-          <tr><td>⊙ 中心点</td><td>{{ coords.ctr }}</td></tr>
+          <tbody>
+            <tr><td>↙ 西南角 (SW)</td><td>{{ coords.sw }}</td></tr>
+            <tr><td>↗ 东北角 (NE)</td><td>{{ coords.ne }}</td></tr>
+            <tr><td>↙ 西北角 (NW)</td><td>{{ coords.nw }}</td></tr>
+            <tr><td>↗ 东南角 (SE)</td><td>{{ coords.se }}</td></tr>
+            <tr><td>⊙ 中心点</td><td>{{ coords.ctr }}</td></tr>
+          </tbody>
         </table>
         <span class="copy-btn" @click="copyCoords">{{ copyLabel }}</span>
       </div>

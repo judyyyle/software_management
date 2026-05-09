@@ -12,10 +12,11 @@ from __future__ import annotations
 
 import logging
 import math
+import re
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Optional
 
-from core.entities.primitives import Position3D
+from core.entities.primitives import Position3D, SourceType, WaypointAction
 from solver.greedy_mmce import AllocationResult, DispatchPlan, GreedyMMCE, TruckRoute
 
 if TYPE_CHECKING:
@@ -66,6 +67,8 @@ class _ModeBDiagnostics:
 
     has_drone: bool = True
     has_station: bool = True
+    available_drone_candidates: int = 0
+    capable_drone_candidates: int = 0
     total_station_trials: int = 0
     scenario_feasible_trials: int = 0
     rejected_detour: int = 0
@@ -105,6 +108,146 @@ class GreedyMMCEBackboneInsertion(GreedyMMCE):
     B_WAIT_ETA_TOP_K = 3
     B_WAIT_MAX_CANDIDATES = 8
     WAIT_PENALTY_TIME_SCALE_S = 60.0
+    FIXED_TRUCK_DRONE_INDEXES = frozenset({1, 2, 3, 4, 5, 6, 7, 8, 11})
+    FIXED_DEPOT_DRONE_INDEXES = frozenset({9, 10, 12})
+
+    def __init__(self, entity_mgr) -> None:
+        super().__init__(entity_mgr)
+        self._fixed_loadout_applied = False
+        self._fixed_truck_drone_pool_by_truck: dict[str, set[str]] = {}
+        self._fixed_depot_drone_pool: set[str] = set()
+
+    @staticmethod
+    def _extract_numeric_suffix(entity_id: str) -> int | None:
+        match = re.search(r"(\d+)$", str(entity_id))
+        if not match:
+            return None
+        return int(match.group(1))
+
+    def _resolve_fixed_drone_pools(self) -> tuple[str, str, set[str], set[str]] | None:
+        """解析固定装载规则对应的实体 ID 池。"""
+        if len(self.entity_mgr.trucks) != 1 or not self.entity_mgr.depots:
+            return None
+
+        truck_id = next(iter(self.entity_mgr.trucks.keys()))
+        depot_id = next(iter(self.entity_mgr.depots.keys()))
+
+        truck_pool: set[str] = set()
+        depot_pool: set[str] = set()
+        for drone_id in self.entity_mgr.drones:
+            idx = self._extract_numeric_suffix(drone_id)
+            if idx is None:
+                continue
+            if idx in self.FIXED_TRUCK_DRONE_INDEXES:
+                truck_pool.add(drone_id)
+            elif idx in self.FIXED_DEPOT_DRONE_INDEXES:
+                depot_pool.add(drone_id)
+
+        if len(truck_pool) < len(self.FIXED_TRUCK_DRONE_INDEXES):
+            return None
+        if len(depot_pool) < len(self.FIXED_DEPOT_DRONE_INDEXES):
+            return None
+        return truck_id, depot_id, truck_pool, depot_pool
+
+    def _apply_fixed_initial_drone_loadout(self, current_time: float) -> None:
+        """按规则固化初始 9/3 归属，并避免重规划后车载无人机异常增长。"""
+        if self._fixed_loadout_applied:
+            return
+
+        resolved = self._resolve_fixed_drone_pools()
+        if resolved is None:
+            self._fixed_loadout_applied = True
+            logger.warning("[MMCE-BI] 固定 9/3 无人机装载规则未生效：实体 ID 不匹配或非单车场景")
+            return
+
+        truck_id, depot_id, truck_pool, depot_pool = resolved
+        truck = self.entity_mgr.trucks.get(truck_id)
+        depot = self.entity_mgr.depots.get(depot_id)
+        if truck is None or depot is None:
+            self._fixed_loadout_applied = True
+            return
+
+        self._fixed_truck_drone_pool_by_truck = {truck_id: set(truck_pool)}
+        self._fixed_depot_drone_pool = set(depot_pool)
+
+        # 起降平台并发槽位至少覆盖固定车载无人机数量，保证可回收可复用。
+        if int(getattr(truck, "parking_slots", 0)) < len(truck_pool):
+            truck.parking_slots = len(truck_pool)
+
+        truck.docked_drones = sorted(truck_pool)
+        for other_truck_id, other_truck in self.entity_mgr.trucks.items():
+            if other_truck_id == truck_id:
+                continue
+            other_truck.docked_drones = [
+                did for did in other_truck.docked_drones
+                if did not in truck_pool
+            ]
+
+        for drone_id, drone in self.entity_mgr.drones.items():
+            if drone_id in truck_pool:
+                drone.home_type = SourceType.TRUCK
+                drone.home_id = truck_id
+                drone.transport_truck_id = truck_id
+                if not drone.status.is_flying:
+                    drone.current_loc = truck.get_location(current_time)
+            elif drone_id in depot_pool:
+                drone.home_type = SourceType.DEPOT
+                drone.home_id = depot_id
+                drone.transport_truck_id = None
+                if not drone.status.is_flying:
+                    drone.current_loc = depot.location
+
+        self._fixed_loadout_applied = True
+        logger.info(
+            "[MMCE-BI] 固定无人机装载已生效: truck=%s (%d 架) depot=%s (%d 架)",
+            truck_id,
+            len(truck_pool),
+            depot_id,
+            len(depot_pool),
+        )
+
+    def _drone_in_truck_pool(self, drone_id: str, truck_id: str) -> bool:
+        pool = self._fixed_truck_drone_pool_by_truck.get(truck_id)
+        if pool is not None:
+            return drone_id in pool
+
+        owner = self._resolve_drone_owner_truck_id(self.entity_mgr.drones[drone_id])
+        return owner == truck_id
+
+    def _get_available_drones_for_truck(
+        self,
+        truck_id: str,
+        allocated_drones: set[str],
+    ) -> list["Drone"]:
+        """返回满足“车载且空闲”的无人机。"""
+        truck = self.entity_mgr.trucks.get(truck_id)
+        if truck is None:
+            return []
+
+        docked = set(getattr(truck, "docked_drones", []))
+        available: list["Drone"] = []
+        for drone in self._get_available_drones():
+            if drone.drone_id in allocated_drones:
+                continue
+            if not self._drone_in_truck_pool(drone.drone_id, truck_id):
+                continue
+
+            transport_truck_id = getattr(drone, "transport_truck_id", "")
+            is_carried = drone.drone_id in docked or transport_truck_id == truck_id
+            if not is_carried:
+                continue
+            available.append(drone)
+        return available
+
+    def _try_mode_c(
+        self,
+        order: "Order",
+        current_time: float,
+        allocated_drones: set[str],
+        truck_last_pos: dict[str, Position3D],
+    ) -> AllocationResult:
+        """MMCE-BI 保留仓库直发模式 C。"""
+        return super()._try_mode_c(order, current_time, allocated_drones, truck_last_pos)
 
     def _nearest_station_for_pos(self, pos: Position3D) -> tuple[str, Position3D] | None:
         """返回距离给定位置最近的充电站 (station_id, location)。"""
@@ -213,7 +356,10 @@ class GreedyMMCEBackboneInsertion(GreedyMMCE):
             )
 
         self._road_distance_memo.clear()
+        self._uav_path_distance_memo.clear()
+        self._activate_path_planner(scene_id)
         self._load_road_graph(bbox, scene_id)
+        self._apply_fixed_initial_drone_loadout(current_time)
 
         sorted_orders = sorted(
             orders.values(),
@@ -337,10 +483,20 @@ class GreedyMMCEBackboneInsertion(GreedyMMCE):
 
             if b_choice is None:
                 if not b_diag.has_drone:
-                    logger.info(
-                        "[MMCE-BI] 订单 %s B_WAIT 未入候选: 无可用无人机",
-                        order.order_id,
-                    )
+                    if b_diag.available_drone_candidates > 0 and b_diag.capable_drone_candidates == 0:
+                        logger.info(
+                            "[MMCE-BI] 订单 %s B_WAIT 未入候选: 车载空闲无人机 %d 架，"
+                            "但载重均不足（订单载重=%.2fkg）",
+                            order.order_id,
+                            b_diag.available_drone_candidates,
+                            float(order.payload_weight),
+                        )
+                    else:
+                        logger.info(
+                            "[MMCE-BI] 订单 %s B_WAIT 未入候选: 无可用车载无人机（空闲=%d）",
+                            order.order_id,
+                            b_diag.available_drone_candidates,
+                        )
                 elif not b_diag.has_station:
                     logger.info(
                         "[MMCE-BI] 订单 %s B_WAIT 未入候选: 无可用充电站",
@@ -703,6 +859,16 @@ class GreedyMMCEBackboneInsertion(GreedyMMCE):
                         continue
                     arr = float(stop.get("arrival_time", current_time))
                     dep = float(stop.get("departure_time", arr))
+
+                    # 增量重调度时，旧 future 停靠可能已经部分等待；
+                    # 若继续使用“原始整段服务时长”，会导致同一站点反复从头等待并卡住。
+                    if current_time > arr:
+                        remaining_service = max(0.0, dep - current_time)
+                        arr = current_time
+                        dep = current_time + remaining_service
+                        stop["arrival_time"] = arr
+                        stop["departure_time"] = dep
+
                     seq.append(
                         {
                             "node_id": stop.get("node_id", ""),
@@ -765,27 +931,31 @@ class GreedyMMCEBackboneInsertion(GreedyMMCE):
             seq = stops_by_truck.get(truck_id, [])
             start_pos = self._get_route_start_pos(truck, current_time, start_from_current_state)
             return_to_depot = True
-            base_len = self._sequence_distance(
-                truck,
-                seq,
-                current_time,
-                start_from_current_state,
-                return_to_depot,
-            )
+            
+            # NOTE: 我们需要计算按序到达各个站点的预期时间（含原有的停靠与等待时间），以便精准评估插入导致的迟到！
+            arrival_times_at_idx = [current_time]
+            cur_t = current_time
+            cur_pos = start_pos
+            speed = max(1.0, float(getattr(truck, "speed", 0.0)))
+            for stop in seq:
+                arr = cur_t + self._road_dist(cur_pos, stop.get("position", cur_pos)) / speed
+                # 若是已有站点可能规定了最小出发时间或服务时间
+                dep = max(arr, stop.get("departure_time", arr))
+                arr_with_service = max(arr + stop.get("service_time", 0.0), dep)
+                arrival_times_at_idx.append(arr)
+                cur_t = arr_with_service
+                cur_pos = stop.get("position", cur_pos)
 
             for idx in range(len(seq) + 1):
-                prev_pos = start_pos if idx == 0 else seq[idx - 1]["position"]
-
+                prev_pos = start_pos if idx == 0 else seq[idx - 1].get("position", start_pos)
+                
                 if idx < len(seq):
-                    next_pos = seq[idx]["position"]
+                    next_pos = seq[idx].get("position")
                     replaced = self._road_dist(prev_pos, next_pos)
                 else:
                     next_pos = None
                     base_anchor = self._terminal_anchor_pos(prev_pos)
-                    if base_anchor is None:
-                        replaced = 0.0
-                    else:
-                        replaced = self._road_dist(prev_pos, base_anchor)
+                    replaced = 0.0 if base_anchor is None else self._road_dist(prev_pos, base_anchor)
 
                 added = self._road_dist(prev_pos, order.delivery_loc)
                 if idx < len(seq) and next_pos is not None:
@@ -794,15 +964,19 @@ class GreedyMMCEBackboneInsertion(GreedyMMCE):
                     new_anchor = self._terminal_anchor_pos(order.delivery_loc)
                     if new_anchor is not None:
                         added += self._road_dist(order.delivery_loc, new_anchor)
+                
                 delta_dist = max(0.0, added - replaced)
 
-                speed = max(1e-6, float(getattr(truck, "speed", 0.0)))
-                delivery_time_est = current_time + (base_len + delta_dist) / speed + self.SERVICE_TIME_CUSTOMER
+                # 精确配送时间 = 该索引处原有到达时间 + 插入点路程耗时
+                dist_to_insert = self._road_dist(prev_pos, order.delivery_loc)
+                delivery_time_est = arrival_times_at_idx[idx] + dist_to_insert / speed + self.SERVICE_TIME_CUSTOMER
+
                 lateness = max(0.0, delivery_time_est - order.deadline)
                 cost_dist = self.C_DIST_ET * delta_dist
                 cost_energy = self.C_ENERGY_ET * self._truck_energy_wh(delta_dist)
                 cost_penalty = self.LAMBDA_TIME * order.penalty_rate * lateness
                 delta_score = cost_dist + cost_energy + cost_penalty
+
 
                 cand = _InsertionChoice(
                     truck_id=truck_id,
@@ -892,15 +1066,7 @@ class GreedyMMCEBackboneInsertion(GreedyMMCE):
         a_baseline: float,
     ) -> tuple[Optional[_ModeBCandidate], _ModeBDiagnostics]:
         """枚举 i/(i,j)+s 方案，应用 B 约束后返回最优候选。"""
-        diag = _ModeBDiagnostics()
-        available_drones = [
-            d for d in self._get_available_drones()
-            if d.drone_id not in allocated_drones
-        ]
-        drone = self._find_capable_drone(order.payload_weight, available_drones)
-        if drone is None:
-            diag.has_drone = False
-            return None, diag
+        diag = _ModeBDiagnostics(has_drone=False)
 
         stations = list(self.entity_mgr.stations.values())
         if not stations:
@@ -911,6 +1077,20 @@ class GreedyMMCEBackboneInsertion(GreedyMMCE):
         best: Optional[_ModeBCandidate] = None
 
         for truck_id, truck in self.entity_mgr.trucks.items():
+            truck_drones = self._get_available_drones_for_truck(truck_id, allocated_drones)
+            diag.available_drone_candidates += len(truck_drones)
+
+            capable_drones = [
+                d for d in truck_drones
+                if float(d.payload_capacity) >= float(order.payload_weight)
+            ]
+            diag.capable_drone_candidates += len(capable_drones)
+
+            drone = self._find_capable_drone(order.payload_weight, capable_drones)
+            if drone is None:
+                continue
+            diag.has_drone = True
+
             seq = stops_by_truck.get(truck_id, [])
             start_pos = self._get_route_start_pos(truck, current_time, start_from_current_state)
             return_to_depot = True
@@ -1060,6 +1240,20 @@ class GreedyMMCEBackboneInsertion(GreedyMMCE):
             return []
 
         speed = max(1e-6, float(getattr(truck, "speed", 0.0)))
+        
+        start_pos = self._get_route_start_pos(truck, current_time, start_from_current_state)
+        
+        # 计算按序到达各个站点的预期时间（含原有的停靠与等待时间）
+        arrival_times_at_idx = [current_time]
+        cur_t = current_time
+        cur_pos = start_pos
+        for stop in seq:
+            arr = cur_t + self._road_dist(cur_pos, stop.get("position", cur_pos)) / speed
+            dep = max(arr, stop.get("departure_time", arr))
+            cur_t = max(arr + stop.get("service_time", 0.0), dep)
+            arrival_times_at_idx.append(arr)
+            cur_pos = stop.get("position", cur_pos)
+
         route_ranked: list[tuple[float, float, float, _StationLaunchOption]] = []
         eta_ranked: list[tuple[float, float, float, _StationLaunchOption]] = []
         task_ranked: list[tuple[float, float, float, _StationLaunchOption]] = []
@@ -1081,7 +1275,13 @@ class GreedyMMCEBackboneInsertion(GreedyMMCE):
                 current_time,
                 start_from_current_state,
             )
-            launch_eta = launch_path_distance / speed
+            # 使用包含停靠与等待历史的精确时间
+            base_arr = arrival_times_at_idx[launch_idx]
+            prev_pos = self._get_route_start_pos(truck, current_time, start_from_current_state) if launch_idx == 0 else seq[launch_idx - 1].get("position", start_pos)
+            dist_to_insert = self._road_dist(prev_pos, station.location)
+            true_arrival_time = base_arr + dist_to_insert / speed
+            launch_eta = max(0.0, true_arrival_time - current_time)
+            
             task_dist = self._dist(order.delivery_loc, station.location)
             option = _StationLaunchOption(
                 station_id=station.station_id,
@@ -1305,7 +1505,7 @@ class GreedyMMCEBackboneInsertion(GreedyMMCE):
         stops_by_truck: dict[str, list[dict]],
         allocations: list[AllocationResult],
     ) -> None:
-        """移除当前批次无任务需求的 station 停靠，减少无效绕行/停留。"""
+        """移除当前批次无任务需求的 station/recovery 停靠，减少无效绕行/停留。"""
         required_by_truck: dict[str, set[str]] = {
             tid: set() for tid in stops_by_truck
         }
@@ -1323,6 +1523,33 @@ class GreedyMMCEBackboneInsertion(GreedyMMCE):
             if alloc.recovery_station_id and alloc.recovery_station_id in self.entity_mgr.stations:
                 required_by_truck[truck_id].add(alloc.recovery_station_id)
 
+        # 并入运行时承诺：避免删掉“无人机正在等回收/在途将回收”的站点。
+        runtime_required_by_truck: dict[str, set[str]] = {
+            tid: set() for tid in stops_by_truck
+        }
+        for drone in self.entity_mgr.drones.values():
+            owner_truck_id = self._resolve_drone_owner_truck_id(drone)
+            if owner_truck_id not in runtime_required_by_truck:
+                continue
+
+            waiting_station_id = getattr(drone, "waiting_recovery_station_id", "")
+            if waiting_station_id and waiting_station_id in self.entity_mgr.stations:
+                runtime_required_by_truck[owner_truck_id].add(waiting_station_id)
+
+            route_plan = getattr(drone, "route_plan", None) or []
+            start_idx = int(getattr(drone, "current_waypoint_index", 0) or 0)
+            start_idx = max(0, min(start_idx, len(route_plan)))
+            for wp in route_plan[start_idx:]:
+                if wp.action not in (WaypointAction.DOCK_DEPOT, WaypointAction.DOCK_TRUCK):
+                    continue
+                target_id = wp.target_entity_id or ""
+                if target_id in self.entity_mgr.stations:
+                    runtime_required_by_truck[owner_truck_id].add(target_id)
+                break
+
+        for truck_id, station_ids in runtime_required_by_truck.items():
+            required_by_truck.setdefault(truck_id, set()).update(station_ids)
+
         for truck_id, seq in stops_by_truck.items():
             required = required_by_truck.get(truck_id, set())
             if not seq:
@@ -1331,17 +1558,13 @@ class GreedyMMCEBackboneInsertion(GreedyMMCE):
             kept: list[dict] = []
             removed = 0
             for stop in seq:
-                if stop.get("node_type") != "station":
+                if stop.get("node_type") not in ("station", "recovery"):
                     kept.append(stop)
                     continue
 
                 sid = str(stop.get("node_id", ""))
-                if stop is seq[-1]:
-                    # 保留终点锚站，保证“最终停靠最近充电站”语义在后续增量中延续。
-                    kept.append(stop)
-                    continue
                 if sid and sid in required:
-                    # 保留被任务引用的站点，并升级为 recovery 节点，便于时序一致处理。
+                    # 保留被任务/运行时承诺引用的站点，统一为 recovery 便于时序一致处理。
                     stop["node_type"] = "recovery"
                     kept.append(stop)
                 else:
