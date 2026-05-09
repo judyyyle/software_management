@@ -1,0 +1,1676 @@
+{
+  "generated_at": "2026-05-09T06:17:26.967973+00:00",
+  "update": 180,
+  "global_step": 737529,
+  "order_source_mode": "poisson",
+  "profiles": {
+    "low": {
+      "generated_at": "2026-05-09T06:17:26.967973+00:00",
+      "update": 180,
+      "global_step": 737529,
+      "split": "stochastic_low",
+      "order_source_mode": "poisson",
+      "episode_count": 5,
+      "mean_total_reward": 357.83739031704533,
+      "mean_episode_length_decisions": 37.8,
+      "mean_episode_end_t_sec": 1727.2900939222168,
+      "mean_delivery_count": 5.6,
+      "sum_delivery_count": 28,
+      "mean_on_time_rate": 1.0,
+      "sum_timeout_order_count": 0,
+      "sum_fallback_count": 0,
+      "sum_hard_failure_count": 0,
+      "sum_reservation_timeout_count": 0,
+      "sum_hard_overdue_count": 0,
+      "sum_dispatch_decision_count": 28,
+      "sum_dispatch_decision_with_legal_mode_c_count": 21,
+      "sum_feasible_mode_c_recover_node_count_total": 82,
+      "avg_feasible_mode_c_nodes_per_dispatch_decision": 2.9285714285714284,
+      "sum_mode_c_selected_count": 0,
+      "sum_mode_c_success_count": 0,
+      "sum_mode_c_post_delivery_revalidation_fail_count": 0,
+      "sum_mode_c_post_delivery_revalidation_fail_reasons": {
+        "energy_feasible": 0,
+        "rendezvous_time_feasible": 0,
+        "node_still_valid": 0
+      },
+      "sum_mode_c_selected_filter_margin_sum": 0.0,
+      "sum_mode_c_selected_execution_slack_sum": 0.0,
+      "sum_mode_c_selected_reservation_count_sum": 0.0,
+      "sum_mode_c_selected_truck_eta_remaining_sum": 0.0,
+      "sum_mode_c_selected_planned_truck_eta_sum": 0.0,
+      "sum_mode_c_selected_planned_uav_eta_sum": 0.0,
+      "sum_mode_c_selected_planned_slack_sum": 0.0,
+      "mode_c_timeout_from_state": {
+        "delivered": 0,
+        "return_to_rendezvous": 0,
+        "waiting_for_truck": 0
+      },
+      "mode_c_fallback_from_state": {
+        "delivered": 0,
+        "return_to_rendezvous": 0,
+        "waiting_for_truck": 0
+      },
+      "sum_t_wait_sec": 0.0,
+      "sum_t_idle_sec": 1496.161170548205,
+      "sum_t_queue_sec": 0.0,
+      "sum_t_fallback_sec": 0.0,
+      "sum_t_overdue_sec": 0.0,
+      "sum_t_reservation_timeout_cost_sec": 0.0,
+      "mode_b_dispatch_ratio": 1.0,
+      "mode_c_dispatch_ratio": 0.0,
+      "episodes": [
+        {
+          "phase": "stochastic_low",
+          "episode_id": 0,
+          "order_source_mode": "poisson",
+          "order_source_seed": 20260501,
+          "total_reward": 524.871479844917,
+          "episode_length_decisions": 40,
+          "global_step_start": null,
+          "global_step_end": null,
+          "update_start": null,
+          "update_end": null,
+          "done_reason": "all_orders_cleared",
+          "episode_end_t_sec": 1712.246734260203,
+          "delivery_count": 7,
+          "on_time_delivery_count": 7,
+          "overdue_delivery_count": 0,
+          "on_time_rate": 1.0,
+          "timeout_order_count": 0,
+          "fallback_count": 0,
+          "hard_failure_count": 0,
+          "reservation_timeout_count": 0,
+          "hard_overdue_count": 0,
+          "wait_action_count": 33,
+          "dispatch_decision_count": 7,
+          "dispatch_decision_with_legal_mode_c_count": 6,
+          "dispatch_mode_b_count": 7,
+          "dispatch_mode_c_count": 0,
+          "mode_c_selected_count": 0,
+          "mode_c_success_count": 0,
+          "mode_c_post_delivery_revalidation_fail_count": 0,
+          "mode_c_post_delivery_revalidation_fail_reasons": {
+            "energy_feasible": 0,
+            "rendezvous_time_feasible": 0,
+            "node_still_valid": 0
+          },
+          "mode_c_selected_filter_margin_sum": 0.0,
+          "mode_c_selected_execution_slack_sum": 0.0,
+          "mode_c_selected_reservation_count_sum": 0.0,
+          "mode_c_selected_truck_eta_remaining_sum": 0.0,
+          "mode_c_selected_planned_truck_eta_sum": 0.0,
+          "mode_c_selected_planned_uav_eta_sum": 0.0,
+          "mode_c_selected_planned_slack_sum": 0.0,
+          "mode_c_timeout_from_state": {
+            "delivered": 0,
+            "return_to_rendezvous": 0,
+            "waiting_for_truck": 0
+          },
+          "mode_c_fallback_from_state": {
+            "delivered": 0,
+            "return_to_rendezvous": 0,
+            "waiting_for_truck": 0
+          },
+          "feasible_mode_c_recover_node_count_total": 25,
+          "avg_feasible_mode_c_nodes_per_dispatch_decision": 3.5714285714285716,
+          "t_wait_sec": 0.0,
+          "t_idle_sec": 39.03846729062752,
+          "t_queue_sec": 0.0,
+          "t_fallback_sec": 0.0,
+          "t_overdue_sec": 0.0,
+          "t_reservation_timeout_cost_sec": 0.0,
+          "pending_primary_order_count": 0,
+          "assigned_primary_order_count": 0,
+          "system_context_stats": {
+            "mode_a_background_order_count": 4,
+            "mode_a_background_completed_count": 4,
+            "mode_a_background_pending_count": 0,
+            "mode_a_background_completion_time_sum": 2369.719931,
+            "truck_background_order_completion_events": [
+              {
+                "order_id": "ORD-STATIC-08",
+                "stop_seq": 1,
+                "node_id": "ORD-STATIC-08",
+                "arrival_time_sec": 203.257434,
+                "departure_time_sec": 263.257434
+              },
+              {
+                "order_id": "ORD-STATIC-02",
+                "stop_seq": 3,
+                "node_id": "ORD-STATIC-02",
+                "arrival_time_sec": 511.773906,
+                "departure_time_sec": 571.773906
+              },
+              {
+                "order_id": "ORD-STATIC-06",
+                "stop_seq": 4,
+                "node_id": "ORD-STATIC-06",
+                "arrival_time_sec": 700.598696,
+                "departure_time_sec": 760.598696
+              },
+              {
+                "order_id": "ORD-STATIC-07",
+                "stop_seq": 6,
+                "node_id": "ORD-STATIC-07",
+                "arrival_time_sec": 954.089895,
+                "departure_time_sec": 1014.089895
+              }
+            ]
+          }
+        },
+        {
+          "phase": "stochastic_low",
+          "episode_id": 1,
+          "order_source_mode": "poisson",
+          "order_source_seed": 20260502,
+          "total_reward": 278.02950126433905,
+          "episode_length_decisions": 25,
+          "global_step_start": null,
+          "global_step_end": null,
+          "update_start": null,
+          "update_end": null,
+          "done_reason": "all_orders_cleared",
+          "episode_end_t_sec": 1219.7049873566093,
+          "delivery_count": 4,
+          "on_time_delivery_count": 4,
+          "overdue_delivery_count": 0,
+          "on_time_rate": 1.0,
+          "timeout_order_count": 0,
+          "fallback_count": 0,
+          "hard_failure_count": 0,
+          "reservation_timeout_count": 0,
+          "hard_overdue_count": 0,
+          "wait_action_count": 21,
+          "dispatch_decision_count": 4,
+          "dispatch_decision_with_legal_mode_c_count": 4,
+          "dispatch_mode_b_count": 4,
+          "dispatch_mode_c_count": 0,
+          "mode_c_selected_count": 0,
+          "mode_c_success_count": 0,
+          "mode_c_post_delivery_revalidation_fail_count": 0,
+          "mode_c_post_delivery_revalidation_fail_reasons": {
+            "energy_feasible": 0,
+            "rendezvous_time_feasible": 0,
+            "node_still_valid": 0
+          },
+          "mode_c_selected_filter_margin_sum": 0.0,
+          "mode_c_selected_execution_slack_sum": 0.0,
+          "mode_c_selected_reservation_count_sum": 0.0,
+          "mode_c_selected_truck_eta_remaining_sum": 0.0,
+          "mode_c_selected_planned_truck_eta_sum": 0.0,
+          "mode_c_selected_planned_uav_eta_sum": 0.0,
+          "mode_c_selected_planned_slack_sum": 0.0,
+          "mode_c_timeout_from_state": {
+            "delivered": 0,
+            "return_to_rendezvous": 0,
+            "waiting_for_truck": 0
+          },
+          "mode_c_fallback_from_state": {
+            "delivered": 0,
+            "return_to_rendezvous": 0,
+            "waiting_for_truck": 0
+          },
+          "feasible_mode_c_recover_node_count_total": 17,
+          "avg_feasible_mode_c_nodes_per_dispatch_decision": 4.25,
+          "t_wait_sec": 0.0,
+          "t_idle_sec": 0.0,
+          "t_queue_sec": 0.0,
+          "t_fallback_sec": 0.0,
+          "t_overdue_sec": 0.0,
+          "t_reservation_timeout_cost_sec": 0.0,
+          "pending_primary_order_count": 0,
+          "assigned_primary_order_count": 0,
+          "system_context_stats": {
+            "mode_a_background_order_count": 4,
+            "mode_a_background_completed_count": 4,
+            "mode_a_background_pending_count": 0,
+            "mode_a_background_completion_time_sum": 2369.719931,
+            "truck_background_order_completion_events": [
+              {
+                "order_id": "ORD-STATIC-08",
+                "stop_seq": 1,
+                "node_id": "ORD-STATIC-08",
+                "arrival_time_sec": 203.257434,
+                "departure_time_sec": 263.257434
+              },
+              {
+                "order_id": "ORD-STATIC-02",
+                "stop_seq": 3,
+                "node_id": "ORD-STATIC-02",
+                "arrival_time_sec": 511.773906,
+                "departure_time_sec": 571.773906
+              },
+              {
+                "order_id": "ORD-STATIC-06",
+                "stop_seq": 4,
+                "node_id": "ORD-STATIC-06",
+                "arrival_time_sec": 700.598696,
+                "departure_time_sec": 760.598696
+              },
+              {
+                "order_id": "ORD-STATIC-07",
+                "stop_seq": 6,
+                "node_id": "ORD-STATIC-07",
+                "arrival_time_sec": 954.089895,
+                "departure_time_sec": 1014.089895
+              }
+            ]
+          }
+        },
+        {
+          "phase": "stochastic_low",
+          "episode_id": 2,
+          "order_source_mode": "poisson",
+          "order_source_seed": 20260503,
+          "total_reward": 512.9650409996311,
+          "episode_length_decisions": 63,
+          "global_step_start": null,
+          "global_step_end": null,
+          "update_start": null,
+          "update_end": null,
+          "done_reason": "all_orders_cleared",
+          "episode_end_t_sec": 2844.1841541849712,
+          "delivery_count": 9,
+          "on_time_delivery_count": 9,
+          "overdue_delivery_count": 0,
+          "on_time_rate": 1.0,
+          "timeout_order_count": 0,
+          "fallback_count": 0,
+          "hard_failure_count": 0,
+          "reservation_timeout_count": 0,
+          "hard_overdue_count": 0,
+          "wait_action_count": 54,
+          "dispatch_decision_count": 9,
+          "dispatch_decision_with_legal_mode_c_count": 5,
+          "dispatch_mode_b_count": 9,
+          "dispatch_mode_c_count": 0,
+          "mode_c_selected_count": 0,
+          "mode_c_success_count": 0,
+          "mode_c_post_delivery_revalidation_fail_count": 0,
+          "mode_c_post_delivery_revalidation_fail_reasons": {
+            "energy_feasible": 0,
+            "rendezvous_time_feasible": 0,
+            "node_still_valid": 0
+          },
+          "mode_c_selected_filter_margin_sum": 0.0,
+          "mode_c_selected_execution_slack_sum": 0.0,
+          "mode_c_selected_reservation_count_sum": 0.0,
+          "mode_c_selected_truck_eta_remaining_sum": 0.0,
+          "mode_c_selected_planned_truck_eta_sum": 0.0,
+          "mode_c_selected_planned_uav_eta_sum": 0.0,
+          "mode_c_selected_planned_slack_sum": 0.0,
+          "mode_c_timeout_from_state": {
+            "delivered": 0,
+            "return_to_rendezvous": 0,
+            "waiting_for_truck": 0
+          },
+          "mode_c_fallback_from_state": {
+            "delivered": 0,
+            "return_to_rendezvous": 0,
+            "waiting_for_truck": 0
+          },
+          "feasible_mode_c_recover_node_count_total": 17,
+          "avg_feasible_mode_c_nodes_per_dispatch_decision": 1.8888888888888888,
+          "t_wait_sec": 0.0,
+          "t_idle_sec": 1026.1654358187166,
+          "t_queue_sec": 0.0,
+          "t_fallback_sec": 0.0,
+          "t_overdue_sec": 0.0,
+          "t_reservation_timeout_cost_sec": 0.0,
+          "pending_primary_order_count": 0,
+          "assigned_primary_order_count": 0,
+          "system_context_stats": {
+            "mode_a_background_order_count": 4,
+            "mode_a_background_completed_count": 4,
+            "mode_a_background_pending_count": 0,
+            "mode_a_background_completion_time_sum": 2369.719931,
+            "truck_background_order_completion_events": [
+              {
+                "order_id": "ORD-STATIC-08",
+                "stop_seq": 1,
+                "node_id": "ORD-STATIC-08",
+                "arrival_time_sec": 203.257434,
+                "departure_time_sec": 263.257434
+              },
+              {
+                "order_id": "ORD-STATIC-02",
+                "stop_seq": 3,
+                "node_id": "ORD-STATIC-02",
+                "arrival_time_sec": 511.773906,
+                "departure_time_sec": 571.773906
+              },
+              {
+                "order_id": "ORD-STATIC-06",
+                "stop_seq": 4,
+                "node_id": "ORD-STATIC-06",
+                "arrival_time_sec": 700.598696,
+                "departure_time_sec": 760.598696
+              },
+              {
+                "order_id": "ORD-STATIC-07",
+                "stop_seq": 6,
+                "node_id": "ORD-STATIC-07",
+                "arrival_time_sec": 954.089895,
+                "departure_time_sec": 1014.089895
+              }
+            ]
+          }
+        },
+        {
+          "phase": "stochastic_low",
+          "episode_id": 3,
+          "order_source_mode": "poisson",
+          "order_source_seed": 20260504,
+          "total_reward": 368.72991897633926,
+          "episode_length_decisions": 41,
+          "global_step_start": null,
+          "global_step_end": null,
+          "update_start": null,
+          "update_end": null,
+          "done_reason": "all_orders_cleared",
+          "episode_end_t_sec": 1906.2246988093,
+          "delivery_count": 6,
+          "on_time_delivery_count": 6,
+          "overdue_delivery_count": 0,
+          "on_time_rate": 1.0,
+          "timeout_order_count": 0,
+          "fallback_count": 0,
+          "hard_failure_count": 0,
+          "reservation_timeout_count": 0,
+          "hard_overdue_count": 0,
+          "wait_action_count": 35,
+          "dispatch_decision_count": 6,
+          "dispatch_decision_with_legal_mode_c_count": 4,
+          "dispatch_mode_b_count": 6,
+          "dispatch_mode_c_count": 0,
+          "mode_c_selected_count": 0,
+          "mode_c_success_count": 0,
+          "mode_c_post_delivery_revalidation_fail_count": 0,
+          "mode_c_post_delivery_revalidation_fail_reasons": {
+            "energy_feasible": 0,
+            "rendezvous_time_feasible": 0,
+            "node_still_valid": 0
+          },
+          "mode_c_selected_filter_margin_sum": 0.0,
+          "mode_c_selected_execution_slack_sum": 0.0,
+          "mode_c_selected_reservation_count_sum": 0.0,
+          "mode_c_selected_truck_eta_remaining_sum": 0.0,
+          "mode_c_selected_planned_truck_eta_sum": 0.0,
+          "mode_c_selected_planned_uav_eta_sum": 0.0,
+          "mode_c_selected_planned_slack_sum": 0.0,
+          "mode_c_timeout_from_state": {
+            "delivered": 0,
+            "return_to_rendezvous": 0,
+            "waiting_for_truck": 0
+          },
+          "mode_c_fallback_from_state": {
+            "delivered": 0,
+            "return_to_rendezvous": 0,
+            "waiting_for_truck": 0
+          },
+          "feasible_mode_c_recover_node_count_total": 14,
+          "avg_feasible_mode_c_nodes_per_dispatch_decision": 2.3333333333333335,
+          "t_wait_sec": 0.0,
+          "t_idle_sec": 406.4761114273074,
+          "t_queue_sec": 0.0,
+          "t_fallback_sec": 0.0,
+          "t_overdue_sec": 0.0,
+          "t_reservation_timeout_cost_sec": 0.0,
+          "pending_primary_order_count": 0,
+          "assigned_primary_order_count": 0,
+          "system_context_stats": {
+            "mode_a_background_order_count": 4,
+            "mode_a_background_completed_count": 4,
+            "mode_a_background_pending_count": 0,
+            "mode_a_background_completion_time_sum": 2369.719931,
+            "truck_background_order_completion_events": [
+              {
+                "order_id": "ORD-STATIC-08",
+                "stop_seq": 1,
+                "node_id": "ORD-STATIC-08",
+                "arrival_time_sec": 203.257434,
+                "departure_time_sec": 263.257434
+              },
+              {
+                "order_id": "ORD-STATIC-02",
+                "stop_seq": 3,
+                "node_id": "ORD-STATIC-02",
+                "arrival_time_sec": 511.773906,
+                "departure_time_sec": 571.773906
+              },
+              {
+                "order_id": "ORD-STATIC-06",
+                "stop_seq": 4,
+                "node_id": "ORD-STATIC-06",
+                "arrival_time_sec": 700.598696,
+                "departure_time_sec": 760.598696
+              },
+              {
+                "order_id": "ORD-STATIC-07",
+                "stop_seq": 6,
+                "node_id": "ORD-STATIC-07",
+                "arrival_time_sec": 954.089895,
+                "departure_time_sec": 1014.089895
+              }
+            ]
+          }
+        },
+        {
+          "phase": "stochastic_low",
+          "episode_id": 4,
+          "order_source_mode": "poisson",
+          "order_source_seed": 20260505,
+          "total_reward": 104.59101050000001,
+          "episode_length_decisions": 20,
+          "global_step_start": null,
+          "global_step_end": null,
+          "update_start": null,
+          "update_end": null,
+          "done_reason": "all_orders_cleared",
+          "episode_end_t_sec": 954.089895,
+          "delivery_count": 2,
+          "on_time_delivery_count": 2,
+          "overdue_delivery_count": 0,
+          "on_time_rate": 1.0,
+          "timeout_order_count": 0,
+          "fallback_count": 0,
+          "hard_failure_count": 0,
+          "reservation_timeout_count": 0,
+          "hard_overdue_count": 0,
+          "wait_action_count": 18,
+          "dispatch_decision_count": 2,
+          "dispatch_decision_with_legal_mode_c_count": 2,
+          "dispatch_mode_b_count": 2,
+          "dispatch_mode_c_count": 0,
+          "mode_c_selected_count": 0,
+          "mode_c_success_count": 0,
+          "mode_c_post_delivery_revalidation_fail_count": 0,
+          "mode_c_post_delivery_revalidation_fail_reasons": {
+            "energy_feasible": 0,
+            "rendezvous_time_feasible": 0,
+            "node_still_valid": 0
+          },
+          "mode_c_selected_filter_margin_sum": 0.0,
+          "mode_c_selected_execution_slack_sum": 0.0,
+          "mode_c_selected_reservation_count_sum": 0.0,
+          "mode_c_selected_truck_eta_remaining_sum": 0.0,
+          "mode_c_selected_planned_truck_eta_sum": 0.0,
+          "mode_c_selected_planned_uav_eta_sum": 0.0,
+          "mode_c_selected_planned_slack_sum": 0.0,
+          "mode_c_timeout_from_state": {
+            "delivered": 0,
+            "return_to_rendezvous": 0,
+            "waiting_for_truck": 0
+          },
+          "mode_c_fallback_from_state": {
+            "delivered": 0,
+            "return_to_rendezvous": 0,
+            "waiting_for_truck": 0
+          },
+          "feasible_mode_c_recover_node_count_total": 9,
+          "avg_feasible_mode_c_nodes_per_dispatch_decision": 4.5,
+          "t_wait_sec": 0.0,
+          "t_idle_sec": 24.481156011553708,
+          "t_queue_sec": 0.0,
+          "t_fallback_sec": 0.0,
+          "t_overdue_sec": 0.0,
+          "t_reservation_timeout_cost_sec": 0.0,
+          "pending_primary_order_count": 0,
+          "assigned_primary_order_count": 0,
+          "system_context_stats": {
+            "mode_a_background_order_count": 4,
+            "mode_a_background_completed_count": 4,
+            "mode_a_background_pending_count": 0,
+            "mode_a_background_completion_time_sum": 2369.719931,
+            "truck_background_order_completion_events": [
+              {
+                "order_id": "ORD-STATIC-08",
+                "stop_seq": 1,
+                "node_id": "ORD-STATIC-08",
+                "arrival_time_sec": 203.257434,
+                "departure_time_sec": 263.257434
+              },
+              {
+                "order_id": "ORD-STATIC-02",
+                "stop_seq": 3,
+                "node_id": "ORD-STATIC-02",
+                "arrival_time_sec": 511.773906,
+                "departure_time_sec": 571.773906
+              },
+              {
+                "order_id": "ORD-STATIC-06",
+                "stop_seq": 4,
+                "node_id": "ORD-STATIC-06",
+                "arrival_time_sec": 700.598696,
+                "departure_time_sec": 760.598696
+              },
+              {
+                "order_id": "ORD-STATIC-07",
+                "stop_seq": 6,
+                "node_id": "ORD-STATIC-07",
+                "arrival_time_sec": 954.089895,
+                "departure_time_sec": 1014.089895
+              }
+            ]
+          }
+        }
+      ],
+      "arrival_rate_per_min": 0.2,
+      "seed_base": 20260501,
+      "seed_count": 5
+    },
+    "medium": {
+      "generated_at": "2026-05-09T06:17:26.967973+00:00",
+      "update": 180,
+      "global_step": 737529,
+      "split": "stochastic_medium",
+      "order_source_mode": "poisson",
+      "episode_count": 5,
+      "mean_total_reward": 1115.6633368655723,
+      "mean_episode_length_decisions": 81.8,
+      "mean_episode_end_t_sec": 3212.7813251949337,
+      "mean_delivery_count": 15.0,
+      "sum_delivery_count": 75,
+      "mean_on_time_rate": 0.9888888888888889,
+      "sum_timeout_order_count": 2,
+      "sum_fallback_count": 0,
+      "sum_hard_failure_count": 0,
+      "sum_reservation_timeout_count": 0,
+      "sum_hard_overdue_count": 2,
+      "sum_dispatch_decision_count": 78,
+      "sum_dispatch_decision_with_legal_mode_c_count": 55,
+      "sum_feasible_mode_c_recover_node_count_total": 176,
+      "avg_feasible_mode_c_nodes_per_dispatch_decision": 2.2564102564102564,
+      "sum_mode_c_selected_count": 9,
+      "sum_mode_c_success_count": 7,
+      "sum_mode_c_post_delivery_revalidation_fail_count": 0,
+      "sum_mode_c_post_delivery_revalidation_fail_reasons": {
+        "energy_feasible": 0,
+        "rendezvous_time_feasible": 0,
+        "node_still_valid": 0
+      },
+      "sum_mode_c_selected_filter_margin_sum": 1028.0912736368455,
+      "sum_mode_c_selected_execution_slack_sum": 1208.0912736368455,
+      "sum_mode_c_selected_reservation_count_sum": 1.0,
+      "sum_mode_c_selected_truck_eta_remaining_sum": 3146.0379073483227,
+      "sum_mode_c_selected_planned_truck_eta_sum": 30502.22265712107,
+      "sum_mode_c_selected_planned_uav_eta_sum": 29204.131383484222,
+      "sum_mode_c_selected_planned_slack_sum": 1298.0912736368455,
+      "mode_c_timeout_from_state": {
+        "delivered": 0,
+        "return_to_rendezvous": 0,
+        "waiting_for_truck": 0
+      },
+      "mode_c_fallback_from_state": {
+        "delivered": 0,
+        "return_to_rendezvous": 0,
+        "waiting_for_truck": 0
+      },
+      "sum_t_wait_sec": 814.9511008382046,
+      "sum_t_idle_sec": 2354.445416795815,
+      "sum_t_queue_sec": 0.0,
+      "sum_t_fallback_sec": 0.0,
+      "sum_t_overdue_sec": 2090.234744609913,
+      "sum_t_reservation_timeout_cost_sec": 0.0,
+      "mode_b_dispatch_ratio": 0.8846153846153846,
+      "mode_c_dispatch_ratio": 0.11538461538461539,
+      "episodes": [
+        {
+          "phase": "stochastic_medium",
+          "episode_id": 0,
+          "order_source_mode": "poisson",
+          "order_source_seed": 20260501,
+          "total_reward": 1325.1119933368282,
+          "episode_length_decisions": 99,
+          "global_step_start": null,
+          "global_step_end": null,
+          "update_start": null,
+          "update_end": null,
+          "done_reason": "upper_horizon_reached",
+          "episode_end_t_sec": 3600.0,
+          "delivery_count": 18,
+          "on_time_delivery_count": 17,
+          "overdue_delivery_count": 1,
+          "on_time_rate": 0.9444444444444444,
+          "timeout_order_count": 0,
+          "fallback_count": 0,
+          "hard_failure_count": 0,
+          "reservation_timeout_count": 0,
+          "hard_overdue_count": 0,
+          "wait_action_count": 80,
+          "dispatch_decision_count": 19,
+          "dispatch_decision_with_legal_mode_c_count": 15,
+          "dispatch_mode_b_count": 15,
+          "dispatch_mode_c_count": 4,
+          "mode_c_selected_count": 4,
+          "mode_c_success_count": 3,
+          "mode_c_post_delivery_revalidation_fail_count": 0,
+          "mode_c_post_delivery_revalidation_fail_reasons": {
+            "energy_feasible": 0,
+            "rendezvous_time_feasible": 0,
+            "node_still_valid": 0
+          },
+          "mode_c_selected_filter_margin_sum": 501.1205112043076,
+          "mode_c_selected_execution_slack_sum": 581.1205112043076,
+          "mode_c_selected_reservation_count_sum": 1.0,
+          "mode_c_selected_truck_eta_remaining_sum": 1278.6484515794696,
+          "mode_c_selected_planned_truck_eta_sum": 13558.483723942534,
+          "mode_c_selected_planned_uav_eta_sum": 12937.363212738226,
+          "mode_c_selected_planned_slack_sum": 621.1205112043076,
+          "mode_c_timeout_from_state": {
+            "delivered": 0,
+            "return_to_rendezvous": 0,
+            "waiting_for_truck": 0
+          },
+          "mode_c_fallback_from_state": {
+            "delivered": 0,
+            "return_to_rendezvous": 0,
+            "waiting_for_truck": 0
+          },
+          "feasible_mode_c_recover_node_count_total": 47,
+          "avg_feasible_mode_c_nodes_per_dispatch_decision": 2.473684210526316,
+          "t_wait_sec": 363.4787736073149,
+          "t_idle_sec": 770.9354390381034,
+          "t_queue_sec": 0.0,
+          "t_fallback_sec": 0.0,
+          "t_overdue_sec": 512.4854485400847,
+          "t_reservation_timeout_cost_sec": 0.0,
+          "pending_primary_order_count": 5,
+          "assigned_primary_order_count": 1,
+          "system_context_stats": {
+            "mode_a_background_order_count": 4,
+            "mode_a_background_completed_count": 4,
+            "mode_a_background_pending_count": 0,
+            "mode_a_background_completion_time_sum": 2369.719931,
+            "truck_background_order_completion_events": [
+              {
+                "order_id": "ORD-STATIC-08",
+                "stop_seq": 1,
+                "node_id": "ORD-STATIC-08",
+                "arrival_time_sec": 203.257434,
+                "departure_time_sec": 263.257434
+              },
+              {
+                "order_id": "ORD-STATIC-02",
+                "stop_seq": 3,
+                "node_id": "ORD-STATIC-02",
+                "arrival_time_sec": 511.773906,
+                "departure_time_sec": 571.773906
+              },
+              {
+                "order_id": "ORD-STATIC-06",
+                "stop_seq": 4,
+                "node_id": "ORD-STATIC-06",
+                "arrival_time_sec": 700.598696,
+                "departure_time_sec": 760.598696
+              },
+              {
+                "order_id": "ORD-STATIC-07",
+                "stop_seq": 6,
+                "node_id": "ORD-STATIC-07",
+                "arrival_time_sec": 954.089895,
+                "departure_time_sec": 1014.089895
+              }
+            ]
+          }
+        },
+        {
+          "phase": "stochastic_medium",
+          "episode_id": 1,
+          "order_source_mode": "poisson",
+          "order_source_seed": 20260502,
+          "total_reward": 696.9249252793252,
+          "episode_length_decisions": 42,
+          "global_step_start": null,
+          "global_step_end": null,
+          "update_start": null,
+          "update_end": null,
+          "done_reason": "all_orders_cleared",
+          "episode_end_t_sec": 1663.9066259746687,
+          "delivery_count": 9,
+          "on_time_delivery_count": 9,
+          "overdue_delivery_count": 0,
+          "on_time_rate": 1.0,
+          "timeout_order_count": 0,
+          "fallback_count": 0,
+          "hard_failure_count": 0,
+          "reservation_timeout_count": 0,
+          "hard_overdue_count": 0,
+          "wait_action_count": 33,
+          "dispatch_decision_count": 9,
+          "dispatch_decision_with_legal_mode_c_count": 8,
+          "dispatch_mode_b_count": 9,
+          "dispatch_mode_c_count": 0,
+          "mode_c_selected_count": 0,
+          "mode_c_success_count": 0,
+          "mode_c_post_delivery_revalidation_fail_count": 0,
+          "mode_c_post_delivery_revalidation_fail_reasons": {
+            "energy_feasible": 0,
+            "rendezvous_time_feasible": 0,
+            "node_still_valid": 0
+          },
+          "mode_c_selected_filter_margin_sum": 0.0,
+          "mode_c_selected_execution_slack_sum": 0.0,
+          "mode_c_selected_reservation_count_sum": 0.0,
+          "mode_c_selected_truck_eta_remaining_sum": 0.0,
+          "mode_c_selected_planned_truck_eta_sum": 0.0,
+          "mode_c_selected_planned_uav_eta_sum": 0.0,
+          "mode_c_selected_planned_slack_sum": 0.0,
+          "mode_c_timeout_from_state": {
+            "delivered": 0,
+            "return_to_rendezvous": 0,
+            "waiting_for_truck": 0
+          },
+          "mode_c_fallback_from_state": {
+            "delivered": 0,
+            "return_to_rendezvous": 0,
+            "waiting_for_truck": 0
+          },
+          "feasible_mode_c_recover_node_count_total": 34,
+          "avg_feasible_mode_c_nodes_per_dispatch_decision": 3.7777777777777777,
+          "t_wait_sec": 0.0,
+          "t_idle_sec": 366.8441212320797,
+          "t_queue_sec": 0.0,
+          "t_fallback_sec": 0.0,
+          "t_overdue_sec": 0.0,
+          "t_reservation_timeout_cost_sec": 0.0,
+          "pending_primary_order_count": 0,
+          "assigned_primary_order_count": 0,
+          "system_context_stats": {
+            "mode_a_background_order_count": 4,
+            "mode_a_background_completed_count": 4,
+            "mode_a_background_pending_count": 0,
+            "mode_a_background_completion_time_sum": 2369.719931,
+            "truck_background_order_completion_events": [
+              {
+                "order_id": "ORD-STATIC-08",
+                "stop_seq": 1,
+                "node_id": "ORD-STATIC-08",
+                "arrival_time_sec": 203.257434,
+                "departure_time_sec": 263.257434
+              },
+              {
+                "order_id": "ORD-STATIC-02",
+                "stop_seq": 3,
+                "node_id": "ORD-STATIC-02",
+                "arrival_time_sec": 511.773906,
+                "departure_time_sec": 571.773906
+              },
+              {
+                "order_id": "ORD-STATIC-06",
+                "stop_seq": 4,
+                "node_id": "ORD-STATIC-06",
+                "arrival_time_sec": 700.598696,
+                "departure_time_sec": 760.598696
+              },
+              {
+                "order_id": "ORD-STATIC-07",
+                "stop_seq": 6,
+                "node_id": "ORD-STATIC-07",
+                "arrival_time_sec": 954.089895,
+                "departure_time_sec": 1014.089895
+              }
+            ]
+          }
+        },
+        {
+          "phase": "stochastic_medium",
+          "episode_id": 2,
+          "order_source_mode": "poisson",
+          "order_source_seed": 20260503,
+          "total_reward": 1452.108115377964,
+          "episode_length_decisions": 96,
+          "global_step_start": null,
+          "global_step_end": null,
+          "update_start": null,
+          "update_end": null,
+          "done_reason": "upper_horizon_reached",
+          "episode_end_t_sec": 3600.0,
+          "delivery_count": 19,
+          "on_time_delivery_count": 19,
+          "overdue_delivery_count": 0,
+          "on_time_rate": 1.0,
+          "timeout_order_count": 2,
+          "fallback_count": 0,
+          "hard_failure_count": 0,
+          "reservation_timeout_count": 0,
+          "hard_overdue_count": 2,
+          "wait_action_count": 77,
+          "dispatch_decision_count": 19,
+          "dispatch_decision_with_legal_mode_c_count": 15,
+          "dispatch_mode_b_count": 16,
+          "dispatch_mode_c_count": 3,
+          "mode_c_selected_count": 3,
+          "mode_c_success_count": 2,
+          "mode_c_post_delivery_revalidation_fail_count": 0,
+          "mode_c_post_delivery_revalidation_fail_reasons": {
+            "energy_feasible": 0,
+            "rendezvous_time_feasible": 0,
+            "node_still_valid": 0
+          },
+          "mode_c_selected_filter_margin_sum": 432.19868129077213,
+          "mode_c_selected_execution_slack_sum": 492.19868129077213,
+          "mode_c_selected_reservation_count_sum": 0.0,
+          "mode_c_selected_truck_eta_remaining_sum": 1219.5069015065392,
+          "mode_c_selected_planned_truck_eta_sum": 10118.056140324257,
+          "mode_c_selected_planned_uav_eta_sum": 9595.857459033485,
+          "mode_c_selected_planned_slack_sum": 522.1986812907721,
+          "mode_c_timeout_from_state": {
+            "delivered": 0,
+            "return_to_rendezvous": 0,
+            "waiting_for_truck": 0
+          },
+          "mode_c_fallback_from_state": {
+            "delivered": 0,
+            "return_to_rendezvous": 0,
+            "waiting_for_truck": 0
+          },
+          "feasible_mode_c_recover_node_count_total": 39,
+          "avg_feasible_mode_c_nodes_per_dispatch_decision": 2.0526315789473686,
+          "t_wait_sec": 351.8999108491671,
+          "t_idle_sec": 597.3989175410293,
+          "t_queue_sec": 0.0,
+          "t_fallback_sec": 0.0,
+          "t_overdue_sec": 1233.6428798132365,
+          "t_reservation_timeout_cost_sec": 0.0,
+          "pending_primary_order_count": 3,
+          "assigned_primary_order_count": 0,
+          "system_context_stats": {
+            "mode_a_background_order_count": 4,
+            "mode_a_background_completed_count": 4,
+            "mode_a_background_pending_count": 0,
+            "mode_a_background_completion_time_sum": 2369.719931,
+            "truck_background_order_completion_events": [
+              {
+                "order_id": "ORD-STATIC-08",
+                "stop_seq": 1,
+                "node_id": "ORD-STATIC-08",
+                "arrival_time_sec": 203.257434,
+                "departure_time_sec": 263.257434
+              },
+              {
+                "order_id": "ORD-STATIC-02",
+                "stop_seq": 3,
+                "node_id": "ORD-STATIC-02",
+                "arrival_time_sec": 511.773906,
+                "departure_time_sec": 571.773906
+              },
+              {
+                "order_id": "ORD-STATIC-06",
+                "stop_seq": 4,
+                "node_id": "ORD-STATIC-06",
+                "arrival_time_sec": 700.598696,
+                "departure_time_sec": 760.598696
+              },
+              {
+                "order_id": "ORD-STATIC-07",
+                "stop_seq": 6,
+                "node_id": "ORD-STATIC-07",
+                "arrival_time_sec": 954.089895,
+                "departure_time_sec": 1014.089895
+              }
+            ]
+          }
+        },
+        {
+          "phase": "stochastic_medium",
+          "episode_id": 3,
+          "order_source_mode": "poisson",
+          "order_source_seed": 20260504,
+          "total_reward": 973.2733061015396,
+          "episode_length_decisions": 87,
+          "global_step_start": null,
+          "global_step_end": null,
+          "update_start": null,
+          "update_end": null,
+          "done_reason": "upper_horizon_reached",
+          "episode_end_t_sec": 3600.0,
+          "delivery_count": 14,
+          "on_time_delivery_count": 14,
+          "overdue_delivery_count": 0,
+          "on_time_rate": 1.0,
+          "timeout_order_count": 0,
+          "fallback_count": 0,
+          "hard_failure_count": 0,
+          "reservation_timeout_count": 0,
+          "hard_overdue_count": 0,
+          "wait_action_count": 72,
+          "dispatch_decision_count": 15,
+          "dispatch_decision_with_legal_mode_c_count": 7,
+          "dispatch_mode_b_count": 14,
+          "dispatch_mode_c_count": 1,
+          "mode_c_selected_count": 1,
+          "mode_c_success_count": 1,
+          "mode_c_post_delivery_revalidation_fail_count": 0,
+          "mode_c_post_delivery_revalidation_fail_reasons": {
+            "energy_feasible": 0,
+            "rendezvous_time_feasible": 0,
+            "node_still_valid": 0
+          },
+          "mode_c_selected_filter_margin_sum": 47.615478502510996,
+          "mode_c_selected_execution_slack_sum": 67.615478502511,
+          "mode_c_selected_reservation_count_sum": 0.0,
+          "mode_c_selected_truck_eta_remaining_sum": 306.4129414513518,
+          "mode_c_selected_planned_truck_eta_sum": 3237.2009730877026,
+          "mode_c_selected_planned_uav_eta_sum": 3159.5854945851916,
+          "mode_c_selected_planned_slack_sum": 77.615478502511,
+          "mode_c_timeout_from_state": {
+            "delivered": 0,
+            "return_to_rendezvous": 0,
+            "waiting_for_truck": 0
+          },
+          "mode_c_fallback_from_state": {
+            "delivered": 0,
+            "return_to_rendezvous": 0,
+            "waiting_for_truck": 0
+          },
+          "feasible_mode_c_recover_node_count_total": 24,
+          "avg_feasible_mode_c_nodes_per_dispatch_decision": 1.6,
+          "t_wait_sec": 60.0,
+          "t_idle_sec": 619.2669389846028,
+          "t_queue_sec": 0.0,
+          "t_fallback_sec": 0.0,
+          "t_overdue_sec": 0.0,
+          "t_reservation_timeout_cost_sec": 0.0,
+          "pending_primary_order_count": 2,
+          "assigned_primary_order_count": 1,
+          "system_context_stats": {
+            "mode_a_background_order_count": 4,
+            "mode_a_background_completed_count": 4,
+            "mode_a_background_pending_count": 0,
+            "mode_a_background_completion_time_sum": 2369.719931,
+            "truck_background_order_completion_events": [
+              {
+                "order_id": "ORD-STATIC-08",
+                "stop_seq": 1,
+                "node_id": "ORD-STATIC-08",
+                "arrival_time_sec": 203.257434,
+                "departure_time_sec": 263.257434
+              },
+              {
+                "order_id": "ORD-STATIC-02",
+                "stop_seq": 3,
+                "node_id": "ORD-STATIC-02",
+                "arrival_time_sec": 511.773906,
+                "departure_time_sec": 571.773906
+              },
+              {
+                "order_id": "ORD-STATIC-06",
+                "stop_seq": 4,
+                "node_id": "ORD-STATIC-06",
+                "arrival_time_sec": 700.598696,
+                "departure_time_sec": 760.598696
+              },
+              {
+                "order_id": "ORD-STATIC-07",
+                "stop_seq": 6,
+                "node_id": "ORD-STATIC-07",
+                "arrival_time_sec": 954.089895,
+                "departure_time_sec": 1014.089895
+              }
+            ]
+          }
+        },
+        {
+          "phase": "stochastic_medium",
+          "episode_id": 4,
+          "order_source_mode": "poisson",
+          "order_source_seed": 20260505,
+          "total_reward": 1130.8983442322037,
+          "episode_length_decisions": 85,
+          "global_step_start": null,
+          "global_step_end": null,
+          "update_start": null,
+          "update_end": null,
+          "done_reason": "upper_horizon_reached",
+          "episode_end_t_sec": 3600.0,
+          "delivery_count": 15,
+          "on_time_delivery_count": 15,
+          "overdue_delivery_count": 0,
+          "on_time_rate": 1.0,
+          "timeout_order_count": 0,
+          "fallback_count": 0,
+          "hard_failure_count": 0,
+          "reservation_timeout_count": 0,
+          "hard_overdue_count": 0,
+          "wait_action_count": 69,
+          "dispatch_decision_count": 16,
+          "dispatch_decision_with_legal_mode_c_count": 10,
+          "dispatch_mode_b_count": 15,
+          "dispatch_mode_c_count": 1,
+          "mode_c_selected_count": 1,
+          "mode_c_success_count": 1,
+          "mode_c_post_delivery_revalidation_fail_count": 0,
+          "mode_c_post_delivery_revalidation_fail_reasons": {
+            "energy_feasible": 0,
+            "rendezvous_time_feasible": 0,
+            "node_still_valid": 0
+          },
+          "mode_c_selected_filter_margin_sum": 47.15660263925474,
+          "mode_c_selected_execution_slack_sum": 67.15660263925474,
+          "mode_c_selected_reservation_count_sum": 0.0,
+          "mode_c_selected_truck_eta_remaining_sum": 341.4696128109622,
+          "mode_c_selected_planned_truck_eta_sum": 3588.481819766573,
+          "mode_c_selected_planned_uav_eta_sum": 3511.3252171273184,
+          "mode_c_selected_planned_slack_sum": 77.15660263925474,
+          "mode_c_timeout_from_state": {
+            "delivered": 0,
+            "return_to_rendezvous": 0,
+            "waiting_for_truck": 0
+          },
+          "mode_c_fallback_from_state": {
+            "delivered": 0,
+            "return_to_rendezvous": 0,
+            "waiting_for_truck": 0
+          },
+          "feasible_mode_c_recover_node_count_total": 32,
+          "avg_feasible_mode_c_nodes_per_dispatch_decision": 2.0,
+          "t_wait_sec": 39.57241638172263,
+          "t_idle_sec": 0.0,
+          "t_queue_sec": 0.0,
+          "t_fallback_sec": 0.0,
+          "t_overdue_sec": 344.10641625659173,
+          "t_reservation_timeout_cost_sec": 0.0,
+          "pending_primary_order_count": 3,
+          "assigned_primary_order_count": 1,
+          "system_context_stats": {
+            "mode_a_background_order_count": 4,
+            "mode_a_background_completed_count": 4,
+            "mode_a_background_pending_count": 0,
+            "mode_a_background_completion_time_sum": 2369.719931,
+            "truck_background_order_completion_events": [
+              {
+                "order_id": "ORD-STATIC-08",
+                "stop_seq": 1,
+                "node_id": "ORD-STATIC-08",
+                "arrival_time_sec": 203.257434,
+                "departure_time_sec": 263.257434
+              },
+              {
+                "order_id": "ORD-STATIC-02",
+                "stop_seq": 3,
+                "node_id": "ORD-STATIC-02",
+                "arrival_time_sec": 511.773906,
+                "departure_time_sec": 571.773906
+              },
+              {
+                "order_id": "ORD-STATIC-06",
+                "stop_seq": 4,
+                "node_id": "ORD-STATIC-06",
+                "arrival_time_sec": 700.598696,
+                "departure_time_sec": 760.598696
+              },
+              {
+                "order_id": "ORD-STATIC-07",
+                "stop_seq": 6,
+                "node_id": "ORD-STATIC-07",
+                "arrival_time_sec": 954.089895,
+                "departure_time_sec": 1014.089895
+              }
+            ]
+          }
+        }
+      ],
+      "arrival_rate_per_min": 0.4,
+      "seed_base": 20260501,
+      "seed_count": 5
+    },
+    "high": {
+      "generated_at": "2026-05-09T06:17:26.967973+00:00",
+      "update": 180,
+      "global_step": 737529,
+      "split": "stochastic_high",
+      "order_source_mode": "poisson",
+      "episode_count": 5,
+      "mean_total_reward": 1420.5717152165598,
+      "mean_episode_length_decisions": 103.8,
+      "mean_episode_end_t_sec": 3600.0,
+      "mean_delivery_count": 19.2,
+      "sum_delivery_count": 96,
+      "mean_on_time_rate": 0.9904761904761905,
+      "sum_timeout_order_count": 13,
+      "sum_fallback_count": 4,
+      "sum_hard_failure_count": 0,
+      "sum_reservation_timeout_count": 4,
+      "sum_hard_overdue_count": 13,
+      "sum_dispatch_decision_count": 99,
+      "sum_dispatch_decision_with_legal_mode_c_count": 82,
+      "sum_feasible_mode_c_recover_node_count_total": 268,
+      "avg_feasible_mode_c_nodes_per_dispatch_decision": 2.707070707070707,
+      "sum_mode_c_selected_count": 18,
+      "sum_mode_c_success_count": 8,
+      "sum_mode_c_post_delivery_revalidation_fail_count": 0,
+      "sum_mode_c_post_delivery_revalidation_fail_reasons": {
+        "energy_feasible": 0,
+        "rendezvous_time_feasible": 0,
+        "node_still_valid": 0
+      },
+      "sum_mode_c_selected_filter_margin_sum": 1959.974415337566,
+      "sum_mode_c_selected_execution_slack_sum": 2319.974415337566,
+      "sum_mode_c_selected_reservation_count_sum": 6.0,
+      "sum_mode_c_selected_truck_eta_remaining_sum": 5856.268265314656,
+      "sum_mode_c_selected_planned_truck_eta_sum": 61795.25363836349,
+      "sum_mode_c_selected_planned_uav_eta_sum": 59295.27922302592,
+      "sum_mode_c_selected_planned_slack_sum": 2499.974415337566,
+      "mode_c_timeout_from_state": {
+        "delivered": 0,
+        "return_to_rendezvous": 3,
+        "waiting_for_truck": 1
+      },
+      "mode_c_fallback_from_state": {
+        "delivered": 0,
+        "return_to_rendezvous": 3,
+        "waiting_for_truck": 1
+      },
+      "sum_t_wait_sec": 1252.9656530816003,
+      "sum_t_idle_sec": 5050.066680645028,
+      "sum_t_queue_sec": 0.0,
+      "sum_t_fallback_sec": 506.04339946112805,
+      "sum_t_overdue_sec": 11226.974054441209,
+      "sum_t_reservation_timeout_cost_sec": 69.61987850470405,
+      "mode_b_dispatch_ratio": 0.8181818181818182,
+      "mode_c_dispatch_ratio": 0.18181818181818182,
+      "episodes": [
+        {
+          "phase": "stochastic_high",
+          "episode_id": 0,
+          "order_source_mode": "poisson",
+          "order_source_seed": 20260501,
+          "total_reward": 1570.176587800691,
+          "episode_length_decisions": 112,
+          "global_step_start": null,
+          "global_step_end": null,
+          "update_start": null,
+          "update_end": null,
+          "done_reason": "upper_horizon_reached",
+          "episode_end_t_sec": 3600.0,
+          "delivery_count": 21,
+          "on_time_delivery_count": 20,
+          "overdue_delivery_count": 1,
+          "on_time_rate": 0.9523809523809523,
+          "timeout_order_count": 2,
+          "fallback_count": 0,
+          "hard_failure_count": 0,
+          "reservation_timeout_count": 0,
+          "hard_overdue_count": 2,
+          "wait_action_count": 88,
+          "dispatch_decision_count": 24,
+          "dispatch_decision_with_legal_mode_c_count": 18,
+          "dispatch_mode_b_count": 19,
+          "dispatch_mode_c_count": 5,
+          "mode_c_selected_count": 5,
+          "mode_c_success_count": 3,
+          "mode_c_post_delivery_revalidation_fail_count": 0,
+          "mode_c_post_delivery_revalidation_fail_reasons": {
+            "energy_feasible": 0,
+            "rendezvous_time_feasible": 0,
+            "node_still_valid": 0
+          },
+          "mode_c_selected_filter_margin_sum": 718.4756390756406,
+          "mode_c_selected_execution_slack_sum": 818.4756390756406,
+          "mode_c_selected_reservation_count_sum": 1.0,
+          "mode_c_selected_truck_eta_remaining_sum": 1773.5261813473394,
+          "mode_c_selected_planned_truck_eta_sum": 16745.147553650364,
+          "mode_c_selected_planned_uav_eta_sum": 15876.671914574727,
+          "mode_c_selected_planned_slack_sum": 868.4756390756406,
+          "mode_c_timeout_from_state": {
+            "delivered": 0,
+            "return_to_rendezvous": 0,
+            "waiting_for_truck": 0
+          },
+          "mode_c_fallback_from_state": {
+            "delivered": 0,
+            "return_to_rendezvous": 0,
+            "waiting_for_truck": 0
+          },
+          "feasible_mode_c_recover_node_count_total": 58,
+          "avg_feasible_mode_c_nodes_per_dispatch_decision": 2.4166666666666665,
+          "t_wait_sec": 380.15638036070163,
+          "t_idle_sec": 1306.9474089967653,
+          "t_queue_sec": 0.0,
+          "t_fallback_sec": 0.0,
+          "t_overdue_sec": 2376.351234281757,
+          "t_reservation_timeout_cost_sec": 0.0,
+          "pending_primary_order_count": 11,
+          "assigned_primary_order_count": 3,
+          "system_context_stats": {
+            "mode_a_background_order_count": 4,
+            "mode_a_background_completed_count": 4,
+            "mode_a_background_pending_count": 0,
+            "mode_a_background_completion_time_sum": 2369.719931,
+            "truck_background_order_completion_events": [
+              {
+                "order_id": "ORD-STATIC-08",
+                "stop_seq": 1,
+                "node_id": "ORD-STATIC-08",
+                "arrival_time_sec": 203.257434,
+                "departure_time_sec": 263.257434
+              },
+              {
+                "order_id": "ORD-STATIC-02",
+                "stop_seq": 3,
+                "node_id": "ORD-STATIC-02",
+                "arrival_time_sec": 511.773906,
+                "departure_time_sec": 571.773906
+              },
+              {
+                "order_id": "ORD-STATIC-06",
+                "stop_seq": 4,
+                "node_id": "ORD-STATIC-06",
+                "arrival_time_sec": 700.598696,
+                "departure_time_sec": 760.598696
+              },
+              {
+                "order_id": "ORD-STATIC-07",
+                "stop_seq": 6,
+                "node_id": "ORD-STATIC-07",
+                "arrival_time_sec": 954.089895,
+                "departure_time_sec": 1014.089895
+              }
+            ]
+          }
+        },
+        {
+          "phase": "stochastic_high",
+          "episode_id": 1,
+          "order_source_mode": "poisson",
+          "order_source_seed": 20260502,
+          "total_reward": 1600.4869208906644,
+          "episode_length_decisions": 104,
+          "global_step_start": null,
+          "global_step_end": null,
+          "update_start": null,
+          "update_end": null,
+          "done_reason": "upper_horizon_reached",
+          "episode_end_t_sec": 3600.0,
+          "delivery_count": 21,
+          "on_time_delivery_count": 21,
+          "overdue_delivery_count": 0,
+          "on_time_rate": 1.0,
+          "timeout_order_count": 0,
+          "fallback_count": 2,
+          "hard_failure_count": 0,
+          "reservation_timeout_count": 2,
+          "hard_overdue_count": 0,
+          "wait_action_count": 83,
+          "dispatch_decision_count": 21,
+          "dispatch_decision_with_legal_mode_c_count": 20,
+          "dispatch_mode_b_count": 17,
+          "dispatch_mode_c_count": 4,
+          "mode_c_selected_count": 4,
+          "mode_c_success_count": 0,
+          "mode_c_post_delivery_revalidation_fail_count": 0,
+          "mode_c_post_delivery_revalidation_fail_reasons": {
+            "energy_feasible": 0,
+            "rendezvous_time_feasible": 0,
+            "node_still_valid": 0
+          },
+          "mode_c_selected_filter_margin_sum": 174.0842459605201,
+          "mode_c_selected_execution_slack_sum": 254.0842459605201,
+          "mode_c_selected_reservation_count_sum": 2.0,
+          "mode_c_selected_truck_eta_remaining_sum": 1420.6274631025217,
+          "mode_c_selected_planned_truck_eta_sum": 13849.956965236719,
+          "mode_c_selected_planned_uav_eta_sum": 13555.872719276198,
+          "mode_c_selected_planned_slack_sum": 294.0842459605201,
+          "mode_c_timeout_from_state": {
+            "delivered": 0,
+            "return_to_rendezvous": 1,
+            "waiting_for_truck": 1
+          },
+          "mode_c_fallback_from_state": {
+            "delivered": 0,
+            "return_to_rendezvous": 1,
+            "waiting_for_truck": 1
+          },
+          "feasible_mode_c_recover_node_count_total": 62,
+          "avg_feasible_mode_c_nodes_per_dispatch_decision": 2.9523809523809526,
+          "t_wait_sec": 91.79723327031525,
+          "t_idle_sec": 834.9177654672455,
+          "t_queue_sec": 0.0,
+          "t_fallback_sec": 304.80270567524167,
+          "t_overdue_sec": 191.03891010852567,
+          "t_reservation_timeout_cost_sec": 29.571180496996476,
+          "pending_primary_order_count": 10,
+          "assigned_primary_order_count": 0,
+          "system_context_stats": {
+            "mode_a_background_order_count": 4,
+            "mode_a_background_completed_count": 4,
+            "mode_a_background_pending_count": 0,
+            "mode_a_background_completion_time_sum": 2369.719931,
+            "truck_background_order_completion_events": [
+              {
+                "order_id": "ORD-STATIC-08",
+                "stop_seq": 1,
+                "node_id": "ORD-STATIC-08",
+                "arrival_time_sec": 203.257434,
+                "departure_time_sec": 263.257434
+              },
+              {
+                "order_id": "ORD-STATIC-02",
+                "stop_seq": 3,
+                "node_id": "ORD-STATIC-02",
+                "arrival_time_sec": 511.773906,
+                "departure_time_sec": 571.773906
+              },
+              {
+                "order_id": "ORD-STATIC-06",
+                "stop_seq": 4,
+                "node_id": "ORD-STATIC-06",
+                "arrival_time_sec": 700.598696,
+                "departure_time_sec": 760.598696
+              },
+              {
+                "order_id": "ORD-STATIC-07",
+                "stop_seq": 6,
+                "node_id": "ORD-STATIC-07",
+                "arrival_time_sec": 954.089895,
+                "departure_time_sec": 1014.089895
+              }
+            ]
+          }
+        },
+        {
+          "phase": "stochastic_high",
+          "episode_id": 2,
+          "order_source_mode": "poisson",
+          "order_source_seed": 20260503,
+          "total_reward": 1424.8152797343641,
+          "episode_length_decisions": 103,
+          "global_step_start": null,
+          "global_step_end": null,
+          "update_start": null,
+          "update_end": null,
+          "done_reason": "upper_horizon_reached",
+          "episode_end_t_sec": 3600.0,
+          "delivery_count": 19,
+          "on_time_delivery_count": 19,
+          "overdue_delivery_count": 0,
+          "on_time_rate": 1.0,
+          "timeout_order_count": 6,
+          "fallback_count": 0,
+          "hard_failure_count": 0,
+          "reservation_timeout_count": 0,
+          "hard_overdue_count": 6,
+          "wait_action_count": 84,
+          "dispatch_decision_count": 19,
+          "dispatch_decision_with_legal_mode_c_count": 15,
+          "dispatch_mode_b_count": 16,
+          "dispatch_mode_c_count": 3,
+          "mode_c_selected_count": 3,
+          "mode_c_success_count": 2,
+          "mode_c_post_delivery_revalidation_fail_count": 0,
+          "mode_c_post_delivery_revalidation_fail_reasons": {
+            "energy_feasible": 0,
+            "rendezvous_time_feasible": 0,
+            "node_still_valid": 0
+          },
+          "mode_c_selected_filter_margin_sum": 528.1819685266264,
+          "mode_c_selected_execution_slack_sum": 588.1819685266264,
+          "mode_c_selected_reservation_count_sum": 1.0,
+          "mode_c_selected_truck_eta_remaining_sum": 1012.7894420990333,
+          "mode_c_selected_planned_truck_eta_sum": 10568.63267676721,
+          "mode_c_selected_planned_uav_eta_sum": 9950.450708240585,
+          "mode_c_selected_planned_slack_sum": 618.1819685266264,
+          "mode_c_timeout_from_state": {
+            "delivered": 0,
+            "return_to_rendezvous": 0,
+            "waiting_for_truck": 0
+          },
+          "mode_c_fallback_from_state": {
+            "delivered": 0,
+            "return_to_rendezvous": 0,
+            "waiting_for_truck": 0
+          },
+          "feasible_mode_c_recover_node_count_total": 52,
+          "avg_feasible_mode_c_nodes_per_dispatch_decision": 2.736842105263158,
+          "t_wait_sec": 341.2694244510567,
+          "t_idle_sec": 878.8316630955148,
+          "t_queue_sec": 0.0,
+          "t_fallback_sec": 0.0,
+          "t_overdue_sec": 4063.107880987719,
+          "t_reservation_timeout_cost_sec": 0.0,
+          "pending_primary_order_count": 6,
+          "assigned_primary_order_count": 0,
+          "system_context_stats": {
+            "mode_a_background_order_count": 4,
+            "mode_a_background_completed_count": 4,
+            "mode_a_background_pending_count": 0,
+            "mode_a_background_completion_time_sum": 2369.719931,
+            "truck_background_order_completion_events": [
+              {
+                "order_id": "ORD-STATIC-08",
+                "stop_seq": 1,
+                "node_id": "ORD-STATIC-08",
+                "arrival_time_sec": 203.257434,
+                "departure_time_sec": 263.257434
+              },
+              {
+                "order_id": "ORD-STATIC-02",
+                "stop_seq": 3,
+                "node_id": "ORD-STATIC-02",
+                "arrival_time_sec": 511.773906,
+                "departure_time_sec": 571.773906
+              },
+              {
+                "order_id": "ORD-STATIC-06",
+                "stop_seq": 4,
+                "node_id": "ORD-STATIC-06",
+                "arrival_time_sec": 700.598696,
+                "departure_time_sec": 760.598696
+              },
+              {
+                "order_id": "ORD-STATIC-07",
+                "stop_seq": 6,
+                "node_id": "ORD-STATIC-07",
+                "arrival_time_sec": 954.089895,
+                "departure_time_sec": 1014.089895
+              }
+            ]
+          }
+        },
+        {
+          "phase": "stochastic_high",
+          "episode_id": 3,
+          "order_source_mode": "poisson",
+          "order_source_seed": 20260504,
+          "total_reward": 1198.567454738131,
+          "episode_length_decisions": 98,
+          "global_step_start": null,
+          "global_step_end": null,
+          "update_start": null,
+          "update_end": null,
+          "done_reason": "upper_horizon_reached",
+          "episode_end_t_sec": 3600.0,
+          "delivery_count": 17,
+          "on_time_delivery_count": 17,
+          "overdue_delivery_count": 0,
+          "on_time_rate": 1.0,
+          "timeout_order_count": 2,
+          "fallback_count": 1,
+          "hard_failure_count": 0,
+          "reservation_timeout_count": 1,
+          "hard_overdue_count": 2,
+          "wait_action_count": 81,
+          "dispatch_decision_count": 17,
+          "dispatch_decision_with_legal_mode_c_count": 13,
+          "dispatch_mode_b_count": 14,
+          "dispatch_mode_c_count": 3,
+          "mode_c_selected_count": 3,
+          "mode_c_success_count": 2,
+          "mode_c_post_delivery_revalidation_fail_count": 0,
+          "mode_c_post_delivery_revalidation_fail_reasons": {
+            "energy_feasible": 0,
+            "rendezvous_time_feasible": 0,
+            "node_still_valid": 0
+          },
+          "mode_c_selected_filter_margin_sum": 357.75890675204755,
+          "mode_c_selected_execution_slack_sum": 417.75890675204755,
+          "mode_c_selected_reservation_count_sum": 1.0,
+          "mode_c_selected_truck_eta_remaining_sum": 913.2623665961692,
+          "mode_c_selected_planned_truck_eta_sum": 10469.336987003127,
+          "mode_c_selected_planned_uav_eta_sum": 10021.57808025108,
+          "mode_c_selected_planned_slack_sum": 447.75890675204755,
+          "mode_c_timeout_from_state": {
+            "delivered": 0,
+            "return_to_rendezvous": 1,
+            "waiting_for_truck": 0
+          },
+          "mode_c_fallback_from_state": {
+            "delivered": 0,
+            "return_to_rendezvous": 1,
+            "waiting_for_truck": 0
+          },
+          "feasible_mode_c_recover_node_count_total": 43,
+          "avg_feasible_mode_c_nodes_per_dispatch_decision": 2.5294117647058822,
+          "t_wait_sec": 328.92874500201606,
+          "t_idle_sec": 987.6640892458815,
+          "t_queue_sec": 0.0,
+          "t_fallback_sec": 105.12483819858517,
+          "t_overdue_sec": 1724.2045758919703,
+          "t_reservation_timeout_cost_sec": 5.8311100733199055,
+          "pending_primary_order_count": 13,
+          "assigned_primary_order_count": 0,
+          "system_context_stats": {
+            "mode_a_background_order_count": 4,
+            "mode_a_background_completed_count": 4,
+            "mode_a_background_pending_count": 0,
+            "mode_a_background_completion_time_sum": 2369.719931,
+            "truck_background_order_completion_events": [
+              {
+                "order_id": "ORD-STATIC-08",
+                "stop_seq": 1,
+                "node_id": "ORD-STATIC-08",
+                "arrival_time_sec": 203.257434,
+                "departure_time_sec": 263.257434
+              },
+              {
+                "order_id": "ORD-STATIC-02",
+                "stop_seq": 3,
+                "node_id": "ORD-STATIC-02",
+                "arrival_time_sec": 511.773906,
+                "departure_time_sec": 571.773906
+              },
+              {
+                "order_id": "ORD-STATIC-06",
+                "stop_seq": 4,
+                "node_id": "ORD-STATIC-06",
+                "arrival_time_sec": 700.598696,
+                "departure_time_sec": 760.598696
+              },
+              {
+                "order_id": "ORD-STATIC-07",
+                "stop_seq": 6,
+                "node_id": "ORD-STATIC-07",
+                "arrival_time_sec": 954.089895,
+                "departure_time_sec": 1014.089895
+              }
+            ]
+          }
+        },
+        {
+          "phase": "stochastic_high",
+          "episode_id": 4,
+          "order_source_mode": "poisson",
+          "order_source_seed": 20260505,
+          "total_reward": 1308.812332918947,
+          "episode_length_decisions": 102,
+          "global_step_start": null,
+          "global_step_end": null,
+          "update_start": null,
+          "update_end": null,
+          "done_reason": "upper_horizon_reached",
+          "episode_end_t_sec": 3600.0,
+          "delivery_count": 18,
+          "on_time_delivery_count": 18,
+          "overdue_delivery_count": 0,
+          "on_time_rate": 1.0,
+          "timeout_order_count": 3,
+          "fallback_count": 1,
+          "hard_failure_count": 0,
+          "reservation_timeout_count": 1,
+          "hard_overdue_count": 3,
+          "wait_action_count": 84,
+          "dispatch_decision_count": 18,
+          "dispatch_decision_with_legal_mode_c_count": 16,
+          "dispatch_mode_b_count": 15,
+          "dispatch_mode_c_count": 3,
+          "mode_c_selected_count": 3,
+          "mode_c_success_count": 1,
+          "mode_c_post_delivery_revalidation_fail_count": 0,
+          "mode_c_post_delivery_revalidation_fail_reasons": {
+            "energy_feasible": 0,
+            "rendezvous_time_feasible": 0,
+            "node_still_valid": 0
+          },
+          "mode_c_selected_filter_margin_sum": 181.47365502273124,
+          "mode_c_selected_execution_slack_sum": 241.47365502273124,
+          "mode_c_selected_reservation_count_sum": 1.0,
+          "mode_c_selected_truck_eta_remaining_sum": 736.0628121695927,
+          "mode_c_selected_planned_truck_eta_sum": 10162.179455706062,
+          "mode_c_selected_planned_uav_eta_sum": 9890.70580068333,
+          "mode_c_selected_planned_slack_sum": 271.47365502273124,
+          "mode_c_timeout_from_state": {
+            "delivered": 0,
+            "return_to_rendezvous": 1,
+            "waiting_for_truck": 0
+          },
+          "mode_c_fallback_from_state": {
+            "delivered": 0,
+            "return_to_rendezvous": 1,
+            "waiting_for_truck": 0
+          },
+          "feasible_mode_c_recover_node_count_total": 53,
+          "avg_feasible_mode_c_nodes_per_dispatch_decision": 2.9444444444444446,
+          "t_wait_sec": 110.81386999751066,
+          "t_idle_sec": 1041.7057538396202,
+          "t_queue_sec": 0.0,
+          "t_fallback_sec": 96.11585558730121,
+          "t_overdue_sec": 2872.271453171237,
+          "t_reservation_timeout_cost_sec": 34.217587934387666,
+          "pending_primary_order_count": 13,
+          "assigned_primary_order_count": 0,
+          "system_context_stats": {
+            "mode_a_background_order_count": 4,
+            "mode_a_background_completed_count": 4,
+            "mode_a_background_pending_count": 0,
+            "mode_a_background_completion_time_sum": 2369.719931,
+            "truck_background_order_completion_events": [
+              {
+                "order_id": "ORD-STATIC-08",
+                "stop_seq": 1,
+                "node_id": "ORD-STATIC-08",
+                "arrival_time_sec": 203.257434,
+                "departure_time_sec": 263.257434
+              },
+              {
+                "order_id": "ORD-STATIC-02",
+                "stop_seq": 3,
+                "node_id": "ORD-STATIC-02",
+                "arrival_time_sec": 511.773906,
+                "departure_time_sec": 571.773906
+              },
+              {
+                "order_id": "ORD-STATIC-06",
+                "stop_seq": 4,
+                "node_id": "ORD-STATIC-06",
+                "arrival_time_sec": 700.598696,
+                "departure_time_sec": 760.598696
+              },
+              {
+                "order_id": "ORD-STATIC-07",
+                "stop_seq": 6,
+                "node_id": "ORD-STATIC-07",
+                "arrival_time_sec": 954.089895,
+                "departure_time_sec": 1014.089895
+              }
+            ]
+          }
+        }
+      ],
+      "arrival_rate_per_min": 0.6,
+      "seed_base": 20260501,
+      "seed_count": 5
+    }
+  }
+}

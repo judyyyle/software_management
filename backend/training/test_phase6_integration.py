@@ -335,10 +335,6 @@ class TestPhase6Integration(unittest.TestCase):
             order_feature.best_mode_c_rendezvous_margin,
             recovery_feature.rendezvous_margin,
         )
-        self.assertAlmostEqual(
-            order_feature.best_mode_c_queue_time_est,
-            recovery_feature.predicted_queue_time_est,
-        )
         self.assertEqual(
             order_feature.best_mode_c_node_type,
             recovery_feature.recover_node_type,

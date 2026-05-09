@@ -361,7 +361,16 @@ class CriticBatchBuilder:
                     _bool(state.reservation is not None),
                     _norm_time_nonneg(
                         (
-                            float(state.reservation.expires_at) - float(decision_context.t_decision)
+                            max(
+                                0.0,
+                                float(
+                                    decision_context.coarse_plan.truck_eta_map.get(
+                                        state.reservation.recover_node,
+                                        decision_context.t_decision,
+                                    )
+                                )
+                                - float(decision_context.t_decision),
+                            )
                             if state.reservation is not None
                             else 0.0
                         ),

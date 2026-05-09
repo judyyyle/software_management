@@ -21,6 +21,7 @@ def select_recovery_pool_for_order(
     max_candidates: int,
     future_scan_limit: int,
     drone_cruise_speed: float,
+    upper_horizon_sec: float,
 ) -> tuple[str, ...]:
     """
     Scan a longer future-backbone prefix and deterministically keep the best top-K.
@@ -30,7 +31,6 @@ def select_recovery_pool_for_order(
       - proxy rendezvous margin: truck ETA minus delivery->recovery fly-time lower bound
       - truck ETA
       - node type
-      - queue time estimate
       - recovery-node distance to the order delivery location
     """
     if max_candidates <= 0 or future_scan_limit <= 0 or not truck_backbone_route:
@@ -45,7 +45,7 @@ def select_recovery_pool_for_order(
         return ()
 
     cruise_speed = max(float(drone_cruise_speed), _TIME_EPS)
-    scored_nodes: list[tuple[tuple[float, float, int, float, float, str], str]] = []
+    scored_nodes: list[tuple[tuple[float, float, int, float, str], str]] = []
     scored_node_ids: set[str] = set()
 
     for node_id in scanned_route:
@@ -59,12 +59,14 @@ def select_recovery_pool_for_order(
         )
         fly_time_lb = delivery_to_node_dist / cruise_speed
         proxy_rendezvous_margin = float(truck_eta) - fly_time_lb
-        queue_time_est = _predicted_queue_time_est(node_state)
+        proxy_score = _proxy_mode_c_score(
+            proxy_rendezvous_margin=proxy_rendezvous_margin,
+            upper_horizon_sec=upper_horizon_sec,
+        )
         score_key = (
-            -proxy_rendezvous_margin,
+            -proxy_score,
             float(truck_eta),
             _node_type_rank(str(node_state.node_type)),
-            queue_time_est,
             delivery_to_node_dist,
             str(node_id),
         )
@@ -90,12 +92,12 @@ def select_recovery_pool_for_order(
             break
 
     return tuple(selected)
-
-
-def _predicted_queue_time_est(node_state: Any) -> float:
-    if int(node_state.available_slots) > 0:
-        return 0.0
-    return (int(node_state.queue_length) + 1) * float(node_state.swap_time)
+def _proxy_mode_c_score(
+    *,
+    proxy_rendezvous_margin: float,
+    upper_horizon_sec: float,
+) -> float:
+    return float(proxy_rendezvous_margin) / max(float(upper_horizon_sec), _TIME_EPS)
 
 
 def _node_type_rank(node_type: str) -> int:
