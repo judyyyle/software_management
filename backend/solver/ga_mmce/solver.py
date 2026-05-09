@@ -534,9 +534,11 @@ class GAMMCESolver:
             "truck_dist": float(candidate.truck_distance or 0.0),
             "uav_dist": float(candidate.uav_distance or 0.0),
             "energy_cost": float(candidate.cost_energy or 0.0),
-            "time_cost": float(candidate.completion_time or 0.0) * float(self.config.weight_completion),
+            "completion_time": float(candidate.completion_time or 0.0),
+            "time_cost": 0.0,
             "sync_waiting_cost": float(candidate.waiting_time or 0.0) * float(self.config.weight_waiting),
             "penalty_cost": float(candidate.cost_penalty or 0.0),
+            "mode_reward": float(getattr(candidate, "mode_reward", 0.0) or 0.0),
             "closure_cost": 0.0,
             "repair_penalty": 0.0,
             "station_queue_penalty": 0.0,
@@ -851,8 +853,8 @@ class GAMMCESolver:
             "best_A_count": best_mode_counts.get("A", 0),
             "best_B_count": best_mode_counts.get("B", 0),
             "best_C_count": best_mode_counts.get("C", 0),
-            "truck_distance": cost_breakdown.get("truck_distance_cost", 0.0),
-            "uav_distance": cost_breakdown.get("uav_distance_cost", 0.0),
+            "truck_distance": cost_breakdown.get("raw_truck_distance", 0.0),
+            "uav_distance": cost_breakdown.get("raw_uav_distance", 0.0),
             "energy": cost_breakdown.get("energy_cost", 0.0),
             "penalty": sum(float(value) for value in penalties.values()) if isinstance(penalties, dict) else 0.0,
             "repair_penalty": cost_breakdown.get("repair_penalty", 0.0),
@@ -920,11 +922,15 @@ class GAMMCESolver:
         self._debug_write(
             "ga_cost_breakdown "
             f"gen={row['gen']} "
+            f"raw_truck_distance={row.get('raw_truck_distance', 0.0)} "
+            f"raw_uav_distance={row.get('raw_uav_distance', 0.0)} "
             f"truck_distance_cost={row.get('truck_distance_cost', 0.0)} "
             f"uav_distance_cost={row.get('uav_distance_cost', 0.0)} "
             f"energy_cost={row.get('energy_cost', 0.0)} "
+            f"plan_completion_time={row.get('plan_completion_time', 0.0)} "
             f"time_cost={row.get('time_cost', 0.0)} "
             f"waiting_cost={row.get('waiting_cost', 0.0)} "
+            f"air_ground_reward={row.get('air_ground_reward', 0.0)} "
             f"closure_route_cost={row.get('closure_route_cost', 0.0)} "
             f"repair_penalty={row.get('repair_penalty', 0.0)} "
             f"station_queue_penalty={row.get('station_queue_penalty', 0.0)} "
@@ -1358,6 +1364,8 @@ class GAMMCESolver:
                         f"truck={candidate.truck_id} drone={candidate.drone_id} "
                         f"launch={candidate.launch_node_id} recover={candidate.recover_node_id} "
                         f"score={candidate.score_total:.3f} "
+                        f"completion={candidate.completion_time:.1f} "
+                        f"reward={float(getattr(candidate, 'mode_reward', 0.0) or 0.0):.1f} "
                         f"truck_dist={candidate.truck_distance:.1f} "
                         f"uav_dist={candidate.uav_distance:.1f}"
                     )

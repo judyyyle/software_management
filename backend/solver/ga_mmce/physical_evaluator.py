@@ -28,6 +28,7 @@ class GACandidate:
     cost_dist: float = 0.0
     cost_energy: float = 0.0
     cost_penalty: float = 0.0
+    mode_reward: float = 0.0
     score_total: float = math.inf
 
     truck_stops: list[dict[str, Any]] = field(default_factory=list)
@@ -59,6 +60,10 @@ class PhysicalEvaluator:
             record[field_name] = value
         else:
             setattr(record, field_name, value)
+
+    def _config_float(self, field_name: str, default: float) -> float:
+        value = self._read_field(self.config, field_name, default)
+        return float(default if value is None else value)
 
     def _as_list(self, value: Any) -> list:
         if value is None:
@@ -614,7 +619,7 @@ class PhysicalEvaluator:
                 "drone_id": drone_id,
                 "order_id": order_id,
                 "mode": "C",
-                "launch_node_id": depot_node_id,
+                "launch_node_id": launch_node_id,
                 "recover_node_id": recover_node_id,
                 "path": [launch_pos, order.delivery_loc, recover_pos],
             },
@@ -632,22 +637,23 @@ class PhysicalEvaluator:
             candidate.score_total = math.inf
             return candidate
 
-        candidate.cost_dist = (
-            candidate.truck_distance * float(self._read_field(self.config, "weight_truck_distance", 1.0) or 1.0)
-            + candidate.uav_distance * float(self._read_field(self.config, "weight_uav_distance", 1.0) or 1.0)
-        )
+        candidate.cost_dist = 0.0
         candidate.cost_energy = (
             candidate.truck_energy + candidate.uav_energy
-        ) * float(self._read_field(self.config, "weight_energy", 0.1) or 0.1)
+        ) * self._config_float("weight_energy", 0.02)
         candidate.cost_penalty = (
-            candidate.lateness * float(self._read_field(self.config, "weight_delay", 10.0) or 10.0)
-            + candidate.waiting_time * float(self._read_field(self.config, "weight_waiting", 5.0) or 5.0)
+            candidate.lateness * self._config_float("weight_delay", 10.0)
+            + candidate.waiting_time * self._config_float("weight_waiting", 0.5)
+        )
+        candidate.mode_reward = (
+            self._config_float("air_ground_mode_reward", 0.0)
+            if candidate.mode == "B"
+            else 0.0
         )
         candidate.score_total = (
-            candidate.completion_time * float(self._read_field(self.config, "weight_completion", 1.0) or 1.0)
-            + candidate.cost_dist
-            + candidate.cost_energy
+            candidate.cost_energy
             + candidate.cost_penalty
+            - candidate.mode_reward
         )
         return candidate
 
