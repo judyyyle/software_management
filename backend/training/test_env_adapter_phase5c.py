@@ -385,6 +385,39 @@ class TestTrainingEnvAdapterPhase5c(unittest.TestCase):
             )
         )
 
+    def test_online_interfaces_apply_wait_without_implicit_advance(self) -> None:
+        env, drone_id = self._reset_controlled_env()
+        env._planned_route_stop_i = len(env._planned_route_stops)
+        self._inject_order(env, drone_id=drone_id, order_id="ORDER-P5C-ONLINE-WAIT")
+        env._enqueue_decision(drone_id, "test_idle", None)
+
+        self.assertAlmostEqual(env.peek_next_decision_time(), env._t_now, places=6)
+        applied = env.apply_decision(WAIT_ACTION)
+
+        self.assertAlmostEqual(applied.runtime_state.t_now, 0.0, places=6)
+        self.assertIsNone(applied.decision_context)
+        self.assertEqual(env._drone_state[drone_id], TrainingDroneState.ACTIVE_WAIT)
+        self.assertAlmostEqual(
+            env._active_wait_until[drone_id],
+            env._cfg.max_wait_decision_gap_sec,
+            places=6,
+        )
+
+        advanced = env.advance_to_time(env._cfg.upper_horizon_sec)
+
+        self.assertAlmostEqual(
+            advanced.runtime_state.t_now,
+            env._cfg.max_wait_decision_gap_sec,
+            places=6,
+        )
+        self.assertIsNotNone(advanced.decision_context)
+        self.assertTrue(
+            any(
+                trigger.drone_id == drone_id and trigger.trigger_type == "wait_resume"
+                for trigger in env._decision_queue
+            )
+        )
+
     def test_step_preserves_delayed_attribution_carry_in_before_current_window(self) -> None:
         env, drone_id = self._reset_controlled_env()
         env._planned_route_stop_i = len(env._planned_route_stops)

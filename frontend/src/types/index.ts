@@ -243,6 +243,47 @@ export interface DispatchDroneRoute {
   path: [number, number][]
 }
 
+export interface RuntimePathEntry {
+  entity_id: string
+  route_version?: number
+  segment_id?: string | number
+  status?: string
+  motion_mode?: string
+  start_time?: number
+  end_time?: number
+  from_node_id?: string
+  to_node_id?: string
+  target_node_id?: string | null
+  target_node_type?: string | null
+  order_id?: string | null
+  distance_m?: number
+  path: [number, number][]
+}
+
+export interface RuntimePaths {
+  trucks: RuntimePathEntry[]
+  drones: RuntimePathEntry[]
+}
+
+export interface DecisionEvent {
+  decision_id: number
+  sim_time: number
+  wall_time_ms: number
+  event_seq: number
+  drone_id: string
+  trigger_type: string
+  trigger_station_id?: string | null
+  candidate_summary?: Record<string, unknown>
+  selected_action?: Record<string, unknown>
+  selected_order_id?: string | null
+  selected_mode?: string | null
+  selected_recover_node?: string | null
+  inference_latency_ms?: number | null
+  status: 'DECISION_PENDING' | 'DECISION_APPLIED' | 'EXECUTION_HARD_FAILED'
+  actor_drone_final_state?: string | null
+  failure_type?: string | null
+}
+
 export interface DispatchPlan {
   total_orders: number
   feasible: number

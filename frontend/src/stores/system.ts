@@ -5,6 +5,7 @@ import { WsClient } from '@/services/websocket'
 import { useEntityStore } from './entity'
 import { useOrderStore } from './order'
 import { useSceneStore } from './scene'
+import type { DecisionEvent, RuntimePaths } from '@/types'
 
 // ── 调试开关 ────────────────────────────────────────────────────
 const DEBUG_WEBSOCKET = false
@@ -21,6 +22,9 @@ export const useSystemStore = defineStore('system', () => {
   const policyName       = ref('')      // 当前激活策略名称
   const policyCheckpoint = ref('')      // 当前激活 checkpoint
   const policyRuntimeType = ref<'classic_sim_engine' | 'training_env_adapter_policy'>('classic_sim_engine')
+  const runtimePaths     = ref<RuntimePaths>({ trucks: [], drones: [] })
+  const decisionEvents   = ref<DecisionEvent[]>([])
+  const latestEventSeq   = ref(0)
 
   // ── WebSocket 客户端（19 为展示层与店间解耦层────────────────
   // 这里使用延迟初始化模式：实际 ws 实例在 initWs() 中创建，避免 Store 定义时 Pinia 尚未就绪
@@ -47,6 +51,30 @@ export const useSystemStore = defineStore('system', () => {
     policyRuntimeType.value = 'classic_sim_engine'
   }
 
+  function normalizeRuntimePaths(raw: any): RuntimePaths {
+    return {
+      trucks: Array.isArray(raw?.trucks) ? raw.trucks : [],
+      drones: Array.isArray(raw?.drones) ? raw.drones : [],
+    }
+  }
+
+  function mergeDecisionEvents(events: any[]) {
+    if (!Array.isArray(events) || events.length === 0) return
+    const bySeq = new Map<number, DecisionEvent>()
+    for (const event of decisionEvents.value) {
+      bySeq.set(Number(event.event_seq), event)
+    }
+    for (const event of events) {
+      const seq = Number(event?.event_seq)
+      if (!Number.isFinite(seq)) continue
+      bySeq.set(seq, event as DecisionEvent)
+    }
+    decisionEvents.value = [...bySeq.entries()]
+      .sort((a, b) => a[0] - b[0])
+      .slice(-100)
+      .map(([, event]) => event)
+  }
+
   // ── FULL_SNAPSHOT 处理器 ───────────────────────────────────────
   function handleFullSnapshot(payload: any) {
     if (DEBUG_WEBSOCKET) {
@@ -68,6 +96,9 @@ export const useSystemStore = defineStore('system', () => {
     simTime.value        = payload.sim_time ?? 0
     running.value        = payload.is_running ?? false
     speedRatio.value     = payload.speed_ratio ?? 1
+    runtimePaths.value   = normalizeRuntimePaths(payload.paths)
+    mergeDecisionEvents(payload.recent_decision_events)
+    latestEventSeq.value = Number(payload.latest_event_seq ?? latestEventSeq.value)
     applyPolicyRuntimeFromStats(payload.stats)
   }
 
@@ -86,6 +117,11 @@ export const useSystemStore = defineStore('system', () => {
       })
     }
     entityStore.setRuntimeAll(payload.entities ?? {})
+    if (payload.paths !== undefined) {
+      runtimePaths.value = normalizeRuntimePaths(payload.paths)
+    }
+    mergeDecisionEvents(payload.recent_decision_events)
+    latestEventSeq.value = Number(payload.latest_event_seq ?? latestEventSeq.value)
     
     // ── 处理订单状态更新 ─────────────────────────────────────
     const orderStore = useOrderStore()
@@ -198,6 +234,9 @@ export const useSystemStore = defineStore('system', () => {
     simTime.value = 0
     initialized.value = false
     initializedSceneId.value = ''
+    runtimePaths.value = { trucks: [], drones: [] }
+    decisionEvents.value = []
+    latestEventSeq.value = 0
   }
 
   async function activatePolicy(payload: {
@@ -342,6 +381,7 @@ export const useSystemStore = defineStore('system', () => {
   return {
     running, simTime, speedRatio, simStartWallMs, initialized, initializedSceneId,
     policyActive, policyName, policyCheckpoint, policyRuntimeType,
+    runtimePaths, decisionEvents, latestEventSeq,
     initWs, probeBackend, onTick,
     start, pause, reset, setSpeed, initSim, dispatch,
     activatePolicy, deactivatePolicy, fetchPolicyState,

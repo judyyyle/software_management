@@ -475,10 +475,12 @@
       "delivery_z": 0,
       "fulfillment_mode": "DRONE_TRUCK_DEPOT",
       "order_id": "DYN-BENCH-10",
+      "spawn_sim_s": 1740,
       "payload_weight": 4.5,
       "pickup_source_id": null,
       "priority": "URGENT",
-      "priority_label": "紧急"
+      "priority_label": "紧急",
+      "source_type": "DEPOT"
     },
     {
       "order_id": "DYN-BENCH-11",

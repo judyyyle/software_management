@@ -37,6 +37,7 @@ from core.entities.order import Order
 from core.entities.primitives import Position3D, SourceType, TaskStatus
 from core.entities.swap_station import SwapStation
 from core.entities.truck import Truck
+from environment.geo.osm_service import build_road_graph, find_nearest_node, shortest_path
 from environment.state.entity_manager import EntityManager
 from environment.state.order_manager import OrderManager
 
@@ -159,6 +160,7 @@ class RuntimeStateView:
 class DecisionContext:
     """一次 PPO 决策点对应的上下文。"""
     # 当前实现只返回 action_lookup；还没有单独暴露 dense action_mask 张量。
+    decision_id: int
     t_decision: float
     deciding_drone_id: str
     trigger_type: str
@@ -212,6 +214,21 @@ class PlannedStop:
 
 
 @dataclass(frozen=True)
+class PlannedTruckSegment:
+    """卡车运行时的一段真实路网几何。"""
+    segment_id: int
+    from_node_id: str
+    to_node_id: str
+    from_node_type: str
+    to_node_type: str
+    start_time: float
+    end_time: float
+    distance_m: float
+    geometry: tuple[Position3D, ...]
+    cumulative_distances_m: tuple[float, ...]
+
+
+@dataclass(frozen=True)
 class FlightLeg:
     """无人机当前正在执行的一段飞行。"""
     # 当前实现把所有空中过程统一收敛为绝对时刻的飞行段，事件推进只看 arrival_time。
@@ -220,6 +237,9 @@ class FlightLeg:
     arrival_time: float
     start_pos: Position3D
     target_pos: Position3D
+    path_points: tuple[Position3D, ...] = ()
+    route_version: int = 0
+    motion_mode: str = "straight_line"
     order_id: str | None = None
     target_node_id: str | None = None
     target_node_type: str | None = None
@@ -245,6 +265,19 @@ class DispatchCommit:
     planned_truck_arrival_time: float | None = None
     planned_uav_arrival_time_lb: float | None = None
     planned_execution_slack_sec: float | None = None
+
+
+@dataclass(frozen=True)
+class AppliedDecision:
+    """一次已提交到环境的决策。
+
+    该对象只拆分 `step()` 内部语义，不改变 PPO transition 的奖励归因口径。
+    """
+    drone_id: str
+    carried_reward: float
+    info: Mapping[str, Any]
+    auto_advance_kind: str
+    wait_until: float | None = None
 
 
 @dataclass(frozen=True)
@@ -342,9 +375,14 @@ class TrainingEnvAdapter:
         self._reset_count = 0
         self._current_episode_order_source_seed = int(self._order_source.seed)
         self._planned_route_stops: list[PlannedStop] = []
+        self._planned_route_segments: list[PlannedTruckSegment] = []
         self._planned_route_stop_i = 1
         self._full_backbone_cache: list[BackboneVisit] = []
         self._allow_empty_backbone_route = False
+        self._truck_route_version = 0
+        self._drone_path_version: dict[DroneId, int] = {}
+        self._road_graph: Any | None = None
+        self._road_nodes: Mapping[str, tuple[float, float]] | None = None
 
         self._drone_state: dict[DroneId, TrainingDroneState] = {}
         # 记录 active_wait 结束后应恢复到哪个基础状态。
@@ -362,6 +400,8 @@ class TrainingEnvAdapter:
         self._decision_queue: list[DecisionTrigger] = []
         self._next_decision_id = 0
         self._last_exposed_decision_id: int | None = None
+        # IDLE WAIT 的显式唤醒截止时刻。riding_with_truck WAIT 仍完全由卡车到站事件恢复。
+        self._active_wait_until: dict[DroneId, float] = {}
 
         # 只跟踪 truck_execution_route 中的 mode A 背景订单完成情况。
         self._background_mode_a_order_count = 0
@@ -466,6 +506,7 @@ class TrainingEnvAdapter:
 
         self._t_now = 0.0
         self._planned_route_stop_i = 1
+        self._planned_route_segments.clear()
         self._flight_legs.clear()
         self._delivery_service_legs.clear()
         self._fallback_leg.clear()
@@ -476,6 +517,7 @@ class TrainingEnvAdapter:
         self._decision_queue.clear()
         self._next_decision_id = 0
         self._last_exposed_decision_id = None
+        self._active_wait_until.clear()
         self._active_wait_resume.clear()
         self._background_mode_a_order_count = 0
         self._background_mode_a_pending.clear()
@@ -489,6 +531,8 @@ class TrainingEnvAdapter:
         self._fallback_event_times.clear()
         self._hard_failure_event_times.clear()
         self._completed_backbone_nodes_since_plan.clear()
+        self._truck_route_version = 1
+        self._drone_path_version.clear()
         self._episode_delivery_count = 0
         self._episode_fallback_count = 0
         self._episode_hard_failure_count = 0
@@ -531,6 +575,7 @@ class TrainingEnvAdapter:
 
         artifacts = self._load_phase4_artifacts()
         self._planned_route_stops = list(artifacts["planned_stops"])
+        self._planned_route_segments = list(artifacts["planned_segments"])
         self._full_backbone_cache = list(artifacts["backbone_cache"])
         self._background_mode_a_order_count = len(artifacts["mode_a_order_ids"])
         self._background_mode_a_pending = set(artifacts["mode_a_order_ids"])
@@ -568,82 +613,123 @@ class TrainingEnvAdapter:
           - 其他无人机在同一时间窗口内产生的成本留在各自的累积器中，
             等到它们自己的决策点时再被取走。
         """
-        if self.is_done():
-            raise RuntimeError("episode 已结束，不能继续 step()")
-        if not self._decision_queue:
-            raise RuntimeError("当前没有可执行的 decision context")
-
-        trigger = self._decision_queue.pop(0)
-        deciding_drone_id = trigger.drone_id
-        decision = self._build_decision_context(trigger)
-        if not self._is_action_allowed(action, decision.action_lookup):
-            raise ValueError(f"非法动作: {action}")
-
-        # 方案一强化版的关键语义：
-        # 当前 drone 在别人动作窗口内累计的自身成本，不应在这里丢失，而应在它自己
-        # 下一次决策时以 carry-in 的形式被取走。
-        carried_reward = self._agent_cost_accum.pop(deciding_drone_id, 0.0)
+        applied = self._apply_decision_core(action)
+        deciding_drone_id = applied.drone_id
         reward_breakdown: dict[str, float] = {}
-        self._last_reward_breakdown = {}
-        info: dict[str, Any] = {
-            "drone_id": deciding_drone_id,
-            "trigger_type": trigger.trigger_type,
-            "trigger_station_id": trigger.trigger_station_id,
-        }
+        info: dict[str, Any] = dict(applied.info)
 
-        if isinstance(action, GlobalWaitAction):
-            self._episode_wait_action_count += 1
-            current_state = self._drone_state[deciding_drone_id]
-            info["applied_action"] = "WAIT"
-            if current_state == TrainingDroneState.IDLE:
-                delta_wait = self._compute_wait_delta(deciding_drone_id)
-                self._apply_wait_action(deciding_drone_id)
-                info["wait_delta"] = delta_wait
-                # T_idle（IDLE 路径）：一次性精确结算，累加进累积器（保留跨区间已积累的成本）
-                idle_penalty = -self._cfg.wait_idle_penalty_coef * delta_wait
-                self._agent_cost_accum[deciding_drone_id] = (
-                    self._agent_cost_accum.get(deciding_drone_id, 0.0) + idle_penalty
-                )
-                self._advance_to_event(self._t_now + delta_wait)
-                _merge_reward_breakdown(reward_breakdown, self._last_reward_breakdown)
-                self._resume_capped_wait_if_needed(deciding_drone_id)
-                if not self._decision_queue and not self.is_done():
-                    self._advance_until_decision_or_done()
-                    _merge_reward_breakdown(reward_breakdown, self._last_reward_breakdown)
-            elif current_state == TrainingDroneState.RIDING_WITH_TRUCK:
-                self._apply_wait_action(deciding_drone_id)
-                info["wait_mode"] = "deferred_riding_with_truck"
+        if applied.auto_advance_kind == "idle_wait":
+            if applied.wait_until is None:
+                raise RuntimeError("idle WAIT 缺少 wait_until")
+            self._advance_to_event(applied.wait_until)
+            _merge_reward_breakdown(reward_breakdown, self._last_reward_breakdown)
+            self._resume_capped_wait_if_needed(deciding_drone_id)
+            if not self._decision_queue and not self.is_done():
                 self._advance_until_decision_or_done()
                 _merge_reward_breakdown(reward_breakdown, self._last_reward_breakdown)
-            else:
-                raise RuntimeError(f"状态 {current_state.value} 不允许执行 WAIT")
-        else:
-            if action.mode == PolicyMode.B:
-                self._episode_dispatch_mode_b_count += 1
-            elif action.mode == PolicyMode.C:
-                self._episode_dispatch_mode_c_count += 1
-            self._apply_dispatch_action(trigger, action)
-            info["applied_action"] = {
-                "order_id": action.order_id,
-                "mode": action.mode.value,
-                "recover_node_id": action.recover_node_id,
-            }
+        elif applied.auto_advance_kind == "until_decision":
             if not self._decision_queue:
                 self._advance_until_decision_or_done()
                 _merge_reward_breakdown(reward_breakdown, self._last_reward_breakdown)
+        elif applied.auto_advance_kind == "none":
+            pass
+        else:
+            raise RuntimeError(f"未知自动推进类型: {applied.auto_advance_kind}")
 
         # 本次 transition 的 reward 由两部分组成：
         # 1. carry-in：该无人机在别人动作期间已累计、延迟到本次决策点取走的成本；
         # 2. post-action：该无人机在本次动作窗口内新产生的归因成本。
         post_action_reward = self._agent_cost_accum.pop(deciding_drone_id, 0.0)
-        reward = carried_reward + post_action_reward
-        reward_breakdown["attributed_carry_in"] = carried_reward
+        reward = applied.carried_reward + post_action_reward
+        reward_breakdown["attributed_carry_in"] = applied.carried_reward
         reward_breakdown["attributed_post_action"] = post_action_reward
         reward_breakdown["attributed_total"] = reward
 
         self._last_reward_breakdown = reward_breakdown
 
         return self._build_step_result(reward=reward, info=info)
+
+    def peek_next_event_time(self) -> float:
+        """查看下一个内部事件时刻；若无事件则返回 `math.inf`。
+
+        该接口只暴露现有事件队列真值，不生成或重排任何事件。
+        """
+        if self.is_done():
+            return math.inf
+        return float(self._next_event_time())
+
+    def peek_next_decision_time(self) -> float:
+        """查看下一次可能暴露决策的时刻。
+
+        当前环境的决策只会由事件推进产生；因此无待处理决策时返回下一事件时刻。
+        真实推进仍由 `advance_to_time()` 负责，并会在决策队列出现时停止。
+        """
+        if self.current_decision_context is not None:
+            return float(self._t_now)
+        if self.is_done():
+            return math.inf
+        return float(self._next_event_time())
+
+    def advance_to_time(
+        self,
+        t_target: float,
+        *,
+        stop_on_training_done: bool = True,
+    ) -> EnvStepResult:
+        """按现有环境真值推进到指定仿真时刻或决策边界。
+
+        与训练 `step()` 的区别是：本接口不消费动作，也不会为了离线 transition
+        自动滚到下一个决策点；一旦决策队列非空即停止。
+
+        `stop_on_training_done=False` 仅供在线播放器使用，用于在订单池清空后继续
+        推进车辆返仓和无人机补能收尾；默认值保持训练/验证原语义。
+        """
+        target = float(t_target)
+        if target < self._t_now - _TIME_EPS:
+            raise ValueError(f"不能回退时间: t_target={target}, t_now={self._t_now}")
+        if (stop_on_training_done and self.is_done()) or self._decision_queue:
+            return self._build_step_result(
+                reward=0.0,
+                info={"event": "advance_to_time", "target_time": target},
+            )
+
+        target = min(target, float(self._cfg.upper_horizon_sec))
+        reward_breakdown: dict[str, float] = {}
+        while (
+            (not stop_on_training_done or not self.is_done())
+            and not self._decision_queue
+            and self._t_now < target - _TIME_EPS
+        ):
+            next_time = self._next_event_time()
+            if math.isinf(next_time):
+                next_time = target
+            else:
+                next_time = min(float(next_time), target)
+            if next_time <= self._t_now + _TIME_EPS:
+                next_time = min(target, self._t_now + 1.0)
+            self._advance_to_event(next_time)
+            _merge_reward_breakdown(reward_breakdown, self._last_reward_breakdown)
+
+        self._last_reward_breakdown = reward_breakdown
+        return self._build_step_result(
+            reward=0.0,
+            info={"event": "advance_to_time", "target_time": target},
+        )
+
+    def apply_decision(self, action: EnvAction) -> EnvStepResult:
+        """在当前决策点提交动作，但不隐式推进到下一决策点。
+
+        该接口和 `step()` 共用同一个动作提交核心；在线模式只能通过
+        `advance_to_time()` 继续推进仿真时间。
+        """
+        applied = self._apply_decision_core(action)
+        info = dict(applied.info)
+        info["event"] = "apply_decision"
+        return self._build_step_result(reward=applied.carried_reward, info=info)
+
+    def build_runtime_snapshot(self) -> dict[str, Any]:
+        """构建与当前 `t_now` 对齐的运行时可视化快照。"""
+        return self.build_visualization_snapshot()
 
     def is_done(self) -> bool:
         """检查 episode 是否满足当前实现中的任一终止条件。"""
@@ -973,7 +1059,132 @@ class TrainingEnvAdapter:
                 if decision is not None
                 else None
             ),
+            "paths": self._build_runtime_path_snapshot(float(runtime_state.t_now)),
             "last_reward_breakdown": dict(self._last_reward_breakdown),
+        }
+
+    def _build_runtime_path_snapshot(self, t_now: float) -> dict[str, list[dict[str, Any]]]:
+        """返回当前时刻仍有效的 truck / drone 路径账本快照。"""
+        truck_paths: list[dict[str, Any]] = []
+        active_truck_path = self._build_active_truck_path_entry(t_now)
+        if active_truck_path is not None:
+            truck_paths.append(active_truck_path)
+
+        drone_paths: list[dict[str, Any]] = []
+        for drone_id, leg in sorted(self._flight_legs.items()):
+            entry = self._build_active_drone_path_entry(drone_id=drone_id, leg=leg, t_now=t_now)
+            if entry is not None:
+                drone_paths.append(entry)
+
+        return {
+            "trucks": truck_paths,
+            "drones": drone_paths,
+        }
+
+    def _build_active_truck_path_entry(self, t_now: float) -> dict[str, Any] | None:
+        if not self._planned_route_segments:
+            return None
+
+        first_stop = self._planned_route_stops[0]
+        if t_now <= first_stop.departure_time + _TIME_EPS:
+            return self._serialize_truck_segment_entry(
+                segment=self._planned_route_segments[0],
+                start_pos=_clone_position(first_stop.position),
+                traveled_m=0.0,
+            )
+
+        for idx, segment in enumerate(self._planned_route_segments):
+            if t_now < segment.end_time - _TIME_EPS:
+                segment_dt = max(_TIME_EPS, segment.end_time - segment.start_time)
+                traveled_m = float(segment.distance_m) * max(
+                    0.0,
+                    min(1.0, (t_now - segment.start_time) / segment_dt),
+                )
+                current_pos = _interpolate_position_on_geometry(
+                    geometry=segment.geometry,
+                    cumulative_distances_m=segment.cumulative_distances_m,
+                    traveled_m=traveled_m,
+                )
+                return self._serialize_truck_segment_entry(
+                    segment=segment,
+                    start_pos=current_pos,
+                    traveled_m=traveled_m,
+                )
+
+            next_stop = self._planned_route_stops[idx + 1]
+            if t_now <= next_stop.departure_time + _TIME_EPS:
+                if idx + 1 >= len(self._planned_route_segments):
+                    return None
+                next_segment = self._planned_route_segments[idx + 1]
+                return self._serialize_truck_segment_entry(
+                    segment=next_segment,
+                    start_pos=_clone_position(next_stop.position),
+                    traveled_m=0.0,
+                )
+
+        return None
+
+    def _serialize_truck_segment_entry(
+        self,
+        *,
+        segment: PlannedTruckSegment,
+        start_pos: Position3D,
+        traveled_m: float,
+    ) -> dict[str, Any]:
+        remaining_points = _remaining_geometry_from_distance(
+            geometry=segment.geometry,
+            cumulative_distances_m=segment.cumulative_distances_m,
+            traveled_m=traveled_m,
+        )
+        if not remaining_points:
+            remaining_points = (_clone_position(start_pos), _clone_position(segment.geometry[-1]))
+        return {
+            "entity_id": str(self._truck_id or ""),
+            "route_version": int(self._truck_route_version),
+            "segment_id": int(segment.segment_id),
+            "status": "active",
+            "motion_mode": "road_network",
+            "start_time": float(segment.start_time),
+            "end_time": float(segment.end_time),
+            "from_node_id": segment.from_node_id,
+            "to_node_id": segment.to_node_id,
+            "distance_m": float(max(0.0, segment.distance_m - traveled_m)),
+            "path_utm": [_position_to_payload(pos) for pos in remaining_points],
+        }
+
+    def _build_active_drone_path_entry(
+        self,
+        *,
+        drone_id: str,
+        leg: FlightLeg,
+        t_now: float,
+    ) -> dict[str, Any] | None:
+        if t_now >= leg.arrival_time - _TIME_EPS:
+            return None
+
+        if t_now <= leg.start_time + _TIME_EPS:
+            current_pos = _clone_position(leg.start_pos)
+        else:
+            ratio = max(
+                0.0,
+                min(1.0, (t_now - leg.start_time) / max(_TIME_EPS, leg.arrival_time - leg.start_time)),
+            )
+            current_pos = leg.start_pos.interpolate(leg.target_pos, ratio)
+
+        remaining_points = (_clone_position(current_pos), _clone_position(leg.target_pos))
+        return {
+            "entity_id": drone_id,
+            "route_version": int(leg.route_version),
+            "segment_id": str(leg.kind),
+            "status": "active",
+            "motion_mode": str(leg.motion_mode),
+            "start_time": float(leg.start_time),
+            "end_time": float(leg.arrival_time),
+            "target_node_id": leg.target_node_id,
+            "target_node_type": leg.target_node_type,
+            "order_id": leg.order_id,
+            "distance_m": float(_polyline_distance_2d(remaining_points)),
+            "path_utm": [_position_to_payload(pos) for pos in remaining_points],
         }
 
     def _build_coarse_plan_view(self, t_now: float) -> CoarsePlanView:
@@ -1332,6 +1543,81 @@ class TrainingEnvAdapter:
         # idle 路径在 step(WAIT) 入口一次性结算；riding_with_truck 路径后续按真实 dt 累计。
         self._drone_state[drone_id] = TrainingDroneState.ACTIVE_WAIT
 
+    def _apply_decision_core(self, action: EnvAction) -> AppliedDecision:
+        """消费当前队首决策并提交动作，不负责自动推进到下一决策点。"""
+        if self.is_done():
+            raise RuntimeError("episode 已结束，不能继续提交决策")
+        if not self._decision_queue:
+            raise RuntimeError("当前没有可执行的 decision context")
+
+        trigger = self._decision_queue.pop(0)
+        deciding_drone_id = trigger.drone_id
+        decision = self._build_decision_context(trigger)
+        if not self._is_action_allowed(action, decision.action_lookup):
+            raise ValueError(f"非法动作: {action}")
+
+        # 与原 step() 语义一致：当前 drone 在别人动作窗口内累计的自身成本，
+        # 在它自己的下一次决策被取走。
+        carried_reward = self._agent_cost_accum.pop(deciding_drone_id, 0.0)
+        self._last_reward_breakdown = {}
+        info: dict[str, Any] = {
+            "drone_id": deciding_drone_id,
+            "trigger_type": trigger.trigger_type,
+            "trigger_station_id": trigger.trigger_station_id,
+        }
+
+        if isinstance(action, GlobalWaitAction):
+            self._episode_wait_action_count += 1
+            current_state = self._drone_state[deciding_drone_id]
+            info["applied_action"] = "WAIT"
+            if current_state == TrainingDroneState.IDLE:
+                delta_wait = self._compute_wait_delta(deciding_drone_id)
+                wait_until = self._t_now + delta_wait
+                self._apply_wait_action(deciding_drone_id)
+                self._active_wait_until[deciding_drone_id] = float(wait_until)
+                info["wait_delta"] = delta_wait
+                # 保持原训练语义：IDLE WAIT 的 T_idle 在动作提交时按完整等待窗结算。
+                idle_penalty = -self._cfg.wait_idle_penalty_coef * delta_wait
+                self._agent_cost_accum[deciding_drone_id] = (
+                    self._agent_cost_accum.get(deciding_drone_id, 0.0) + idle_penalty
+                )
+                return AppliedDecision(
+                    drone_id=deciding_drone_id,
+                    carried_reward=carried_reward,
+                    info=info,
+                    auto_advance_kind="idle_wait",
+                    wait_until=float(wait_until),
+                )
+            if current_state == TrainingDroneState.RIDING_WITH_TRUCK:
+                self._apply_wait_action(deciding_drone_id)
+                self._active_wait_until.pop(deciding_drone_id, None)
+                info["wait_mode"] = "deferred_riding_with_truck"
+                return AppliedDecision(
+                    drone_id=deciding_drone_id,
+                    carried_reward=carried_reward,
+                    info=info,
+                    auto_advance_kind="until_decision",
+                )
+            raise RuntimeError(f"状态 {current_state.value} 不允许执行 WAIT")
+
+        if action.mode == PolicyMode.B:
+            self._episode_dispatch_mode_b_count += 1
+        elif action.mode == PolicyMode.C:
+            self._episode_dispatch_mode_c_count += 1
+        self._active_wait_until.pop(deciding_drone_id, None)
+        self._apply_dispatch_action(trigger, action)
+        info["applied_action"] = {
+            "order_id": action.order_id,
+            "mode": action.mode.value,
+            "recover_node_id": action.recover_node_id,
+        }
+        return AppliedDecision(
+            drone_id=deciding_drone_id,
+            carried_reward=carried_reward,
+            info=info,
+            auto_advance_kind=("none" if self._decision_queue else "until_decision"),
+        )
+
     def _apply_dispatch_action(
         self,
         trigger: DecisionTrigger,
@@ -1417,6 +1703,7 @@ class TrainingEnvAdapter:
             trigger_station_id=trigger.trigger_station_id,
         )
         return DecisionContext(
+            decision_id=int(trigger.decision_id),
             t_decision=float(runtime_state.t_now),
             deciding_drone_id=trigger.drone_id,
             trigger_type=trigger.trigger_type,
@@ -1672,6 +1959,8 @@ class TrainingEnvAdapter:
                         trigger_station_id=None,
                     )
 
+        self._resume_due_active_waits(t_next)
+
         # order_mgr.tick() 可能注入了新 Poisson 订单；唤醒因无单而"睡死"的 idle UAV。
         self._wake_stranded_idle_drones()
 
@@ -1874,12 +2163,17 @@ class TrainingEnvAdapter:
             from_pos=start_pos,
             to_pos=target_pos,
         )
+        route_version = int(self._drone_path_version.get(drone_id, 0) + 1)
+        self._drone_path_version[drone_id] = route_version
         self._flight_legs[drone_id] = FlightLeg(
             kind=kind,
             start_time=effective_start_time,
             arrival_time=float(effective_start_time + flight_time),
             start_pos=start_pos,
             target_pos=_clone_position(target_pos),
+            path_points=(start_pos, _clone_position(target_pos)),
+            route_version=route_version,
+            motion_mode="straight_line",
             order_id=target_order_id,
             target_node_id=target_node_id,
             target_node_type=target_node_type,
@@ -2752,8 +3046,19 @@ class TrainingEnvAdapter:
             return
 
         self._active_wait_resume.pop(drone_id, None)
+        self._active_wait_until.pop(drone_id, None)
         self._drone_state[drone_id] = TrainingDroneState.IDLE
         self._enqueue_decision(drone_id, "wait_resume", None)
+
+    def _resume_due_active_waits(self, t_now: float) -> None:
+        """恢复已到显式 WAIT 截止时刻的 IDLE UAV。"""
+        due = [
+            drone_id
+            for drone_id, wait_until in list(self._active_wait_until.items())
+            if wait_until <= t_now + _TIME_EPS
+        ]
+        for drone_id in due:
+            self._resume_capped_wait_if_needed(drone_id)
 
     def _effective_battery_current(self, drone_id: str, t_now: float) -> float:
         """返回给定时刻的有效剩余电量（含飞行中线性耗电近似）。"""
@@ -2819,6 +3124,9 @@ class TrainingEnvAdapter:
 
         for done_time in self._truck_charge_until.values():
             candidates.append(done_time)
+
+        for wait_until in self._active_wait_until.values():
+            candidates.append(float(wait_until))
 
         reservation_probe_time = self._next_reservation_timeout_probe_time()
         if math.isfinite(reservation_probe_time):
@@ -3026,6 +3334,7 @@ class TrainingEnvAdapter:
         ]
         for drone_id in resumable:
             self._active_wait_resume.pop(drone_id, None)
+            self._active_wait_until.pop(drone_id, None)
             self._drone_state[drone_id] = TrainingDroneState.IDLE
             self._enqueue_decision(drone_id, "wait_resume", None)
 
@@ -3034,6 +3343,7 @@ class TrainingEnvAdapter:
         resumable = list(self._active_wait_resume.items())
         for drone_id, state in resumable:
             self._active_wait_resume.pop(drone_id, None)
+            self._active_wait_until.pop(drone_id, None)
             self._drone_state[drone_id] = state
             if state == TrainingDroneState.IDLE:
                 self._enqueue_decision(drone_id, "wait_resume", None)
@@ -3100,6 +3410,7 @@ class TrainingEnvAdapter:
         route_dir = self._phase4_route_dir
         execution_payload = _load_json(route_dir / "truck_execution_route.json")
         planned_stops: list[PlannedStop] = []
+        planned_segments: list[PlannedTruckSegment] = []
         backbone_cache: list[BackboneVisit] = []
         mode_a_order_ids: list[str] = []
 
@@ -3131,8 +3442,52 @@ class TrainingEnvAdapter:
                 # truck_execution_route 里的 customer stop 对应 mode A 背景完成事件。
                 mode_a_order_ids.append(stop.order_id)
 
+        raw_segments = execution_payload.get("segments")
+        if raw_segments is not None:
+            if not isinstance(raw_segments, list):
+                raise ValueError("truck_execution_route.segments 必须为 list")
+            if len(raw_segments) != max(0, len(planned_stops) - 1):
+                raise ValueError(
+                    "truck_execution_route.segments 与 stops 数量不一致: "
+                    f"segments={len(raw_segments)}, stops={len(planned_stops)}"
+                )
+            road_nodes = None
+            for idx, raw_segment in enumerate(raw_segments, start=1):
+                if not isinstance(raw_segment, Mapping):
+                    raise ValueError("truck_execution_route.segments 元素必须为对象")
+                from_stop = planned_stops[idx - 1]
+                to_stop = planned_stops[idx]
+                geometry = _parse_segment_geometry_payload(raw_segment)
+                if geometry is None:
+                    osm_node_path_raw = raw_segment.get("osm_node_path")
+                    if not isinstance(osm_node_path_raw, list):
+                        raise ValueError("缺少 segment.geometry，且 osm_node_path 非法")
+                    if road_nodes is None:
+                        _, road_nodes = self._require_road_graph()
+                    geometry = _build_geometry_from_osm_node_path(
+                        from_pos=from_stop.position,
+                        to_pos=to_stop.position,
+                        osm_node_path=[str(item) for item in osm_node_path_raw],
+                        road_nodes=road_nodes,
+                    )
+                planned_segments.append(
+                    PlannedTruckSegment(
+                        segment_id=idx - 1,
+                        from_node_id=str(raw_segment.get("from_node_id", from_stop.node_id)),
+                        to_node_id=str(raw_segment.get("to_node_id", to_stop.node_id)),
+                        from_node_type=str(raw_segment.get("from_node_type", from_stop.node_type)),
+                        to_node_type=str(raw_segment.get("to_node_type", to_stop.node_type)),
+                        start_time=float(from_stop.departure_time),
+                        end_time=float(to_stop.arrival_time),
+                        distance_m=float(raw_segment.get("distance_m", _polyline_distance_2d(geometry))),
+                        geometry=geometry,
+                        cumulative_distances_m=_build_cumulative_distances(geometry),
+                    )
+                )
+
         return {
             "planned_stops": planned_stops,
+            "planned_segments": planned_segments,
             "backbone_cache": backbone_cache,
             "mode_a_order_ids": tuple(mode_a_order_ids),
         }
@@ -3155,6 +3510,8 @@ class TrainingEnvAdapter:
         entity_mgr = self._require_entity_manager()
         truck = self._require_truck()
         depot = self._require_depot()
+        road_graph, road_nodes = self._require_road_graph()
+        nearest_cache: dict[tuple[float, float], tuple[str, float]] = {}
         stations = sorted(entity_mgr.stations.values(), key=lambda item: item.station_id)
         if not stations:
             return
@@ -3189,7 +3546,17 @@ class TrainingEnvAdapter:
 
             current_pos = _clone_position(depot.location)
             for station in chosen:
-                travel_time = current_pos.distance_2d(station.location) / max(_TIME_EPS, truck.speed)
+                prev_stop = self._planned_route_stops[-1]
+                segment_geometry = _build_route_geometry_between_positions(
+                    from_pos=current_pos,
+                    to_pos=station.location,
+                    road_graph=road_graph,
+                    road_nodes=road_nodes,
+                    nearest_cache=nearest_cache,
+                )
+                travel_distance = _polyline_distance_2d(segment_geometry)
+                segment_start_time = t_cursor
+                travel_time = travel_distance / max(_TIME_EPS, truck.speed)
                 t_cursor += travel_time
                 seq += 1
                 departure_time = t_cursor + station_hold_time
@@ -3203,6 +3570,20 @@ class TrainingEnvAdapter:
                     departure_time=departure_time,
                 )
                 self._planned_route_stops.append(planned_stop)
+                self._planned_route_segments.append(
+                    PlannedTruckSegment(
+                        segment_id=len(self._planned_route_segments),
+                        from_node_id=prev_stop.node_id,
+                        to_node_id=station.station_id,
+                        from_node_type=prev_stop.node_type,
+                        to_node_type="station",
+                        start_time=segment_start_time,
+                        end_time=t_cursor,
+                        distance_m=travel_distance,
+                        geometry=segment_geometry,
+                        cumulative_distances_m=_build_cumulative_distances(segment_geometry),
+                    )
+                )
                 self._full_backbone_cache.append(
                     BackboneVisit(
                         node_id=station.station_id,
@@ -3213,20 +3594,43 @@ class TrainingEnvAdapter:
                 current_pos = station.location
                 t_cursor = departure_time
 
-            travel_time_back = current_pos.distance_2d(depot.location) / max(_TIME_EPS, truck.speed)
+            segment_geometry = _build_route_geometry_between_positions(
+                from_pos=current_pos,
+                to_pos=depot.location,
+                road_graph=road_graph,
+                road_nodes=road_nodes,
+                nearest_cache=nearest_cache,
+            )
+            travel_distance_back = _polyline_distance_2d(segment_geometry)
+            segment_start_time = t_cursor
+            travel_time_back = travel_distance_back / max(_TIME_EPS, truck.speed)
             t_cursor += travel_time_back
             seq += 1
             # depot 同样属于 future fixed node；若不写入骨架缓存，
             # 则尾段会出现“物理路线仍在继续，但 coarse backbone 已耗尽”的语义裂缝。
-            self._planned_route_stops.append(
-                PlannedStop(
-                    seq=seq,
-                    node_type="depot",
-                    node_id=depot.depot_id,
-                    position=_clone_position(depot.location),
-                    order_id=None,
-                    arrival_time=t_cursor,
-                    departure_time=t_cursor,
+            depot_stop = PlannedStop(
+                seq=seq,
+                node_type="depot",
+                node_id=depot.depot_id,
+                position=_clone_position(depot.location),
+                order_id=None,
+                arrival_time=t_cursor,
+                departure_time=t_cursor,
+            )
+            self._planned_route_stops.append(depot_stop)
+            prev_stop = self._planned_route_stops[-2]
+            self._planned_route_segments.append(
+                PlannedTruckSegment(
+                    segment_id=len(self._planned_route_segments),
+                    from_node_id=prev_stop.node_id,
+                    to_node_id=depot.depot_id,
+                    from_node_type=prev_stop.node_type,
+                    to_node_type="depot",
+                    start_time=segment_start_time,
+                    end_time=t_cursor,
+                    distance_m=travel_distance_back,
+                    geometry=segment_geometry,
+                    cumulative_distances_m=_build_cumulative_distances(segment_geometry),
                 )
             )
             self._full_backbone_cache.append(
@@ -3244,11 +3648,35 @@ class TrainingEnvAdapter:
         truck = self._require_truck()
         route_nodes = [stop.node_id for stop in self._planned_route_stops]
         route_positions = [_clone_position(stop.position) for stop in self._planned_route_stops]
+        geometry: list[Position3D] = []
+        for segment in self._planned_route_segments:
+            if not geometry:
+                geometry.extend(_clone_position(pos) for pos in segment.geometry)
+                continue
+            if geometry[-1].distance_2d(segment.geometry[0]) <= 0.5:
+                geometry.extend(_clone_position(pos) for pos in segment.geometry[1:])
+            else:
+                geometry.extend(_clone_position(pos) for pos in segment.geometry)
         truck.set_route(
             route_nodes=route_nodes,
             route_positions=route_positions,
             departure_time=0.0,
+            geometry=geometry if len(geometry) >= 2 else None,
         )
+
+    def _require_road_graph(self) -> tuple[Any, Mapping[str, tuple[float, float]]]:
+        """按需加载场景 OSM 路网图，供运行时真实路径计算复用。"""
+        if self._road_graph is not None and self._road_nodes is not None:
+            return self._road_graph, self._road_nodes
+
+        xml_path = self._scene_ctx.road_network.xml_path
+        if not xml_path:
+            raise ValueError("scene_ctx 缺少 osm_network.xml 路径，无法构造真实路网几何")
+        osm_xml = Path(xml_path).read_text(encoding="utf-8")
+        road_graph, road_nodes = build_road_graph(osm_xml, respect_osm_oneway=True)
+        self._road_graph = road_graph
+        self._road_nodes = road_nodes
+        return road_graph, road_nodes
 
     def _initialize_drone_states(self) -> None:
         """根据 drone.home_type 建立训练侧初始状态。"""
@@ -3439,18 +3867,24 @@ class TrainingEnvAdapter:
         if t_now <= first_stop.departure_time + _TIME_EPS:
             return _clone_position(first_stop.position)
 
-        prev_stop = first_stop
-        for stop in self._planned_route_stops[1:]:
-            if t_now < stop.arrival_time - _TIME_EPS:
-                segment_dt = max(_TIME_EPS, stop.arrival_time - prev_stop.departure_time)
+        for idx, segment in enumerate(self._planned_route_segments):
+            if t_now < segment.start_time - _TIME_EPS:
+                return _clone_position(self._planned_route_stops[idx].position)
+            if t_now < segment.end_time - _TIME_EPS:
+                segment_dt = max(_TIME_EPS, segment.end_time - segment.start_time)
                 ratio = max(
                     0.0,
-                    min(1.0, (t_now - prev_stop.departure_time) / segment_dt),
+                    min(1.0, (t_now - segment.start_time) / segment_dt),
                 )
-                return prev_stop.position.interpolate(stop.position, ratio)
-            if t_now <= stop.departure_time + _TIME_EPS:
-                return _clone_position(stop.position)
-            prev_stop = stop
+                traveled_m = float(segment.distance_m) * ratio
+                return _interpolate_position_on_geometry(
+                    geometry=segment.geometry,
+                    cumulative_distances_m=segment.cumulative_distances_m,
+                    traveled_m=traveled_m,
+                )
+            next_stop = self._planned_route_stops[idx + 1]
+            if t_now <= next_stop.departure_time + _TIME_EPS:
+                return _clone_position(next_stop.position)
 
         return _clone_position(self._planned_route_stops[-1].position)
 
@@ -3602,6 +4036,188 @@ def _require_singleton(mapping: Mapping[str, Any], label: str) -> tuple[str, Any
 def _clone_position(pos: Position3D) -> Position3D:
     """复制 Position3D，避免直接复用实体上的同一对象引用。"""
     return Position3D(x=float(pos.x), y=float(pos.y), z=float(pos.z))
+
+
+def _position_to_payload(pos: Position3D) -> dict[str, float]:
+    return {
+        "x": float(pos.x),
+        "y": float(pos.y),
+        "z": float(pos.z),
+    }
+
+
+def _build_cumulative_distances(geometry: tuple[Position3D, ...]) -> tuple[float, ...]:
+    cumulative = [0.0]
+    for idx in range(1, len(geometry)):
+        cumulative.append(cumulative[-1] + geometry[idx - 1].distance_2d(geometry[idx]))
+    return tuple(cumulative)
+
+
+def _polyline_distance_2d(points: tuple[Position3D, ...] | list[Position3D]) -> float:
+    if len(points) < 2:
+        return 0.0
+    return sum(points[idx - 1].distance_2d(points[idx]) for idx in range(1, len(points)))
+
+
+def _interpolate_position_on_geometry(
+    *,
+    geometry: tuple[Position3D, ...],
+    cumulative_distances_m: tuple[float, ...],
+    traveled_m: float,
+) -> Position3D:
+    if not geometry:
+        raise ValueError("geometry 不能为空")
+    if len(geometry) == 1:
+        return _clone_position(geometry[0])
+
+    clamped = max(0.0, min(float(traveled_m), float(cumulative_distances_m[-1])))
+    for idx in range(1, len(geometry)):
+        seg_end = cumulative_distances_m[idx]
+        if clamped > seg_end + _TIME_EPS:
+            continue
+        seg_start = cumulative_distances_m[idx - 1]
+        seg_length = max(_TIME_EPS, seg_end - seg_start)
+        ratio = max(0.0, min(1.0, (clamped - seg_start) / seg_length))
+        return geometry[idx - 1].interpolate(geometry[idx], ratio)
+    return _clone_position(geometry[-1])
+
+
+def _remaining_geometry_from_distance(
+    *,
+    geometry: tuple[Position3D, ...],
+    cumulative_distances_m: tuple[float, ...],
+    traveled_m: float,
+) -> tuple[Position3D, ...]:
+    if not geometry:
+        return ()
+    if len(geometry) == 1:
+        return (_clone_position(geometry[0]),)
+
+    clamped = max(0.0, min(float(traveled_m), float(cumulative_distances_m[-1])))
+    if clamped <= _TIME_EPS:
+        return tuple(_clone_position(pos) for pos in geometry)
+    if clamped >= cumulative_distances_m[-1] - _TIME_EPS:
+        return (_clone_position(geometry[-1]),)
+
+    current_pos = _interpolate_position_on_geometry(
+        geometry=geometry,
+        cumulative_distances_m=cumulative_distances_m,
+        traveled_m=clamped,
+    )
+    remaining: list[Position3D] = [_clone_position(current_pos)]
+    for idx in range(1, len(geometry)):
+        if cumulative_distances_m[idx] <= clamped + _TIME_EPS:
+            continue
+        if remaining[-1].distance_2d(geometry[idx]) > 0.5:
+            remaining.append(_clone_position(geometry[idx]))
+    if len(remaining) == 1:
+        remaining.append(_clone_position(geometry[-1]))
+    return tuple(remaining)
+
+
+def _parse_segment_geometry_payload(raw_segment: Mapping[str, Any]) -> tuple[Position3D, ...] | None:
+    raw_geometry = raw_segment.get("geometry")
+    if raw_geometry is None:
+        return None
+    if not isinstance(raw_geometry, list):
+        raise ValueError("segment.geometry 必须为 list")
+    geometry: list[Position3D] = []
+    for raw_point in raw_geometry:
+        if not isinstance(raw_point, Mapping):
+            raise ValueError("segment.geometry 点必须为对象")
+        geometry.append(
+            Position3D(
+                x=float(raw_point["x"]),
+                y=float(raw_point["y"]),
+                z=float(raw_point.get("z", 0.0)),
+            )
+        )
+    if len(geometry) < 2:
+        raise ValueError("segment.geometry 至少需要 2 个点")
+    return tuple(geometry)
+
+
+def _build_geometry_from_osm_node_path(
+    *,
+    from_pos: Position3D,
+    to_pos: Position3D,
+    osm_node_path: list[str],
+    road_nodes: Mapping[str, tuple[float, float]],
+) -> tuple[Position3D, ...]:
+    geometry: list[Position3D] = [_clone_position(from_pos)]
+    for osm_node_id in osm_node_path:
+        pos = _road_node_position(road_nodes, osm_node_id)
+        if geometry[-1].distance_2d(pos) > 0.5:
+            geometry.append(pos)
+    if geometry[-1].distance_2d(to_pos) > 0.5:
+        geometry.append(_clone_position(to_pos))
+    return tuple(geometry)
+
+
+def _build_route_geometry_between_positions(
+    *,
+    from_pos: Position3D,
+    to_pos: Position3D,
+    road_graph: Any,
+    road_nodes: Mapping[str, tuple[float, float]],
+    nearest_cache: dict[tuple[float, float], tuple[str, float]],
+) -> tuple[Position3D, ...]:
+    from_node_id, _ = _find_nearest_node_cached(
+        road_graph=road_graph,
+        road_nodes=road_nodes,
+        position=from_pos,
+        cache=nearest_cache,
+    )
+    to_node_id, _ = _find_nearest_node_cached(
+        road_graph=road_graph,
+        road_nodes=road_nodes,
+        position=to_pos,
+        cache=nearest_cache,
+    )
+    if from_node_id == to_node_id:
+        osm_path = [from_node_id]
+    else:
+        osm_path = shortest_path(road_graph, from_node_id, to_node_id)
+        if not osm_path:
+            raise ValueError(f"OSM 路网不可达: {from_node_id} -> {to_node_id}")
+    return _build_geometry_from_osm_node_path(
+        from_pos=from_pos,
+        to_pos=to_pos,
+        osm_node_path=[str(node_id) for node_id in osm_path],
+        road_nodes=road_nodes,
+    )
+
+
+def _find_nearest_node_cached(
+    *,
+    road_graph: Any,
+    road_nodes: Mapping[str, tuple[float, float]],
+    position: Position3D,
+    cache: dict[tuple[float, float], tuple[str, float]],
+) -> tuple[str, float]:
+    key = (round(float(position.x), 2), round(float(position.y), 2))
+    cached = cache.get(key)
+    if cached is not None:
+        return cached
+    nearest_node_id = find_nearest_node(road_graph, road_nodes, position.x, position.y)
+    if not nearest_node_id:
+        raise ValueError(f"无法将坐标映射到 OSM 节点: ({position.x}, {position.y})")
+    nearest_pos = _road_node_position(road_nodes, str(nearest_node_id))
+    snapped = (str(nearest_node_id), position.distance_2d(nearest_pos))
+    cache[key] = snapped
+    return snapped
+
+
+def _road_node_position(
+    road_nodes: Mapping[str, tuple[float, float]],
+    osm_node_id: str,
+) -> Position3D:
+    from pyproj import Transformer
+
+    lon, lat = road_nodes[osm_node_id]
+    transformer = Transformer.from_crs("EPSG:4326", "EPSG:32651", always_xy=True)
+    x, y = transformer.transform(lon, lat)
+    return Position3D(x=float(x), y=float(y), z=0.0)
 
 
 def _host_id(host: ChargingHost) -> str:

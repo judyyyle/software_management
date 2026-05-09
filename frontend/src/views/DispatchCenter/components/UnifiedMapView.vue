@@ -70,6 +70,7 @@ let stationGroup:   L.LayerGroup   | null = null
 let orderGroup:     L.LayerGroup   | null = null
 let routeGroup:     L.LayerGroup   | null = null
 let routeMarkerGroup: L.LayerGroup | null = null
+let runtimePathGroup: L.LayerGroup | null = null
 let truckMarkers:   Map<string, L.Marker> = new Map()
 let droneMarkers:   Map<string, L.Marker> = new Map()
 let truckGroup:     L.LayerGroup   | null = null
@@ -450,6 +451,44 @@ function drawDispatchRoutes(plan: { truck_routes?: Record<string, any>; drone_ro
   }
 }
 
+function drawRuntimePaths(paths: { trucks?: any[]; drones?: any[] }) {
+  if (!map) return
+  if (runtimePathGroup) {
+    runtimePathGroup.clearLayers()
+    runtimePathGroup.remove()
+    runtimePathGroup = null
+  }
+
+  runtimePathGroup = L.layerGroup().addTo(map)
+
+  const drawPath = (entry: any, color: string, dashed = false) => {
+    const rawPath = Array.isArray(entry?.path) ? entry.path : []
+    const coords: [number, number][] = rawPath
+      .filter((point: any) => Array.isArray(point) && point.length >= 2)
+      .map(([lng, lat]: [number, number]) => [Number(lat), Number(lng)] as [number, number])
+      .filter((point: [number, number]) => Number.isFinite(point[0]) && Number.isFinite(point[1]))
+    if (coords.length <= 1) return
+    L.polyline(coords, {
+      color,
+      weight: dashed ? 3 : 4,
+      opacity: dashed ? 0.88 : 0.72,
+      dashArray: dashed ? '8,6' : undefined,
+      pane: dashed ? 'droneRoutePane' : undefined,
+    }).addTo(runtimePathGroup as L.LayerGroup)
+  }
+
+  for (const truckPath of paths.trucks ?? []) {
+    if ((truckPath?.status ?? 'active') === 'active') {
+      drawPath(truckPath, '#2563eb', false)
+    }
+  }
+  for (const dronePath of paths.drones ?? []) {
+    if ((dronePath?.status ?? 'active') === 'active') {
+      drawPath(dronePath, '#7c3aed', true)
+    }
+  }
+}
+
 // ── 生命周期 ──────────────────────────────────────────────────────
 
 onMounted(() => {
@@ -467,6 +506,7 @@ onBeforeUnmount(() => {
   depotGroup?.remove()
   stationGroup?.remove()
   orderGroup?.remove()
+  runtimePathGroup?.remove()
   map?.remove()
   map = null
 })
@@ -586,7 +626,8 @@ function updateDrone(droneId: string, lng: number, lat: number, status: string =
   }
 
   const drone = entityStore.drones.find(d => d.drone_id === droneId)
-  const name = drone?.name || droneId
+  const name = drone?.drone_id || droneId
+  const rtDrone = entityStore.rtDrones.find(d => d.drone_id === droneId)
   
   // 检查无人机是否在卡车上
   const isOnTruck = entityStore.rtTrucks.some(t => t.docked_drones?.includes(droneId))
@@ -607,7 +648,7 @@ function updateDrone(droneId: string, lng: number, lat: number, status: string =
         `<div class="fac-popup">
           <div class="fac-popup__title">🚁 ${name}</div>
           <div class="fac-popup__row"><span>状态</span><span>${status}</span></div>
-          <div class="fac-popup__row"><span>电量</span><span>${drone?.battery_percent?.toFixed(0) || '—'}%</span></div>
+          <div class="fac-popup__row"><span>电量</span><span>${rtDrone?.battery_ratio !== undefined ? (rtDrone.battery_ratio * 100).toFixed(0) : '—'}%</span></div>
           <div class="fac-popup__row"><span>坐标</span><span>${lng.toFixed(5)}, ${lat.toFixed(5)}</span></div>
         </div>`,
         { maxWidth: 200, className: 'fac-popup-wrap' }
@@ -661,7 +702,7 @@ function getCurrentBounds() {
   }
 }
 
-defineExpose({ setFacilities, updateTruck, updateDrone, addOrder, clearDynamic, clearDispatchRoutes: clearRouteOverlays, drawDispatchRoutes, drawOrders, clearDynamicEntities, getCurrentBounds })
+defineExpose({ setFacilities, updateTruck, updateDrone, addOrder, clearDynamic, clearDispatchRoutes: clearRouteOverlays, drawDispatchRoutes, drawRuntimePaths, drawOrders, clearDynamicEntities, getCurrentBounds })
 </script>
 
 <style scoped>
