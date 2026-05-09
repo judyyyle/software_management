@@ -53,6 +53,7 @@ from .order_source_adapter import (
     build_order_source,
     ensure_mode_allowed,
 )
+from .export_sumo_truck_route import export_phase4_truck_route
 from .rollout_buffer import (
     RolloutTransition,
     build_batch_view_from_transitions,
@@ -482,6 +483,7 @@ def train_cmrappo(
     out_dir = Path(output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     shutil.copy2(Path(config_path), out_dir / "training_config_snapshot.yaml")
+    export_phase4_truck_route(config_path=config_path)
 
     env = TrainingEnvAdapter(
         scene_ctx=scene_ctx,

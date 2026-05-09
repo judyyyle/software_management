@@ -347,6 +347,7 @@ const dispatchPlan = ref<DispatchPlan | null>(null)
 const totalEnergyCostWh = ref(0)
 type DispatchSolverName = 'greedy' | 'greedy_mmce' | 'greedy_mmce_bi' | 'market'
 const dispatchSolver = ref<DispatchSolverName>('greedy_mmce_bi')
+const lastRenderedDecisionEventSeq = ref(0)
 
 function dispatchSolverLabel(solver: DispatchSolverName): string {
   if (solver === 'greedy') return '贪心（baseline）'
@@ -548,6 +549,7 @@ async function doInit() {
 
 async function doReset() {
   await systemStore.reset().catch(() => {})
+  lastRenderedDecisionEventSeq.value = 0
   totalEnergyCostWh.value = 0
   _log('warn', '🔄 仿真已重置，请重新初始化')
 }
@@ -563,6 +565,7 @@ async function doActivatePolicy() {
     return
   }
   policyLoading.value = true
+  lastRenderedDecisionEventSeq.value = 0
   _log('info', `🤖 正在激活 PPO 在线策略：${policyPath.value}`)
   try {
     await systemStore.activatePolicy({
@@ -589,6 +592,7 @@ async function doDeactivatePolicy() {
   _log('info', '↩ 正在切回 Classic 仿真运行时...')
   try {
     await systemStore.deactivatePolicy()
+    lastRenderedDecisionEventSeq.value = 0
     await systemStore.fetchPolicyState()
     _log('success', '✅ 已切回 Classic 仿真运行时')
   } catch (e: any) {
@@ -656,6 +660,7 @@ async function doDispatch() {
       }
 
       mapRef.value?.clearDispatchRoutes?.()
+      mapRef.value?.drawRuntimePaths?.({ trucks: [], drones: [] })
       
       // 调试：打印无人机路线信息便于诊断显示问题
       if (plan.drone_routes && plan.drone_routes.length > 0) {
@@ -767,6 +772,27 @@ function setupRealtimeUpdates() {
       if (drone.lng && drone.lat) {
         mapRef.value?.updateDrone?.(drone.drone_id, drone.lng, drone.lat, drone.status)
       }
+    }
+
+    if (systemStore.policyActive) {
+      mapRef.value?.drawRuntimePaths?.(systemStore.runtimePaths)
+    } else {
+      mapRef.value?.drawRuntimePaths?.({ trucks: [], drones: [] })
+    }
+
+    for (const event of systemStore.decisionEvents) {
+      if (event.event_seq <= lastRenderedDecisionEventSeq.value) continue
+      const mode = event.selected_mode ? ` ${event.selected_mode}` : ''
+      const order = event.selected_order_id ? ` / ${event.selected_order_id}` : ''
+      const latency = event.inference_latency_ms != null ? ` · ${event.inference_latency_ms}ms` : ''
+      if (event.status === 'DECISION_PENDING') {
+        flowPanelRef.value?.addEvent?.('⏳', `PPO 决策待处理 #${event.decision_id} · ${event.drone_id}`)
+      } else if (event.status === 'DECISION_APPLIED') {
+        flowPanelRef.value?.addEvent?.('🤖', `PPO 决策已应用 #${event.decision_id}${mode}${order}${latency}`)
+      } else if (event.status === 'EXECUTION_HARD_FAILED') {
+        flowPanelRef.value?.addEvent?.('⚠️', `PPO 执行硬失败 #${event.decision_id} · ${event.failure_type || 'unknown'}`)
+      }
+      lastRenderedDecisionEventSeq.value = Math.max(lastRenderedDecisionEventSeq.value, event.event_seq)
     }
     
     // 重绘订单标记（使用最新的订单状态）

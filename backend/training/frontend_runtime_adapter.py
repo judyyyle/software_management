@@ -13,7 +13,9 @@ from __future__ import annotations
 
 import copy
 import logging
+import shutil
 import threading
+import tempfile
 import time
 from collections import deque
 from dataclasses import dataclass
@@ -26,7 +28,9 @@ from core.entities.primitives import Position3D, SourceType
 from environment.state.entity_manager import EntityManager
 from training.critic_batch_builder import CriticBatchBuilder
 from training.contracts import ResolvedActionIndices
+from training.actions import DispatchAction, EnvAction, GlobalWaitAction
 from training.env_adapter import TrainingEnvAdapter
+from training.export_sumo_truck_route import export_phase4_truck_route_for_scene
 from training.model import SharedPPOActorCritic
 from training.observation_tensorizer import ObservationTensorizer
 from training.order_source_adapter import OrderSourceMode, build_order_source
@@ -61,6 +65,13 @@ logger = logging.getLogger(__name__)
 _TICK_INTERVAL_SEC = 0.1
 _MIN_SPEED_RATIO = 1e-3
 _MAX_ORDER_LIMIT = 500
+_RECENT_DECISION_EVENT_LIMIT = 100
+_HARD_FAILURE_STATE = "airborne_energy_failure"
+_HOME_DISTANCE_TOLERANCE_M = 5.0
+
+DECISION_PENDING = "DECISION_PENDING"
+DECISION_APPLIED = "DECISION_APPLIED"
+EXECUTION_HARD_FAILED = "EXECUTION_HARD_FAILED"
 
 _TRAINING_TO_FRONTEND_DRONE_STATUS: Mapping[str, str] = {
     "idle": "IDLE",
@@ -94,6 +105,16 @@ class PolicyActivationConfig:
     seed: int | None
     arrival_rate_per_min: float | None
     device: str
+
+
+@dataclass(frozen=True)
+class PendingRuntimeTransition:
+    decision_context: Any
+    candidate_out: Any
+    action_indices: ResolvedActionIndices
+    actor_drone_id: str
+    applied_event_seq: int
+    hard_failure_reported: bool = False
 
 
 def resolve_scene_context(
@@ -134,6 +155,7 @@ def load_policy_runtime_for_scene(
     policy_path: str | Path,
     config_path: str | Path = DEFAULT_CONFIG_PATH,
     device: str = "auto",
+    phase4_route_dir: str | Path | None = None,
 ) -> LoadedPolicyRuntime:
     """
     为指定 `scene_ctx` 加载推理 runtime。
@@ -158,6 +180,7 @@ def load_policy_runtime_for_scene(
         scene_ctx=scene_ctx,
         order_source=bootstrap_source,
         config_path=cfg_path,
+        phase4_route_dir=phase4_route_dir,
     )
     bootstrap_result = bootstrap_env.reset()
     if bootstrap_result.decision_context is None:
@@ -238,6 +261,8 @@ class TrainingTelemetryBridge:
         speed_ratio: float,
         deterministic: bool,
         order_source_mode: str,
+        recent_decision_events: tuple[Mapping[str, Any], ...] = (),
+        latest_event_seq: int = 0,
     ) -> dict[str, Any]:
         runtime_state = env.build_runtime_state_view()
         decision = env.current_decision_context
@@ -255,6 +280,7 @@ class TrainingTelemetryBridge:
                 "deterministic": bool(deterministic),
                 "current_decision": (
                     {
+                        "decision_id": int(decision.decision_id),
                         "drone_id": str(decision.deciding_drone_id),
                         "trigger_type": str(decision.trigger_type),
                         "trigger_station_id": decision.trigger_station_id,
@@ -270,6 +296,9 @@ class TrainingTelemetryBridge:
             "sim_time": round(float(runtime_state.t_now), 3),
             "entities": entities,
             "orders": order_mgr.get_recent_orders(limit=_MAX_ORDER_LIMIT),
+            "paths": self._serialize_paths_to_frontend(visual_snapshot.get("paths")),
+            "recent_decision_events": [dict(event) for event in recent_decision_events],
+            "latest_event_seq": int(latest_event_seq),
             "stats": stats,
         }
 
@@ -282,6 +311,8 @@ class TrainingTelemetryBridge:
         sim_start_wall_ms: int,
         deterministic: bool,
         order_source_mode: str,
+        recent_decision_events: tuple[Mapping[str, Any], ...] = (),
+        latest_event_seq: int = 0,
     ) -> dict[str, Any]:
         runtime_state = env.build_runtime_state_view()
         entity_mgr = env._require_entity_manager()
@@ -292,6 +323,8 @@ class TrainingTelemetryBridge:
             speed_ratio=speed_ratio,
             deterministic=deterministic,
             order_source_mode=order_source_mode,
+            recent_decision_events=recent_decision_events,
+            latest_event_seq=latest_event_seq,
         )
         payload.update(
             {
@@ -363,10 +396,46 @@ class TrainingTelemetryBridge:
             if key in snapshot
         }
 
+    def _serialize_paths_to_frontend(self, raw_paths: Any) -> dict[str, list[dict[str, Any]]]:
+        if not isinstance(raw_paths, Mapping):
+            return {"trucks": [], "drones": []}
+        return {
+            "trucks": [
+                self._serialize_path_entry(entry)
+                for entry in list(raw_paths.get("trucks") or [])
+                if isinstance(entry, Mapping)
+            ],
+            "drones": [
+                self._serialize_path_entry(entry)
+                for entry in list(raw_paths.get("drones") or [])
+                if isinstance(entry, Mapping)
+            ],
+        }
 
-class TrainingPolicyRuntimeAdapter:
+    def _serialize_path_entry(self, entry: Mapping[str, Any]) -> dict[str, Any]:
+        payload = dict(entry)
+        raw_points = payload.pop("path_utm", None)
+        path_points: list[list[float]] = []
+        if isinstance(raw_points, list):
+            for point in raw_points:
+                if not isinstance(point, Mapping):
+                    continue
+                try:
+                    lon, lat = Position3D(
+                        x=float(point["x"]),
+                        y=float(point["y"]),
+                        z=float(point.get("z", 0.0)),
+                    ).to_wgs84()
+                except Exception:
+                    continue
+                path_points.append([float(lon), float(lat)])
+        payload["path"] = path_points
+        return payload
+
+
+class OnlinePolicyRuntimePlayer:
     """
-    将 `TrainingEnvAdapter` 伪装成 `SimulationEngine` 风格接口的在线运行时。
+    将 `TrainingEnvAdapter` 作为统一环境核心驱动的在线策略播放器。
 
     暴露：
       - start / pause / reset / set_speed
@@ -382,16 +451,25 @@ class TrainingPolicyRuntimeAdapter:
     ) -> None:
         self._activation = activation
         self._scene_ctx = scene_ctx
-        self._runtime = load_policy_runtime_for_scene(
-            scene_ctx=scene_ctx,
-            policy_path=activation.policy_path,
-            config_path=activation.config_path,
-            device=activation.device,
-        )
-        self._telemetry = TrainingTelemetryBridge(
-            policy_name=activation.policy_name,
-            checkpoint_path=str(self._runtime.policy_path),
-        )
+        self._phase4_route_dir = Path(
+            tempfile.mkdtemp(prefix="hivelogix_phase4_runtime_")
+        ).resolve()
+        try:
+            self._replan_phase4_locked()
+            self._runtime = load_policy_runtime_for_scene(
+                scene_ctx=scene_ctx,
+                policy_path=activation.policy_path,
+                config_path=activation.config_path,
+                device=activation.device,
+                phase4_route_dir=self._phase4_route_dir,
+            )
+            self._telemetry = TrainingTelemetryBridge(
+                policy_name=activation.policy_name,
+                checkpoint_path=str(self._runtime.policy_path),
+            )
+        except Exception:
+            shutil.rmtree(self._phase4_route_dir, ignore_errors=True)
+            raise
 
         self._lock = threading.RLock()
         self._stop_event = threading.Event()
@@ -403,6 +481,9 @@ class TrainingPolicyRuntimeAdapter:
         self._env: TrainingEnvAdapter | None = None
         self._result: Any = None
         self._history_buffer: deque[Any] | None = None
+        self._pending_transition: PendingRuntimeTransition | None = None
+        self._decision_event_ledger: list[dict[str, Any]] = []
+        self._next_decision_event_seq = 1
         self._last_seen_plan_version_by_drone: dict[str, int] = {}
         self._lstm_state_by_drone: dict[str, Any] = {}
         self._recurrent_segment_id_by_drone: dict[str, int] = {}
@@ -432,7 +513,7 @@ class TrainingPolicyRuntimeAdapter:
                 self._stop_event.clear()
                 self._thread = threading.Thread(
                     target=self._run_loop,
-                    name="TrainingPolicyRuntimeAdapter",
+                    name="OnlinePolicyRuntimePlayer",
                     daemon=True,
                 )
                 self._thread.start()
@@ -448,6 +529,7 @@ class TrainingPolicyRuntimeAdapter:
         with self._lock:
             self.is_running = False
             self.sim_start_wall_ms = 0
+            self._replan_phase4_locked()
             self._reset_runtime_state_locked()
 
     def set_speed(self, speed_ratio: float) -> None:
@@ -464,6 +546,7 @@ class TrainingPolicyRuntimeAdapter:
         if self._thread is not None:
             self._thread.join(timeout=2.0)
             self._thread = None
+        shutil.rmtree(self._phase4_route_dir, ignore_errors=True)
 
     def get_recent_orders(self, limit: int = 100) -> list[dict[str, Any]]:
         with self._lock:
@@ -479,6 +562,8 @@ class TrainingPolicyRuntimeAdapter:
                 speed_ratio=self.speed_ratio,
                 deterministic=self._activation.deterministic,
                 order_source_mode=self._activation.order_source_mode.value,
+                recent_decision_events=self._recent_decision_events(),
+                latest_event_seq=self._latest_decision_event_seq(),
             )
 
     def build_full_snapshot(self) -> dict[str, Any]:
@@ -491,55 +576,198 @@ class TrainingPolicyRuntimeAdapter:
                 sim_start_wall_ms=self.sim_start_wall_ms,
                 deterministic=self._activation.deterministic,
                 order_source_mode=self._activation.order_source_mode.value,
+                recent_decision_events=self._recent_decision_events(),
+                latest_event_seq=self._latest_decision_event_seq(),
             )
 
     def _run_loop(self) -> None:
         while not self._stop_event.is_set():
+            # ── 暂停态：低频空转 ──────────────────────────────────────────
             with self._lock:
-                if not self.is_running:
-                    sleep_interval = 0.05
-                    payload = None
-                else:
-                    loop_started = time.monotonic()
-                    payload = self._run_one_cycle_locked()
-                    elapsed = time.monotonic() - loop_started
-                    sleep_interval = max(
-                        0.0,
-                        (_TICK_INTERVAL_SEC / max(self.speed_ratio, _MIN_SPEED_RATIO)) - elapsed,
+                if not self.is_running or self._result is None:
+                    self._stop_event.wait(0.05)
+                    continue
+
+                # ── 在线结束：订单全清且车辆/UAV 收尾闭合后才停止 ─────────────
+                if self._is_online_done_locked():
+                    self.is_running = False
+                    self._stop_event.wait(0.05)
+                    continue
+
+                # ── 在线播放：决策点提交动作，否则按时间窗推进 ─────────────
+                sleep_after_tick = _TICK_INTERVAL_SEC
+                decision_context = getattr(self._result, "decision_context", None)
+                if decision_context is not None:
+                    self._finalize_pending_transition_locked(self._result)
+                    self._apply_policy_once_locked(
+                        env=self._require_env_locked(),
+                        decision_context=decision_context,
                     )
+                    # 同一 sim_time 下可能还有队列内决策，不人为拉长 wall-clock。
+                    sleep_after_tick = 0.0
+                else:
+                    env = self._require_env_locked()
+                    current_t = float(self._result.runtime_state.t_now)
+                    target_t = current_t + _TICK_INTERVAL_SEC * max(
+                        self.speed_ratio,
+                        _MIN_SPEED_RATIO,
+                    )
+                    self._result = env.advance_to_time(
+                        target_t,
+                        stop_on_training_done=False,
+                    )
+                    if getattr(self._result, "decision_context", None) is not None or getattr(
+                        self._result,
+                        "done",
+                        False,
+                    ):
+                        self._finalize_pending_transition_locked(self._result)
 
-            if payload is not None:
-                try:
-                    broadcast_tick(payload)
-                except Exception:
-                    logger.exception("[TrainingPolicyRuntimeAdapter] 广播 TICK 失败")
+                payload = self._telemetry.build_tick_payload(
+                    env=self._require_env_locked(),
+                    speed_ratio=self.speed_ratio,
+                    deterministic=self._activation.deterministic,
+                    order_source_mode=self._activation.order_source_mode.value,
+                    recent_decision_events=self._recent_decision_events(),
+                    latest_event_seq=self._latest_decision_event_seq(),
+                )
 
-            self._stop_event.wait(sleep_interval)
+            # ── 广播当前帧 ────────────────────────────────────────────────
+            try:
+                broadcast_tick(payload)
+            except Exception:
+                logger.exception("[OnlinePolicyRuntimePlayer] 广播 TICK 失败")
+
+            if sleep_after_tick > 0:
+                self._stop_event.wait(sleep_after_tick)
 
     def _run_one_cycle_locked(self) -> dict[str, Any]:
+        # 保留此方法供外部快照调用，实际循环逻辑已移至 _run_loop
         env = self._require_env_locked()
-        while self.is_running and self._result is not None and not self._result.done:
-            decision_context = getattr(self._result, "decision_context", None)
-            if decision_context is None:
-                break
-            self._step_policy_once_locked(env=env, decision_context=decision_context)
-
-        if self._result is not None and getattr(self._result, "done", False):
-            self.is_running = False
-
         return self._telemetry.build_tick_payload(
             env=env,
             speed_ratio=self.speed_ratio,
             deterministic=self._activation.deterministic,
             order_source_mode=self._activation.order_source_mode.value,
+            recent_decision_events=self._recent_decision_events(),
+            latest_event_seq=self._latest_decision_event_seq(),
         )
 
-    def _step_policy_once_locked(self, *, env: TrainingEnvAdapter, decision_context: Any) -> None:
+    def _is_online_done_locked(self) -> bool:
+        """在线播放结束条件：订单结束 + 设备回仓 + 无执行链路。"""
+        env = self._require_env_locked()
+        runtime_state = env.build_runtime_state_view()
+        if runtime_state.t_now >= env._cfg.upper_horizon_sec - 1e-6:
+            return True
+
+        order_mgr = env._require_order_manager()
+        if order_mgr.pending_orders or order_mgr.assigned_orders:
+            return False
+        if getattr(env, "_background_mode_a_pending", set()):
+            return False
+        if self._has_future_dynamic_orders_locked(env):
+            return False
+        if self._has_open_execution_chain_locked(env):
+            return False
+        if not self._truck_is_at_depot_locked(env):
+            return False
+        return self._all_drones_are_home_locked(env)
+
+    def _has_future_dynamic_orders_locked(self, env: TrainingEnvAdapter) -> bool:
+        order_mgr = env._require_order_manager()
+        scheduled = list(getattr(order_mgr, "_scheduled_dynamic", []) or [])
+        scheduled_i = int(getattr(order_mgr, "_scheduled_dynamic_i", 0))
+        if scheduled_i < len(scheduled):
+            return True
+
+        gen_config = getattr(order_mgr, "_gen_config", None) or {}
+        if not gen_config:
+            return False
+        max_orders = gen_config.get("max_orders")
+        total_orders = (
+            len(order_mgr.pending_orders)
+            + len(order_mgr.assigned_orders)
+            + len(order_mgr.completed_orders)
+        )
+        if max_orders is not None and total_orders >= int(max_orders):
+            return False
+        arrival_rate = float(gen_config.get("arrival_rate", 0.0) or 0.0)
+        next_order_time = float(getattr(order_mgr, "_next_order_time", float("inf")))
+        return arrival_rate > 0.0 and next_order_time < float("inf")
+
+    def _has_open_execution_chain_locked(self, env: TrainingEnvAdapter) -> bool:
+        if getattr(env, "_decision_queue", []):
+            return True
+        if getattr(env, "_flight_legs", {}):
+            return True
+        if getattr(env, "_delivery_service_legs", {}):
+            return True
+        if getattr(env, "_fallback_leg", {}):
+            return True
+        if getattr(env, "_truck_charge_until", {}):
+            return True
+        if getattr(env, "_active_wait_until", {}):
+            return True
+        if getattr(env, "_active_wait_resume", {}):
+            return True
+
+        entity_mgr = env._require_entity_manager()
+        hosts = (
+            list(entity_mgr.depots.values())
+            + list(entity_mgr.stations.values())
+            + [env._require_truck()]
+        )
+        return any(host.serving_drones or host.wait_queue for host in hosts)
+
+    def _truck_is_at_depot_locked(self, env: TrainingEnvAdapter) -> bool:
+        entity_mgr = env._require_entity_manager()
+        truck = env._require_truck()
+        return any(
+            truck.current_loc.distance_2d(depot.location) <= _HOME_DISTANCE_TOLERANCE_M
+            for depot in entity_mgr.depots.values()
+        )
+
+    def _all_drones_are_home_locked(self, env: TrainingEnvAdapter) -> bool:
+        entity_mgr = env._require_entity_manager()
+        truck = env._require_truck()
+        truck_at_depot = self._truck_is_at_depot_locked(env)
+        depot_positions = tuple(depot.location for depot in entity_mgr.depots.values())
+        for drone_id, drone in entity_mgr.drones.items():
+            drone_state = env._drone_state.get(drone_id)
+            drone_state_value = getattr(drone_state, "value", str(drone_state))
+            if truck_at_depot and (
+                drone_id in truck.docked_drones
+                or drone_state_value in {
+                    "riding_with_truck",
+                    "charging_on_truck",
+                }
+            ):
+                continue
+            if any(
+                drone.current_loc.distance_2d(depot_pos) <= _HOME_DISTANCE_TOLERANCE_M
+                for depot_pos in depot_positions
+            ):
+                continue
+            return False
+        return True
+
+    def _apply_policy_once_locked(self, *, env: TrainingEnvAdapter, decision_context: Any) -> None:
         drone_id = str(decision_context.deciding_drone_id)
         candidate_out = _build_candidate_output(
             env=env,
             decision_context=decision_context,
             last_seen_plan_version_by_drone=self._last_seen_plan_version_by_drone,
+        )
+        decision_start_wall_ms = int(time.time() * 1000)
+        self._append_decision_event(
+            decision_context=decision_context,
+            candidate_out=candidate_out,
+            status=DECISION_PENDING,
+            wall_time_ms=decision_start_wall_ms,
+            inference_latency_ms=None,
+            selected_action=None,
+            actor_drone_final_state=None,
+            failure_type=None,
         )
         transition_history = tuple(self._history_buffer or ())
         observation_batch = self._runtime.tensorizer.build(
@@ -564,6 +792,7 @@ class TrainingPolicyRuntimeAdapter:
                 action_mask=action_mask,
                 deterministic=self._activation.deterministic,
             )
+        decision_finish_wall_ms = int(time.time() * 1000)
         action_indices = ResolvedActionIndices(**sampled_action)
         env_action = candidate_out.resolved_action_lookup.resolve(
             root_branch_idx=int(action_indices.root_branch_idx),
@@ -577,7 +806,42 @@ class TrainingPolicyRuntimeAdapter:
                 None if action_indices.recovery_idx is None else int(action_indices.recovery_idx)
             ),
         )
-        step_result = env.step(env_action)
+        step_result = env.apply_decision(env_action)
+        applied_event_seq = self._append_decision_event(
+            decision_context=decision_context,
+            candidate_out=candidate_out,
+            status=DECISION_APPLIED,
+            wall_time_ms=decision_finish_wall_ms,
+            inference_latency_ms=max(0, decision_finish_wall_ms - decision_start_wall_ms),
+            selected_action=env_action,
+            actor_drone_final_state=self._actor_drone_state(step_result, drone_id),
+            failure_type=None,
+        )
+        self._pending_transition = PendingRuntimeTransition(
+            decision_context=decision_context,
+            candidate_out=candidate_out,
+            action_indices=action_indices,
+            actor_drone_id=drone_id,
+            applied_event_seq=applied_event_seq,
+        )
+        self._last_seen_plan_version_by_drone[drone_id] = decision_context.coarse_plan.plan_version
+        self._lstm_state_by_drone[drone_id] = _detach_lstm_state(lstm_state=next_lstm_state)
+        _reset_recurrent_state_for_failed_drones(
+            runtime_state=step_result.runtime_state,
+            lstm_state_by_drone=self._lstm_state_by_drone,
+            recurrent_segment_id_by_drone=self._recurrent_segment_id_by_drone,
+        )
+        self._result = step_result
+        if step_result.decision_context is not None or step_result.done:
+            self._finalize_pending_transition_locked(step_result)
+
+    def _finalize_pending_transition_locked(self, step_result: Any) -> None:
+        if self._pending_transition is None:
+            return
+        pending = self._pending_transition
+        decision_context = pending.decision_context
+        candidate_out = pending.candidate_out
+        action_indices = pending.action_indices
         if self._history_buffer is not None:
             self._history_buffer.append(
                 self._runtime.tensorizer.build_transition_summary(
@@ -587,14 +851,135 @@ class TrainingPolicyRuntimeAdapter:
                     step_result=step_result,
                 )
             )
-        self._last_seen_plan_version_by_drone[drone_id] = decision_context.coarse_plan.plan_version
-        self._lstm_state_by_drone[drone_id] = _detach_lstm_state(lstm_state=next_lstm_state)
+        actor_final_state = self._actor_drone_state(step_result, pending.actor_drone_id)
+        if (
+            not pending.hard_failure_reported
+            and actor_final_state == _HARD_FAILURE_STATE
+        ):
+            self._append_decision_event(
+                decision_context=decision_context,
+                candidate_out=candidate_out,
+                status=EXECUTION_HARD_FAILED,
+                wall_time_ms=int(time.time() * 1000),
+                inference_latency_ms=None,
+                selected_action=None,
+                actor_drone_final_state=actor_final_state,
+                failure_type="airborne_energy_failure",
+            )
         _reset_recurrent_state_for_failed_drones(
             runtime_state=step_result.runtime_state,
             lstm_state_by_drone=self._lstm_state_by_drone,
             recurrent_segment_id_by_drone=self._recurrent_segment_id_by_drone,
         )
-        self._result = step_result
+        self._pending_transition = None
+
+    def _append_decision_event(
+        self,
+        *,
+        decision_context: Any,
+        candidate_out: Any,
+        status: str,
+        wall_time_ms: int,
+        inference_latency_ms: int | None,
+        selected_action: EnvAction | None,
+        actor_drone_final_state: str | None,
+        failure_type: str | None,
+    ) -> int:
+        event_seq = int(self._next_decision_event_seq)
+        self._next_decision_event_seq += 1
+        action_payload = self._serialize_env_action(selected_action)
+        event = {
+            "decision_id": int(getattr(decision_context, "decision_id", event_seq)),
+            "sim_time": float(decision_context.t_decision),
+            "wall_time_ms": int(wall_time_ms),
+            "event_seq": event_seq,
+            "drone_id": str(decision_context.deciding_drone_id),
+            "trigger_type": str(decision_context.trigger_type),
+            "trigger_station_id": decision_context.trigger_station_id,
+            "candidate_summary": self._build_candidate_summary(
+                decision_context=decision_context,
+                candidate_out=candidate_out,
+            ),
+            "selected_action": action_payload,
+            "selected_order_id": action_payload.get("order_id"),
+            "selected_mode": action_payload.get("mode"),
+            "selected_recover_node": action_payload.get("recover_node_id"),
+            "inference_latency_ms": inference_latency_ms,
+            "status": str(status),
+            "actor_drone_final_state": actor_drone_final_state,
+            "failure_type": failure_type,
+        }
+        self._decision_event_ledger.append(event)
+        return event_seq
+
+    def _build_candidate_summary(self, *, decision_context: Any, candidate_out: Any) -> dict[str, Any]:
+        action_lookup = tuple(getattr(decision_context, "action_lookup", ()) or ())
+        dispatch_actions = [action for action in action_lookup if isinstance(action, DispatchAction)]
+        return {
+            "action_count": len(action_lookup),
+            "dispatch_action_count": len(dispatch_actions),
+            "candidate_order_count": int(
+                sum(1 for value in tuple(getattr(candidate_out, "order_mask", ()) or ()) if value)
+            ),
+            "mode_b_action_count": int(
+                sum(1 for action in dispatch_actions if str(action.mode) == "B")
+            ),
+            "mode_c_action_count": int(
+                sum(1 for action in dispatch_actions if str(action.mode) == "C")
+            ),
+            "has_wait_action": bool(getattr(candidate_out, "has_wait_action", False)),
+            "plan_version": int(decision_context.coarse_plan.plan_version),
+        }
+
+    def _serialize_env_action(self, action: EnvAction | None) -> dict[str, Any]:
+        if action is None:
+            return {}
+        if isinstance(action, GlobalWaitAction):
+            return {
+                "type": "WAIT",
+                "mode": "WAIT",
+                "order_id": None,
+                "recover_node_id": None,
+            }
+        if isinstance(action, DispatchAction):
+            return {
+                "type": "DISPATCH",
+                "mode": str(action.mode),
+                "order_id": str(action.order_id),
+                "recover_node_id": action.recover_node_id,
+            }
+        raise TypeError(f"未知 EnvAction 类型: {type(action)!r}")
+
+    def _actor_drone_state(self, step_result: Any, drone_id: str) -> str | None:
+        runtime_state = getattr(step_result, "runtime_state", None)
+        drone_states = getattr(runtime_state, "drone_states", None)
+        if not isinstance(drone_states, Mapping):
+            return None
+        drone_state = drone_states.get(drone_id)
+        if drone_state is None:
+            return None
+        return str(getattr(drone_state, "training_state", ""))
+
+    def _recent_decision_events(self) -> tuple[Mapping[str, Any], ...]:
+        return tuple(self._decision_event_ledger[-_RECENT_DECISION_EVENT_LIMIT:])
+
+    def _latest_decision_event_seq(self) -> int:
+        if not self._decision_event_ledger:
+            return 0
+        return int(self._decision_event_ledger[-1]["event_seq"])
+
+    def get_decision_events(self, *, after_seq: int = 0, limit: int = 200) -> list[dict[str, Any]]:
+        bounded_limit = max(1, min(int(limit), 1000))
+        with self._lock:
+            return [
+                dict(event)
+                for event in self._decision_event_ledger
+                if int(event.get("event_seq", 0)) > int(after_seq)
+            ][:bounded_limit]
+
+    def latest_decision_event_seq(self) -> int:
+        with self._lock:
+            return self._latest_decision_event_seq()
 
     def _reset_runtime_state_locked(self) -> None:
         overrides: dict[str, Any] = {}
@@ -611,17 +996,32 @@ class TrainingPolicyRuntimeAdapter:
             scene_ctx=self._scene_ctx,
             order_source=order_source,
             config_path=self._activation.config_path,
+            phase4_route_dir=self._phase4_route_dir,
         )
         self._result = self._env.reset()
         self._history_buffer = deque(maxlen=self._runtime.policy_cfg.hist_len)
+        self._pending_transition = None
+        self._decision_event_ledger = []
+        self._next_decision_event_seq = 1
         self._last_seen_plan_version_by_drone = {}
         self._lstm_state_by_drone = {}
         self._recurrent_segment_id_by_drone = {}
+
+    def _replan_phase4_locked(self) -> None:
+        export_phase4_truck_route_for_scene(
+            scene_ctx=self._scene_ctx,
+            config_path=self._activation.config_path,
+            output_dir=self._phase4_route_dir,
+        )
 
     def _require_env_locked(self) -> TrainingEnvAdapter:
         if self._env is None:
             raise RuntimeError("runtime env 尚未初始化")
         return self._env
+
+
+class TrainingPolicyRuntimeAdapter(OnlinePolicyRuntimePlayer):
+    """向后兼容旧导入名；新代码应使用 `OnlinePolicyRuntimePlayer`。"""
 
 
 def build_policy_activation_config(payload: Mapping[str, Any]) -> PolicyActivationConfig:
@@ -785,13 +1185,17 @@ def build_orders_raw_from_sim_init_payload(
     将现有 `/api/sim/init` 请求体中的订单字段桥接为训练侧 `orders_raw` 结构。
 
     约定：
-      - `initial_orders` 语义是“当前应进入运行时订单池的订单”，
-        在线 PPO 适配时将其桥接为 `spawn_sim_s=create_time` 的 benchmark dynamic replay；
+      - `initial_orders` 语义是“当前应进入运行时订单池的订单”；
+      - 在线 PPO 适配时，它们既保留为 `static_orders` 供 phase4 卡车骨架重规划使用，
+        也桥接为 `spawn_sim_s=create_time` 的 benchmark dynamic replay；
       - `scheduled_dynamic_orders` 原样保留为后续注入流。
     """
 
+    normalized_initial_orders = _normalize_initial_orders_batch(initial_orders)
+    static_orders = [copy.deepcopy(entry) for entry in normalized_initial_orders]
+
     dynamic_orders: list[dict[str, Any]] = []
-    for entry in _normalize_initial_orders_batch(initial_orders):
+    for entry in normalized_initial_orders:
         dynamic_orders.append(
             {
                 "order_id": str(entry["order_id"]),
@@ -814,7 +1218,7 @@ def build_orders_raw_from_sim_init_payload(
 
     dynamic_orders.sort(key=lambda item: (float(item.get("spawn_sim_s", 0.0)), str(item.get("order_id", ""))))
     return {
-        "static_orders": [],
+        "static_orders": static_orders,
         "dynamic_orders": dynamic_orders,
     }
 
