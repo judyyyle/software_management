@@ -1,0 +1,5 @@
+event_time,new_order_ids,completed_ids,locked_ids,pending_count,reoptimized_order_count,frozen_future_order_count,warm_start_count,population_size,max_generations,actual_generations,elapsed_seconds,time_budget_hit,early_stop_triggered,fallback_used,fallback_level,best_fitness,final_A_count,final_B_count,final_C_count,unserved_order_ids
+600.0,ORD-DYN-TEST-01,,,10,9,2,16,30,60,0,10.322145700454712,True,False,False,none,66012.76850307219,11,0,0,
+600.0,ORD-DYN-TEST-01,,,10,9,2,16,30,60,0,10.724911212921143,True,False,False,none,63082.987806792975,10,0,1,
+600.0,ORD-DYN-TEST-01,,,10,9,2,15,30,60,0,9.796571731567383,True,False,False,none,59432.190479537865,10,0,1,
+600.0,ORD-DYN-TEST-01,,,10,9,2,15,30,60,0,11.126056909561157,True,False,False,none,6688.0172727179215,10,0,1,

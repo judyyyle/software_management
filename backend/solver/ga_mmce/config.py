@@ -38,13 +38,18 @@ class GAConfig:
 
     big_m: float = 1e9
 
+    # 计划级完成时间权重：使用本轮所有订单的最大完成时间，而不是逐单累加。
     weight_completion: float = 1.0
     weight_delay: float = 10.0
-    weight_energy: float = 0.1
-    weight_waiting: float = 5.0
+    # 距离已经通过能耗模型间接体现，目标函数中不再重复计入距离成本。
+    weight_energy: float = 0.02
+    weight_waiting: float = 0.5
     weight_infeasible: float = 100000.0
-    weight_truck_distance: float = 1.0
-    weight_uav_distance: float = 1.0
+    weight_truck_distance: float = 0.0
+    weight_uav_distance: float = 0.0
+
+    # 鼓励空地协同：每接受一个 B 模式订单，从目标函数中扣减该奖励值。
+    air_ground_mode_reward: float = 1000.0
 
     max_runtime_seconds: float | None = None
     random_seed: int | None = 42
