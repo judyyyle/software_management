@@ -52,6 +52,7 @@ class _CandidateConfig:
     max_candidate_actions: int
     station_wait_threshold_sec: float
     rendezvous_filter_margin_sec: float
+    upper_horizon_sec: float
 
 
 class CandidateBuilder:
@@ -186,11 +187,6 @@ class CandidateBuilder:
                 has_mode_c_action=mode_c_summary is not None,
                 best_mode_c_rendezvous_margin=(
                     float(mode_c_summary["rendezvous_margin"])
-                    if mode_c_summary is not None
-                    else 0.0
-                ),
-                best_mode_c_queue_time_est=(
-                    float(mode_c_summary["queue_time_est"])
                     if mode_c_summary is not None
                     else 0.0
                 ),
@@ -436,16 +432,20 @@ class CandidateBuilder:
                     reservation_count=int(
                         runtime_state.reservation_count.get(node_id, 0)
                     ),
-                    predicted_queue_time_est=_predicted_queue_time_est(node_state),
-                    service_time=float(node_state.swap_time),
                     is_valid=True,
                 )
             )
 
         candidates.sort(
             key=lambda item: (
-                item.predicted_queue_time_est > self._cfg.station_wait_threshold_sec,
-                item.predicted_queue_time_est,
+                -_exact_mode_c_score(
+                    rendezvous_margin=float(item.rendezvous_margin),
+                    truck_eta_remaining=max(
+                        0.0,
+                        float(item.truck_eta) - float(runtime_state.t_now),
+                    ),
+                    upper_horizon_sec=self._cfg.upper_horizon_sec,
+                ),
                 -item.rendezvous_margin,
                 item.truck_eta,
                 item.recover_node_id,
@@ -462,10 +462,24 @@ class CandidateBuilder:
         if not recovery_candidates:
             return None
 
-        best_candidate = recovery_candidates[0]
+        best_candidate = max(
+            recovery_candidates,
+            key=lambda item: (
+                _exact_mode_c_score(
+                    rendezvous_margin=float(item.rendezvous_margin),
+                    truck_eta_remaining=max(
+                        0.0,
+                        float(item.truck_eta) - float(t_now),
+                    ),
+                    upper_horizon_sec=self._cfg.upper_horizon_sec,
+                ),
+                float(item.rendezvous_margin),
+                -float(item.truck_eta),
+                str(item.recover_node_id),
+            ),
+        )
         return {
             "rendezvous_margin": float(best_candidate.rendezvous_margin),
-            "queue_time_est": float(best_candidate.predicted_queue_time_est),
             "node_type": str(best_candidate.recover_node_type),
             "truck_eta_remaining": max(
                 0.0,
@@ -560,7 +574,11 @@ class CandidateBuilder:
             training_state=str(drone_view.training_state),
             has_reservation=reservation is not None,
             reservation_remaining_sec=(
-                max(0.0, float(reservation.expires_at) - float(runtime_state.t_now))
+                max(
+                    0.0,
+                    float(coarse_plan.truck_eta_map.get(reservation.recover_node, runtime_state.t_now))
+                    - float(runtime_state.t_now),
+                )
                 if reservation is not None
                 else 0.0
             ),
@@ -665,6 +683,18 @@ def _predicted_queue_time_est(node_state: Any) -> float:
     return (int(node_state.queue_length) + 1) * float(node_state.swap_time)
 
 
+def _exact_mode_c_score(
+    *,
+    rendezvous_margin: float,
+    truck_eta_remaining: float,
+    upper_horizon_sec: float,
+) -> float:
+    norm_base = max(float(upper_horizon_sec), _TIME_EPS)
+    normalized_margin = float(rendezvous_margin) / norm_base
+    normalized_eta = float(truck_eta_remaining) / norm_base
+    return normalized_margin - 0.05 * normalized_eta
+
+
 def _is_riding_with_truck_trigger(trigger_type: str) -> bool:
     """兼容文档对外语义名与 env 内部事件名。"""
     return trigger_type in {"riding_with_truck", "truck_station_arrival"}
@@ -707,7 +737,6 @@ def _padding_order_feature() -> OrderFeatures:
         best_mode_b_queue_time_est=0.0,
         has_mode_c_action=False,
         best_mode_c_rendezvous_margin=0.0,
-        best_mode_c_queue_time_est=0.0,
         best_mode_c_node_type="",
         best_mode_c_truck_eta_remaining=0.0,
         is_valid=False,
@@ -725,8 +754,6 @@ def _padding_recovery_feature() -> RecoveryFeatures:
         truck_eta=0.0,
         rendezvous_margin=0.0,
         reservation_count=0,
-        predicted_queue_time_est=0.0,
-        service_time=0.0,
         is_valid=False,
     )
 
@@ -747,6 +774,7 @@ def _load_candidate_config(config_path: Path) -> _CandidateConfig:
                 candidate.get("rendezvous_eta_safe_margin_sec"),
             )
         ),
+        upper_horizon_sec=float(_require_mapping(raw, "planner")["upper_horizon_sec"]),
     )
 
 

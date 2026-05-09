@@ -1570,6 +1570,8 @@ def _summarize_episode_records(
         )
     )
     mode_c_revalidation_fail_reason_totals: dict[str, int] = {}
+    mode_c_timeout_from_state_totals: dict[str, int] = {}
+    mode_c_fallback_from_state_totals: dict[str, int] = {}
     for item in episodes:
         for reason_key, count in dict(
             item.get("mode_c_post_delivery_revalidation_fail_reasons", {})
@@ -1577,6 +1579,14 @@ def _summarize_episode_records(
             mode_c_revalidation_fail_reason_totals[str(reason_key)] = (
                 mode_c_revalidation_fail_reason_totals.get(str(reason_key), 0)
                 + int(count)
+            )
+        for state_key, count in dict(item.get("mode_c_timeout_from_state", {})).items():
+            mode_c_timeout_from_state_totals[str(state_key)] = (
+                mode_c_timeout_from_state_totals.get(str(state_key), 0) + int(count)
+            )
+        for state_key, count in dict(item.get("mode_c_fallback_from_state", {})).items():
+            mode_c_fallback_from_state_totals[str(state_key)] = (
+                mode_c_fallback_from_state_totals.get(str(state_key), 0) + int(count)
             )
     payload = {
         "generated_at": generated_at,
@@ -1631,6 +1641,29 @@ def _summarize_episode_records(
         "sum_mode_c_post_delivery_revalidation_fail_reasons": dict(
             mode_c_revalidation_fail_reason_totals
         ),
+        "sum_mode_c_selected_filter_margin_sum": float(
+            sum(float(item.get("mode_c_selected_filter_margin_sum", 0.0)) for item in episodes)
+        ),
+        "sum_mode_c_selected_execution_slack_sum": float(
+            sum(float(item.get("mode_c_selected_execution_slack_sum", 0.0)) for item in episodes)
+        ),
+        "sum_mode_c_selected_reservation_count_sum": float(
+            sum(float(item.get("mode_c_selected_reservation_count_sum", 0.0)) for item in episodes)
+        ),
+        "sum_mode_c_selected_truck_eta_remaining_sum": float(
+            sum(float(item.get("mode_c_selected_truck_eta_remaining_sum", 0.0)) for item in episodes)
+        ),
+        "sum_mode_c_selected_planned_truck_eta_sum": float(
+            sum(float(item.get("mode_c_selected_planned_truck_eta_sum", 0.0)) for item in episodes)
+        ),
+        "sum_mode_c_selected_planned_uav_eta_sum": float(
+            sum(float(item.get("mode_c_selected_planned_uav_eta_sum", 0.0)) for item in episodes)
+        ),
+        "sum_mode_c_selected_planned_slack_sum": float(
+            sum(float(item.get("mode_c_selected_planned_slack_sum", 0.0)) for item in episodes)
+        ),
+        "mode_c_timeout_from_state": dict(mode_c_timeout_from_state_totals),
+        "mode_c_fallback_from_state": dict(mode_c_fallback_from_state_totals),
         "sum_t_wait_sec": float(sum(float(item["t_wait_sec"]) for item in episodes)),
         "sum_t_idle_sec": float(sum(float(item["t_idle_sec"]) for item in episodes)),
         "sum_t_queue_sec": float(sum(float(item["t_queue_sec"]) for item in episodes)),

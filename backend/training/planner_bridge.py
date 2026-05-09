@@ -186,6 +186,7 @@ class PlannerBridge:
                     max_candidates=self._cfg.max_candidate_recovery_per_order,
                     future_scan_limit=self._cfg.recovery_pool_future_scan_limit,
                     drone_cruise_speed=self._recovery_pool_drone_cruise_speed,
+                    upper_horizon_sec=self._cfg.upper_horizon_sec,
                 )
             else:
                 policy_mode_mask[order_id] = frozenset({PolicyMode.B})
