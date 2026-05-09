@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import logging
 import math
+import copy
 from typing import TYPE_CHECKING
 
 from flask import Blueprint, jsonify, request
@@ -34,6 +35,13 @@ from entity_manager import EntityManager
 from order_manager import OrderManager
 from sim_engine import SimulationEngine
 from solver.decision_engine import DispatchDecisionEngine
+from training.frontend_runtime_adapter import (
+    TrainingPolicyRuntimeAdapter,
+    build_orders_raw_from_sim_init_payload,
+    build_policy_activation_config,
+    build_runtime_scene_context_from_payload,
+    resolve_scene_context,
+)
 from utils.coord_utils import utm_to_wgs84
 
 # 导入预设场景模块
@@ -55,6 +63,8 @@ _entity_mgr: EntityManager           = EntityManager()
 _order_mgr:  OrderManager            = OrderManager()
 _sim_engine: SimulationEngine         = SimulationEngine()
 _dispatch_engine: DispatchDecisionEngine | None = None
+_policy_runtime: TrainingPolicyRuntimeAdapter | None = None
+_last_init_payload: dict | None = None
 
 # 注册 WebSocket 遥测端点，并将 sim_engine 的完整快照构造函数注入 telemetry 模块
 register_route(sock)
@@ -135,6 +145,54 @@ def _load_initial_orders(initial_orders: list[dict], order_mgr: OrderManager) ->
                          order_data.get("order_id", "unknown"), str(e))
 
     logger.info("[_load_initial_orders] 加载了 %d 笔初始订单", len(initial_orders))
+
+
+def _get_active_runtime():
+    """返回当前对外提供 `/control` `/state` `/ws` 的活跃运行时。"""
+    return _policy_runtime if _policy_runtime is not None else _sim_engine
+
+
+def _restore_classic_runtime() -> None:
+    """恢复 classic SimulationEngine 为当前活跃运行时。"""
+    set_snapshot_builder(_sim_engine.build_full_snapshot)
+
+
+def _shutdown_policy_runtime() -> None:
+    """停止并移除当前 PPO 在线运行时。"""
+    global _policy_runtime
+    if _policy_runtime is not None:
+        try:
+            _policy_runtime.shutdown()
+        except Exception:
+            logger.exception("[policy_runtime] shutdown 失败")
+        _policy_runtime = None
+    _restore_classic_runtime()
+
+
+def _switch_to_policy_runtime(runtime: TrainingPolicyRuntimeAdapter) -> None:
+    """将遥测输出切换到 PPO 在线运行时。"""
+    global _policy_runtime
+    if _policy_runtime is not None and _policy_runtime is not runtime:
+        _shutdown_policy_runtime()
+    _policy_runtime = runtime
+    set_snapshot_builder(runtime.build_full_snapshot)
+
+
+def _build_policy_scene_context_from_last_init(base_scene_ctx, payload: dict):
+    entities = payload.get("entities")
+    if not isinstance(entities, dict):
+        raise ValueError("当前 init payload 缺少 entities，无法构造 policy scene context")
+    orders_raw = build_orders_raw_from_sim_init_payload(
+        initial_orders=list(payload.get("initial_orders") or []),
+        scheduled_dynamic_orders=list(payload.get("scheduled_dynamic_orders") or []),
+    )
+    bounds = payload.get("bbox") or {}
+    return build_runtime_scene_context_from_payload(
+        scene_ctx=base_scene_ctx,
+        entities_raw=entities,
+        orders_raw=orders_raw,
+        bounds_override=bounds if isinstance(bounds, dict) else None,
+    )
 
 
 def _serialize_truck_route(route: "TruckRoute") -> dict:
@@ -519,7 +577,7 @@ def sim_init():
       "order_gen_config": { "arrival_rate": 4, ... }
     }
     """
-    global _entity_mgr, _order_mgr, _sim_engine, _dispatch_engine
+    global _entity_mgr, _order_mgr, _sim_engine, _dispatch_engine, _last_init_payload
 
     body = request.get_json(silent=True)
     if not body:
@@ -537,6 +595,7 @@ def sim_init():
 
     # ── 重置并重新初始化 ─────────────────────────────────────────────────────
     try:
+        _shutdown_policy_runtime()
         _sim_engine.reset()
 
         _entity_mgr = EntityManager()
@@ -563,6 +622,7 @@ def sim_init():
 
         # 更新 telemetry 快照构造函数绑定（新 _sim_engine 实例）
         set_snapshot_builder(_sim_engine.build_full_snapshot)
+        _last_init_payload = copy.deepcopy(body)
 
         logger.info(
             "[sim_init] 初始化完成：scene_id=%s，%d 仓库，%d 换电站，%d 卡车，%d 无人机，%d 初始订单",
@@ -607,25 +667,28 @@ def sim_control():
     body   = request.get_json(silent=True) or {}
     action = body.get("action", "")
     speed  = body.get("speed")
+    runtime = _get_active_runtime()
 
     try:
         if action == "start":
-            if not _sim_engine.is_running:
-                logger.info("[sim_control] 启动仿真，_entity_mgr=%s, _order_mgr=%s",
-                           "OK" if _sim_engine._entity_mgr else "None",
-                           "OK" if _sim_engine._order_mgr else "None")
-                _sim_engine.start()
+            if runtime is _sim_engine and not _sim_engine.is_running:
+                logger.info(
+                    "[sim_control] 启动 classic 仿真，_entity_mgr=%s, _order_mgr=%s",
+                    "OK" if _sim_engine._entity_mgr else "None",
+                    "OK" if _sim_engine._order_mgr else "None",
+                )
+            runtime.start()
         elif action == "pause":
-            _sim_engine.pause()
+            runtime.pause()
         elif action == "reset":
-            _sim_engine.reset()
+            runtime.reset()
         elif action == "set_speed":
             pass  # 仅调整速率，不改变运行状态
         else:
             return jsonify({"error": f"未知 action: '{action}'，支持 start/pause/reset/set_speed"}), 400
 
         if speed is not None:
-            _sim_engine.set_speed(float(speed))
+            runtime.set_speed(float(speed))
 
     except (RuntimeError, ValueError) as exc:
         logger.exception("[sim_control] 控制异常：action=%s, error=%s", action, str(exc))
@@ -633,9 +696,9 @@ def sim_control():
 
     return jsonify({
         "status":      "ok",
-        "is_running":  _sim_engine.is_running,
-        "sim_time":    round(_sim_engine.current_time, 3),
-        "speed_ratio": _sim_engine.speed_ratio,
+        "is_running":  runtime.is_running,
+        "sim_time":    round(runtime.current_time, 3),
+        "speed_ratio": runtime.speed_ratio,
     })
 
 
@@ -651,7 +714,7 @@ def sim_state():
     响应结构与 WebSocket FULL_SNAPSHOT payload 完全对齐，
     但不包含 type 字段（直接返回 payload 内容）。
     """
-    snapshot = _sim_engine.build_full_snapshot()
+    snapshot = _get_active_runtime().build_full_snapshot()
     return jsonify(snapshot["payload"])
 
 
@@ -673,11 +736,121 @@ def sim_orders():
     except (TypeError, ValueError):
         limit = 100
 
-    orders = _order_mgr.get_recent_orders(limit)
+    runtime = _get_active_runtime()
+    if hasattr(runtime, "get_recent_orders"):
+        orders = runtime.get_recent_orders(limit)
+    else:
+        orders = _order_mgr.get_recent_orders(limit)
     return jsonify({
         "total":  len(orders),
         "orders": orders,
     })
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# POST /policy/activate
+# ══════════════════════════════════════════════════════════════════════════════
+
+@sim_bp.route("/policy/activate", methods=["POST"])
+def sim_policy_activate():
+    """
+    激活基于 TrainingEnvAdapter 的在线 PPO 运行时。
+
+    说明：
+      - 不替换 classic SimulationEngine 代码路径；
+      - 仅通过活跃运行时切换，让现有 `/control` `/state` `/ws` 自动复用。
+    """
+    body = request.get_json(silent=True) or {}
+
+    try:
+        activation = build_policy_activation_config(body)
+        base_scene_ctx = resolve_scene_context(
+            config_path=activation.config_path,
+            scene_id=activation.scene_id or None,
+            scene_bundle_dir=activation.scene_bundle_dir,
+        )
+
+        use_current_init_payload = bool(body.get("use_current_init_payload", True))
+        if use_current_init_payload and _last_init_payload is not None:
+            init_scene_id = str(_last_init_payload.get("scene_id", "")).strip()
+            requested_scene_id = activation.scene_id or base_scene_ctx.scene_id
+            if init_scene_id and requested_scene_id and init_scene_id != requested_scene_id:
+                raise ValueError(
+                    "当前 init scene_id 与 policy 激活 scene_id 不一致: "
+                    f"init={init_scene_id}, requested={requested_scene_id}"
+                )
+            scene_ctx = _build_policy_scene_context_from_last_init(base_scene_ctx, _last_init_payload)
+        else:
+            scene_ctx = base_scene_ctx
+
+        _sim_engine.pause()
+        runtime = TrainingPolicyRuntimeAdapter(
+            activation=activation,
+            scene_ctx=scene_ctx,
+        )
+        _switch_to_policy_runtime(runtime)
+
+        try:
+            broadcast_tick(runtime.build_tick_payload())
+        except Exception:
+            logger.exception("[sim_policy_activate] 激活后首帧广播失败")
+
+        return jsonify(
+            {
+                "status": "activated",
+                "runtime": {
+                    "type": "training_env_adapter_policy",
+                    "policy_name": runtime.policy_name,
+                    "checkpoint": runtime.checkpoint_path,
+                    "scene_id": scene_ctx.scene_id,
+                    "is_running": runtime.is_running,
+                    "sim_time": round(runtime.current_time, 3),
+                    "speed_ratio": runtime.speed_ratio,
+                },
+            }
+        )
+    except Exception as exc:
+        logger.exception("[sim_policy_activate] 激活失败")
+        return jsonify({"error": str(exc)}), 422
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# POST /policy/deactivate
+# ══════════════════════════════════════════════════════════════════════════════
+
+@sim_bp.route("/policy/deactivate", methods=["POST"])
+def sim_policy_deactivate():
+    """停用 PPO 在线运行时，恢复 classic SimulationEngine。"""
+    active = _policy_runtime is not None
+    _shutdown_policy_runtime()
+    return jsonify(
+        {
+            "status": "deactivated" if active else "noop",
+            "active_runtime": "classic_sim_engine",
+        }
+    )
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# GET /policy/state
+# ══════════════════════════════════════════════════════════════════════════════
+
+@sim_bp.route("/policy/state", methods=["GET"])
+def sim_policy_state():
+    """返回当前 PPO 在线运行时状态。"""
+    if _policy_runtime is None:
+        return jsonify({"active": False})
+
+    snapshot = _policy_runtime.build_full_snapshot()["payload"]
+    return jsonify(
+        {
+            "active": True,
+            "runtime_type": "training_env_adapter_policy",
+            "policy_name": _policy_runtime.policy_name,
+            "checkpoint": _policy_runtime.checkpoint_path,
+            "snapshot": snapshot,
+        }
+    )
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -710,6 +883,9 @@ def sim_dispatch():
         "timestamp": <float>
       }
     """
+    if _policy_runtime is not None:
+        return jsonify({"error": "当前处于 PPO 在线策略模式，/api/sim/dispatch 不可用"}), 409
+
     if not _dispatch_engine:
         return jsonify({"error": "调度引擎未初始化，请先调用 /api/sim/init"}), 409
 
