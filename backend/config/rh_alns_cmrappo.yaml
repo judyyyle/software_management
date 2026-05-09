@@ -302,8 +302,8 @@ training:
 
   # PPO 核心超参数。
   total_timesteps: 1500000
-  # Run11: 在保守区间内略微提速，避免 critic / actor 更新过慢。
-  ppo_learning_rate: 0.00008
+  # Run16: 小幅回升学习率，补偿更大 Huber delta 下 critic 梯度绝对值下降。
+  ppo_learning_rate: 0.0001
   rollout_steps: 4096
   recurrent_ppo: true
   sequence_len: 16
@@ -325,9 +325,12 @@ training:
   entropy_coef: 0.10
   # Run12: recovery head 样本本就稀疏，不再额外降权；否则几乎总是塌到第一个候选节点。
   recovery_entropy_coef: 1.0
-  value_loss_coef: 0.05
+  # Run16: 配合更宽的 Huber 二次区，适度提高 critic loss 权重。
+  value_loss_coef: 0.10
   value_loss_type: huber
-  value_huber_delta: 5.0
+  # Run16: 当前 return_std 约 40~50，delta=5 使大多数样本停留在线性区；
+  # 提高到 25 以恢复更多样本的自适应二次梯度。
+  value_huber_delta: 25.0
   max_grad_norm: 1.0
   normalize_advantage: true
   target_kl: 0.05

@@ -20,7 +20,6 @@ from .env_adapter import (
     BackboneVisit,
     DecisionTrigger,
     DispatchAction,
-    ReservationState,
     TrainingDroneState,
     TrainingEnvAdapter,
     WAIT_ACTION,
@@ -128,7 +127,7 @@ class TestTrainingEnvAdapterPhase5c(unittest.TestCase):
         self.assertIn(recover_node_id, runtime_state.reservation_count)
         self.assertEqual(runtime_state.reservation_count[recover_node_id], 1)
 
-    def test_mode_c_reservation_expiry_tracks_truck_eta_baseline(self) -> None:
+    def test_mode_c_dispatch_commit_records_planned_commitment_metrics(self) -> None:
         env, drone_id = self._reset_controlled_env()
         entity_mgr = env._require_entity_manager()
         drone = entity_mgr.drones[drone_id]
@@ -160,25 +159,36 @@ class TestTrainingEnvAdapterPhase5c(unittest.TestCase):
             ),
         )
 
-        reservation = env._reservations[drone_id]
-        host = env._resolve_fixed_node(recover_node_id)
-        t_arrive_truck = t_deliver + 900.0
-        expected_tau = (
-            env._cfg.reservation_alpha * (t_arrive_truck - env._t_now)
-            + env._cfg.reservation_gamma * float(host.estimate_wait_time(env._t_now))
+        commit = env._dispatch_commit[drone_id]
+        recover_host = env._resolve_fixed_node(recover_node_id)
+        expected_delivery_finish = (
+            env._estimate_delivery_arrival_time(drone, order)
+            + env._scene_solver_params().drone_service_time_order_s
         )
+        expected_uav_arrival_lb = expected_delivery_finish + env._estimate_flight_time(
+            drone=drone,
+            from_pos=order.delivery_loc,
+            to_pos=recover_host.get_location(expected_delivery_finish),
+        )
+        expected_truck_arrival = t_deliver + 900.0
 
         self.assertAlmostEqual(
-            reservation.expires_at,
-            env._t_now + expected_tau,
+            commit.planned_truck_arrival_time,
+            expected_truck_arrival,
             places=6,
         )
-        self.assertGreater(
-            reservation.expires_at,
-            t_arrive_truck,
+        self.assertAlmostEqual(
+            commit.planned_uav_arrival_time_lb,
+            expected_uav_arrival_lb,
+            places=6,
+        )
+        self.assertAlmostEqual(
+            commit.planned_execution_slack_sec,
+            expected_truck_arrival - expected_uav_arrival_lb,
+            places=6,
         )
 
-    def test_mode_c_reservation_expiry_uses_decision_to_truck_eta_for_riding_launch(self) -> None:
+    def test_mode_c_riding_launch_commitment_uses_decision_time_truck_eta(self) -> None:
         env = self._make_env()
         env.reset()
 
@@ -223,22 +233,17 @@ class TestTrainingEnvAdapterPhase5c(unittest.TestCase):
             ),
         )
 
-        reservation = env._reservations[drone_id]
-        host = env._resolve_fixed_node(recover_node_id)
-        t_arrive_truck = env._t_now + 1200.0
-        expected_tau = (
-            env._cfg.reservation_alpha * (t_arrive_truck - env._t_now)
-            + env._cfg.reservation_gamma * float(host.estimate_wait_time(env._t_now))
-        )
+        commit = env._dispatch_commit[drone_id]
 
         self.assertAlmostEqual(
-            reservation.expires_at,
-            env._t_now + expected_tau,
+            float(commit.planned_truck_arrival_time),
+            env._t_now + 1200.0,
             places=6,
         )
-        self.assertGreater(reservation.expires_at, t_arrive_truck)
+        self.assertIsNotNone(commit.planned_uav_arrival_time_lb)
+        self.assertIsNotNone(commit.planned_execution_slack_sec)
 
-    def test_mode_c_reservation_expiry_never_precedes_truck_arrival(self) -> None:
+    def test_runtime_state_reservation_view_does_not_expose_fixed_expiry(self) -> None:
         env, drone_id = self._reset_controlled_env()
         entity_mgr = env._require_entity_manager()
         recover_node_id = sorted(entity_mgr.stations)[0]
@@ -269,8 +274,10 @@ class TestTrainingEnvAdapterPhase5c(unittest.TestCase):
             ),
         )
 
-        reservation = env._reservations[drone_id]
-        self.assertGreater(reservation.expires_at, t_arrive_truck)
+        runtime_state = env.build_runtime_state_view()
+        reservation = runtime_state.drone_states[drone_id].reservation
+        self.assertIsNotNone(reservation)
+        self.assertFalse(hasattr(reservation, "expires_at"))
 
     def test_reservation_timeout_switches_to_fallback_after_delivery(self) -> None:
         env, drone_id = self._reset_controlled_env()
@@ -308,18 +315,20 @@ class TestTrainingEnvAdapterPhase5c(unittest.TestCase):
         service_finish_time = env._delivery_service_legs[drone_id].finish_time
         env._advance_to_event(service_finish_time)
 
-        reservation = env._reservations[drone_id]
-        env._reservations[drone_id] = ReservationState(
-            recover_node=reservation.recover_node,
-            issued_at=reservation.issued_at,
-            expires_at=env._t_now + 0.25,
-        )
+        rendezvous_leg = env._flight_legs[drone_id]
+        env._advance_to_event(rendezvous_leg.arrival_time)
 
-        reward = env._advance_to_event(env._t_now + 1.0)
+        coarse_plan = env._build_coarse_plan_view(env._t_now)
+        t_arrive_truck = coarse_plan.truck_eta_map[recover_node_id]
+        timeout_probe_t = t_arrive_truck - env._cfg.rendezvous_execution_margin_sec + 1.0
+        reward = env._advance_to_event(timeout_probe_t)
+        expected_wait_penalty = -env._cfg.lambda_wait * (
+            timeout_probe_t - rendezvous_leg.arrival_time
+        )
 
         self.assertAlmostEqual(
             reward,
-            -env._cfg.lambda_res_timeout * 0.75,
+            expected_wait_penalty - env._cfg.lambda_res_timeout * 1.0,
             places=6,
         )
         self.assertEqual(env._drone_state[drone_id], TrainingDroneState.FALLBACK_RECOVERY)

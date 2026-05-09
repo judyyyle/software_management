@@ -99,7 +99,6 @@ ORDER_TOKEN_FIELDS = (
     "best_mode_b_queue_time_est_norm",
     "has_mode_c_action",
     "best_mode_c_rendezvous_margin_norm",
-    "best_mode_c_queue_time_est_norm",
     "best_mode_c_node_type_code_norm",
     "best_mode_c_truck_eta_remaining_norm",
 )
@@ -111,11 +110,7 @@ RECOVERY_TOKEN_FIELDS = (
     "y_norm",
     "z_norm",
     "truck_eta_remaining_norm",
-    "has_truck_eta",
     "rendezvous_margin_norm",
-    "reservation_count_norm",
-    "predicted_queue_time_est_norm",
-    "service_time_norm",
 )
 
 INFRA_TOKEN_FIELDS = (
@@ -402,7 +397,6 @@ class ObservationTensorizer:
                     self._norm_time_nonneg(float(item.best_mode_b_queue_time_est)),
                     self._bool(bool(item.has_mode_c_action)),
                     self._norm_time_signed(float(item.best_mode_c_rendezvous_margin)),
-                    self._norm_time_nonneg(float(item.best_mode_c_queue_time_est)),
                     self._code_norm(_HOST_TYPE_CODE, str(item.best_mode_c_node_type)),
                     self._norm_time_nonneg(float(item.best_mode_c_truck_eta_remaining)),
                 ],
@@ -438,11 +432,7 @@ class ObservationTensorizer:
                         self._norm_y(float(item.y)),
                         self._norm_z(float(item.z)),
                         self._norm_time_nonneg(eta_remaining),
-                        self._bool(True),
                         self._norm_time_signed(float(item.rendezvous_margin)),
-                        self._clip01(float(item.reservation_count) / max(self._cfg.queue_norm_cap, _TIME_EPS)),
-                        self._norm_time_nonneg(float(item.predicted_queue_time_est)),
-                        self._norm_time_nonneg(float(item.service_time)),
                     ],
                     dtype=_FLOAT_DTYPE,
                 )
