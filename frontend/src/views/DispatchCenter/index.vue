@@ -21,24 +21,24 @@
           <span>运行模式：<strong>{{ systemStore.policyActive ? 'PPO 在线推理' : 'Classic 仿真' }}</strong></span>
         </div>
 
+        <!-- 实体摘要 -->
+        <div class="sc-entity-row">
+          <div class="sc-ent" :class="{ 'sc-ent--empty': !entityStore.depots.length }">
+            🏭 仓库 <strong>{{ entityStore.depots.length }}</strong>
+          </div>
+          <div class="sc-ent" :class="{ 'sc-ent--empty': !entityStore.stations.length }">
+            ⚡ 充换电站 <strong>{{ entityStore.stations.length }}</strong>
+          </div>
+          <div class="sc-ent" :class="{ 'sc-ent--empty': !entityStore.trucks.length }">
+            🚛 卡车 <strong>{{ entityStore.trucks.length }}</strong>
+          </div>
+          <div class="sc-ent" :class="{ 'sc-ent--empty': !entityStore.drones.length }">
+            🚁 无人机 <strong>{{ entityStore.drones.length }}</strong>
+          </div>
+        </div>
+
         <!-- 控制操作行 -->
         <div class="sc-ctrl-row">
-          <!-- 实体摘要 -->
-          <div class="sc-entity-row">
-            <div class="sc-ent" :class="{ 'sc-ent--empty': !entityStore.depots.length }">
-              🏭 仓库 <strong>{{ entityStore.depots.length }}</strong>
-            </div>
-            <div class="sc-ent" :class="{ 'sc-ent--empty': !entityStore.stations.length }">
-              ⚡ 充换电站 <strong>{{ entityStore.stations.length }}</strong>
-            </div>
-            <div class="sc-ent" :class="{ 'sc-ent--empty': !entityStore.trucks.length }">
-              🚛 卡车 <strong>{{ entityStore.trucks.length }}</strong>
-            </div>
-            <div class="sc-ent" :class="{ 'sc-ent--empty': !entityStore.drones.length }">
-              🚁 无人机 <strong>{{ entityStore.drones.length }}</strong>
-            </div>
-          </div>
-
           <!-- 操作按钮 + 速率选择 -->
           <div class="sc-actions-area">
             <!-- bbox 提示 -->
@@ -920,15 +920,17 @@ onBeforeUnmount(() => {
 /* 控制操作行：左实体摘要，右按钮+速率 */
 .sc-ctrl-row {
   display: flex;
-  gap: var(--hl-space-md);
-  align-items: flex-start;
-  flex-wrap: wrap;
+  flex-direction: column;
+  gap: var(--hl-space-sm);
 }
 
 /* 实体摘要 */
-.sc-entity-row { display: flex; gap: 8px; flex-wrap: wrap; flex: 1; min-width: 0; }
+.sc-entity-row {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 8px;
+}
 .sc-ent {
-  flex: 1; min-width: 110px;
   padding: 8px 12px;
   background: var(--hl-card-bg);
   border: 1px solid var(--hl-card-border);
@@ -939,7 +941,12 @@ onBeforeUnmount(() => {
 .sc-ent--empty strong { color: var(--hl-danger); }
 
 /* 操作区：bbox + 按钮行 + 速率 */
-.sc-actions-area { display: flex; flex-direction: column; gap: 8px; flex-shrink: 0; }
+.sc-actions-area {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  min-width: 0;
+}
 
 /* bbox 提示 */
 .sc-bbox-hint {
@@ -1375,6 +1382,10 @@ onBeforeUnmount(() => {
 }
 
 @media (max-width: 1080px) {
+  .sc-entity-row {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
   .sc-policy-head {
     flex-direction: column;
     align-items: stretch;
@@ -1385,6 +1396,12 @@ onBeforeUnmount(() => {
   }
 
   .sc-policy-grid {
+    grid-template-columns: 1fr;
+  }
+}
+
+@media (max-width: 640px) {
+  .sc-entity-row {
     grid-template-columns: 1fr;
   }
 }
