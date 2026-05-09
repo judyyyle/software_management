@@ -34,6 +34,7 @@ except Exception:  # pragma: no cover - supports isolated GA unit tests without 
             cost_dist: float = 0.0
             cost_energy: float = 0.0
             cost_penalty: float = 0.0
+            mode_reward: float = 0.0
 
         @dataclass
         class TruckRouteNode:
@@ -211,7 +212,8 @@ class GADecoder:
             candidates=candidates,
             state=state_copy,
         )
-        objective += metrics.get("closure_route_cost", 0.0)
+        plan_completion_time = self._plan_completion_time(candidates, initial_time)
+        objective += plan_completion_time * float(self.config.weight_completion)
 
         objective = self._finite_or(objective, self.config.big_m)
         diagnostics = self._collect_decode_diagnostics(gene_attempts, candidates, closure_info)
@@ -220,6 +222,7 @@ class GADecoder:
             metrics=metrics,
             penalties=penalties,
             fitness_total=objective + sum(float(value) for value in penalties.values()),
+            plan_completion_time=plan_completion_time,
         )
         plan = self._build_dispatch_plan(
             allocations=allocations,
@@ -307,14 +310,18 @@ class GADecoder:
         metrics: dict[str, float],
         penalties: dict[str, float],
         fitness_total: float,
+        plan_completion_time: float,
     ) -> dict[str, float]:
-        truck_distance_cost = sum(float(c.truck_distance or 0.0) for c in candidates) * float(self.config.weight_truck_distance)
-        uav_distance_cost = sum(float(c.uav_distance or 0.0) for c in candidates) * float(self.config.weight_uav_distance)
+        raw_truck_distance = sum(float(c.truck_distance or 0.0) for c in candidates)
+        raw_uav_distance = sum(float(c.uav_distance or 0.0) for c in candidates)
+        truck_distance_cost = 0.0
+        uav_distance_cost = 0.0
         energy_cost = sum(float(c.cost_energy or 0.0) for c in candidates)
-        time_cost = sum(float(c.completion_time or 0.0) for c in candidates) * float(self.config.weight_completion)
+        time_cost = float(plan_completion_time) * float(self.config.weight_completion)
         waiting_cost = sum(float(c.waiting_time or 0.0) for c in candidates) * float(self.config.weight_waiting)
         delay_cost = sum(float(c.lateness or 0.0) for c in candidates) * float(self.config.weight_delay)
-        closure_route_cost = float(metrics.get("closure_route_cost", 0.0) or 0.0)
+        mode_reward = sum(float(getattr(c, "mode_reward", 0.0) or 0.0) for c in candidates)
+        closure_route_cost = 0.0
         repair_penalty = float(penalties.get("repair_penalty", 0.0) or 0.0)
         station_queue_penalty = float(penalties.get("station_queue_penalty", 0.0) or 0.0)
         unserved_penalty = float(penalties.get("unserved_order_penalty", 0.0) or 0.0)
@@ -333,15 +340,20 @@ class GADecoder:
             + unserved_penalty
             + infeasible_penalty
             + final_return_penalty
+            - mode_reward
         )
         residual = float(fitness_total) - total
         return {
+            "raw_truck_distance": raw_truck_distance,
+            "raw_uav_distance": raw_uav_distance,
             "truck_distance_cost": truck_distance_cost,
             "uav_distance_cost": uav_distance_cost,
             "energy_cost": energy_cost,
             "time_cost": time_cost,
             "waiting_cost": waiting_cost,
             "delay_cost": delay_cost,
+            "plan_completion_time": float(plan_completion_time),
+            "air_ground_reward": mode_reward,
             "closure_route_cost": closure_route_cost,
             "repair_penalty": repair_penalty,
             "station_queue_penalty": station_queue_penalty,
@@ -604,7 +616,7 @@ class GADecoder:
         route_truck_distance = sum(float(route.total_distance or 0.0) for route in truck_routes.values())
         candidate_truck_distance = sum(float(candidate.truck_distance or 0.0) for candidate in candidates)
         closure_route_distance = max(0.0, route_truck_distance - candidate_truck_distance)
-        closure_route_cost = closure_route_distance * float(self.config.weight_truck_distance)
+        closure_route_cost = 0.0
 
         closure_waiting_drone_count = 0.0
         closure_waiting_time = 0.0
@@ -630,6 +642,12 @@ class GADecoder:
             "closure_waiting_drone_count": closure_waiting_drone_count,
             "closure_waiting_time": closure_waiting_time,
         }
+
+    def _plan_completion_time(self, candidates: list[GACandidate], initial_time: float = 0.0) -> float:
+        if not candidates:
+            return 0.0
+        latest_completion = max(float(candidate.completion_time or 0.0) for candidate in candidates)
+        return max(0.0, latest_completion - float(initial_time or 0.0))
 
     def _closure_stop_waiting_time(
         self,
