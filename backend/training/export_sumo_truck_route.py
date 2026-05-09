@@ -105,6 +105,7 @@ class RouteSegment:
     to_node_type: str
     distance_m: float
     travel_time_sec: float
+    geometry: tuple[Position3D, ...]
     osm_node_path: tuple[str, ...]
     sumo_edge_ids: tuple[str, ...]
 
@@ -128,8 +129,9 @@ class Phase4ExportResult:
     validation_report: Mapping[str, Any]
 
 
-def export_phase4_truck_route(
+def export_phase4_truck_route_for_scene(
     *,
+    scene_ctx: TrainingSceneContext,
     config_path: str | Path = DEFAULT_CONFIG_PATH,
     output_dir: str | Path | None = None,
     min_future_fixed_nodes: int | None = None,
@@ -139,7 +141,6 @@ def export_phase4_truck_route(
         config_path=config_path,
         override=min_future_fixed_nodes,
     )
-    scene_ctx = load_default_scene(config_path=config_path)
     export_dir = _resolve_output_dir(scene_ctx, output_dir)
     export_dir.mkdir(parents=True, exist_ok=True)
 
@@ -243,6 +244,21 @@ def export_phase4_truck_route(
         truck_eta_map=truck_eta_map,
         route_drift_ref=route_drift_ref,
         validation_report=validation_report,
+    )
+
+
+def export_phase4_truck_route(
+    *,
+    config_path: str | Path = DEFAULT_CONFIG_PATH,
+    output_dir: str | Path | None = None,
+    min_future_fixed_nodes: int | None = None,
+) -> Phase4ExportResult:
+    scene_ctx = load_default_scene(config_path=config_path)
+    return export_phase4_truck_route_for_scene(
+        scene_ctx=scene_ctx,
+        config_path=config_path,
+        output_dir=output_dir,
+        min_future_fixed_nodes=min_future_fixed_nodes,
     )
 
 
@@ -542,7 +558,11 @@ def _materialize_execution_route(
                 f"OSM 路网不可达: {prev_stop.node_id} -> {cur_stop.node_id}"
             )
 
-        segment_distance = _segment_distance_with_snap(prev_stop, cur_stop, path, road_nodes)
+        segment_geometry = _segment_geometry_with_snap(prev_stop, cur_stop, path, road_nodes)
+        segment_distance = sum(
+            segment_geometry[i - 1].distance_2d(segment_geometry[i])
+            for i in range(1, len(segment_geometry))
+        )
         travel_time = segment_distance / truck_speed
         arrival_time = route_stops[idx - 1].departure_time_sec + travel_time
         departure_time = arrival_time + _stop_service_time_sec(cur_stop.node_type)
@@ -572,6 +592,7 @@ def _materialize_execution_route(
                 to_node_type=updated_cur.node_type,
                 distance_m=segment_distance,
                 travel_time_sec=travel_time,
+                geometry=segment_geometry,
                 osm_node_path=tuple(path),
                 sumo_edge_ids=segment_edge_ids,
             )
@@ -617,14 +638,22 @@ def _find_nearest_node_cached(
     return cache[key]
 
 
-def _segment_distance_with_snap(
+def _segment_geometry_with_snap(
     from_stop: RouteStop,
     to_stop: RouteStop,
     path: Sequence[str],
     road_nodes: Mapping[str, tuple[float, float]],
-) -> float:
-    # 路段距离 = snap 到起点 + OSM 路径折线 + snap 到终点，
-    # 避免纯用 OSM 节点距离时忽略 stop 坐标与最近节点之间的偏移。
+) -> tuple[Position3D, ...]:
+    """
+    构造 stop-to-stop 的真实路径几何。
+
+    几何包含：
+      1. 起点 stop 的真实坐标
+      2. OSM 路径上的中间节点坐标
+      3. 终点 stop 的真实坐标
+
+    这样运行时消费方无需再次反查 OSM 节点，即可沿真实折线推进位置。
+    """
     geometry = [from_stop.position]
     for osm_node_id in path:
         pos = _osm_node_position(road_nodes, osm_node_id)
@@ -632,7 +661,7 @@ def _segment_distance_with_snap(
             geometry.append(pos)
     if geometry[-1].distance_2d(to_stop.position) > 0.5:
         geometry.append(to_stop.position)
-    return sum(geometry[i - 1].distance_2d(geometry[i]) for i in range(1, len(geometry)))
+    return tuple(geometry)
 
 
 def _osm_node_position(
@@ -980,6 +1009,14 @@ def _build_execution_route_payload(execution_route: TruckExecutionRoute) -> dict
                 "to_node_type": segment.to_node_type,
                 "distance_m": round(float(segment.distance_m), 6),
                 "travel_time_sec": round(float(segment.travel_time_sec), 6),
+                "geometry": [
+                    {
+                        "x": round(float(pos.x), 6),
+                        "y": round(float(pos.y), 6),
+                        "z": round(float(pos.z), 6),
+                    }
+                    for pos in segment.geometry
+                ],
                 "osm_node_path": list(segment.osm_node_path),
                 "sumo_edge_ids": list(segment.sumo_edge_ids),
             }

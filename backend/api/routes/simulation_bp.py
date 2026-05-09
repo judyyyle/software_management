@@ -36,7 +36,7 @@ from order_manager import OrderManager
 from sim_engine import SimulationEngine
 from solver.decision_engine import DispatchDecisionEngine
 from training.frontend_runtime_adapter import (
-    TrainingPolicyRuntimeAdapter,
+    OnlinePolicyRuntimePlayer,
     build_orders_raw_from_sim_init_payload,
     build_policy_activation_config,
     build_runtime_scene_context_from_payload,
@@ -63,7 +63,7 @@ _entity_mgr: EntityManager           = EntityManager()
 _order_mgr:  OrderManager            = OrderManager()
 _sim_engine: SimulationEngine         = SimulationEngine()
 _dispatch_engine: DispatchDecisionEngine | None = None
-_policy_runtime: TrainingPolicyRuntimeAdapter | None = None
+_policy_runtime: OnlinePolicyRuntimePlayer | None = None
 _last_init_payload: dict | None = None
 
 # 注册 WebSocket 遥测端点，并将 sim_engine 的完整快照构造函数注入 telemetry 模块
@@ -169,7 +169,7 @@ def _shutdown_policy_runtime() -> None:
     _restore_classic_runtime()
 
 
-def _switch_to_policy_runtime(runtime: TrainingPolicyRuntimeAdapter) -> None:
+def _switch_to_policy_runtime(runtime: OnlinePolicyRuntimePlayer) -> None:
     """将遥测输出切换到 PPO 在线运行时。"""
     global _policy_runtime
     if _policy_runtime is not None and _policy_runtime is not runtime:
@@ -788,7 +788,7 @@ def sim_policy_activate():
             scene_ctx = base_scene_ctx
 
         _sim_engine.pause()
-        runtime = TrainingPolicyRuntimeAdapter(
+        runtime = OnlinePolicyRuntimePlayer(
             activation=activation,
             scene_ctx=scene_ctx,
         )
@@ -853,6 +853,37 @@ def sim_policy_state():
             "policy_name": _policy_runtime.policy_name,
             "checkpoint": _policy_runtime.checkpoint_path,
             "snapshot": snapshot,
+        }
+    )
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# GET /policy/events
+# ══════════════════════════════════════════════════════════════════════════════
+
+@sim_bp.route("/policy/events", methods=["GET"])
+def sim_policy_events():
+    """按 event_seq 拉取 PPO 在线决策事件。"""
+    if _policy_runtime is None:
+        return jsonify(
+            {
+                "active": False,
+                "events": [],
+                "latest_event_seq": 0,
+            }
+        )
+    try:
+        after_seq = int(request.args.get("after_seq", 0))
+        limit = int(request.args.get("limit", 200))
+    except (TypeError, ValueError):
+        return jsonify({"error": "after_seq 和 limit 必须为整数"}), 400
+
+    events = _policy_runtime.get_decision_events(after_seq=after_seq, limit=limit)
+    return jsonify(
+        {
+            "active": True,
+            "events": events,
+            "latest_event_seq": _policy_runtime.latest_decision_event_seq(),
         }
     )
 
