@@ -30,6 +30,12 @@ logging.basicConfig(
 )
 # 降低 Werkzeug 路由日志噪声（只保留 WARNING 以上）
 logging.getLogger("werkzeug").setLevel(logging.WARNING)
+# 地图加载阶段会触发 geopandas/fiona/GDAL 大量逐要素 DEBUG 日志；单独压低第三方噪声。
+logging.getLogger("fiona").setLevel(logging.WARNING)
+logging.getLogger("fiona.collection").setLevel(logging.WARNING)
+logging.getLogger("fiona.env").setLevel(logging.WARNING)
+logging.getLogger("fiona.ogrext").setLevel(logging.WARNING)
+logging.getLogger("geopandas").setLevel(logging.WARNING)
 
 from flask import Flask, jsonify
 from flask_cors import CORS
