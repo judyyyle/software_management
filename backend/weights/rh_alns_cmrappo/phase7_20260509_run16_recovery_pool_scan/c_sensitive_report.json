@@ -1,7 +1,7 @@
 {
-  "generated_at": "2026-05-09T08:29:55.494985+00:00",
-  "update": 240,
-  "global_step": 983344,
+  "generated_at": "2026-05-09T05:13:11.727990+00:00",
+  "update": 100,
+  "global_step": 409748,
   "split": "c_sensitive",
   "order_source_mode": "benchmark",
   "episode_count": 1,
