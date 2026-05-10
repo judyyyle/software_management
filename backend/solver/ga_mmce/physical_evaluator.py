@@ -173,20 +173,17 @@ class PhysicalEvaluator:
     def _independent_launch_node(self, state: Any, drone: Any, drone_id: str) -> tuple[str, Any] | tuple[None, None]:
         host_type = str(self._read_field(drone, "_ga_host_type", "") or "").upper()
         host_node_id = str(self._read_field(drone, "_ga_host_node_id", "") or "")
-        if host_type in {"DEPOT", "STATION"} and host_node_id:
+        if host_type == "DEPOT" and host_node_id:
             launch_pos = self.get_node_position(host_node_id, state)
             if launch_pos is not None:
                 return host_node_id, launch_pos
+        if host_type == "STATION":
+            return None, None
 
         for depot_id, depot in self._depot_items(state):
             idle_drones = self._ga_list(depot, "_ga_idle_drones", "idle_drones")
             if drone_id in idle_drones:
                 return depot_id, self._read_field(depot, "location")
-
-        for station_id, station in self._station_items(state):
-            idle_drones = self._ga_list(station, "_ga_idle_drones", "idle_drones")
-            if drone_id in idle_drones:
-                return station_id, self._read_field(station, "location")
 
         depot_id, depot = self._first_depot(state)
         return depot_id, self._read_field(depot, "location")
@@ -256,9 +253,7 @@ class PhysicalEvaluator:
             _, station = self._find_station_by_node_id(state, host_node_id)
             if station is not None:
                 waiting_drones = self._ga_list(station, "_ga_waiting_drones", "waiting_drones")
-                idle_drones = self._ga_list(station, "_ga_idle_drones", "idle_drones")
                 self._write_ga_list(station, "_ga_waiting_drones", waiting_drones + [drone_id])
-                self._write_ga_list(station, "_ga_idle_drones", idle_drones + [drone_id])
                 if candidate is not None:
                     self._append_station_queue_state(station, drone_id, candidate)
 
@@ -381,7 +376,7 @@ class PhysicalEvaluator:
                 return False, "drone_on_truck"
             if self._read_field(drone, "transport_truck_id"):
                 return False, "drone_on_truck"
-            if self._is_drone_at_ga_depot(state, drone, drone_id) or self._is_drone_at_ga_station(state, drone, drone_id):
+            if self._is_drone_at_ga_depot(state, drone, drone_id):
                 return True, ""
             return False, "drone_not_at_independent_node"
 
