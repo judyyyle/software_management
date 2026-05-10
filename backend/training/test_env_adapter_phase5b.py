@@ -129,11 +129,12 @@ class TestTrainingEnvAdapterPhase5b(unittest.TestCase):
         self.assertNotIn(station_ids[0], mode_c_nodes)
         self.assertIn(station_ids[1], mode_c_nodes)
 
-    def test_mode_b_return_host_uses_score_instead_of_depot_priority(self) -> None:
+    def test_mode_b_return_host_prefers_depot_when_reachable(self) -> None:
         env, drone_id = self._reset_controlled_env()
         entity_mgr = env._require_entity_manager()
         drone = entity_mgr.drones[drone_id]
         station = next(iter(entity_mgr.stations.values()))
+        depot = env._require_depot()
 
         drone.current_loc = Position3D(
             x=station.location.x,
@@ -144,7 +145,52 @@ class TestTrainingEnvAdapterPhase5b(unittest.TestCase):
         selected_host = env._select_return_host_mode_b(drone_id, current_time=env._t_now)
 
         self.assertIsNotNone(selected_host)
+        self.assertEqual(selected_host.depot_id, depot.depot_id)
+
+    def test_mode_b_return_host_uses_station_only_when_depot_unreachable(self) -> None:
+        env, drone_id = self._reset_controlled_env()
+        entity_mgr = env._require_entity_manager()
+        drone = entity_mgr.drones[drone_id]
+        station = next(iter(entity_mgr.stations.values()))
+
+        selected_host = env._select_return_host_mode_b(
+            drone_id,
+            from_pos=station.location,
+            battery_current=drone.safe_margin_j + 1.0,
+            current_time=env._t_now,
+        )
+
+        self.assertIsNotNone(selected_host)
         self.assertEqual(selected_host.station_id, station.station_id)
+
+    def test_mode_b_station_charge_completion_auto_returns_to_depot(self) -> None:
+        env, drone_id = self._reset_controlled_env()
+        entity_mgr = env._require_entity_manager()
+        drone = entity_mgr.drones[drone_id]
+        station = next(iter(entity_mgr.stations.values()))
+        depot = env._require_depot()
+
+        drone.current_loc = Position3D(
+            x=station.location.x,
+            y=station.location.y,
+            z=station.location.z,
+        )
+        env._drone_state[drone_id] = TrainingDroneState.CHARGING_OR_SWAP
+        env._mode_b_pending_depot_return[drone_id] = depot.depot_id
+        station.serving_drones[drone_id] = env._t_now
+
+        env._advance_to_event(env._t_now)
+
+        self.assertEqual(env._drone_state[drone_id], TrainingDroneState.RETURN_TO_DEPOT)
+        self.assertNotIn(drone_id, env._mode_b_pending_depot_return)
+        return_leg = env._flight_legs[drone_id]
+        self.assertEqual(return_leg.kind, "mode_b_return_to_depot")
+        self.assertEqual(return_leg.target_node_id, depot.depot_id)
+
+        env._advance_to_event(return_leg.arrival_time)
+
+        self.assertEqual(env._drone_state[drone_id], TrainingDroneState.IDLE)
+        self.assertNotIn(drone_id, env._flight_legs)
 
     def test_coarse_plan_recovery_pool_scans_future_backbone_then_selects_top_k(self) -> None:
         env, _drone_id = self._reset_controlled_env()
