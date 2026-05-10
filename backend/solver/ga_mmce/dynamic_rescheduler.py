@@ -424,7 +424,7 @@ def _freeze_runtime_resources(snapshot: Any, event_time: float, locked_order_ids
         if carrying in locked_order_ids or is_busy:
             busy_drone_ids.add(str(drone_id))
             locked_drone_ids.add(str(drone_id))
-            available_time, available_pos = _estimate_drone_available(drone, event_time)
+            available_time, available_pos = _estimate_drone_available(snapshot, drone, event_time)
             _write_field(drone, "_ga_available_time", available_time)
             _write_field(drone, "_ga_time", available_time)
             if available_pos is not None:
@@ -450,6 +450,11 @@ def _freeze_runtime_resources(snapshot: Any, event_time: float, locked_order_ids
 
 
 def _future_drone_host(snapshot: Any, drone: Any, drone_id: str) -> tuple[str, str, str | None]:
+    route_host = _pending_route_recovery_host(snapshot, drone)
+    if route_host is not None:
+        host_type, host_node_id = route_host
+        return host_type, host_node_id, None
+
     truck_id = str(_read_field(drone, "_ga_transport_truck_id", _read_field(drone, "transport_truck_id", "")) or "")
     if truck_id:
         return "TRUCK", truck_id, truck_id
@@ -477,6 +482,65 @@ def _future_drone_host(snapshot: Any, drone: Any, drone_id: str) -> tuple[str, s
     return "", "", None
 
 
+def _pending_route_recovery_host(snapshot: Any, drone: Any) -> tuple[str, str] | None:
+    route_plan = list(_read_field(drone, "route_plan", []) or [])
+    if not route_plan:
+        return None
+
+    start_idx = int(_read_field(drone, "current_waypoint_index", 0) or 0)
+    start_idx = max(0, min(start_idx, len(route_plan)))
+    for wp in route_plan[start_idx:]:
+        action_name = _waypoint_action_name(_read_field(wp, "action"))
+        if action_name not in {"DOCK_TRUCK", "DOCK_DEPOT"}:
+            continue
+        node_id = str(_read_field(wp, "target_entity_id", "") or "")
+        if not node_id:
+            node_id = _nearest_support_node_id(snapshot, _read_field(wp, "loc"))
+        host_type = _node_host_type(snapshot, node_id)
+        if host_type in {"DEPOT", "STATION"}:
+            return host_type, node_id
+    return None
+
+
+def _waypoint_action_name(action: Any) -> str:
+    if action is None:
+        return ""
+    if hasattr(action, "value"):
+        action = action.value
+    return str(action).strip().upper()
+
+
+def _node_host_type(snapshot: Any, node_id: str) -> str:
+    if not node_id:
+        return ""
+    mgr = _entity_mgr(snapshot)
+    if node_id in (_mapping(mgr, "stations") or {}):
+        return "STATION"
+    if node_id in (_mapping(mgr, "depots") or {}) or _is_depot_node_id(node_id):
+        return "DEPOT"
+    return ""
+
+
+def _nearest_support_node_id(snapshot: Any, pos: Any) -> str:
+    if pos is None:
+        return ""
+    mgr = _entity_mgr(snapshot)
+    best_id = ""
+    best_dist = math.inf
+    for mapping_name in ("stations", "depots"):
+        for node_id, node in (_mapping(mgr, mapping_name) or {}).items():
+            dist = _distance(pos, _read_field(node, "location"))
+            if dist < best_dist:
+                best_dist = dist
+                best_id = str(node_id)
+    return best_id if best_dist <= 60.0 else ""
+
+
+def _is_depot_node_id(node_id: str) -> bool:
+    normalized = str(node_id).strip().upper()
+    return normalized == "DEPOT" or normalized.startswith("DEPOT") or normalized.startswith("DEP-")
+
+
 def _add_drone_to_future_host(snapshot: Any, drone_id: str, host_type: str, host_node_id: str, truck_id: str | None) -> None:
     mgr = _entity_mgr(snapshot)
     if host_type == "TRUCK" and truck_id:
@@ -492,7 +556,7 @@ def _add_drone_to_future_host(snapshot: Any, drone_id: str, host_type: str, host
     if host_type == "STATION":
         station = (_mapping(mgr, "stations") or {}).get(host_node_id)
         if station is not None:
-            _append_unique_field(station, "_ga_idle_drones", drone_id)
+            _append_unique_field(station, "_ga_waiting_drones", drone_id)
 
 
 def _append_unique_field(record: Any, field_name: str, value: str) -> None:
@@ -1096,19 +1160,23 @@ def _estimate_truck_available(truck: Any, event_time: float, locked_order_ids: s
     return freeze_time, freeze_pos
 
 
-def _estimate_drone_available(drone: Any, event_time: float) -> tuple[float, Any]:
+def _estimate_drone_available(snapshot: Any, drone: Any, event_time: float) -> tuple[float, Any]:
     route_plan = _read_field(drone, "route_plan", []) or []
     idx = int(_read_field(drone, "current_waypoint_index", 0) or 0)
     cur = _read_field(drone, "current_loc")
     if idx >= len(route_plan):
         return float(event_time), cur
     dist = 0.0
+    service_time = _safe_float(_read_field(_entity_mgr(snapshot), "DRONE_SERVICE_TIME_ORDER", 0.0), 0.0)
+    service_total = 0.0
     for wp in route_plan[idx:]:
         loc = _read_field(wp, "loc")
         dist += _distance(cur, loc)
         cur = loc
+        if _waypoint_action_name(_read_field(wp, "action")) == "DELIVER":
+            service_total += service_time
     speed = max(1e-6, _safe_float(_read_field(drone, "cruise_speed", 0.0), 0.0))
-    return float(event_time) + dist / speed, cur
+    return float(event_time) + dist / speed + service_total, cur
 
 
 def _distance(pos_a: Any, pos_b: Any) -> float:

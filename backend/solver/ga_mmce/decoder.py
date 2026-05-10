@@ -204,6 +204,7 @@ class GADecoder:
             initial_time,
             initial_truck_position,
         )
+        self._retime_closure_pickup_stops(state_copy, truck_routes, truck_ordered_stops)
         drone_routes = self._group_drone_route_fragments(drone_route_fragments)
         metrics = self._collect_plan_metrics(
             truck_routes=truck_routes,
@@ -605,6 +606,69 @@ class GADecoder:
         route.total_distance = total_dist
         return route
 
+    def _retime_closure_pickup_stops(
+        self,
+        state: Any,
+        truck_routes: dict[str, TruckRoute],
+        truck_ordered_stops: list[dict[str, Any]],
+    ) -> None:
+        """Make terminal recovery stops wait until already-committed drones arrive."""
+        if not truck_routes or not truck_ordered_stops:
+            return
+
+        event_stops = [
+            stop
+            for stop in truck_ordered_stops
+            if stop.get("position") is not None
+        ]
+        if not event_stops:
+            return
+
+        recover_time = self._recover_service_time()
+        event_node_types = {"customer", "recovery", "station"}
+        for route in truck_routes.values():
+            delay = 0.0
+            stop_index = 0
+            for node in route.nodes:
+                stop = None
+                if node.node_type in event_node_types and stop_index < len(event_stops):
+                    stop = event_stops[stop_index]
+                    stop_index += 1
+
+                if delay:
+                    node.arrival_time += delay
+                    node.departure_time += delay
+
+                if not stop or stop.get("action") != "closure_pickup_c_drone":
+                    continue
+
+                ready_time = self._closure_ready_time(
+                    state,
+                    stop.get("drone_ids", []) or [],
+                    node.arrival_time,
+                )
+                needed_departure = max(node.arrival_time, ready_time) + recover_time
+                if node.departure_time + 1e-6 >= needed_departure:
+                    continue
+                extra_delay = needed_departure - node.departure_time
+                node.departure_time = needed_departure
+                delay += extra_delay
+
+    def _closure_ready_time(self, state: Any, drone_ids: list[str], fallback: float) -> float:
+        drones = self._mapping(state, "drones")
+        ready_times: list[float] = []
+        for drone_id in drone_ids:
+            drone = drones.get(str(drone_id))
+            if drone is None:
+                continue
+            ready_times.append(float(self._read_field(drone, "_ga_time", fallback) or fallback))
+        return max(ready_times) if ready_times else float(fallback)
+
+    def _recover_service_time(self) -> float:
+        if hasattr(self.evaluator, "_recover_time"):
+            return float(self.evaluator._recover_time())  # noqa: SLF001 - GA internals share service constants.
+        return 10.0
+
     def _collect_plan_metrics(
         self,
         truck_routes: dict[str, TruckRoute],
@@ -722,10 +786,13 @@ class GADecoder:
         )
 
     def _candidate_to_allocation_fragment(self, candidate: GACandidate) -> AllocationResult:
+        runtime_mode = candidate.mode
+        if candidate.mode == "B" and candidate.launch_node_id:
+            runtime_mode = "B_WAIT"
         return AllocationResult(
             order_id=candidate.order_id,
             vehicle_id=candidate.truck_id or candidate.launch_node_id or "DEPOT",
-            mode=candidate.mode,
+            mode=runtime_mode,
             distance=float(candidate.truck_distance or 0.0) + float(candidate.uav_distance or 0.0),
             feasible=candidate.feasible,
             reason=candidate.reason,

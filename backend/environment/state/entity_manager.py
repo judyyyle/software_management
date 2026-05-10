@@ -437,7 +437,14 @@ class EntityManager:
                         if launch_loc is None:
                             continue
 
-                        launch_tol_m = max(15.0, float(getattr(carrier, "speed", 0.0)) * 1.5)
+                        carrier_speed = float(getattr(carrier, "speed", 0.0))
+                        if str(getattr(drone, "_runtime_solver", "") or "").lower() == "ga_mmce":
+                            launch_tol_m = max(
+                                self.RECOVERY_PROXIMITY_BASE_M,
+                                carrier_speed * self.RECOVERY_PROXIMITY_SPEED_FACTOR,
+                            )
+                        else:
+                            launch_tol_m = max(15.0, carrier_speed * 1.5)
                         dist_to_launch = carrier.current_loc.distance_2d(launch_loc)
                         if dist_to_launch > launch_tol_m:
                             last_log_t = float(getattr(drone, "_last_launch_wait_log_time", -1e9))
@@ -488,7 +495,19 @@ class EntityManager:
                     if 0 < drone.current_waypoint_index <= len(drone.route_plan):
                         reached_wp = drone.route_plan[drone.current_waypoint_index - 1]
                     reached_target = reached_wp.target_entity_id if reached_wp else None
-                    
+
+                    runtime_handler = getattr(drone, "_runtime_action_handler", None)
+                    if callable(runtime_handler) and runtime_handler(
+                        entity_mgr=self,
+                        order_mgr=order_mgr,
+                        drone=drone,
+                        action=action,
+                        reached_wp=reached_wp,
+                        reached_target=reached_target,
+                        current_time=current_time,
+                    ):
+                        continue
+
                     # ── 处理航路点 action ──────────────────────────────────────
                     if action == WaypointAction.DOCK_DEPOT or action == WaypointAction.DOCK_TRUCK:
                         dock_target = reached_target or "-"
@@ -543,9 +562,12 @@ class EntityManager:
         while cursor < len(planned_stops):
             stop = planned_stops[cursor]
             node_type = stop.get("node_type", "")
-            # recovery 节点需要等到 departure_time（含等待时长）再执行回收；
-            # customer 节点按 arrival_time 即可判定送达完成。
-            if node_type == "recovery":
+            # recovery 需要等到 departure_time（含等待时长）再执行回收。
+            # GA-MMCE 的 station 节点承载放飞/回收服务，也按服务结束触发；
+            # customer 保持既有语义：到达即完成订单，随后继续执行服务停留。
+            if node_type == "recovery" or (
+                node_type == "station" and self._is_ga_truck_route(truck)
+            ):
                 event_time = float(stop.get("departure_time", stop.get("arrival_time", float("inf"))))
             else:
                 event_time = float(stop.get("arrival_time", float("inf")))
@@ -574,22 +596,32 @@ class EntityManager:
         truck._planned_route_cursor = cursor
 
     def _get_truck_wait_stop(self, truck: Truck, current_time: float) -> Optional[dict]:
-        """返回当前时刻卡车应等待的节点（customer/recovery），否则返回 None。"""
+        """返回当前时刻卡车应等待的节点；GA-MMCE 额外支持 station 服务停留。"""
         planned_stops = getattr(truck, "_planned_route_stops", None)
         if not planned_stops:
             return None
 
+        wait_node_types = {"customer", "recovery"}
+        if self._is_ga_truck_route(truck):
+            wait_node_types.add("station")
+
         for stop in planned_stops:
             node_type = stop.get("node_type", "")
-            if node_type not in {"customer", "recovery"}:
+            if node_type not in wait_node_types:
                 continue
             arrival = float(stop.get("arrival_time", float("inf")))
             departure = float(stop.get("departure_time", arrival))
+            if departure <= arrival + 1e-6:
+                continue
             if arrival <= current_time + 1e-6 < departure - 1e-6:
                 if not self._truck_is_near_stop(truck, stop):
                     continue
                 return stop
         return None
+
+    def _is_ga_truck_route(self, truck: Truck) -> bool:
+        """判断当前卡车计划是否来自 GA-MMCE，避免影响其它调度算法的站点语义。"""
+        return str(getattr(truck, "_planned_route_solver", "") or "").lower() == "ga_mmce"
 
     def _truck_is_near_stop(self, truck: Truck, stop: dict) -> bool:
         """判定卡车是否已接近停靠点，防止仅按时刻触发导致位置跳变。"""
@@ -653,6 +685,15 @@ class EntityManager:
             self._recharge_drone_to_full(drone, f"卡车 {truck.truck_id} 在站点 {station_id} 回收")
             if drone.drone_id not in truck.docked_drones:
                 truck.docked_drones.append(drone.drone_id)
+            runtime_recovery_handler = getattr(drone, "_runtime_recovery_handler", None)
+            if callable(runtime_recovery_handler):
+                runtime_recovery_handler(
+                    entity_mgr=self,
+                    truck=truck,
+                    station_id=station_id,
+                    drone=drone,
+                    current_time=current_time,
+                )
             recovered.append(drone.drone_id)
 
         if recovered:

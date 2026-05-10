@@ -248,8 +248,34 @@ const ORDER_STATUS_META: Record<string, { icon: string; cls: string; label: stri
   REJECTED:   { icon: '❌', cls: 'order-pin--rejected',   label: '已拒绝' },
 }
 
-function _orderIcon(status: string, priority?: string) {
+const DRONE_ASSIGNED_ORDER_META = {
+  icon: '🚀',
+  cls: 'order-pin--drone-assigned',
+  label: '无人机配送订单',
+}
+
+function _isDroneDeliveryMode(mode?: unknown): boolean {
+  const normalized = String(mode ?? '').trim().toUpperCase()
+  if (!normalized || normalized === '—') return false
+  return normalized === 'B'
+    || normalized === 'B_WAIT'
+    || normalized === 'B_DYNAMIC'
+    || normalized === 'C'
+    || normalized.startsWith('B_')
+    || normalized.startsWith('C_')
+    || normalized.startsWith('DRONE')
+}
+
+function _orderDisplayMeta(status: string, deliveryMode?: unknown) {
   const meta = ORDER_STATUS_META[status] ?? ORDER_STATUS_META['PENDING']
+  if (status === 'ASSIGNED' && _isDroneDeliveryMode(deliveryMode)) {
+    return DRONE_ASSIGNED_ORDER_META
+  }
+  return meta
+}
+
+function _orderIcon(status: string, priority?: string, deliveryMode?: unknown) {
+  const meta = _orderDisplayMeta(status, deliveryMode)
   const pClass = priority === 'URGENT' ? ' order-pin--urgent' : ''
   return L.divIcon({
     className: '',
@@ -350,11 +376,12 @@ function drawOrders() {
       : '—'
     const modeStr = order.assigned_mode ?? order.fulfillment_mode ?? '—'
     const vehicleStr = order.assigned_vehicle_id ?? '—'
+    const displayMeta = _orderDisplayMeta(status, modeStr)
 
-    const marker = L.marker([lat, lng], { icon: _orderIcon(status, priority), draggable: true })
+    const marker = L.marker([lat, lng], { icon: _orderIcon(status, priority, modeStr), draggable: true })
       .bindPopup(
         `<div class="fac-popup">
-          <div class="fac-popup__title order-popup__title">${meta.icon} 订单 ${order.order_id.slice(-6)}</div>
+          <div class="fac-popup__title order-popup__title">${displayMeta.icon} 订单 ${order.order_id.slice(-6)}</div>
           <div class="fac-popup__row"><span>状态</span><span>${meta.label}</span></div>
           <div class="fac-popup__row"><span>优先级</span><span>${pLabel}</span></div>
           <div class="fac-popup__row"><span>重量</span><span>${order.payload_weight.toFixed(2)} kg</span></div>
@@ -808,6 +835,7 @@ defineExpose({ setFacilities, updateTruck, updateDrone, addOrder, clearDynamic, 
 
 :deep(.order-pin--pending)    { background: #6d28d9; }
 :deep(.order-pin--assigned)   { background: #0369a1; }
+:deep(.order-pin--drone-assigned) { background: #0284c7; }
 :deep(.order-pin--pickedup)   { background: #0891b2; }
 :deep(.order-pin--delivering) { background: #0284c7; }
 :deep(.order-pin--completed)  { background: #16a34a; }
