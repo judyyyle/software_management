@@ -626,8 +626,17 @@ function updateDrone(droneId: string, lng: number, lat: number, status: string =
   }
 
   const drone = entityStore.drones.find(d => d.drone_id === droneId)
-  const name = drone?.drone_id || droneId
   const rtDrone = entityStore.rtDrones.find(d => d.drone_id === droneId)
+  const name = (rtDrone as any)?.name || (drone as any)?.name || drone?.drone_id || droneId
+  const batteryText = rtDrone?.battery_ratio !== undefined
+    ? `${(rtDrone.battery_ratio * 100).toFixed(0)}%`
+    : '—'
+  const popupContent = `<div class="fac-popup">
+    <div class="fac-popup__title">🚁 ${name}</div>
+    <div class="fac-popup__row"><span>状态</span><span>${status}</span></div>
+    <div class="fac-popup__row"><span>电量</span><span>${batteryText}</span></div>
+    <div class="fac-popup__row"><span>坐标</span><span>${lng.toFixed(5)}, ${lat.toFixed(5)}</span></div>
+  </div>`
   
   // 检查无人机是否在卡车上
   const isOnTruck = entityStore.rtTrucks.some(t => t.docked_drones?.includes(droneId))
@@ -638,6 +647,7 @@ function updateDrone(droneId: string, lng: number, lat: number, status: string =
     marker.setLatLng([lat, lng])
     marker.setIcon(_droneIcon(name, status))
     marker.setOpacity(displayOpacity)
+    marker.getPopup()?.setContent(popupContent)
     const el = marker.getElement()
     if (el) {
       el.style.pointerEvents = isOnTruck ? 'none' : 'auto'
@@ -645,12 +655,7 @@ function updateDrone(droneId: string, lng: number, lat: number, status: string =
   } else {
     const marker = L.marker([lat, lng], { icon: _droneIcon(name, status), opacity: displayOpacity })
       .bindPopup(
-        `<div class="fac-popup">
-          <div class="fac-popup__title">🚁 ${name}</div>
-          <div class="fac-popup__row"><span>状态</span><span>${status}</span></div>
-          <div class="fac-popup__row"><span>电量</span><span>${rtDrone?.battery_ratio !== undefined ? (rtDrone.battery_ratio * 100).toFixed(0) : '—'}%</span></div>
-          <div class="fac-popup__row"><span>坐标</span><span>${lng.toFixed(5)}, ${lat.toFixed(5)}</span></div>
-        </div>`,
+        popupContent,
         { maxWidth: 200, className: 'fac-popup-wrap' }
       )
       .addTo(droneGroup)
