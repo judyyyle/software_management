@@ -73,6 +73,29 @@ def make_single_b_seed_individual(
     return ind
 
 
+def make_combined_b_seed_individual(
+    order_ids: list[str],
+    b_seed_rendezvous_by_order: dict[str, tuple[str, dict[str, str]]],
+) -> Individual:
+    assignment = ["A"] * len(order_ids)
+    rvs = [None] * len(order_ids)
+    index_by_order = {order_id: idx for idx, order_id in enumerate(order_ids)}
+    for order_id, seed_data in b_seed_rendezvous_by_order.items():
+        idx = index_by_order.get(order_id)
+        if idx is None:
+            continue
+        b_gene, rv = seed_data
+        assignment[idx] = b_gene
+        rvs[idx] = dict(rv)
+    ind = Individual(
+        sequence=list(order_ids),
+        assignment=assignment,
+        rendezvous=rvs,
+    )
+    ind.validate()
+    return ind
+
+
 def make_truck_only_individual(order_ids: list[str]) -> Individual:
     ind = Individual(
         sequence=list(order_ids),
@@ -253,13 +276,27 @@ def initialize_population(
         )
 
     if b_seed_rendezvous_by_order:
+        valid_b_seeds = {
+            order_id: (b_gene, rv)
+            for order_id, (b_gene, rv) in b_seed_rendezvous_by_order.items()
+            if order_id in order_set and b_gene in gene_set
+        }
+        if valid_b_seeds:
+            population.append(
+                enforce_fixed_tail(
+                    make_combined_b_seed_individual(order_ids, valid_b_seeds),
+                    fixed_tail_order_ids,
+                    fixed_tail_gene_by_order,
+                )
+            )
+            if len(population) >= pop_size:
+                return population[:pop_size]
+
         for order_id in order_ids:
-            seed_data = b_seed_rendezvous_by_order.get(order_id)
+            seed_data = valid_b_seeds.get(order_id)
             if seed_data is None:
                 continue
             b_gene, rv = seed_data
-            if b_gene not in gene_set:
-                continue
             population.append(
                 enforce_fixed_tail(
                     make_single_b_seed_individual(order_ids, order_id, b_gene, rv),

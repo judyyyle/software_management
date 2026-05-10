@@ -3,11 +3,14 @@ from __future__ import annotations
 import copy
 import logging
 import math
+import os
+import pickle
 import random
 import time
 from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 from .adapters import (
@@ -29,6 +32,9 @@ from .population import enforce_fixed_tail, initialize_population
 logger = logging.getLogger(__name__)
 DEBUG_LOG_PATH = Path(__file__).resolve().parents[1] / "ga_mmce_debug_log"
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
+STATIC_PLAN_CACHE_SCHEMA = 1
+STATIC_PLAN_CACHE_ENV = "GA_MMCE_REUSE_STATIC_PLAN"
+STATIC_PLAN_CACHE_PATH_ENV = "GA_MMCE_STATIC_PLAN_CACHE_PATH"
 
 
 @dataclass
@@ -61,9 +67,18 @@ class GAMMCESolver:
         self._time_budget_hit: bool = False
         self._actual_generations: int = 0
         self._active_diagnostics_label: str = "static"
+        self._reuse_static_plan_cache_override: bool | None = None
 
         if self.config.random_seed is not None:
             random.seed(self.config.random_seed)
+
+    def set_static_plan_cache_reuse(self, enabled: bool | None) -> None:
+        """Enable/disable static plan cache reuse for the next GA static dispatch.
+
+        Passing None clears the request-level override and falls back to the
+        GA_MMCE_REUSE_STATIC_PLAN environment variable.
+        """
+        self._reuse_static_plan_cache_override = None if enabled is None else bool(enabled)
 
     def dispatch(
         self,
@@ -195,6 +210,16 @@ class GAMMCESolver:
             mode="dynamic" if "dynamic" in str(dispatch_type) or "incremental" in str(dispatch_type) else "static",
         )
         self._debug_run_start(state, context, dispatch_type)
+        if dispatch_type == "full" and self._static_plan_cache_reuse_enabled():
+            cached_plan = self._load_static_plan_cache(
+                state=state,
+                context=context,
+                started=started,
+                dispatch_type=dispatch_type,
+            )
+            if cached_plan is not None:
+                self._restore_runtime_config(previous_config, previous_evaluator_config, previous_decoder_config)
+                return cached_plan
 
         if not context.order_ids:
             plan = self._empty_plan(dispatch_type=dispatch_type)
@@ -368,6 +393,8 @@ class GAMMCESolver:
         self._annotate_plan(plan, context, started, dispatch_type)
         plan.summary["b_mode_final_diag"] = self._build_b_final_summary(best)
         self._attach_solve_result(plan, best, started)
+        if dispatch_type == "full":
+            self._save_static_plan_cache(state=state, context=context, plan=plan, best=best)
         self._write_evolution_outputs()
         self._debug_run_end(plan, best, context, started)
         self._restore_runtime_config(previous_config, previous_evaluator_config, previous_decoder_config)
@@ -650,6 +677,220 @@ class GAMMCESolver:
         self.evaluator.config = evaluator_config
         self.decoder.config = decoder_config
         self._active_time_budget_seconds = None
+
+    def _static_plan_cache_reuse_enabled(self) -> bool:
+        if self._reuse_static_plan_cache_override is not None:
+            return self._reuse_static_plan_cache_override
+        return self._truthy_env(os.environ.get(STATIC_PLAN_CACHE_ENV))
+
+    @staticmethod
+    def _truthy_env(value: Any) -> bool:
+        return str(value or "").strip().lower() in {"1", "true", "yes", "y", "on"}
+
+    def _static_plan_cache_path(self) -> Path:
+        raw = os.environ.get(STATIC_PLAN_CACHE_PATH_ENV, "logs/ga_static_plan_cache.pkl")
+        path = Path(raw)
+        if not path.is_absolute():
+            path = PROJECT_ROOT / path
+        return path
+
+    def _load_static_plan_cache(
+        self,
+        *,
+        state: Any,
+        context: Any,
+        started: float,
+        dispatch_type: str,
+    ) -> DispatchPlan | None:
+        path = self._static_plan_cache_path()
+        if not path.exists():
+            self._debug_write(f"static_plan_cache miss reason=file_not_found path={path}")
+            return None
+
+        expected_signature = self._static_plan_cache_signature(state, context)
+        try:
+            with path.open("rb") as fh:
+                payload = pickle.load(fh)
+        except Exception as exc:
+            logger.warning("[GA-MMCE] 静态计划缓存读取失败: %s", exc)
+            self._debug_write(f"static_plan_cache miss reason=load_failed error={exc}")
+            return None
+
+        if not isinstance(payload, dict) or payload.get("schema") != STATIC_PLAN_CACHE_SCHEMA:
+            self._debug_write("static_plan_cache miss reason=schema_mismatch")
+            return None
+        cached_signature = payload.get("signature")
+        if self._normalized_static_plan_cache_signature(cached_signature) != expected_signature:
+            mismatch = self._static_plan_cache_mismatch_reasons(
+                cached_signature,
+                expected_signature,
+            )
+            self._debug_write(
+                "static_plan_cache miss reason=signature_mismatch "
+                f"details={mismatch}"
+            )
+            return None
+
+        cached_plan = payload.get("plan")
+        if cached_plan is None:
+            self._debug_write("static_plan_cache miss reason=missing_plan")
+            return None
+
+        cached_best = copy.deepcopy(payload.get("best_individual"))
+        plan = copy.deepcopy(cached_plan)
+        self.last_best_individual = cached_best
+        self.last_best_decode_result = (
+            getattr(cached_best, "decoded_result", None)
+            if cached_best is not None
+            else None
+        )
+        if self.last_best_decode_result is None:
+            self.last_best_decode_result = SimpleNamespace(plan=plan)
+
+        self._actual_generations = 0
+        self._annotate_plan(plan, context, started, dispatch_type)
+        plan.summary["static_cache_reused"] = True
+        plan.summary["static_cache_path"] = str(path)
+        plan.summary["static_cache_saved_at"] = payload.get("saved_at")
+        self._attach_solve_result(plan, cached_best, started)
+        self._debug_write(
+            "static_plan_cache hit "
+            f"path={path} "
+            f"saved_at={payload.get('saved_at')} "
+            f"orders={len(context.order_ids)}"
+        )
+        logger.info("[GA-MMCE] 复用静态计划缓存: %s", path)
+        self._debug_run_end(plan, cached_best, context, started)
+        return plan
+
+    def _save_static_plan_cache(
+        self,
+        *,
+        state: Any,
+        context: Any,
+        plan: DispatchPlan,
+        best: Individual | None,
+    ) -> None:
+        if not getattr(plan, "allocations", None):
+            return
+
+        path = self._static_plan_cache_path()
+        payload = {
+            "schema": STATIC_PLAN_CACHE_SCHEMA,
+            "saved_at": time.time(),
+            "signature": self._static_plan_cache_signature(state, context),
+            "plan": copy.deepcopy(plan),
+            "best_individual": copy.deepcopy(best),
+        }
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with path.open("wb") as fh:
+                pickle.dump(payload, fh, protocol=pickle.HIGHEST_PROTOCOL)
+            self._debug_write(f"static_plan_cache saved path={path}")
+        except Exception as exc:
+            logger.warning("[GA-MMCE] 静态计划缓存写入失败: %s", exc)
+            self._debug_write(f"static_plan_cache save_failed path={path} error={exc}")
+
+    def _static_plan_cache_signature(self, state: Any, context: Any) -> dict[str, Any]:
+        mgr = getattr(state, "entity_mgr", None) or self.entity_mgr
+        orders = getattr(state, "orders", {}) or {}
+
+        def order_by_id(order_id: str) -> Any:
+            if isinstance(orders, dict):
+                return orders.get(order_id)
+            return None
+
+        order_sig = []
+        for order_id in context.order_ids:
+            order = order_by_id(order_id)
+            order_sig.append(
+                {
+                    "id": str(order_id),
+                    "payload_weight": self._rounded_number(self._field(order, "payload_weight", 0.0)),
+                    "deadline": self._rounded_number(self._field(order, "deadline", 0.0)),
+                    "delivery": self._loc_signature(self._field(order, "delivery_loc", None)),
+                }
+            )
+
+        return {
+            "scene_id": str(getattr(state, "scene_id", "") or ""),
+            "orders": order_sig,
+            "depots": self._host_signature(getattr(mgr, "depots", {}) or {}, context.depot_ids),
+            "stations": self._host_signature(getattr(mgr, "stations", {}) or {}, context.station_ids),
+            "trucks": self._truck_signature(getattr(mgr, "trucks", {}) or {}, context.truck_ids),
+            "truck_drone_ids": tuple(str(v) for v in context.truck_drone_ids),
+            "depot_drone_ids": tuple(str(v) for v in context.depot_drone_ids),
+            "all_drone_ids": tuple(str(v) for v in context.all_drone_ids),
+            "support_node_ids": tuple(str(v) for v in context.support_node_ids),
+        }
+
+    def _normalized_static_plan_cache_signature(self, signature: Any) -> Any:
+        if not isinstance(signature, dict):
+            return signature
+        normalized = dict(signature)
+        # Older caches included the current map viewport. That value changes
+        # with pan/zoom and does not affect an already decoded static plan.
+        normalized.pop("bbox", None)
+        return normalized
+
+    def _static_plan_cache_mismatch_reasons(
+        self,
+        cached_signature: Any,
+        expected_signature: dict[str, Any],
+    ) -> list[str]:
+        cached = self._normalized_static_plan_cache_signature(cached_signature)
+        if not isinstance(cached, dict):
+            return ["invalid_cached_signature"]
+        reasons: list[str] = []
+        for key, expected_value in expected_signature.items():
+            if cached.get(key) != expected_value:
+                reasons.append(str(key))
+        for key in cached:
+            if key not in expected_signature:
+                reasons.append(f"extra:{key}")
+        return reasons
+
+    def _host_signature(self, hosts: dict[str, Any], host_ids: list[str]) -> tuple[tuple[str, tuple[float, float, float]], ...]:
+        rows = []
+        for host_id in host_ids:
+            host = hosts.get(host_id)
+            rows.append((str(host_id), self._loc_signature(getattr(host, "location", None))))
+        return tuple(rows)
+
+    def _truck_signature(self, trucks: dict[str, Any], truck_ids: list[str]) -> tuple[tuple[str, tuple[float, float, float], float], ...]:
+        rows = []
+        for truck_id in truck_ids:
+            truck = trucks.get(truck_id)
+            rows.append(
+                (
+                    str(truck_id),
+                    self._loc_signature(getattr(truck, "current_loc", None)),
+                    self._rounded_number(getattr(truck, "speed", 0.0)),
+                )
+            )
+        return tuple(rows)
+
+    def _loc_signature(self, loc: Any) -> tuple[float, float, float]:
+        if loc is None:
+            return (0.0, 0.0, 0.0)
+        return (
+            self._rounded_number(getattr(loc, "x", 0.0)),
+            self._rounded_number(getattr(loc, "y", 0.0)),
+            self._rounded_number(getattr(loc, "z", 0.0)),
+        )
+
+    def _field(self, record: Any, field_name: str, default: Any = None) -> Any:
+        return self.evaluator._read_field(record, field_name, default)  # noqa: SLF001 - shared GA adapter helper.
+
+    @staticmethod
+    def _rounded_number(value: Any) -> float:
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            return 0.0
+        if not math.isfinite(number):
+            return 0.0
+        return round(number, 6)
 
     def _resolve_diagnostics_label(self, dispatch_type: str) -> str:
         configured = str(getattr(self.config, "diagnostics_label", "") or "").strip().lower()
