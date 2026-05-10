@@ -126,6 +126,7 @@ class DispatchDecisionEngine:
         # 调用求解器，传递 scene_id 以支持使用缓存的 OSM 数据
         plan = self.solver.dispatch(pending, current_time, bbox, scene_id=scene_id)
         plan.summary["solver"] = self.solver_name
+        self._normalize_plan_for_runtime(plan)
 
         if self.solver_name != "market":
             bad = [a.order_id for a in plan.allocations if a.mode == "B_DYNAMIC"]
@@ -188,6 +189,7 @@ class DispatchDecisionEngine:
         plan.summary["solver"] = self.solver_name
         plan.summary["dispatch_type"] = "incremental"
         plan.summary["new_orders"] = len(new_orders)
+        self._normalize_plan_for_runtime(plan)
 
         if self.solver_name != "market":
             bad = [a.order_id for a in plan.allocations if a.mode == "B_DYNAMIC"]
@@ -256,6 +258,7 @@ class DispatchDecisionEngine:
         plan.summary["dispatch_type"] = "dynamic_replan"
         plan.summary["replanned_assigned_orders"] = len(replannable_assigned)
         plan.summary["new_orders"] = len(new_orders)
+        self._normalize_plan_for_runtime(plan)
 
         if self.solver_name != "market":
             bad = [a.order_id for a in plan.allocations if a.mode == "B_DYNAMIC"]
@@ -276,6 +279,13 @@ class DispatchDecisionEngine:
             plan.summary.get("feasible", 0),
         )
         return plan
+
+    def _normalize_plan_for_runtime(self, plan: DispatchPlan) -> None:
+        if self.solver_name != "ga_mmce":
+            return
+        from solver.ga_mmce.runtime_adapter import normalize_ga_allocation_modes
+
+        normalize_ga_allocation_modes(plan)
 
     def _accumulate_plan_metrics(self, plan: DispatchPlan) -> None:
         """累计调度成本，用于运行时 KPI 展示。"""
@@ -418,6 +428,7 @@ class DispatchDecisionEngine:
                     }
                     for node in route.nodes
                 ]
+                truck._planned_route_solver = self.solver_name
                 truck._planned_route_cursor = 0
                 logger.info(
                     "[DispatchDecisionEngine] 已将路由应用至卡车 %s（%d 个关键节点，几何路径 %d 点）",
@@ -487,6 +498,7 @@ class DispatchDecisionEngine:
         """
         existing_stops: list[dict] = getattr(truck, "_planned_route_stops", None) or []
         cursor = int(getattr(truck, "_planned_route_cursor", 0))
+        truck._planned_route_solver = self.solver_name
 
         if not existing_stops:
             # 卡车尚未有路线（首次被增量调度命中），按全量模式设置
@@ -502,6 +514,7 @@ class DispatchDecisionEngine:
                     }
                     for n in new_route.nodes
                 ]
+                truck._planned_route_solver = self.solver_name
                 truck._planned_route_cursor = 0
                 logger.info(
                     "[DispatchDecisionEngine] 增量模式首次为卡车 %s 设置路由 (%d 节点)",
@@ -1078,6 +1091,17 @@ class DispatchDecisionEngine:
 
         增量安全：跳过正在飞行中的无人机，避免覆盖其当前路径和位置。
         """
+        if self.solver_name == "ga_mmce":
+            from solver.ga_mmce.runtime_adapter import apply_ga_mmce_runtime_plan
+
+            apply_ga_mmce_runtime_plan(
+                entity_mgr=self.entity_mgr,
+                order_mgr=self.order_mgr,
+                plan=plan,
+                current_time=current_time,
+            )
+            return
+
         for alloc in plan.allocations:
             if not alloc.feasible or alloc.mode == "A" or not alloc.drone_id:
                 continue
@@ -1246,6 +1270,16 @@ class DispatchDecisionEngine:
 
         将分配中的无人机路由转换为DroneRoute对象，包含完整的飞行路径坐标序列。
         """
+        if self.solver_name == "ga_mmce":
+            from solver.ga_mmce.runtime_adapter import build_ga_mmce_drone_routes
+
+            build_ga_mmce_drone_routes(
+                entity_mgr=self.entity_mgr,
+                order_mgr=self.order_mgr,
+                plan=plan,
+            )
+            return
+
         from solver.greedy_mmce import DroneRoute
 
         for alloc in plan.allocations:

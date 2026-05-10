@@ -256,7 +256,8 @@ def _distance_2d(pos_a: Any, pos_b: Any) -> float | None:
 
 
 def _is_at_depot(drone: Any, depot: Any) -> bool:
-    distance = _distance_2d(_read_field(drone, "current_loc"), _read_field(depot, "location"))
+    drone_pos = _read_field(drone, "_ga_position") or _read_field(drone, "current_loc")
+    distance = _distance_2d(drone_pos, _read_field(depot, "location"))
     if distance is None:
         return True
     return distance <= _DEPOT_LAUNCH_TOLERANCE_M
@@ -271,7 +272,7 @@ def extract_depot_drone_ids(state) -> list[str]:
     seen: set[str] = set()
     result: list[str] = []
 
-    independent_nodes = list(_as_values(_mapping(state, "depots"))) + list(_as_values(_mapping(state, "stations")))
+    independent_nodes = list(_as_values(_mapping(state, "depots")))
     for node in independent_nodes:
         idle_drones = list(_read_field(node, "_ga_idle_drones", []) or [])
         idle_drones.extend(_read_field(node, "idle_drones", []) or [])
