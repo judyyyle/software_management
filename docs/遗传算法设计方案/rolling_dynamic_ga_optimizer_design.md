@@ -124,9 +124,263 @@ reopt_window_size = 8
 
 ---
 
-## 2. 当前为什么慢，为什么容易退化为全 A
+## 2. 当前存在的主要问题
 
-### 2.1 只复用 previous_best，历史搜索空间丢失
+当前动态重规划已经具备“新单 + 可重排旧单 + 当前运行态资源快照”的机制，但它在运行时仍表现出计算阻塞、方案不稳定、A 模式偏置、局部区域服务不足和路线震荡等问题。
+
+### 2.1 动态订单触发同步大规模重规划，前端容易冻结
+
+当前 `reschedule_on_event()` 会在新单到达后同步完成一整套流程：
+
+```text
+推进状态
+  -> 订单分桶
+  -> 构造动态快照
+  -> 冻结资源
+  -> 构造 warm start
+  -> 调用 solver.solve()
+  -> fallback
+  -> 写日志
+```
+
+它是一个同步执行的完整重规划过程，不是轻量插入，也不是异步优化。因此前端卡住的本质链路是：
+
+```text
+动态订单到达
+  -> 后端同步构造快照 + 资源冻结 + GA 初始化 + 个体 decode + 物理评估
+  -> 仿真循环等待重规划返回
+  -> 前端表现为整体状态停顿、冻结、长时间无响应
+```
+
+当订单数较多、B/C 候选较多、站点较多、无人机较多时，初始种群评估本身就会消耗大量时间。此时还没真正进入有效进化，时间预算可能已经耗尽。
+
+### 2.2 当前不是局部修补，而是把较大订单池重新规划
+
+动态重规划并不只处理新单，而是会把 `new_orders` 和部分 `pending_orders` 放入重优化窗口，同时还会把剩余 pending 作为 `frozen_future` 一起纳入 `planning_orders`。
+
+当前 `planning_orders` 由以下两部分构造：
+
+```text
+reoptimized_ids + frozen_future_ids
+```
+
+这会导致一个问题：即使部分订单理论上只是“尾部保留”，它们仍然出现在规划问题中，需要参与个体结构修复、fixed tail 检查、decode 或可行性验证。也就是说，当前动态重规划的实际计算范围仍然偏大。
+
+### 2.3 历史计算结果复用不足，每次重规划仍像半重新开始
+
+当前动态入口主要复用：
+
+```text
+previous_best = last_best_individual
+previous_plan = last_best_decode_result.plan
+```
+
+也就是上一轮最优个体和最优解码结果。
+
+问题在于，上一轮 GA 中其实有大量有价值的信息没有被保存和复用，例如：
+
+```text
+上一轮 top-K 种群
+B 模式较多的个体
+C 模式较多的个体
+等待时间较低的个体
+延迟惩罚较低的个体
+优秀 rendezvous 组合
+历史 candidate 评估结果
+历史距离/能耗计算结果
+```
+
+现在只复用 `previous_best`，信息量太少。新单一来，很多 B/C 结构、无人机协同结构、站点回收结构又要重新随机生成、重新评估，因此重复计算严重。
+
+### 2.4 B/C 候选评估成本高，但缺少缓存
+
+`PhysicalEvaluator` 中 A/B/C 模式评估会反复读取 `_ga_position`、`_ga_time`、`_ga_energy`、无人机 host 状态，并计算卡车路程、无人机飞行距离、能耗、等待时间、延迟惩罚等。
+
+B 模式尤其复杂，需要判断：
+
+```text
+无人机是否在车上
+launch / recover 是否合法
+payload 是否超载
+电量是否足够
+卡车和无人机是否同步
+等待是否超过阈值
+```
+
+动态重规划中经常会重复计算类似组合：
+
+```text
+订单 O1 + UAV-TEST-03 + launch STA-01 + recover STA-04
+订单 O2 + UAV-TEST-05 + launch DEPOT + recover STA-02
+卡车当前位置 -> launch 点
+launch 点 -> recover 点
+UAV launch -> customer -> recover
+```
+
+这些组合在相邻两次重规划中变化可能不大，但当前没有 `candidate cache` / `distance cache`，因此每次都会重新算，导致初始 population decode 很慢。
+
+### 2.5 时间预算太紧时，GA 没有足够机会进化
+
+当前 `population.py` 虽然已经支持 warm start、truck-only seed、OBL seed、B seed 和 balanced initialization，但如果时间预算很紧，GA 可能只来得及完成初始种群评估，没有时间进行足够的交叉、变异和选择。
+
+这时 A 模式天然占优势：
+
+```text
+A 模式：卡车直送，通常最容易可行
+B 模式：需要无人机在车上 + payload 可行 + 电量可行 + launch/recover 合法 + 同步等待可接受
+C 模式：需要无人机在独立节点 + 回收点合法 + 电量可行
+```
+
+因此，在 `actual_generations = 0` 或 `actual_generations = 1` 的情况下，B/C 还没来得及通过变异和选择形成优势结构，最终结果很容易被 A 模式占据。
+
+这不是简单的“B 不可行”，而是：
+
+```text
+B/C 评估更复杂、更难随机命中、更需要进化搜索；
+但动态预算太短，导致搜索没展开。
+```
+
+### 2.6 卡车直送模式过多，空地协同潜力没有充分利用
+
+如果明明可以使用 B 空地协同，但结果很多是卡车直送 A 模式，说明当前 GA 的动态搜索存在明显的模式利用不足问题。
+
+可能原因包括：
+
+```text
+1. 初始种群中 A 个体更稳定、更容易可行。
+2. B/C 候选虽然可行，但还没经过足够进化就被时间截断。
+3. B/C 的等待惩罚、同步惩罚、回收绕行成本较高，导致局部评分不占优。
+4. B seed 数量有限，不能覆盖足够多订单和 rendezvous 组合。
+5. 没有保存上一轮 B/C-heavy 个体，导致每次重规划都重新寻找协同结构。
+```
+
+当前代码中虽然有 `make_combined_b_seed_individual()` 和 `make_single_b_seed_individual()`，但这些只是初始化层面的补救，并没有形成长期积累的 B/C 搜索经验。
+
+### 2.7 每次重规划可能改变卡车后续路线，导致路线震荡
+
+当前动态重规划是滚动重优化，理论上会根据当前订单池重新选择较优路径。但如果没有路线稳定性约束或局部连续性惩罚，每次新单到来后，卡车可能被新的全局方案牵引到另一个区域。
+
+当前优化目标更关注：
+
+```text
+当前个体总成本最低
+当前订单池整体可行
+当前模式组合成本较低
+```
+
+但没有显式强调：
+
+```text
+卡车不要频繁改变方向
+卡车优先清理当前区域附近订单
+卡车不要因为一个远处订单立刻离开局部高密度区域
+已经规划但未执行的短期路线尽量保持稳定
+```
+
+所以可能出现：
+
+```text
+卡车当前区域还有很多订单
+但新一轮重规划后卡车离开当前区域
+附近订单被延后
+部分订单超时
+卡车后面又绕回来，产生绕路
+```
+
+这属于典型的滚动优化路线震荡问题。
+
+### 2.8 当前区域订单密度没有被显式建模
+
+当前希望卡车/无人机在当前区域附近先完成一批订单，但 GA 的目标函数和候选评估更像是逐订单、逐候选地计算代价，而不是明确建模：
+
+```text
+当前区域订单密度
+局部订单簇
+卡车当前位置附近未完成订单
+无人机从当前车载状态可覆盖的局部订单集合
+区域内订单即将超时风险
+```
+
+因此，算法可能看到某个远处订单在局部评分上更优，或者某个 recover 点使当前个体总成本暂时更低，就让卡车离开当前区域。
+
+这会导致两个后果：
+
+```text
+局部订单没有被连续服务；
+卡车路径呈现跳跃式重规划，而不是区域内逐步清扫。
+```
+
+### 2.9 B 模式 launch/recover 决策可能把卡车牵引到不合适的回收点
+
+B 模式评估中，卡车需要从当前位置到 launch 点，再到 recover 点；候选的最终 truck node 也会变成 recover node。
+
+这意味着，如果 GA 选择了一个远离当前订单簇的 recover station，卡车就会被迫前往该回收点。即使当前区域还有很多订单，卡车也可能因为 B 模式回收约束被拉走。
+
+隐含问题是：
+
+```text
+B 模式虽然实现了空地协同，
+但如果 rendezvous 选择不好，
+反而会诱导卡车绕路或离开当前服务区域。
+```
+
+这不是 B 模式本身的问题，而是 B 模式需要更强的 rendezvous 约束，例如：
+
+```text
+回收点不能明显偏离当前区域；
+回收点应位于卡车未来局部路径上；
+B 模式收益必须覆盖卡车绕行成本；
+优先选择能服务当前订单簇的 launch/recover。
+```
+
+### 2.10 订单超时说明 deadline / lateness 在动态阶段优先级可能不够强
+
+`PhysicalEvaluator` 中候选会计算 `lateness`，并在评分中加入 delay penalty。但如果动态运行中仍观察到订单超时，说明可能存在：
+
+```text
+1. deadline 惩罚权重不够强。
+2. 即将超时订单没有被强制提前。
+3. 当前区域订单没有按紧迫性聚类处理。
+4. 重规划只看整体成本，牺牲了部分订单的时效性。
+5. 卡车频繁被新方案牵引，导致原本快要服务的订单被推迟。
+```
+
+也就是说，超时不一定是路线不可行，而是动态目标函数没有足够强调：
+
+```text
+即将超时订单优先级
+当前区域订单优先级
+已接近服务完成的订单不要被反复推后
+```
+
+### 2.11 Runtime 层可以执行多段无人机任务，但频繁重规划会扰动任务队列
+
+`runtime_adapter.py` 已经支持同一无人机多个 GA segment 排队执行，并且会把 GA plan 转换为仿真可执行的 waypoint 队列。
+
+但重规划频繁时会出现风险：
+
+```text
+新 plan 应用后，尚未开始执行的无人机 route 可能被替换或清理；
+正在执行的无人机会被跳过或锁定；
+未飞但已经规划好的任务队列可能发生变化。
+```
+
+这会让系统表现为：
+
+```text
+计划不断变；
+卡车路线不断变；
+无人机任务队列不断重排；
+局部订单迟迟没有稳定执行。
+```
+
+因此当前不仅是求解慢，还有一个计划稳定性不足的问题。
+
+---
+
+## 3. 根因总结：为什么慢，为什么容易退化为全 A
+
+### 3.1 只复用 previous_best，历史搜索空间丢失
 
 当前动态复用主要是：
 
@@ -149,7 +403,7 @@ B/C 多但总成本略高的个体
 
 动态订单一来，这些结构又要靠随机初始化或变异重新碰出来。
 
-### 2.2 初始评估成本太高，generation loop 可能还没开始就超时
+### 3.2 初始评估成本太高，generation loop 可能还没开始就超时
 
 `solver.solve()` 当前顺序是：
 
@@ -176,7 +430,7 @@ best = 初始种群中的某个个体
 
 如果初始 best 偏 A，输出就会是全 A 或 A-heavy。
 
-### 2.3 候选和距离重复计算严重
+### 3.3 候选和距离重复计算严重
 
 `physical_evaluator.py` 的 A/B/C 候选评估会反复计算：
 
@@ -195,7 +449,7 @@ station/recovery soft penalty
 
 ---
 
-## 3. 目标架构
+## 4. 目标架构
 
 目标是把动态 GA 改成以下结构：
 
@@ -230,9 +484,9 @@ P5：增加 incremental decode / prefix trace
 
 ---
 
-## 4. 第一阶段：动态 Archive
+## 5. 第一阶段：动态 Archive
 
-### 4.1 新增文件
+### 5.1 新增文件
 
 建议新增：
 
@@ -249,7 +503,7 @@ backend/solver/ga_mmce/archive.py
 4. 为 dynamic_rescheduler 提供 archive seeds。
 ```
 
-### 4.2 ArchiveEntry 字段
+### 5.2 ArchiveEntry 字段
 
 建议结构：
 
@@ -274,7 +528,7 @@ ArchiveEntry
 
 `order_signature` 和 `resource_signature` 暂时可以用于诊断；第一阶段不必严格作为复用门槛，因为动态适配会再次校验 gene_pool 和 fixed tail。
 
-### 4.3 Archive 修剪策略
+### 5.3 Archive 修剪策略
 
 不能只保留 top fitness，否则 B/C 结构仍然可能被 A-heavy 个体挤掉。建议分桶保留：
 
@@ -298,7 +552,7 @@ ArchiveEntry
 )
 ```
 
-### 4.4 修改 solver.py
+### 5.4 修改 solver.py
 
 在 `GAMMCESolver.__init__()` 增加：
 
@@ -325,7 +579,7 @@ _update_dynamic_archive(population, source, generation, event_time)
 
 只在 `dispatch_type == "dynamic_replan"` 或 anytime 优化时更新。
 
-### 4.5 修改 dynamic_rescheduler.py
+### 5.5 修改 dynamic_rescheduler.py
 
 当前 warm start 只有：
 
@@ -355,7 +609,7 @@ repair_rendezvous_against_current_nodes()
 merge_warm_starts()
 ```
 
-### 4.6 Archive 个体适配规则
+### 5.6 Archive 个体适配规则
 
 历史个体不能直接放入当前 population，必须适配：
 
@@ -382,9 +636,9 @@ merge_warm_starts()
 
 ---
 
-## 5. 第二阶段：Fast Incumbent
+## 6. 第二阶段：Fast Incumbent
 
-### 5.1 目标
+### 6.1 目标
 
 动态触发时不要先赌完整 GA。应先用历史 seeds 快速评估出一个可执行 plan：
 
@@ -397,7 +651,7 @@ archive seeds + previous_best seeds + combined B seed
 
 这样即使 `solver.solve()` 里 `actual_generations = 0`，也可以有一个明确的历史 incumbent 作为兜底。
 
-### 5.2 修改 dynamic_rescheduler.py
+### 6.2 修改 dynamic_rescheduler.py
 
 在调用 `solver.solve()` 前增加：
 
@@ -422,7 +676,7 @@ fast_plan = _fast_incumbent_plan(
 
 更理想的第二步是扩展 `solver.solve(..., incumbent_plan=fast_plan)`，让 solver 内部把 incumbent 作为 best-so-far。
 
-### 5.3 Fast Incumbent 评价范围
+### 6.3 Fast Incumbent 评价范围
 
 不要评估太多，否则会吃掉动态预算。建议：
 
@@ -443,15 +697,15 @@ fast_incumbent_budget_seconds = 0.2 ~ 0.5
 
 ---
 
-## 6. 第三阶段：Distance Cache
+## 7. 第三阶段：Distance Cache
 
-### 6.1 修改文件
+### 7.1 修改文件
 
 ```text
 backend/solver/ga_mmce/physical_evaluator.py
 ```
 
-### 6.2 缓存对象挂载位置
+### 7.2 缓存对象挂载位置
 
 不要挂在每次新建的 evaluator 临时局部上。推荐挂到 solver 长生命周期对象之一：
 
@@ -462,7 +716,7 @@ solver.greedy_helper._ga_candidate_cache
 
 当前 `PhysicalEvaluator` 已经持有 `greedy_helper`，因此可以在 evaluator 初始化时确保缓存存在。
 
-### 6.3 缓存内容
+### 7.3 缓存内容
 
 优先缓存：
 
@@ -475,7 +729,7 @@ flight energy: greedy._flight_energy(drone, pos_a, pos_b, payload)
 nearest support node lookup
 ```
 
-### 6.4 key 设计
+### 7.4 key 设计
 
 距离缓存可以用位置 bucket：
 
@@ -497,9 +751,9 @@ payload_bucket_kg = 0.1
 
 ---
 
-## 7. 第四阶段：Candidate Cache
+## 8. 第四阶段：Candidate Cache
 
-### 7.1 修改文件
+### 8.1 修改文件
 
 ```text
 backend/solver/ga_mmce/physical_evaluator.py
@@ -523,7 +777,7 @@ _evaluate_fixed_mode_c_uncached()
 
 外层先查 cache，miss 再调用 uncached。
 
-### 7.2 candidate key 必须包含动态状态
+### 8.2 candidate key 必须包含动态状态
 
 不能只用：
 
@@ -563,7 +817,7 @@ config_sig:
   weight_energy / weight_delay / weight_waiting
 ```
 
-### 7.3 复用策略
+### 8.3 复用策略
 
 Candidate cache 有近似风险，建议分层使用：
 
@@ -575,9 +829,9 @@ Candidate cache 有近似风险，建议分层使用：
 
 ---
 
-## 8. 第五阶段：population.py 动态种群配比
+## 9. 第五阶段：population.py 动态种群配比
 
-### 8.1 当前逻辑
+### 9.1 当前逻辑
 
 `initialize_population()` 当前顺序：
 
@@ -594,7 +848,7 @@ random
 
 这个基础很好，但动态场景应让 archive/warm start 占主要比例，而不是让随机个体和 truck-only seed 占太多预算。
 
-### 8.2 新增配置
+### 9.2 新增配置
 
 在 `GAConfig` 和 `DYNAMIC_GA_CONFIG` 中新增：
 
@@ -609,7 +863,7 @@ dynamic_random_seed_ratio = 0.20
 dynamic_force_combined_b_seed = True
 ```
 
-### 8.3 动态初始化策略
+### 9.3 动态初始化策略
 
 当 `context.mode == "dynamic"` 或 `dispatch_type == "dynamic_replan"` 时：
 
@@ -629,9 +883,9 @@ population_size = 30
 
 ---
 
-## 9. 第六阶段：Time-Sliced Anytime GA
+## 10. 第六阶段：Time-Sliced Anytime GA
 
-### 9.1 不建议第一版上后台线程
+### 10.1 不建议第一版上后台线程
 
 真实后台线程会和仿真状态、实体 route、runtime adapter 竞争可变对象，容易出现状态污染。第一版推荐单线程 time-sliced：
 
@@ -643,7 +897,7 @@ population_size = 30
       solver.improve_archive_slice(snapshot, budget=0.03s ~ 0.1s)
 ```
 
-### 9.2 新增 solver 方法
+### 10.2 新增 solver 方法
 
 在 `backend/solver/ga_mmce/solver.py` 新增：
 
@@ -662,7 +916,7 @@ improve_archive_slice(state, config=None, time_budget_seconds=0.05)
 6. 只更新 dynamic_archive，不应用 runtime plan。
 ```
 
-### 9.3 外层调用位置
+### 10.3 外层调用位置
 
 优先考虑：
 
@@ -687,11 +941,11 @@ backend/solver/decision_engine.py
 
 ---
 
-## 10. 第七阶段：Incremental Decode / Prefix Trace
+## 11. 第七阶段：Incremental Decode / Prefix Trace
 
 这是中长期优化，收益大但改动也最大。
 
-### 10.1 新增 DecodeTrace
+### 11.1 新增 DecodeTrace
 
 建议在 `decoder.py` 或新文件 `decode_trace.py` 中定义：
 
@@ -712,7 +966,7 @@ DecodeTrace
 individual._ga_decode_trace
 ```
 
-### 10.2 Dirty index
+### 11.2 Dirty index
 
 当 child 来自 parent mutation/crossover 时，计算最早变化位置：
 
@@ -725,7 +979,7 @@ first index where:
 
 如果 `dirty_idx > 0` 且 prefix trace 仍匹配，则从 `dirty_idx - 1` 的状态继续 decode，只重算后缀。
 
-### 10.3 限制
+### 11.3 限制
 
 B/C 会改变无人机 host、energy、waiting station、truck timing，所以 prefix trace 只能在以下条件下复用：
 
@@ -740,7 +994,7 @@ B/C 会改变无人机 host、energy、waiting station、truck timing，所以 p
 
 ---
 
-## 11. Runtime 安全应用规则
+## 12. Runtime 安全应用规则
 
 如果后续 anytime GA 找到了更优 plan，不建议立刻覆盖 runtime route。建议只在安全切换点应用：
 
@@ -776,7 +1030,7 @@ Runtime apply 时检查 generation，防止旧 plan 覆盖新 plan。
 
 ---
 
-## 12. 配置新增建议
+## 13. 配置新增建议
 
 在 `backend/solver/ga_mmce/config.py` 中扩展 `GAConfig` 和 `DYNAMIC_GA_CONFIG`：
 
@@ -819,9 +1073,9 @@ dynamic_force_combined_b_seed = True
 
 ---
 
-## 13. 文件级修改清单
+## 14. 文件级修改清单
 
-### 13.1 新增文件
+### 14.1 新增文件
 
 ```text
 backend/solver/ga_mmce/archive.py
@@ -844,7 +1098,7 @@ backend/solver/ga_mmce/decode_trace.py
 
 第一版可以先把 LRU cache 放在 `physical_evaluator.py` 内，稳定后再抽出。
 
-### 13.2 修改 solver.py
+### 14.2 修改 solver.py
 
 ```text
 1. __init__ 增加 dynamic_archive / last_population。
@@ -856,7 +1110,7 @@ backend/solver/ga_mmce/decode_trace.py
 7. 可选：solve() 支持 incumbent_plan / incumbent_individual。
 ```
 
-### 13.3 修改 dynamic_rescheduler.py
+### 14.3 修改 dynamic_rescheduler.py
 
 ```text
 1. 在 previous_best warm start 前后加入 archive warm starts。
@@ -868,7 +1122,7 @@ backend/solver/ga_mmce/decode_trace.py
 7. summary/CSV 增加 archive/fast/cache 诊断字段。
 ```
 
-### 13.4 修改 population.py
+### 14.4 修改 population.py
 
 ```text
 1. 支持 dynamic_warm_start_target_ratio。
@@ -877,7 +1131,7 @@ backend/solver/ga_mmce/decode_trace.py
 4. 控制 truck-only / random seed 比例。
 ```
 
-### 13.5 修改 physical_evaluator.py
+### 14.5 修改 physical_evaluator.py
 
 ```text
 1. 增加 distance cache。
@@ -887,11 +1141,11 @@ backend/solver/ga_mmce/decode_trace.py
 5. 增加 cache hit/miss 诊断。
 ```
 
-### 13.6 修改 config.py
+### 14.6 修改 config.py
 
 增加 archive、fast incumbent、cache、anytime、dynamic population mix 配置字段。
 
-### 13.7 修改 sim_engine.py 或 decision_engine.py
+### 14.7 修改 sim_engine.py 或 decision_engine.py
 
 ```text
 1. 在无新单、无 dispatch 应用时调用 improve_archive_slice()。
@@ -899,7 +1153,7 @@ backend/solver/ga_mmce/decode_trace.py
 3. 不直接应用 anytime plan，只更新 archive。
 ```
 
-### 13.8 修改 runtime_adapter.py
+### 14.8 修改 runtime_adapter.py
 
 第一阶段不必改。后续若 anytime plan 要自动替换 runtime route，需要加：
 
@@ -911,7 +1165,7 @@ safe switch point 检查
 
 ---
 
-## 14. 诊断字段建议
+## 15. 诊断字段建议
 
 为确认滚动优化是否生效，建议在 GA summary 和 debug log 加：
 
@@ -957,9 +1211,9 @@ plan.summary
 
 ---
 
-## 15. 验证计划
+## 16. 验证计划
 
-### 15.1 单元级
+### 16.1 单元级
 
 ```text
 1. archive 去重和多桶保留。
@@ -969,7 +1223,7 @@ plan.summary
 5. candidate cache 不跨错误 host/energy 状态复用。
 ```
 
-### 15.2 脚本级
+### 16.2 脚本级
 
 继续使用：
 
@@ -985,7 +1239,7 @@ actual_generations = 0 时仍能有 B/C 或至少有 archive seed 参与
 time_budget_hit = True 时 final plan 仍来自 fast incumbent 或 archive seed
 ```
 
-### 15.3 日志级
+### 16.3 日志级
 
 检查：
 
@@ -997,7 +1251,7 @@ candidate_cache_hit 随多次动态重规划上升
 distance_cache_hit 随多次动态重规划上升
 ```
 
-### 15.4 回归风险
+### 16.4 回归风险
 
 重点防：
 
@@ -1011,7 +1265,7 @@ distance_cache_hit 随多次动态重规划上升
 
 ---
 
-## 16. 推荐实施顺序
+## 17. 推荐实施顺序
 
 ### Step 1：Archive 复用
 
@@ -1107,7 +1361,7 @@ archive.py
 
 ---
 
-## 17. 最小可落地版本
+## 18. 最小可落地版本
 
 如果只做一版最小但有效的改造，建议范围是：
 
@@ -1128,4 +1382,3 @@ actual_generations = 0 不再天然等价于全 A。
 ```
 
 随后再做 distance cache 和 candidate cache，用于解决计算成本问题。
-
