@@ -512,8 +512,40 @@ class CandidateBuilder:
         battery_after_delivery: float,
     ) -> dict[str, Any] | None:
         safe_margin = self._safe_margin_j_by_drone[drone_view.drone_id]
-        scored_hosts: list[tuple[float, float, float, float, str, str]] = []
+        depot_nodes = [
+            node_state
+            for node_state in runtime_state.node_states.values()
+            if str(node_state.node_type) == "depot"
+        ]
+        depot_nodes.sort(key=lambda item: str(item.node_id))
+        if depot_nodes:
+            depot_node = depot_nodes[0]
+            if _can_reach(
+                drone_view=drone_view,
+                from_pos=deliver_pos,
+                to_pos=depot_node.position,
+                payload=0.0,
+                safe_margin=safe_margin,
+                battery_current=battery_after_delivery,
+            ):
+                fly_time = _estimate_flight_time(
+                    drone_view=drone_view,
+                    from_pos=deliver_pos,
+                    to_pos=depot_node.position,
+                )
+                return {
+                    "score": float(t_deliver_finish + fly_time),
+                    "queue_time_est": 0.0,
+                    "host_type": "depot",
+                }
+
+        if not depot_nodes:
+            return None
+        depot_node = depot_nodes[0]
+        scored_hosts: list[tuple[float, float, float, str, str]] = []
         for node_state in runtime_state.node_states.values():
+            if str(node_state.node_type) != "station":
+                continue
             if not _can_reach(
                 drone_view=drone_view,
                 from_pos=deliver_pos,
@@ -523,21 +555,34 @@ class CandidateBuilder:
                 battery_current=battery_after_delivery,
             ):
                 continue
+            if not _can_reach(
+                drone_view=drone_view,
+                from_pos=node_state.position,
+                to_pos=depot_node.position,
+                payload=0.0,
+                safe_margin=safe_margin,
+                battery_current=float(drone_view.battery_max),
+            ):
+                continue
 
             fly_time = _estimate_flight_time(
                 drone_view=drone_view,
                 from_pos=deliver_pos,
                 to_pos=node_state.position,
             )
+            depot_fly_time = _estimate_flight_time(
+                drone_view=drone_view,
+                from_pos=node_state.position,
+                to_pos=depot_node.position,
+            )
             queue_time_est = _predicted_queue_time_est(node_state)
             service_time = float(node_state.swap_time)
-            score = t_deliver_finish + fly_time + queue_time_est + service_time
+            score = t_deliver_finish + fly_time + queue_time_est + service_time + depot_fly_time
             scored_hosts.append(
                 (
+                    deliver_pos.distance_2d(node_state.position),
                     score,
-                    fly_time,
                     queue_time_est,
-                    service_time,
                     str(node_state.node_id),
                     str(node_state.node_type),
                 )
@@ -547,7 +592,7 @@ class CandidateBuilder:
             return None
 
         scored_hosts.sort(key=lambda item: item[:-1])
-        score, _fly_time, queue_time_est, _service_time, _node_id, host_type = scored_hosts[0]
+        _distance, score, queue_time_est, _node_id, host_type = scored_hosts[0]
         return {
             "score": float(score),
             "queue_time_est": float(queue_time_est),

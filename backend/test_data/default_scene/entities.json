@@ -124,20 +124,20 @@
     {
       "drone_id": "UAV-TEST-02",
       "drone_type": "LightDrone",
-      "home_id": "DEP-TEST-01",
-      "home_type": "DEPOT"
+      "home_id": "TRK-TEST-01",
+      "home_type": "TRUCK"
     },
     {
       "drone_id": "UAV-TEST-03",
       "drone_type": "LightDrone",
-      "home_id": "DEP-TEST-01",
-      "home_type": "DEPOT"
+      "home_id": "TRK-TEST-01",
+      "home_type": "TRUCK"
     },
     {
       "drone_id": "UAV-TEST-04",
       "drone_type": "LightDrone",
-      "home_id": "DEP-TEST-01",
-      "home_type": "DEPOT"
+      "home_id": "TRK-TEST-01",
+      "home_type": "TRUCK"
     },
     {
       "drone_id": "UAV-TEST-05",
@@ -172,14 +172,14 @@
     {
       "drone_id": "UAV-TEST-10",
       "drone_type": "HeavyDrone",
-      "home_id": "DEP-TEST-01",
-      "home_type": "DEPOT"
+      "home_id": "TRK-TEST-01",
+      "home_type": "TRUCK"
     },
     {
       "drone_id": "UAV-TEST-11",
       "drone_type": "HeavyDrone",
-      "home_id": "DEP-TEST-01",
-      "home_type": "DEPOT"
+      "home_id": "TRK-TEST-01",
+      "home_type": "TRUCK"
     },
     {
       "drone_id": "UAV-TEST-12",
