@@ -12,7 +12,7 @@ HiveLogix — Phase 5c 训练环境适配器。
 本文件当前实现到 Phase 5c：
   - 完整 action_mask：mode C 候选按时序/能量精细过滤
   - 完整 post_delivery_revalidation：送达后对 mode C 原选回收点做三条件复核
-  - mode B 返程宿主使用确定性 score 规则选择
+  - mode B 优先返仓；电量不足返仓时先到可达 station 补能再自动返仓
   - reservation 状态机与 timeout 触发 fallback
   - 完整 per-dt reward：T_overdue / T_wait / T_queue / T_fallback
   - WAIT 动作的 T_idle 一次性精确结算
@@ -393,6 +393,8 @@ class TrainingEnvAdapter:
         self._fallback_leg: dict[DroneId, FallbackLeg] = {}
         # 记录当前订单对应的 dispatch 承诺，供 delivered 后执行层继续转移。
         self._dispatch_commit: dict[DroneId, DispatchCommit] = {}
+        # Mode B 在 station 补能后必须继续返仓；key 为无人机，value 为目标 depot_id。
+        self._mode_b_pending_depot_return: dict[DroneId, NodeId] = {}
         self._reservations: dict[DroneId, ReservationState] = {}
         self._reservation_count: dict[NodeId, int] = {}
         # 车载充换电完成时刻；到点后 charging_on_truck -> riding_with_truck。
@@ -511,6 +513,7 @@ class TrainingEnvAdapter:
         self._delivery_service_legs.clear()
         self._fallback_leg.clear()
         self._dispatch_commit.clear()
+        self._mode_b_pending_depot_return.clear()
         self._reservations.clear()
         self._reservation_count.clear()
         self._truck_charge_until.clear()
@@ -1075,6 +1078,16 @@ class TrainingEnvAdapter:
             entry = self._build_active_drone_path_entry(drone_id=drone_id, leg=leg, t_now=t_now)
             if entry is not None:
                 drone_paths.append(entry)
+        for drone_id, depot_id in sorted(self._mode_b_pending_depot_return.items()):
+            if drone_id in self._flight_legs:
+                continue
+            entry = self._build_pending_mode_b_depot_path_entry(
+                drone_id=drone_id,
+                depot_id=depot_id,
+                t_now=t_now,
+            )
+            if entry is not None:
+                drone_paths.append(entry)
 
         return {
             "trucks": truck_paths,
@@ -1171,7 +1184,10 @@ class TrainingEnvAdapter:
             )
             current_pos = leg.start_pos.interpolate(leg.target_pos, ratio)
 
-        remaining_points = (_clone_position(current_pos), _clone_position(leg.target_pos))
+        tail_points = tuple(_clone_position(pos) for pos in leg.path_points[1:])
+        if not tail_points:
+            tail_points = (_clone_position(leg.target_pos),)
+        remaining_points = (_clone_position(current_pos),) + tail_points
         return {
             "entity_id": drone_id,
             "route_version": int(leg.route_version),
@@ -1185,6 +1201,42 @@ class TrainingEnvAdapter:
             "order_id": leg.order_id,
             "distance_m": float(_polyline_distance_2d(remaining_points)),
             "path_utm": [_position_to_payload(pos) for pos in remaining_points],
+        }
+
+    def _build_pending_mode_b_depot_path_entry(
+        self,
+        *,
+        drone_id: str,
+        depot_id: str,
+        t_now: float,
+    ) -> dict[str, Any] | None:
+        """Mode B station 补能等待期间，继续暴露后续返仓折线。"""
+        state = self._drone_state.get(drone_id)
+        if state not in {
+            TrainingDroneState.QUEUEING_AT_HOST,
+            TrainingDroneState.CHARGING_OR_SWAP,
+        }:
+            return None
+        entity_mgr = self._require_entity_manager()
+        drone = entity_mgr.drones.get(drone_id)
+        depot = entity_mgr.depots.get(depot_id)
+        if drone is None or depot is None:
+            return None
+        depot_pos = _clone_position(depot.get_location(t_now))
+        path_points = (_clone_position(drone.current_loc), depot_pos)
+        return {
+            "entity_id": drone_id,
+            "route_version": int(self._drone_path_version.get(drone_id, 0)),
+            "segment_id": "mode_b_pending_return_to_depot",
+            "status": "active",
+            "motion_mode": "straight_line",
+            "start_time": float(t_now),
+            "end_time": None,
+            "target_node_id": str(depot_id),
+            "target_node_type": "depot",
+            "order_id": None,
+            "distance_m": float(_polyline_distance_2d(path_points)),
+            "path_utm": [_position_to_payload(pos) for pos in path_points],
         }
 
     def _build_coarse_plan_view(self, t_now: float) -> CoarsePlanView:
@@ -1887,6 +1939,7 @@ class TrainingEnvAdapter:
 
         # 3b. UAV 到站 + host charge complete + truck charge complete
         newly_idle_from_host: list[str] = []
+        mode_b_depot_return_ready: list[str] = []
         for drone_id, leg in non_delivery_ready:
             self._process_non_delivery_arrival(drone_id, leg)
 
@@ -1902,8 +1955,29 @@ class TrainingEnvAdapter:
         for host in list(entity_mgr.stations.values()) + list(entity_mgr.depots.values()):
             completed = host.tick_update(t_next)
             if completed:
-                newly_idle_from_host.extend(completed)
+                if isinstance(host, SwapStation):
+                    for drone_id in completed:
+                        if drone_id in self._mode_b_pending_depot_return:
+                            mode_b_depot_return_ready.append(drone_id)
+                        else:
+                            newly_idle_from_host.append(drone_id)
+                else:
+                    newly_idle_from_host.extend(completed)
             self._sync_host_service_states(host)
+
+        for drone_id in mode_b_depot_return_ready:
+            drone = entity_mgr.drones[drone_id]
+            drone.recharge_to_full()
+            depot_id = self._mode_b_pending_depot_return.get(drone_id)
+            depot = entity_mgr.depots.get(depot_id) if depot_id is not None else None
+            if depot is None:
+                self._mark_hard_failure(drone_id)
+                continue
+            self._schedule_mode_b_return_to_depot(
+                drone_id,
+                depot,
+                start_time=t_next,
+            )
 
         for drone_id in newly_idle_from_host:
             drone = entity_mgr.drones[drone_id]
@@ -2036,11 +2110,20 @@ class TrainingEnvAdapter:
             if target is None:
                 self._mark_hard_failure(drone_id)
                 return
-            self._schedule_return_to_host(
-                drone_id,
-                target,
-                start_time=service_leg.finish_time,
-            )
+            if isinstance(target, Depot):
+                self._schedule_mode_b_return_to_depot(
+                    drone_id,
+                    target,
+                    start_time=service_leg.finish_time,
+                )
+            elif isinstance(target, SwapStation):
+                self._schedule_mode_b_return_to_station(
+                    drone_id,
+                    target,
+                    start_time=service_leg.finish_time,
+                )
+            else:
+                raise TypeError(f"不支持的 mode B 返程宿主类型: {type(target)!r}")
             return
 
         selected_node = commit.selected_recover_node
@@ -2085,6 +2168,13 @@ class TrainingEnvAdapter:
 
         if leg.kind == "return_to_rendezvous":
             self._drone_state[drone_id] = TrainingDroneState.WAITING_FOR_TRUCK
+            return
+
+        if leg.kind == "mode_b_return_to_depot":
+            self._mode_b_pending_depot_return.pop(drone_id, None)
+            drone.recharge_to_full()
+            self._dispatch_commit.pop(drone_id, None)
+            self._drone_state[drone_id] = TrainingDroneState.IDLE
             return
 
         host = self._resolve_host(leg.target_node_id, leg.target_node_type)
@@ -2146,6 +2236,7 @@ class TrainingEnvAdapter:
         target_order_id: str | None = None,
         target_node_id: str | None = None,
         target_node_type: str | None = None,
+        path_points: tuple[Position3D, ...] | None = None,
     ) -> None:
         """为 UAV 写入一段新的飞行账本。"""
         entity_mgr = self._require_entity_manager()
@@ -2165,13 +2256,18 @@ class TrainingEnvAdapter:
         )
         route_version = int(self._drone_path_version.get(drone_id, 0) + 1)
         self._drone_path_version[drone_id] = route_version
+        visual_path_points = (
+            tuple(_clone_position(pos) for pos in path_points)
+            if path_points is not None
+            else (start_pos, _clone_position(target_pos))
+        )
         self._flight_legs[drone_id] = FlightLeg(
             kind=kind,
             start_time=effective_start_time,
             arrival_time=float(effective_start_time + flight_time),
             start_pos=start_pos,
             target_pos=_clone_position(target_pos),
-            path_points=(start_pos, _clone_position(target_pos)),
+            path_points=visual_path_points,
             route_version=route_version,
             motion_mode="straight_line",
             order_id=target_order_id,
@@ -2211,6 +2307,56 @@ class TrainingEnvAdapter:
             start_time=effective_start_time,
             target_node_id=node_id,
             target_node_type=node_type,
+        )
+
+    def _schedule_mode_b_return_to_depot(
+        self,
+        drone_id: str,
+        depot: Depot,
+        *,
+        start_time: float | None = None,
+    ) -> None:
+        """Mode B 的最终返仓飞行；到达 depot 后直接回到 IDLE。"""
+        effective_start_time = float(self._t_now if start_time is None else start_time)
+        self._mode_b_pending_depot_return.pop(drone_id, None)
+        self._drone_state[drone_id] = TrainingDroneState.RETURN_TO_DEPOT
+        self._schedule_flight_leg(
+            drone_id=drone_id,
+            kind="mode_b_return_to_depot",
+            target_pos=_clone_position(depot.get_location(effective_start_time)),
+            payload=0.0,
+            start_time=effective_start_time,
+            target_node_id=depot.depot_id,
+            target_node_type="depot",
+        )
+
+    def _schedule_mode_b_return_to_station(
+        self,
+        drone_id: str,
+        station: SwapStation,
+        *,
+        start_time: float | None = None,
+    ) -> None:
+        """Mode B 电量不足返仓时，先到 station 补能，补能后自动返 depot。"""
+        depot = self._require_depot()
+        effective_start_time = float(self._t_now if start_time is None else start_time)
+        station_pos = _clone_position(station.get_location(effective_start_time))
+        depot_pos = _clone_position(depot.get_location(effective_start_time))
+        self._mode_b_pending_depot_return[drone_id] = depot.depot_id
+        self._drone_state[drone_id] = TrainingDroneState.RETURN_TO_STATION
+        self._schedule_flight_leg(
+            drone_id=drone_id,
+            kind="return_to_station",
+            target_pos=station_pos,
+            payload=0.0,
+            start_time=effective_start_time,
+            target_node_id=station.station_id,
+            target_node_type="station",
+            path_points=(
+                _clone_position(self._require_entity_manager().drones[drone_id].current_loc),
+                station_pos,
+                depot_pos,
+            ),
         )
 
     def _schedule_return_to_rendezvous(
@@ -2549,6 +2695,7 @@ class TrainingEnvAdapter:
             self._delivery_service_legs.pop(drone_id, None)
             self._release_reservation(drone_id)
             self._dispatch_commit.pop(drone_id, None)
+            self._mode_b_pending_depot_return.pop(drone_id, None)
             if self._drone_state.get(drone_id) != TrainingDroneState.AIRBORNE_ENERGY_FAILURE:
                 self._drone_state[drone_id] = TrainingDroneState.DELIVERED
                 if not self._enter_fallback_recovery(drone_id, start_time=t_now):
@@ -2801,51 +2948,48 @@ class TrainingEnvAdapter:
         eval_battery = float(drone.battery_current if battery_current is None else battery_current)
         eval_time = float(self._t_now if current_time is None else current_time)
 
-        scored_hosts: list[tuple[float, float, float, float, str, ChargingHost]] = []
-        for host in self._all_return_hosts():
-            host_pos = host.get_location(eval_time)
+        depot = self._require_depot()
+        depot_pos = depot.get_location(eval_time)
+        if self._can_reach_from(
+            drone=drone,
+            from_pos=eval_pos,
+            to_pos=depot_pos,
+            payload=0.0,
+            safe_margin=drone.safe_margin_j,
+            battery_current=eval_battery,
+        ):
+            return depot
+
+        reachable_stations: list[tuple[float, str, SwapStation]] = []
+        for station in entity_mgr.stations.values():
+            station_pos = station.get_location(eval_time)
             if not self._can_reach_from(
                 drone=drone,
                 from_pos=eval_pos,
-                to_pos=host_pos,
+                to_pos=station_pos,
                 payload=0.0,
                 safe_margin=drone.safe_margin_j,
                 battery_current=eval_battery,
             ):
                 continue
-
-            fly_time = self._estimate_flight_time(
+            if not self._can_reach_from(
                 drone=drone,
-                from_pos=eval_pos,
-                to_pos=host_pos,
-            )
-            predicted_queue_time = float(host.estimate_wait_time(eval_time))
-            service_time = float(host.swap_time)
-            score = fly_time + predicted_queue_time + service_time
-            scored_hosts.append(
-                (
-                    score,
-                    fly_time,
-                    predicted_queue_time,
-                    service_time,
-                    _host_id(host),
-                    host,
-                )
+                from_pos=station_pos,
+                to_pos=depot_pos,
+                payload=0.0,
+                safe_margin=drone.safe_margin_j,
+                battery_current=drone.battery_max,
+            ):
+                continue
+            reachable_stations.append(
+                (eval_pos.distance_2d(station_pos), station.station_id, station)
             )
 
-        if not scored_hosts:
+        if not reachable_stations:
             return None
 
-        scored_hosts.sort(
-            key=lambda item: (
-                item[0],
-                item[1],
-                item[2],
-                item[3],
-                item[4],
-            )
-        )
-        return scored_hosts[0][5]
+        reachable_stations.sort(key=lambda item: (item[0], item[1]))
+        return reachable_stations[0][2]
 
     def _revalidate_mode_c_recover_node(
         self,
@@ -3705,6 +3849,7 @@ class TrainingEnvAdapter:
         self._flight_legs.pop(drone_id, None)
         self._delivery_service_legs.pop(drone_id, None)
         self._fallback_leg.pop(drone_id, None)
+        self._mode_b_pending_depot_return.pop(drone_id, None)
         self._truck_charge_until.pop(drone_id, None)
         self._active_wait_resume.pop(drone_id, None)
         self._release_reservation(drone_id)
