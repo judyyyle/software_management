@@ -248,8 +248,8 @@ def load_preset_scene(preset_id: str) -> Optional[dict]:
         _tr = Transformer.from_crs("EPSG:4326", "EPSG:32651", always_xy=True)
         ox, oy = _tr.transform(sel_bounds["minx"], sel_bounds["miny"])
         
-        # 组装 SceneContext
-        scene_id = str(uuid.uuid4())
+        # 组装 SceneContext，预设场景使用 preset_id 作为稳定标识符
+        scene_id = preset_id
         ctx: dict = {
             "scene_id": scene_id,
             "sel_bounds": sel_bounds,

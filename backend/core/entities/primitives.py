@@ -203,8 +203,8 @@ class DroneStatus(str, Enum):
     FLYING_TO_STATION  = "FLYING_TO_STATION"  # 飞往充换电站补能
     FLYING_TO_TRUCK    = "FLYING_TO_TRUCK"    # 追赶移动卡车
     RETURNING_TO_DEPOT = "RETURNING_TO_DEPOT" # 返回仓库
-    QUEUING            = "QUEUING"            # 在充换电宿主等待空闲槽位
-    CHARGING           = "CHARGING"           # 占用槽位，正在执行换电
+    QUEUING            = "QUEUING"            # 已到达充换电宿主，等待补能服务空闲槽位
+    CHARGING           = "CHARGING"           # 已占用补能服务槽位，正在执行换电
     LOADING            = "LOADING"            # 装载货物，短暂不可调度
     UNLOADING          = "UNLOADING"          # 卸载货物，短暂不可调度
     DEAD               = "DEAD"               # 异常终止，需人工介入

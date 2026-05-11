@@ -14,6 +14,11 @@ HiveLogix — 无人机实体 (Section 2)
 路由设计：
   route_plan 是 RouteWaypoint 的**只读列表**，current_waypoint_index 为当前
   执行指针，move_step() 推进指针而非弹出元素，保留完整序列以支持回放与诊断。
+
+状态语义边界：
+  - `QUEUING` / `CHARGING` 只表示无人机已经到达 ChargingHost
+    （station / depot / truck）后的补能服务阶段；
+  - 不表示 mode C 中的 rendezvous 或等待被卡车回收阶段。
 """
 
 from __future__ import annotations
@@ -160,6 +165,10 @@ class Drone:
 
         仅在 status.is_flying 时消耗巡航功率；地面状态（IDLE/LOADING/等）
         不消耗（或可扩展为极低待机功率，当前设计省略）。
+
+        这里的地面状态包含补能服务阶段的 `QUEUING` / `CHARGING`。
+        mode C 的等待回收阶段若后续被建模为独立状态，其能耗语义应与
+        “已到达充换电宿主后的排队/服务”分开处理。
 
         若电量耗尽（battery_current ≤ 0），状态自动转为 DEAD 并记录告警。
 

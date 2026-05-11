@@ -8,24 +8,24 @@
         <div class="truck-header">
           <span class="truck-icon">🚛</span>
           <span class="truck-name">{{ truck.name || truck.truck_id }}</span>
-          <span class="truck-status" :class="`status-${truck.status.toLowerCase()}`">
+          <span class="truck-status" :class="statusClass(truck.status)">
             {{ getStatusLabel(truck.status) }}
           </span>
         </div>
         <div class="truck-details">
           <div class="detail-row">
             <span class="label">位置</span>
-            <span class="value">{{ truck.lng.toFixed(5) }}, {{ truck.lat.toFixed(5) }}</span>
+            <span class="value">{{ formatCoord(truck.lng) }}, {{ formatCoord(truck.lat) }}</span>
           </div>
           <div class="detail-row">
             <span class="label">货物</span>
-            <span class="value">{{ truck.inventory_count }} / {{ truck.max_inventory }} 件</span>
+            <span class="value">{{ truck.inventory_count ?? 0 }} / {{ truck.max_inventory ?? 0 }} 件</span>
           </div>
           <div class="detail-row">
             <span class="label">停靠无人机</span>
-            <span class="value">{{ truck.docked_drones.length }} 架</span>
+            <span class="value">{{ truck.docked_drones?.length ?? 0 }} 架</span>
           </div>
-          <div v-if="truck.docked_drones.length > 0" class="drone-list">
+          <div v-if="(truck.docked_drones?.length ?? 0) > 0" class="drone-list">
             <span v-for="did in truck.docked_drones" :key="did" class="drone-tag">🚁 {{ did }}</span>
           </div>
         </div>
@@ -40,20 +40,20 @@
         <div class="drone-header">
           <span class="drone-icon">🚁</span>
           <span class="drone-name">{{ drone.name || drone.drone_id }}</span>
-          <span class="drone-status" :class="`status-${drone.status.toLowerCase()}`">
+          <span class="drone-status" :class="statusClass(drone.status)">
             {{ getStatusLabel(drone.status) }}
           </span>
         </div>
         <div class="drone-details">
           <div class="detail-row">
             <span class="label">位置</span>
-            <span class="value">{{ drone.lng?.toFixed(5) || '—' }}, {{ drone.lat?.toFixed(5) || '—' }}</span>
+            <span class="value">{{ formatCoord(drone.lng) }}, {{ formatCoord(drone.lat) }}</span>
           </div>
           <div class="detail-row">
             <span class="label">电量</span>
             <div class="battery-bar">
-              <div class="battery-fill" :style="{ width: (drone.battery_percent ?? 0) + '%' }"></div>
-              <span class="battery-text">{{ (drone.battery_percent ?? 0).toFixed(0) }}%</span>
+              <div class="battery-fill" :style="{ width: drone.batteryPercent + '%' }"></div>
+              <span class="battery-text">{{ drone.batteryPercent.toFixed(0) }}%</span>
             </div>
           </div>
           <div class="detail-row">
@@ -84,16 +84,42 @@
 </template>
 
 <script setup lang="ts">
-import { ref, watch } from 'vue'
+import { computed, ref } from 'vue'
 import { useEntityStore } from '@/stores/entity'
 import { useSystemStore } from '@/stores/system'
 
 const entityStore = useEntityStore()
 const systemStore = useSystemStore()
 
-const trucks = ref<any[]>([])
-const drones = ref<any[]>([])
 const events = ref<Array<{ time: number; icon: string; msg: string }>>([])
+
+const trucks = computed(() => {
+  const runtimeTrucks = entityStore.rtTrucks.length > 0 ? entityStore.rtTrucks : entityStore.trucks
+  return runtimeTrucks.map((truck: any) => {
+    const config = entityStore.trucks.find(t => t.truck_id === truck.truck_id)
+    return {
+      ...config,
+      ...truck,
+      status: truck.status ?? 'IDLE',
+      inventory_count: truck.inventory_count ?? 0,
+      max_inventory: truck.max_inventory ?? config?.max_inventory ?? 0,
+      docked_drones: truck.docked_drones ?? [],
+    }
+  })
+})
+
+const drones = computed(() => {
+  const runtimeDrones = entityStore.rtDrones.length > 0 ? entityStore.rtDrones : entityStore.drones
+  return runtimeDrones.map((drone: any) => {
+    const config = entityStore.drones.find(d => d.drone_id === drone.drone_id)
+    return {
+      ...config,
+      ...drone,
+      status: drone.status ?? 'IDLE',
+      batteryPercent: getBatteryPercent(drone),
+    }
+  })
+})
 
 const statusLabelMap: Record<string, string> = {
   'IDLE': '空闲',
@@ -110,22 +136,27 @@ function getStatusLabel(status: string): string {
   return statusLabelMap[status] || status
 }
 
-// 监听实体变化
-watch(
-  () => entityStore.trucks,
-  (newTrucks) => {
-    trucks.value = newTrucks || []
-  },
-  { deep: true }
-)
+function statusClass(status: string | undefined): string {
+  return `status-${(status ?? 'IDLE').toLowerCase()}`
+}
 
-watch(
-  () => entityStore.drones,
-  (newDrones) => {
-    drones.value = newDrones || []
-  },
-  { deep: true }
-)
+function formatCoord(value: number | undefined): string {
+  return typeof value === 'number' ? value.toFixed(5) : '—'
+}
+
+function getBatteryPercent(drone: any): number {
+  if (typeof drone.battery_ratio === 'number') {
+    return clampPercent(drone.battery_ratio * 100)
+  }
+  if (typeof drone.battery_percent === 'number') {
+    return clampPercent(drone.battery_percent)
+  }
+  return 0
+}
+
+function clampPercent(value: number): number {
+  return Math.min(100, Math.max(0, value))
+}
 
 // 添加事件日志
 function addEvent(icon: string, msg: string) {
