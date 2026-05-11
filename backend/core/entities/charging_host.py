@@ -9,8 +9,13 @@ HiveLogix — 充换电宿主抽象基类 (Section 0.2)
 
 换电服务队列模型：
   - parking_slots (K) 个并发槽位：类似 K 服务台 M/D/K 排队论模型
-  - wait_queue：FIFO 等待队列，加入后按顺序占用释放的槽位
+  - wait_queue：FIFO **充换电服务等待队列**，加入后按顺序占用释放的槽位
   - serving_drones：{drone_id: finish_time} 正在服务的无人机
+
+语义边界：
+  - 本基类只建模“无人机已经到达 ChargingHost 之后”的充换电服务排队与并发服务。
+  - 它不建模 mode C 中的 rendezvous / 等待被卡车回收阶段。
+  - 因此，wait_queue 不应被解释为“等待被回收队列”，只表示后续补能服务等待队列。
 
 线程安全说明：
   仿真引擎预期以单线程时间步推进，_lock 提供防御性保护以供未来并发场景扩展。
@@ -38,7 +43,7 @@ class ChargingHost(ABC):
 
     Args:
         swap_time:     单次换电耗时（秒）
-        parking_slots: 并发服务槽位数 K，同一时刻最多可服务的无人机数量
+        parking_slots: 并发服务槽位数 K，同一时刻最多可执行补能服务的无人机数量
         host_id:       宿主实体 ID，用于日志与调试
     """
 
@@ -78,6 +83,10 @@ class ChargingHost(ABC):
 
         重复到达防护：若同一 drone_id 在 serving_drones 或 wait_queue 中已存在，
         记录警告并忽略本次调用（防止仿真引擎双重推进导致状态腐化）。
+
+        语义边界：
+          - 本方法表示无人机**已经到达宿主并可进入补能流程**
+          - 不表示 mode C 中“等待被回收”或“等待卡车到站”
 
         子类（如 Truck）应先检查物理平台占位后再调用 super().arrive()。
 
@@ -180,8 +189,9 @@ class ChargingHost(ABC):
             2. 每个提前排队的无人机占用该槽位 swap_time 秒
             3. 累加等待时间
 
-        注意：这是乐观估计（不考虑网络时延与飞行时间），调度器应叠加飞行时间后
-        再比较多个宿主的总等待成本。
+        注意：
+          - 这是补能服务阶段的等待估计，不含 mode C rendezvous 等待。
+          - 调度器应叠加飞行时间后再比较多个宿主的总等待成本。
 
         Args:
             current_time: 当前仿真时间（秒）
@@ -214,7 +224,7 @@ class ChargingHost(ABC):
 
     @property
     def queue_length(self) -> int:
-        """当前等待队列长度。"""
+        """当前充换电服务等待队列长度。"""
         with self._lock:
             return len(self.wait_queue)
 

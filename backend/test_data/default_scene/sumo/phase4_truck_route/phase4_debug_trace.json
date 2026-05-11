@@ -1,0 +1,295 @@
+{
+  "execution_stop_trace": [
+    {
+      "arrival_time_sec": 0.0,
+      "departure_time_sec": 0.0,
+      "nearest_osm_node_id": "13340772659",
+      "node_id": "DEP-TEST-01",
+      "node_type": "depot",
+      "order_id": null,
+      "seq": 0,
+      "snap_distance_m": 13.66971
+    },
+    {
+      "arrival_time_sec": 203.257434,
+      "departure_time_sec": 263.257434,
+      "nearest_osm_node_id": "11770830110",
+      "node_id": "ORD-STATIC-08",
+      "node_type": "customer",
+      "order_id": "ORD-STATIC-08",
+      "seq": 1,
+      "snap_distance_m": 21.062956
+    },
+    {
+      "arrival_time_sec": 439.765453,
+      "departure_time_sec": 449.765453,
+      "nearest_osm_node_id": "11393537553",
+      "node_id": "STA-TEST-02",
+      "node_type": "station",
+      "order_id": null,
+      "seq": 2,
+      "snap_distance_m": 38.853532
+    },
+    {
+      "arrival_time_sec": 511.773906,
+      "departure_time_sec": 571.773906,
+      "nearest_osm_node_id": "7113128125",
+      "node_id": "ORD-STATIC-02",
+      "node_type": "customer",
+      "order_id": "ORD-STATIC-02",
+      "seq": 3,
+      "snap_distance_m": 85.058173
+    },
+    {
+      "arrival_time_sec": 700.598696,
+      "departure_time_sec": 760.598696,
+      "nearest_osm_node_id": "11459214575",
+      "node_id": "ORD-STATIC-06",
+      "node_type": "customer",
+      "order_id": "ORD-STATIC-06",
+      "seq": 4,
+      "snap_distance_m": 83.102197
+    },
+    {
+      "arrival_time_sec": 864.035942,
+      "departure_time_sec": 874.035942,
+      "nearest_osm_node_id": "859872265",
+      "node_id": "STA-TEST-08",
+      "node_type": "station",
+      "order_id": null,
+      "seq": 5,
+      "snap_distance_m": 42.90158
+    },
+    {
+      "arrival_time_sec": 954.089895,
+      "departure_time_sec": 1014.089895,
+      "nearest_osm_node_id": "7743084366",
+      "node_id": "ORD-STATIC-07",
+      "node_type": "customer",
+      "order_id": "ORD-STATIC-07",
+      "seq": 6,
+      "snap_distance_m": 27.764065
+    },
+    {
+      "arrival_time_sec": 1067.088768,
+      "departure_time_sec": 1077.088768,
+      "nearest_osm_node_id": "1601488743",
+      "node_id": "STA-TEST-09",
+      "node_type": "station",
+      "order_id": null,
+      "seq": 7,
+      "snap_distance_m": 16.131889
+    },
+    {
+      "arrival_time_sec": 1273.871568,
+      "departure_time_sec": 1273.871568,
+      "nearest_osm_node_id": "13340772659",
+      "node_id": "DEP-TEST-01",
+      "node_type": "depot",
+      "order_id": null,
+      "seq": 8,
+      "snap_distance_m": 13.66971
+    }
+  ],
+  "final_execution_plan": [
+    {
+      "node_id": "DEP-TEST-01",
+      "node_type": "depot",
+      "order_id": null,
+      "seq": 0,
+      "x": 329911.498876,
+      "y": 3437187.13333
+    },
+    {
+      "node_id": "ORD-STATIC-08",
+      "node_type": "customer",
+      "order_id": "ORD-STATIC-08",
+      "seq": 1,
+      "x": 327922.908444,
+      "y": 3436197.921126
+    },
+    {
+      "node_id": "STA-TEST-02",
+      "node_type": "station",
+      "order_id": null,
+      "seq": 2,
+      "x": 329868.109481,
+      "y": 3435203.636057
+    },
+    {
+      "node_id": "ORD-STATIC-02",
+      "node_type": "customer",
+      "order_id": "ORD-STATIC-02",
+      "seq": 3,
+      "x": 329936.202353,
+      "y": 3434305.971757
+    },
+    {
+      "node_id": "ORD-STATIC-06",
+      "node_type": "customer",
+      "order_id": "ORD-STATIC-06",
+      "seq": 4,
+      "x": 331208.334522,
+      "y": 3434403.622656
+    },
+    {
+      "node_id": "STA-TEST-08",
+      "node_type": "station",
+      "order_id": null,
+      "seq": 5,
+      "x": 330054.7848,
+      "y": 3433924.198188
+    },
+    {
+      "node_id": "ORD-STATIC-07",
+      "node_type": "customer",
+      "order_id": "ORD-STATIC-07",
+      "seq": 6,
+      "x": 328904.916466,
+      "y": 3433946.343896
+    },
+    {
+      "node_id": "STA-TEST-09",
+      "node_type": "station",
+      "order_id": null,
+      "seq": 7,
+      "x": 329458.957408,
+      "y": 3434328.271882
+    },
+    {
+      "node_id": "DEP-TEST-01",
+      "node_type": "depot",
+      "order_id": null,
+      "seq": 8,
+      "x": 329911.498876,
+      "y": 3437187.13333
+    }
+  ],
+  "initial_execution_plan": [
+    {
+      "node_id": "DEP-TEST-01",
+      "node_type": "depot",
+      "order_id": null,
+      "seq": 0,
+      "x": 329911.498876,
+      "y": 3437187.13333
+    },
+    {
+      "node_id": "ORD-STATIC-08",
+      "node_type": "customer",
+      "order_id": "ORD-STATIC-08",
+      "seq": 1,
+      "x": 327922.908444,
+      "y": 3436197.921126
+    },
+    {
+      "node_id": "ORD-STATIC-02",
+      "node_type": "customer",
+      "order_id": "ORD-STATIC-02",
+      "seq": 2,
+      "x": 329936.202353,
+      "y": 3434305.971757
+    },
+    {
+      "node_id": "ORD-STATIC-06",
+      "node_type": "customer",
+      "order_id": "ORD-STATIC-06",
+      "seq": 3,
+      "x": 331208.334522,
+      "y": 3434403.622656
+    },
+    {
+      "node_id": "ORD-STATIC-07",
+      "node_type": "customer",
+      "order_id": "ORD-STATIC-07",
+      "seq": 4,
+      "x": 328904.916466,
+      "y": 3433946.343896
+    },
+    {
+      "node_id": "DEP-TEST-01",
+      "node_type": "depot",
+      "order_id": null,
+      "seq": 5,
+      "x": 329911.498876,
+      "y": 3437187.13333
+    }
+  ],
+  "inserted_fixed_nodes": [
+    {
+      "detour_cost_road_m": -9.094947017729282e-13,
+      "insert_index": 2,
+      "node_id": "STA-TEST-02",
+      "node_type": "station",
+      "reason": "on_route"
+    },
+    {
+      "detour_cost_road_m": 0.0,
+      "insert_index": 6,
+      "node_id": "STA-TEST-09",
+      "node_type": "station",
+      "reason": "on_route"
+    },
+    {
+      "detour_cost_road_m": 290.64399708542805,
+      "insert_index": 5,
+      "node_id": "STA-TEST-08",
+      "node_type": "station",
+      "reason": "min_future_fixed_nodes"
+    }
+  ],
+  "min_future_fixed_nodes": 3,
+  "ordered_truck_orders": [
+    {
+      "deadline": 2700.0,
+      "delivery_x": 327922.908444,
+      "delivery_y": 3436197.921126,
+      "fulfillment_mode": "DRONE_TRUCK_DEPOT",
+      "order_id": "ORD-STATIC-08",
+      "seq": 0
+    },
+    {
+      "deadline": 4200.0,
+      "delivery_x": 329936.202353,
+      "delivery_y": 3434305.971757,
+      "fulfillment_mode": "DRONE_DIRECT",
+      "order_id": "ORD-STATIC-02",
+      "seq": 1
+    },
+    {
+      "deadline": 4200.0,
+      "delivery_x": 331208.334522,
+      "delivery_y": 3434403.622656,
+      "fulfillment_mode": "DRONE_TRUCK_DEPOT",
+      "order_id": "ORD-STATIC-06",
+      "seq": 2
+    },
+    {
+      "deadline": 5400.0,
+      "delivery_x": 328904.916466,
+      "delivery_y": 3433946.343896,
+      "fulfillment_mode": "DRONE_DIRECT",
+      "order_id": "ORD-STATIC-07",
+      "seq": 3
+    }
+  ],
+  "truck_id": "TRK-TEST-01",
+  "visited_fixed_node_ids": [
+    "DEP-TEST-01",
+    "STA-TEST-02",
+    "STA-TEST-08",
+    "STA-TEST-09",
+    "DEP-TEST-01"
+  ],
+  "visited_order_ids": [
+    "ORD-STATIC-08",
+    "ORD-STATIC-02",
+    "ORD-STATIC-06",
+    "ORD-STATIC-07"
+  ],
+  "visited_station_ids": [
+    "STA-TEST-02",
+    "STA-TEST-08",
+    "STA-TEST-09"
+  ]
+}

@@ -89,7 +89,7 @@ entities_config = {
             "lat": CENTER_LAT,
             "altitude": 0,
             "capacity": 500,
-            "swap_time": 90,
+            "swap_time": 120,
             "parking_slots": 4,
         }
     ],
@@ -100,7 +100,7 @@ entities_config = {
             "lng": CENTER_LON + (i % 5) * 0.004,  # 在中心周围均匀分布
             "lat": CENTER_LAT + (i // 5) * 0.004,
             "altitude": 0,
-            "swap_time": 60,
+            "swap_time": 120,
             "parking_slots": 2,
         }
         for i in range(1, 11)  # 10 个充电站
@@ -109,9 +109,9 @@ entities_config = {
         {
             "truck_id": "TRK-TEST-01",
             "name": "卡车-01",
-            "speed": 15,
+            "speed": 16.5,
             "max_inventory": 30,
-            "swap_time": 90,
+            "swap_time": 120,
             "parking_slots": 3,
             "home_depot_id": "DEP-TEST-01",
         }

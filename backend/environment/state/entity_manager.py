@@ -67,7 +67,10 @@ class EntityManager:
         self._metadata: dict[str, dict]       = {}
 
         runtime_cfg = load_solver_energy_params()
+        self.TRUCK_SERVICE_TIME_ORDER = runtime_cfg.truck_service_time_order_s
         self.DRONE_SERVICE_TIME_ORDER = runtime_cfg.drone_service_time_order_s
+        self.TRUCK_DRONE_LAUNCH_TIME = runtime_cfg.truck_drone_launch_time_s
+        self.TRUCK_DRONE_RECOVER_TIME = runtime_cfg.truck_drone_recover_time_s
         # 停靠触发容差：recovery/station 采用更宽容阈值，降低路网几何误差导致的漏触发。
         self.STOP_PROXIMITY_BASE_M = 15.0
         self.STOP_PROXIMITY_SPEED_FACTOR = 1.5

@@ -5,6 +5,7 @@ import { WsClient } from '@/services/websocket'
 import { useEntityStore } from './entity'
 import { useOrderStore } from './order'
 import { useSceneStore } from './scene'
+import type { DecisionEvent, RuntimePaths } from '@/types'
 
 // ── 调试开关 ────────────────────────────────────────────────────
 const DEBUG_WEBSOCKET = false
@@ -16,6 +17,14 @@ export const useSystemStore = defineStore('system', () => {
   const speedRatio       = ref(1)       // 仿真加速倍率
   const simStartWallMs   = ref(0)       // 引擎启动时的 wall-clock 毫秒时间戳
   const initialized      = ref(false)   // 是否已完成初始化
+  const initializedSceneId = ref('')    // 最近一次 /api/sim/init 成功时的 scene_id
+  const policyActive     = ref(false)   // 当前是否已切换到 PPO 在线策略运行时
+  const policyName       = ref('')      // 当前激活策略名称
+  const policyCheckpoint = ref('')      // 当前激活 checkpoint
+  const policyRuntimeType = ref<'classic_sim_engine' | 'training_env_adapter_policy'>('classic_sim_engine')
+  const runtimePaths     = ref<RuntimePaths>({ trucks: [], drones: [] })
+  const decisionEvents   = ref<DecisionEvent[]>([])
+  const latestEventSeq   = ref(0)
 
   // ── WebSocket 客户端（19 为展示层与店间解耦层────────────────
   // 这里使用延迟初始化模式：实际 ws 实例在 initWs() 中创建，避免 Store 定义时 Pinia 尚未就绪
@@ -25,6 +34,45 @@ export const useSystemStore = defineStore('system', () => {
   // ── TICK 回调管理 ──────────────────────────────────────────────
   function onTick(callback: () => void) {
     _tickCallbacks.push(callback)
+  }
+
+  function applyPolicyRuntimeFromStats(stats: any) {
+    const activePolicy = typeof stats?.active_policy === 'string' ? stats.active_policy.trim() : ''
+    if (activePolicy) {
+      policyActive.value = true
+      policyName.value = activePolicy
+      policyCheckpoint.value = String(stats?.checkpoint ?? '')
+      policyRuntimeType.value = 'training_env_adapter_policy'
+      return
+    }
+    policyActive.value = false
+    policyName.value = ''
+    policyCheckpoint.value = ''
+    policyRuntimeType.value = 'classic_sim_engine'
+  }
+
+  function normalizeRuntimePaths(raw: any): RuntimePaths {
+    return {
+      trucks: Array.isArray(raw?.trucks) ? raw.trucks : [],
+      drones: Array.isArray(raw?.drones) ? raw.drones : [],
+    }
+  }
+
+  function mergeDecisionEvents(events: any[]) {
+    if (!Array.isArray(events) || events.length === 0) return
+    const bySeq = new Map<number, DecisionEvent>()
+    for (const event of decisionEvents.value) {
+      bySeq.set(Number(event.event_seq), event)
+    }
+    for (const event of events) {
+      const seq = Number(event?.event_seq)
+      if (!Number.isFinite(seq)) continue
+      bySeq.set(seq, event as DecisionEvent)
+    }
+    decisionEvents.value = [...bySeq.entries()]
+      .sort((a, b) => a[0] - b[0])
+      .slice(-100)
+      .map(([, event]) => event)
   }
 
   // ── FULL_SNAPSHOT 处理器 ───────────────────────────────────────
@@ -48,6 +96,10 @@ export const useSystemStore = defineStore('system', () => {
     simTime.value        = payload.sim_time ?? 0
     running.value        = payload.is_running ?? false
     speedRatio.value     = payload.speed_ratio ?? 1
+    runtimePaths.value   = normalizeRuntimePaths(payload.paths)
+    mergeDecisionEvents(payload.recent_decision_events)
+    latestEventSeq.value = Number(payload.latest_event_seq ?? latestEventSeq.value)
+    applyPolicyRuntimeFromStats(payload.stats)
   }
 
   // ── TICK 处理器 ─────────────────────────────────────────────
@@ -65,6 +117,11 @@ export const useSystemStore = defineStore('system', () => {
       })
     }
     entityStore.setRuntimeAll(payload.entities ?? {})
+    if (payload.paths !== undefined) {
+      runtimePaths.value = normalizeRuntimePaths(payload.paths)
+    }
+    mergeDecisionEvents(payload.recent_decision_events)
+    latestEventSeq.value = Number(payload.latest_event_seq ?? latestEventSeq.value)
     
     // ── 处理订单状态更新 ─────────────────────────────────────
     const orderStore = useOrderStore()
@@ -116,6 +173,7 @@ export const useSystemStore = defineStore('system', () => {
     
     if (payload.stats !== undefined) {
       orderStore.stats = payload.stats
+      applyPolicyRuntimeFromStats(payload.stats)
     }
     // 触发所有已注册的 TICK 回调
     _tickCallbacks.forEach(cb => {
@@ -150,10 +208,13 @@ export const useSystemStore = defineStore('system', () => {
       if (state?.is_running) {
         // 后端已在运行：直接应用快照，跳过 /api/sim/init
         handleFullSnapshot(state)
+      } else {
+        applyPolicyRuntimeFromStats(state?.stats)
       }
     } catch {
       // 后端未启动或网络不可达，保持本地配置态
     }
+    await fetchPolicyState().catch(() => {})
   }
 
   // ── 仿真控制 API ────────────────────────────────────────
@@ -172,6 +233,54 @@ export const useSystemStore = defineStore('system', () => {
     running.value = false
     simTime.value = 0
     initialized.value = false
+    initializedSceneId.value = ''
+    runtimePaths.value = { trucks: [], drones: [] }
+    decisionEvents.value = []
+    latestEventSeq.value = 0
+  }
+
+  async function activatePolicy(payload: {
+    policy_name: string
+    policy_path: string
+    config_path: string
+    scene_id: string
+    deterministic: boolean
+    speed_ratio: number
+    order_source_mode: 'benchmark' | 'poisson' | 'hybrid'
+    use_current_init_payload: boolean
+  }) {
+    const result = await http.post<any>('/api/sim/policy/activate', payload)
+    const runtime = result?.runtime ?? {}
+    policyActive.value = true
+    policyRuntimeType.value = 'training_env_adapter_policy'
+    policyName.value = String(runtime.policy_name ?? payload.policy_name ?? '')
+    policyCheckpoint.value = String(runtime.checkpoint ?? payload.policy_path ?? '')
+    return result
+  }
+
+  async function deactivatePolicy() {
+    const result = await http.post<any>('/api/sim/policy/deactivate', {})
+    policyActive.value = false
+    policyRuntimeType.value = 'classic_sim_engine'
+    policyName.value = ''
+    policyCheckpoint.value = ''
+    return result
+  }
+
+  async function fetchPolicyState() {
+    const result = await http.get<any>('/api/sim/policy/state')
+    if (result?.active) {
+      policyActive.value = true
+      policyRuntimeType.value = 'training_env_adapter_policy'
+      policyName.value = String(result.policy_name ?? '')
+      policyCheckpoint.value = String(result.checkpoint ?? '')
+    } else {
+      policyActive.value = false
+      policyRuntimeType.value = 'classic_sim_engine'
+      policyName.value = ''
+      policyCheckpoint.value = ''
+    }
+    return result
   }
 
   /** 调整仿真速率（并实时通知后端）*/
@@ -234,6 +343,7 @@ export const useSystemStore = defineStore('system', () => {
     })
     // 初始化成功后，标记为已初始化
     initialized.value = true
+    initializedSceneId.value = String(opts.sceneId ?? 'ui-test')
     return result
   }
 
@@ -273,8 +383,11 @@ export const useSystemStore = defineStore('system', () => {
   }
 
   return {
-    running, simTime, speedRatio, simStartWallMs, initialized,
+    running, simTime, speedRatio, simStartWallMs, initialized, initializedSceneId,
+    policyActive, policyName, policyCheckpoint, policyRuntimeType,
+    runtimePaths, decisionEvents, latestEventSeq,
     initWs, probeBackend, onTick,
     start, pause, reset, setSpeed, initSim, dispatch,
+    activatePolicy, deactivatePolicy, fetchPolicyState,
   }
 })
