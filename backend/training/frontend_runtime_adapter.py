@@ -203,7 +203,6 @@ def load_policy_runtime_for_scene(
     model = SharedPPOActorCritic(
         uav_feat_dim=int(bootstrap_observation.uav_self_token.shape[-1]),
         order_feat_dim=int(bootstrap_observation.order_tokens.shape[-1]),
-        recovery_feat_dim=int(bootstrap_observation.recovery_tokens.shape[-1]),
         infra_feat_dim=int(bootstrap_observation.infra_tokens.shape[-1]),
         history_feat_dim=int(bootstrap_observation.history_tokens.shape[-1]),
         critic_order_feat_dim=int(bootstrap_critic.global_order_pool_tokens.shape[-1]),
@@ -267,10 +266,17 @@ class TrainingTelemetryBridge:
         runtime_state = env.build_runtime_state_view()
         decision = env.current_decision_context
         visual_snapshot = env.build_visualization_snapshot()
+        dispatch_chains = self._serialize_dispatch_chains_to_frontend(
+            visual_snapshot.get("dispatch_chains")
+        )
         entity_mgr = env._require_entity_manager()
         order_mgr = env._require_order_manager()
         entities = entity_mgr.get_telemetry()
-        self._overlay_runtime_entities(entities, runtime_state)
+        self._overlay_runtime_entities(
+            entities,
+            runtime_state,
+            dispatch_chains=dispatch_chains,
+        )
         stats = order_mgr.get_status_summary()
         stats.update(
             {
@@ -297,6 +303,7 @@ class TrainingTelemetryBridge:
             "entities": entities,
             "orders": order_mgr.get_recent_orders(limit=_MAX_ORDER_LIMIT),
             "paths": self._serialize_paths_to_frontend(visual_snapshot.get("paths")),
+            "dispatch_chains": dispatch_chains,
             "recent_decision_events": [dict(event) for event in recent_decision_events],
             "latest_event_seq": int(latest_event_seq),
             "stats": stats,
@@ -317,7 +324,6 @@ class TrainingTelemetryBridge:
         runtime_state = env.build_runtime_state_view()
         entity_mgr = env._require_entity_manager()
         entities = entity_mgr.get_static_snapshot()
-        self._overlay_runtime_entities(entities, runtime_state)
         payload = self.build_tick_payload(
             env=env,
             speed_ratio=speed_ratio,
@@ -325,6 +331,11 @@ class TrainingTelemetryBridge:
             order_source_mode=order_source_mode,
             recent_decision_events=recent_decision_events,
             latest_event_seq=latest_event_seq,
+        )
+        self._overlay_runtime_entities(
+            entities,
+            runtime_state,
+            dispatch_chains=payload.get("dispatch_chains"),
         )
         payload.update(
             {
@@ -336,7 +347,13 @@ class TrainingTelemetryBridge:
         )
         return {"type": "FULL_SNAPSHOT", "payload": payload}
 
-    def _overlay_runtime_entities(self, entities: dict[str, Any], runtime_state: Any) -> None:
+    def _overlay_runtime_entities(
+        self,
+        entities: dict[str, Any],
+        runtime_state: Any,
+        *,
+        dispatch_chains: Any = None,
+    ) -> None:
         truck_payload = entities.get("trucks")
         if isinstance(truck_payload, list) and truck_payload:
             truck = truck_payload[0]
@@ -350,6 +367,14 @@ class TrainingTelemetryBridge:
             drone_id = drone.get("drone_id")
             if isinstance(drone_id, str):
                 drone_by_id[drone_id] = drone
+        chain_by_drone: dict[str, Mapping[str, Any]] = {}
+        if isinstance(dispatch_chains, list):
+            for item in dispatch_chains:
+                if not isinstance(item, Mapping):
+                    continue
+                drone_id = item.get("drone_id")
+                if isinstance(drone_id, str):
+                    chain_by_drone[drone_id] = item
 
         for drone_id, drone_state in runtime_state.drone_states.items():
             drone_payload = drone_by_id.get(drone_id)
@@ -375,6 +400,24 @@ class TrainingTelemetryBridge:
                 if drone_state.reservation is None
                 else str(drone_state.reservation.recover_node)
             )
+            chain = chain_by_drone.get(drone_id)
+            drone_payload["dispatch_chain"] = dict(chain) if chain is not None else None
+            if chain is not None:
+                drone_payload["dispatch_order_id"] = chain.get("order_id")
+                drone_payload["dispatch_mode"] = chain.get("mode")
+                drone_payload["selected_recover_node_id"] = chain.get(
+                    "selected_recover_node_id"
+                )
+                drone_payload["recovery_stage"] = chain.get("recovery_stage")
+                drone_payload["planned_truck_arrival_time"] = chain.get(
+                    "planned_truck_arrival_time"
+                )
+                drone_payload["planned_uav_arrival_time_lb"] = chain.get(
+                    "planned_uav_arrival_time_lb"
+                )
+                drone_payload["planned_execution_slack_sec"] = chain.get(
+                    "planned_execution_slack_sec"
+                )
 
     def _select_episode_stats(self, snapshot: Mapping[str, Any]) -> dict[str, Any]:
         keys = (
@@ -411,6 +454,25 @@ class TrainingTelemetryBridge:
                 if isinstance(entry, Mapping)
             ],
         }
+
+    def _serialize_dispatch_chains_to_frontend(self, raw_chains: Any) -> list[dict[str, Any]]:
+        if not isinstance(raw_chains, list):
+            return []
+        chains: list[dict[str, Any]] = []
+        for item in raw_chains:
+            if not isinstance(item, Mapping):
+                continue
+            payload = dict(item)
+            for key in (
+                "planned_truck_arrival_time",
+                "planned_uav_arrival_time_lb",
+                "planned_execution_slack_sec",
+                "snapshot_time",
+            ):
+                value = payload.get(key)
+                payload[key] = None if value is None else float(value)
+            chains.append(payload)
+        return chains
 
     def _serialize_path_entry(self, entry: Mapping[str, Any]) -> dict[str, Any]:
         payload = dict(entry)
@@ -798,9 +860,6 @@ class OnlinePolicyRuntimePlayer:
             mode_idx=(
                 None if action_indices.mode_idx is None else int(action_indices.mode_idx)
             ),
-            recovery_idx=(
-                None if action_indices.recovery_idx is None else int(action_indices.recovery_idx)
-            ),
         )
         step_result = env.apply_decision(env_action)
         applied_event_seq = self._append_decision_event(
@@ -900,6 +959,7 @@ class OnlinePolicyRuntimePlayer:
             "selected_order_id": action_payload.get("order_id"),
             "selected_mode": action_payload.get("mode"),
             "selected_recover_node": action_payload.get("recover_node_id"),
+            "recovery_selection_stage": action_payload.get("recovery_selection_stage"),
             "inference_latency_ms": inference_latency_ms,
             "status": str(status),
             "actor_drone_final_state": actor_drone_final_state,
@@ -936,13 +996,22 @@ class OnlinePolicyRuntimePlayer:
                 "mode": "WAIT",
                 "order_id": None,
                 "recover_node_id": None,
+                "recovery_selection_stage": "not_applicable",
             }
         if isinstance(action, DispatchAction):
+            recovery_selection_stage = "not_applicable"
+            if str(action.mode) == "C":
+                recovery_selection_stage = (
+                    "selected_at_decision"
+                    if action.recover_node_id is not None
+                    else "pending_post_delivery_selection"
+                )
             return {
                 "type": "DISPATCH",
                 "mode": str(action.mode),
                 "order_id": str(action.order_id),
                 "recover_node_id": action.recover_node_id,
+                "recovery_selection_stage": recovery_selection_stage,
             }
         raise TypeError(f"未知 EnvAction 类型: {type(action)!r}")
 

@@ -49,6 +49,7 @@ class RolloutTransition:
     sample_loss_weight: float = 1.0
     rendezvous_arrive_bonus_applied: bool = False
     rendezvous_success_bonus_applied: bool = False
+    fallback_cause: str = "none"
 
     @property
     def is_finalized(self) -> bool:

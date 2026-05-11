@@ -87,7 +87,6 @@ class _TrainingConfig:
     gae_lambda: float
     clip_coef: float
     entropy_coef: float
-    recovery_entropy_coef: float
     rendezvous_arrive_bonus: float
     rendezvous_bonus: float
     mode_c_attempt_bonus: float
@@ -215,7 +214,6 @@ def _shape_post_action_reward_for_rendezvous(
     transition_summary: Any,
     rendezvous_arrive_bonus: float,
     rendezvous_bonus: float,
-    mode_c_attempt_bonus: float = 0.0,
 ) -> tuple[float, bool, bool]:
     if not _is_mode_c_action_indices(action_indices):
         return float(post_action_reward), False, False
@@ -223,9 +221,6 @@ def _shape_post_action_reward_for_rendezvous(
     shaped_reward = float(post_action_reward)
     arrive_applied = False
     success_applied = False
-    attempt_bonus = float(mode_c_attempt_bonus)
-    if attempt_bonus > 0.0:
-        shaped_reward += attempt_bonus
     rendezvous_success = bool(getattr(transition_summary, "rendezvous_success", False))
     training_state_after = str(
         getattr(transition_summary, "actor_training_state_after", "")
@@ -621,7 +616,6 @@ def train_cmrappo(
     model = SharedPPOActorCritic(
         uav_feat_dim=int(np.asarray(bootstrap_observation.uav_self_token).shape[-1]),
         order_feat_dim=int(np.asarray(bootstrap_observation.order_tokens).shape[-1]),
-        recovery_feat_dim=int(np.asarray(bootstrap_observation.recovery_tokens).shape[-1]),
         infra_feat_dim=int(np.asarray(bootstrap_observation.infra_tokens).shape[-1]),
         history_feat_dim=int(np.asarray(bootstrap_observation.history_tokens).shape[-1]),
         critic_order_feat_dim=int(np.asarray(bootstrap_critic.global_order_pool_tokens).shape[-1]),
@@ -857,7 +851,6 @@ def train_cmrappo(
                 root_branch_idx=action_indices.root_branch_idx,
                 order_idx=action_indices.order_idx,
                 mode_idx=action_indices.mode_idx,
-                recovery_idx=action_indices.recovery_idx,
             )
             step_result = env.step(env_action)
             carry_in_reward, post_action_reward = _extract_attributed_step_reward_parts(
@@ -890,7 +883,6 @@ def train_cmrappo(
                 transition_summary=transition_summary,
                 rendezvous_arrive_bonus=train_cfg.rendezvous_arrive_bonus,
                 rendezvous_bonus=train_cfg.rendezvous_bonus,
-                mode_c_attempt_bonus=train_cfg.mode_c_attempt_bonus,
             )
             current_transition = RolloutTransition(
                 observation_batch=observation_batch,
@@ -917,6 +909,7 @@ def train_cmrappo(
                 ),
                 rendezvous_arrive_bonus_applied=arrive_bonus_applied,
                 rendezvous_success_bonus_applied=success_bonus_applied,
+                fallback_cause=str(getattr(transition_summary, "fallback_cause", "none")),
             )
             terminal_reward_by_drone: dict[str, float] = {}
             if step_result.done:
@@ -1652,7 +1645,6 @@ def _evaluate_policy_episode(
             root_branch_idx=action_indices.root_branch_idx,
             order_idx=action_indices.order_idx,
             mode_idx=action_indices.mode_idx,
-            recovery_idx=action_indices.recovery_idx,
         )
         step_result = env.step(env_action)
         history_buffer.append(
@@ -1723,6 +1715,8 @@ def _summarize_episode_records(
     mode_c_revalidation_fail_reason_totals: dict[str, int] = {}
     mode_c_timeout_from_state_totals: dict[str, int] = {}
     mode_c_fallback_from_state_totals: dict[str, int] = {}
+    fallback_cause_totals: dict[str, int] = {}
+    reservation_release_cause_totals: dict[str, int] = {}
     for item in episodes:
         for reason_key, count in dict(
             item.get("mode_c_post_delivery_revalidation_fail_reasons", {})
@@ -1738,6 +1732,16 @@ def _summarize_episode_records(
         for state_key, count in dict(item.get("mode_c_fallback_from_state", {})).items():
             mode_c_fallback_from_state_totals[str(state_key)] = (
                 mode_c_fallback_from_state_totals.get(str(state_key), 0) + int(count)
+            )
+        for cause_key, count in dict(item.get("fallback_cause_counts", {})).items():
+            fallback_cause_totals[str(cause_key)] = (
+                fallback_cause_totals.get(str(cause_key), 0) + int(count)
+            )
+        for cause_key, count in dict(
+            item.get("reservation_release_cause_counts", {})
+        ).items():
+            reservation_release_cause_totals[str(cause_key)] = (
+                reservation_release_cause_totals.get(str(cause_key), 0) + int(count)
             )
     payload = {
         "generated_at": generated_at,
@@ -1815,10 +1819,24 @@ def _summarize_episode_records(
         ),
         "mode_c_timeout_from_state": dict(mode_c_timeout_from_state_totals),
         "mode_c_fallback_from_state": dict(mode_c_fallback_from_state_totals),
+        "fallback_cause_counts": dict(fallback_cause_totals),
+        "sum_ppo_attributed_fallback_count": int(
+            sum(int(item.get("ppo_attributed_fallback_count", 0)) for item in episodes)
+        ),
+        "sum_system_attributed_fallback_count": int(
+            sum(int(item.get("system_attributed_fallback_count", 0)) for item in episodes)
+        ),
+        "reservation_release_cause_counts": dict(reservation_release_cause_totals),
         "sum_t_wait_sec": float(sum(float(item["t_wait_sec"]) for item in episodes)),
         "sum_t_idle_sec": float(sum(float(item["t_idle_sec"]) for item in episodes)),
         "sum_t_queue_sec": float(sum(float(item["t_queue_sec"]) for item in episodes)),
         "sum_t_fallback_sec": float(sum(float(item["t_fallback_sec"]) for item in episodes)),
+        "sum_t_ppo_attributed_fallback_sec": float(
+            sum(float(item.get("t_ppo_attributed_fallback_sec", 0.0)) for item in episodes)
+        ),
+        "sum_t_system_attributed_fallback_sec": float(
+            sum(float(item.get("t_system_attributed_fallback_sec", 0.0)) for item in episodes)
+        ),
         "sum_t_overdue_sec": float(sum(float(item["t_overdue_sec"]) for item in episodes)),
         "sum_t_reservation_timeout_cost_sec": float(
             sum(float(item["t_reservation_timeout_cost_sec"]) for item in episodes)
@@ -2160,7 +2178,6 @@ def _ppo_update(
                 policy_out=flat_policy_out,
                 action_mask=flat_action_mask,
                 action_indices=flat_action_indices,
-                recovery_entropy_coef=train_cfg.recovery_entropy_coef,
             )
 
             old_log_probs = minibatch.old_log_probs.reshape(-1)
@@ -2352,7 +2369,6 @@ def _drain_pending_transitions_after_collection(
             root_branch_idx=action_indices.root_branch_idx,
             order_idx=action_indices.order_idx,
             mode_idx=action_indices.mode_idx,
-            recovery_idx=action_indices.recovery_idx,
         )
         step_result = env.step(env_action)
         carry_in_reward, _post_action_reward = _extract_attributed_step_reward_parts(
@@ -2480,7 +2496,6 @@ def _advance_until_rollout_bootstraps_resolved_after_collection(
             root_branch_idx=action_indices.root_branch_idx,
             order_idx=action_indices.order_idx,
             mode_idx=action_indices.mode_idx,
-            recovery_idx=action_indices.recovery_idx,
         )
         step_result = env.step(env_action)
         history_buffer.append(
@@ -2682,7 +2697,6 @@ def _build_sequence_minibatch(
     root_branch_idx = np.zeros((batch_size, seq_len), dtype=np.int64)
     order_idx = np.zeros((batch_size, seq_len), dtype=np.int64)
     mode_idx = np.zeros((batch_size, seq_len), dtype=np.int64)
-    recovery_idx = np.zeros((batch_size, seq_len), dtype=np.int64)
     old_log_probs = np.zeros((batch_size, seq_len), dtype=np.float32)
     old_values = np.zeros((batch_size, seq_len), dtype=np.float32)
     returns = np.zeros((batch_size, seq_len), dtype=np.float32)
@@ -2713,9 +2727,6 @@ def _build_sequence_minibatch(
             root_branch_idx[seq_row, step_idx] = int(action.root_branch_idx)
             order_idx[seq_row, step_idx] = 0 if action.order_idx is None else int(action.order_idx)
             mode_idx[seq_row, step_idx] = 0 if action.mode_idx is None else int(action.mode_idx)
-            recovery_idx[seq_row, step_idx] = (
-                0 if action.recovery_idx is None else int(action.recovery_idx)
-            )
             old_log_probs[seq_row, step_idx] = float(transition.log_prob_old)
             old_values[seq_row, step_idx] = float(transition.value_old)
             returns[seq_row, step_idx] = float(sequence.returns[step_idx])
@@ -2743,7 +2754,6 @@ def _build_sequence_minibatch(
             "root_branch_idx": torch.as_tensor(root_branch_idx, dtype=torch.long, device=device),
             "order_idx": torch.as_tensor(order_idx, dtype=torch.long, device=device),
             "mode_idx": torch.as_tensor(mode_idx, dtype=torch.long, device=device),
-            "recovery_idx": torch.as_tensor(recovery_idx, dtype=torch.long, device=device),
         },
         old_log_probs=torch.as_tensor(old_log_probs, dtype=torch.float32, device=device),
         old_values=torch.as_tensor(old_values, dtype=torch.float32, device=device),
@@ -2791,7 +2801,6 @@ def _stack_action_masks_from_steps(step_masks: Sequence[Any]) -> Any:
         root_branch_mask=np.stack([item.root_branch_mask for item in step_masks], axis=0),
         order_mask=np.stack([item.order_mask for item in step_masks], axis=0),
         mode_mask=np.stack([item.mode_mask for item in step_masks], axis=0),
-        recovery_mask=np.stack([item.recovery_mask for item in step_masks], axis=0),
     )
 
 
@@ -2829,7 +2838,6 @@ def _stack_sequence_action_mask_rows(rows: Sequence[Any]) -> Any:
         root_branch_mask=np.stack([item.root_branch_mask for item in rows], axis=0),
         order_mask=np.stack([item.order_mask for item in rows], axis=0),
         mode_mask=np.stack([item.mode_mask for item in rows], axis=0),
-        recovery_mask=np.stack([item.recovery_mask for item in rows], axis=0),
     )
 
 
@@ -2871,7 +2879,6 @@ def _zero_action_mask_like(template: Any) -> Any:
         root_branch_mask=root_branch_mask,
         order_mask=np.zeros_like(template.order_mask, dtype=np.bool_),
         mode_mask=np.zeros_like(template.mode_mask, dtype=np.bool_),
-        recovery_mask=np.zeros_like(template.recovery_mask, dtype=np.bool_),
     )
 
 
@@ -2884,11 +2891,6 @@ def _flatten_sequence_policy_output(policy_out: Any) -> Any:
             -1,
             policy_out.mode_logits.shape[-2],
             policy_out.mode_logits.shape[-1],
-        ),
-        recovery_logits=policy_out.recovery_logits.reshape(
-            -1,
-            policy_out.recovery_logits.shape[-2],
-            policy_out.recovery_logits.shape[-1],
         ),
         value=policy_out.value.reshape(-1),
     )
@@ -2904,11 +2906,6 @@ def _flatten_sequence_action_mask(action_mask: Any) -> Any:
             action_mask.mode_mask.shape[-2],
             action_mask.mode_mask.shape[-1],
         ),
-        recovery_mask=action_mask.recovery_mask.reshape(
-            -1,
-            action_mask.recovery_mask.shape[-2],
-            action_mask.recovery_mask.shape[-1],
-        ),
     )
 
 
@@ -2917,7 +2914,6 @@ def _flatten_sequence_action_indices(action_indices: Mapping[str, Any]) -> dict[
         "root_branch_idx": action_indices["root_branch_idx"].reshape(-1),
         "order_idx": action_indices["order_idx"].reshape(-1),
         "mode_idx": action_indices["mode_idx"].reshape(-1),
-        "recovery_idx": action_indices["recovery_idx"].reshape(-1),
     }
 
 
@@ -3496,7 +3492,6 @@ def _load_training_config(config_path: Path) -> _TrainingConfig:
         gae_lambda=float(training["gae_lambda"]),
         clip_coef=float(training["clip_coef"]),
         entropy_coef=float(training["entropy_coef"]),
-        recovery_entropy_coef=float(training.get("recovery_entropy_coef", 1.0)),
         rendezvous_arrive_bonus=float(reward.get("rendezvous_arrive_bonus", 0.0)),
         rendezvous_bonus=float(reward.get("rendezvous_bonus", 0.0)),
         mode_c_attempt_bonus=float(reward.get("mode_c_attempt_bonus", 0.0)),

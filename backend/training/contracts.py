@@ -51,6 +51,21 @@ class PolicyMode(StrEnum):
     C = "C"
 
 
+class ReservationConstraintState(StrEnum):
+    """卡车粗规划层看到的 reservation 强度。"""
+
+    HARD = "hard"
+    STRONG_HARD = "strong_hard"
+
+
+class ReservationPlanStatus(StrEnum):
+    """PlannerBridge 对单个 reservation 约束的处理结果。"""
+
+    KEPT = "kept"
+    DRIFTED = "drifted"
+    INVALIDATED = "invalidated"
+
+
 _POLICY_TO_PLANNER_MODE: Mapping[PolicyMode, PlannerMode] = {
     PolicyMode.B: PlannerMode.B,
     PolicyMode.C: PlannerMode.C,
@@ -78,6 +93,103 @@ class RouteDriftRef:
         if self.route_index_ref < 0:
             raise ValueError(
                 f"route_index_ref 不能为负数: {self.route_index_ref}"
+            )
+
+
+@dataclass(frozen=True)
+class TruckReservationConstraint:
+    """PlannerBridge 重规划时接收的卡车 rendezvous reservation 约束。"""
+
+    reservation_id: str
+    drone_id: str
+    node_id: NodeId
+    state: ReservationConstraintState
+    eta_ref: EtaSec
+    max_eta_drift_sec: float
+    issued_at: SimTimeSec
+    related_order_id: OrderId | None = None
+
+    def __post_init__(self) -> None:
+        if not self.reservation_id:
+            raise ValueError("reservation_id 不能为空")
+        if not self.drone_id:
+            raise ValueError("drone_id 不能为空")
+        if not self.node_id:
+            raise ValueError("node_id 不能为空")
+        if self.state not in set(ReservationConstraintState):
+            raise ValueError(f"非法 reservation state: {self.state}")
+        if self.eta_ref < 0:
+            raise ValueError(f"eta_ref 不能为负数: {self.eta_ref}")
+        if self.max_eta_drift_sec < 0:
+            raise ValueError(
+                f"max_eta_drift_sec 不能为负数: {self.max_eta_drift_sec}"
+            )
+        if self.issued_at < 0:
+            raise ValueError(f"issued_at 不能为负数: {self.issued_at}")
+
+
+@dataclass(frozen=True)
+class ReservationPlanOutcome:
+    """PlannerBridge 对 reservation 的结构化诊断输出。"""
+
+    reservation_id: str
+    node_id: NodeId
+    old_eta: EtaSec
+    new_eta: EtaSec | None
+    eta_drift_sec: float | None
+    status: ReservationPlanStatus
+    invalidate_cause: str | None = None
+
+    def __post_init__(self) -> None:
+        if not self.reservation_id:
+            raise ValueError("reservation_id 不能为空")
+        if not self.node_id:
+            raise ValueError("node_id 不能为空")
+        if self.old_eta < 0:
+            raise ValueError(f"old_eta 不能为负数: {self.old_eta}")
+        if self.new_eta is not None and self.new_eta < 0:
+            raise ValueError(f"new_eta 不能为负数: {self.new_eta}")
+        if self.eta_drift_sec is not None and self.eta_drift_sec < 0:
+            raise ValueError(
+                f"eta_drift_sec 不能为负数: {self.eta_drift_sec}"
+            )
+        if self.status not in set(ReservationPlanStatus):
+            raise ValueError(f"非法 reservation outcome status: {self.status}")
+        if self.status == ReservationPlanStatus.INVALIDATED:
+            if not self.invalidate_cause:
+                raise ValueError("invalidated outcome 必须提供 invalidate_cause")
+        elif self.invalidate_cause is not None:
+            raise ValueError("非 invalidated outcome 不应提供 invalidate_cause")
+
+
+@dataclass(frozen=True)
+class TruckPlanStopView:
+    """PlannerBridge 输出给环境侧执行的卡车停靠点。"""
+
+    seq: int
+    node_type: str
+    node_id: NodeId
+    order_id: OrderId | None
+    arrival_time: SimTimeSec
+    departure_time: SimTimeSec
+
+    def __post_init__(self) -> None:
+        if self.seq < 0:
+            raise ValueError(f"seq 不能为负数: {self.seq}")
+        if self.node_type not in {"station", "depot", "customer"}:
+            raise ValueError(f"非法 truck plan node_type: {self.node_type}")
+        if not self.node_id:
+            raise ValueError("node_id 不能为空")
+        if self.node_type == "customer" and not self.order_id:
+            raise ValueError("customer truck plan stop 必须携带 order_id")
+        if self.node_type != "customer" and self.order_id is not None:
+            raise ValueError("非 customer truck plan stop 不应携带 order_id")
+        if self.arrival_time < 0:
+            raise ValueError(f"arrival_time 不能为负数: {self.arrival_time}")
+        if self.departure_time < self.arrival_time:
+            raise ValueError(
+                "departure_time 必须大于等于 arrival_time: "
+                f"{self.departure_time} < {self.arrival_time}"
             )
 
 
@@ -138,6 +250,12 @@ class CoarsePlanView:
     # 可选退化开关：当为 True 时，允许 truck_backbone_route 为空，表示“卡车未来骨架已耗尽”。
     # 仅建议在 benchmark / hybrid 等不追加巡站循环的验证场景中显式开启；默认保持严格契约。
     allow_empty_backbone_route: bool = False
+    # PlannerBridge 对 hard / strong-hard reservation 约束的处理结果。
+    reservation_outcomes: Mapping[str, ReservationPlanOutcome] = field(
+        default_factory=dict
+    )
+    # 可选执行计划：为空时表示沿用当前 Phase4/patrol 未来路线；非空时由 env_adapter 替换未来 truck stops。
+    truck_plan_stops: tuple[TruckPlanStopView, ...] = ()
 
     # 缓存集合，便于高频 membership 查询。
     _authorized_order_set: FrozenSet[OrderId] = field(init=False, repr=False)
@@ -297,6 +415,22 @@ class CoarsePlanView:
                 raise ValueError(
                     f"node_charge_load_budget[{node_id}] 不能为负数: {budget}"
                 )
+
+        for reservation_id, outcome in self.reservation_outcomes.items():
+            if reservation_id != outcome.reservation_id:
+                raise ValueError(
+                    "reservation_outcomes 的 key 必须等于 outcome.reservation_id: "
+                    f"{reservation_id} != {outcome.reservation_id}"
+                )
+
+        previous_departure = self.issued_at
+        for stop in self.truck_plan_stops:
+            if stop.arrival_time < previous_departure - 1e-6:
+                raise ValueError(
+                    "truck_plan_stops 必须按时间递增且不可早于上一站 departure: "
+                    f"{stop.arrival_time} < {previous_departure}"
+                )
+            previous_departure = stop.departure_time
 
         object.__setattr__(self, "_authorized_order_set", authorized_set)
         object.__setattr__(
@@ -459,7 +593,7 @@ class FactorizedActionSchema:
     max_recovery_slots: int
 
 
-ResolvedDispatchKey: TypeAlias = tuple[int, int, int | None]
+ResolvedDispatchKey: TypeAlias = tuple[int, int]
 
 
 @dataclass(frozen=True)
@@ -473,7 +607,6 @@ class ResolvedActionLookup:
         root_branch_idx: int,
         order_idx: int | None = None,
         mode_idx: int | None = None,
-        recovery_idx: int | None = None,
     ) -> GlobalWaitAction | DispatchAction:
         if root_branch_idx == 0:
             return self.wait_action
@@ -481,7 +614,7 @@ class ResolvedActionLookup:
             raise KeyError(f"未知 root_branch_idx: {root_branch_idx}")
         if order_idx is None or mode_idx is None:
             raise KeyError("DISPATCH 分支必须同时提供 order_idx 与 mode_idx")
-        key = (order_idx, mode_idx, recovery_idx)
+        key = (order_idx, mode_idx)
         if key not in self.dispatch_actions:
             raise KeyError(f"未找到结构化动作索引: {key}")
         return self.dispatch_actions[key]
@@ -494,7 +627,6 @@ class ResolvedActionLookup:
                 key=lambda item: (
                     item[0][0],
                     item[0][1],
-                    -1 if item[0][2] is None else item[0][2],
                 ),
             )
         ]
@@ -508,7 +640,6 @@ class CandidateOutput:
     has_wait_action: bool
     order_mask: tuple[bool, ...]
     mode_mask: tuple[tuple[bool, bool], ...]
-    recovery_mask: tuple[tuple[bool, ...], ...]
     factorized_action_schema: FactorizedActionSchema
     resolved_action_lookup: ResolvedActionLookup
 
@@ -542,7 +673,6 @@ class FactorizedActionMask:
     root_branch_mask: Any
     order_mask: Any
     mode_mask: Any
-    recovery_mask: Any
 
 
 @dataclass(frozen=True)
@@ -552,25 +682,17 @@ class ResolvedActionIndices:
     root_branch_idx: int
     order_idx: int | None = None
     mode_idx: int | None = None
-    recovery_idx: int | None = None
 
     def __post_init__(self) -> None:
         if self.root_branch_idx == 0:
-            if any(
-                item is not None
-                for item in (self.order_idx, self.mode_idx, self.recovery_idx)
-            ):
-                raise ValueError("WAIT 分支不应携带 order/mode/recovery 索引")
+            if any(item is not None for item in (self.order_idx, self.mode_idx)):
+                raise ValueError("WAIT 分支不应携带 order/mode 索引")
             return
 
         if self.root_branch_idx != 1:
             raise ValueError(f"未知 root_branch_idx: {self.root_branch_idx}")
         if self.order_idx is None or self.mode_idx is None:
             raise ValueError("DISPATCH 分支必须携带 order_idx 与 mode_idx")
-        if self.mode_idx == 0 and self.recovery_idx is not None:
-            raise ValueError("mode B 不应携带 recovery_idx")
-        if self.mode_idx == 1 and self.recovery_idx is None:
-            raise ValueError("mode C 必须携带 recovery_idx")
 
 
 @dataclass(frozen=True)
@@ -619,6 +741,7 @@ class TransitionSummary:
     hard_failure: bool
     queue_entered: bool
     service_completed: bool
+    fallback_cause: str = "none"
 
 
 @dataclass(frozen=True)
@@ -998,6 +1121,9 @@ __all__ = [
     "PolicyMeta",
     "PolicyMode",
     "PriorityBand",
+    "ReservationConstraintState",
+    "ReservationPlanOutcome",
+    "ReservationPlanStatus",
     "RecoveryFeatures",
     "ResolvedActionIndices",
     "ResolvedActionLookup",
@@ -1009,6 +1135,8 @@ __all__ = [
     "SolverEnergyRuntimeSnapshot",
     "TrainingInputMeta",
     "TrainingRunMeta",
+    "TruckReservationConstraint",
+    "TruckPlanStopView",
     "TransitionSummary",
     "UavSelfFeatures",
     "build_meta_json_dict",

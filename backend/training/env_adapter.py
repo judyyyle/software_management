@@ -25,7 +25,7 @@ import copy
 import json
 import math
 import random
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from enum import StrEnum
 from pathlib import Path
 from typing import Any, Mapping, TypeAlias
@@ -51,7 +51,11 @@ from .contracts import (
     PlannerMode,
     PlannerTriggerContext,
     PolicyMode,
+    ReservationConstraintState,
+    ReservationPlanStatus,
     RouteDriftRef,
+    TruckPlanStopView,
+    TruckReservationConstraint,
 )
 from .order_source_adapter import (
     OrderSourceConfig,
@@ -75,6 +79,37 @@ _MODE_C_REVALIDATION_REASON_KEYS = (
     "rendezvous_time_feasible",
     "node_still_valid",
 )
+FALLBACK_CAUSE_PLANNER_INVALIDATED_FOR_TRUCK_ORDER = "planner_invalidated_for_truck_order"
+FALLBACK_CAUSE_C_REVALIDATION_FAILED = "c_revalidation_failed"
+FALLBACK_CAUSE_RENDEZVOUS_WAIT_TIMEOUT = "rendezvous_wait_timeout"
+FALLBACK_CAUSE_ENERGY_OR_NODE_INVALID = "energy_or_node_invalid"
+FALLBACK_CAUSE_NO_POST_DELIVERY_C_NODE = "no_post_delivery_c_node"
+FALLBACK_CAUSE_HARD_FAILURE_FALLBACK = "hard_failure_fallback"
+FALLBACK_CAUSE_NONE = "none"
+_FALLBACK_CAUSE_KEYS = (
+    FALLBACK_CAUSE_PLANNER_INVALIDATED_FOR_TRUCK_ORDER,
+    FALLBACK_CAUSE_C_REVALIDATION_FAILED,
+    FALLBACK_CAUSE_RENDEZVOUS_WAIT_TIMEOUT,
+    FALLBACK_CAUSE_ENERGY_OR_NODE_INVALID,
+    FALLBACK_CAUSE_NO_POST_DELIVERY_C_NODE,
+    FALLBACK_CAUSE_HARD_FAILURE_FALLBACK,
+)
+_SYSTEM_ATTRIBUTED_FALLBACK_CAUSES = {
+    FALLBACK_CAUSE_PLANNER_INVALIDATED_FOR_TRUCK_ORDER,
+}
+
+
+def _normalize_fallback_cause(cause: str | None) -> str:
+    if cause is None:
+        return FALLBACK_CAUSE_HARD_FAILURE_FALLBACK
+    normalized = str(cause)
+    if normalized in _FALLBACK_CAUSE_KEYS:
+        return normalized
+    return FALLBACK_CAUSE_HARD_FAILURE_FALLBACK
+
+
+def _is_ppo_attributed_fallback_cause(cause: str | None) -> bool:
+    return _normalize_fallback_cause(cause) not in _SYSTEM_ATTRIBUTED_FALLBACK_CAUSES
 
 
 class TrainingDroneState(StrEnum):
@@ -189,6 +224,7 @@ class FallbackLeg:
     host_node_id: str
     host_node_type: str
     arrival_time: float
+    cause: str = FALLBACK_CAUSE_HARD_FAILURE_FALLBACK
 
 
 @dataclass(frozen=True)
@@ -268,6 +304,18 @@ class DispatchCommit:
 
 
 @dataclass(frozen=True)
+class ModeCPostDeliverySelection:
+    """送达后按当前 truck future backbone 选出的 mode C 回收点。"""
+
+    recover_node_id: str
+    planned_truck_arrival_time: float
+    planned_uav_arrival_time: float
+    planned_execution_slack_sec: float
+    uav_flight_time_sec: float
+    wait_time_sec: float
+
+
+@dataclass(frozen=True)
 class AppliedDecision:
     """一次已提交到环境的决策。
 
@@ -306,6 +354,7 @@ class _YamlConfig:
     reservation_alpha: float
     reservation_beta: float
     reservation_gamma: float
+    reservation_drift_eta_abs_threshold_sec: float
     lambda_wait: float
     wait_idle_penalty_coef: float
     wait_opportunity_penalty_coef: float
@@ -314,6 +363,7 @@ class _YamlConfig:
     lambda_res_timeout: float
     lambda_overdue: float
     R_delivery_bonus: float
+    mode_c_attempt_bonus: float
     max_overdue_sec: float
     hard_overdue_penalty_sec: float
     hard_failure_penalty_sec: float
@@ -385,6 +435,10 @@ class TrainingEnvAdapter:
         self._drone_path_version: dict[DroneId, int] = {}
         self._road_graph: Any | None = None
         self._road_nodes: Mapping[str, tuple[float, float]] | None = None
+        self._truck_road_route_geometry_cache: dict[
+            tuple[float, float, float, float],
+            tuple[Position3D, ...],
+        ] = {}
 
         self._drone_state: dict[DroneId, TrainingDroneState] = {}
         # 记录 active_wait 结束后应恢复到哪个基础状态。
@@ -456,10 +510,18 @@ class TrainingEnvAdapter:
             "return_to_rendezvous": 0,
             "waiting_for_truck": 0,
         }
+        self._episode_fallback_cause_counts = {
+            key: 0 for key in _FALLBACK_CAUSE_KEYS
+        }
+        self._episode_ppo_attributed_fallback_count = 0
+        self._episode_system_attributed_fallback_count = 0
+        self._episode_reservation_release_cause_counts: dict[str, int] = {}
         self._episode_wait_time_sec = 0.0
         self._episode_idle_time_sec = 0.0
         self._episode_queue_time_sec = 0.0
         self._episode_fallback_time_sec = 0.0
+        self._episode_ppo_attributed_fallback_time_sec = 0.0
+        self._episode_system_attributed_fallback_time_sec = 0.0
         self._episode_overdue_time_sec = 0.0
         self._episode_reservation_timeout_cost_sec = 0.0
         self._planner_bridge = (
@@ -470,6 +532,8 @@ class TrainingEnvAdapter:
                     future_backbone_provider=self._future_backbone_visits,
                     config_path=self._config_path,
                     heavy_payload_capacity=self._heavy_payload_capacity,
+                    truck_speed_provider=lambda: self._require_truck().speed,
+                    truck_travel_time_provider=self._estimate_truck_road_travel_time,
                 )
                 if enable_phase6
                 else None
@@ -546,6 +610,7 @@ class TrainingEnvAdapter:
         self._completed_backbone_nodes_since_plan.clear()
         self._truck_route_version = 1
         self._drone_path_version.clear()
+        self._truck_road_route_geometry_cache.clear()
         self._episode_delivery_count = 0
         self._episode_fallback_count = 0
         self._episode_hard_failure_count = 0
@@ -579,10 +644,18 @@ class TrainingEnvAdapter:
             "return_to_rendezvous": 0,
             "waiting_for_truck": 0,
         }
+        self._episode_fallback_cause_counts = {
+            key: 0 for key in _FALLBACK_CAUSE_KEYS
+        }
+        self._episode_ppo_attributed_fallback_count = 0
+        self._episode_system_attributed_fallback_count = 0
+        self._episode_reservation_release_cause_counts = {}
         self._episode_wait_time_sec = 0.0
         self._episode_idle_time_sec = 0.0
         self._episode_queue_time_sec = 0.0
         self._episode_fallback_time_sec = 0.0
+        self._episode_ppo_attributed_fallback_time_sec = 0.0
+        self._episode_system_attributed_fallback_time_sec = 0.0
         self._episode_overdue_time_sec = 0.0
         self._episode_reservation_timeout_cost_sec = 0.0
 
@@ -891,6 +964,12 @@ class TrainingEnvAdapter:
 
     def build_system_context_stats(self) -> dict[str, Any]:
         """返回不进入 PPO 主奖励的系统上下文统计。"""
+        order_mgr = self._require_order_manager()
+        truck_only_events = [
+            event
+            for event in self._truck_background_order_completion_events
+            if event.get("truck_only_dynamic")
+        ]
         return {
             "mode_a_background_order_count": int(self._background_mode_a_order_count),
             "mode_a_background_completed_count": len(self._background_mode_a_completed),
@@ -898,6 +977,12 @@ class TrainingEnvAdapter:
             "mode_a_background_completion_time_sum": float(
                 self._background_mode_a_completion_time_sum
             ),
+            "truck_only_dynamic_pending_count": sum(
+                1
+                for order in order_mgr.pending_orders.values()
+                if self._is_truck_only_order(order)
+            ),
+            "truck_only_dynamic_completed_count": len(truck_only_events),
             "truck_background_order_completion_events": tuple(
                 dict(event) for event in self._truck_background_order_completion_events
             ),
@@ -983,6 +1068,16 @@ class TrainingEnvAdapter:
             ),
             "mode_c_timeout_from_state": dict(self._episode_mode_c_timeout_from_state),
             "mode_c_fallback_from_state": dict(self._episode_mode_c_fallback_from_state),
+            "fallback_cause_counts": dict(self._episode_fallback_cause_counts),
+            "ppo_attributed_fallback_count": int(
+                self._episode_ppo_attributed_fallback_count
+            ),
+            "system_attributed_fallback_count": int(
+                self._episode_system_attributed_fallback_count
+            ),
+            "reservation_release_cause_counts": dict(
+                self._episode_reservation_release_cause_counts
+            ),
             "feasible_mode_c_recover_node_count_total": int(
                 self._episode_feasible_mode_c_recover_node_count_total
             ),
@@ -996,6 +1091,12 @@ class TrainingEnvAdapter:
             "t_idle_sec": float(self._episode_idle_time_sec),
             "t_queue_sec": float(self._episode_queue_time_sec),
             "t_fallback_sec": float(self._episode_fallback_time_sec),
+            "t_ppo_attributed_fallback_sec": float(
+                self._episode_ppo_attributed_fallback_time_sec
+            ),
+            "t_system_attributed_fallback_sec": float(
+                self._episode_system_attributed_fallback_time_sec
+            ),
             "t_overdue_sec": float(self._episode_overdue_time_sec),
             "t_reservation_timeout_cost_sec": float(
                 self._episode_reservation_timeout_cost_sec
@@ -1060,6 +1161,10 @@ class TrainingEnvAdapter:
                 key=lambda item: item.drone_id,
             )
         ]
+        dispatch_chains = self._build_dispatch_chain_snapshot(
+            runtime_state=runtime_state,
+            t_now=float(runtime_state.t_now),
+        )
 
         return {
             "t_now": float(runtime_state.t_now),
@@ -1071,6 +1176,7 @@ class TrainingEnvAdapter:
             },
             "drones": drones,
             "orders": orders,
+            "dispatch_chains": dispatch_chains,
             "current_decision": (
                 {
                     "drone_id": str(decision.deciding_drone_id),
@@ -1083,6 +1189,61 @@ class TrainingEnvAdapter:
             "paths": self._build_runtime_path_snapshot(float(runtime_state.t_now)),
             "last_reward_breakdown": dict(self._last_reward_breakdown),
         }
+
+    def _build_dispatch_chain_snapshot(
+        self,
+        *,
+        runtime_state: RuntimeStateView,
+        t_now: float,
+    ) -> list[dict[str, Any]]:
+        """暴露 PPO dispatch 意图到执行层承诺的运行时链路。"""
+        chains: list[dict[str, Any]] = []
+        for drone_id, commit in sorted(self._dispatch_commit.items()):
+            drone_state = runtime_state.drone_states.get(drone_id)
+            reservation = self._reservations.get(drone_id)
+            active_leg = self._flight_legs.get(drone_id)
+            mode = str(commit.mode.value)
+            selected_node = commit.selected_recover_node
+            if mode != PolicyMode.C.value:
+                recovery_stage = "not_applicable"
+            elif selected_node is None:
+                recovery_stage = "pending_post_delivery_selection"
+            elif reservation is not None:
+                recovery_stage = "reservation_active"
+            else:
+                recovery_stage = "rendezvous_selected"
+
+            chains.append(
+                {
+                    "drone_id": str(drone_id),
+                    "order_id": str(commit.order_id),
+                    "mode": mode,
+                    "trigger_station_id": commit.trigger_station_id,
+                    "selected_recover_node_id": selected_node,
+                    "reservation_node_id": (
+                        None if reservation is None else str(reservation.recover_node)
+                    ),
+                    "recovery_stage": recovery_stage,
+                    "planned_truck_arrival_time": commit.planned_truck_arrival_time,
+                    "planned_uav_arrival_time_lb": commit.planned_uav_arrival_time_lb,
+                    "planned_execution_slack_sec": commit.planned_execution_slack_sec,
+                    "training_state": (
+                        None if drone_state is None else str(drone_state.training_state)
+                    ),
+                    "carrying_order_id": (
+                        None if drone_state is None else drone_state.carrying_order_id
+                    ),
+                    "active_leg_kind": None if active_leg is None else str(active_leg.kind),
+                    "active_leg_target_node_id": (
+                        None if active_leg is None else active_leg.target_node_id
+                    ),
+                    "active_leg_target_node_type": (
+                        None if active_leg is None else active_leg.target_node_type
+                    ),
+                    "snapshot_time": float(t_now),
+                }
+            )
+        return chains
 
     def _build_runtime_path_snapshot(self, t_now: float) -> dict[str, list[dict[str, Any]]]:
         """返回当前时刻仍有效的 truck / drone 路径账本快照。"""
@@ -1389,17 +1550,261 @@ class TrainingEnvAdapter:
             runtime_state = self.build_runtime_state_view()
 
         trigger_ctx = self._build_planner_trigger_context(runtime_state)
-        coarse_plan = self._planner_bridge.maybe_replan(runtime_state, trigger_ctx)
+        reservation_constraints = self._build_truck_reservation_constraints(
+            runtime_state
+        )
+        coarse_plan = self._planner_bridge.maybe_replan(
+            runtime_state,
+            trigger_ctx,
+            reservation_constraints=reservation_constraints,
+        )
         if (
             self._current_coarse_plan is None
             or coarse_plan.plan_version > self._current_coarse_plan.plan_version
         ):
             self._current_coarse_plan = coarse_plan
+            if coarse_plan.truck_plan_stops:
+                self._apply_dynamic_truck_plan(coarse_plan.truck_plan_stops)
+            self._apply_planner_reservation_outcomes(
+                coarse_plan=coarse_plan,
+                reservation_constraints=reservation_constraints,
+                t_now=float(runtime_state.t_now),
+            )
             self._active_launch_stations = set(coarse_plan.launch_candidate_stations)
             self._completed_backbone_nodes_since_plan.clear()
 
         self._prune_active_launch_stations(runtime_state)
         return self._current_coarse_plan
+
+    def _build_truck_reservation_constraints(
+        self,
+        runtime_state: RuntimeStateView,
+    ) -> tuple[TruckReservationConstraint, ...]:
+        """把环境内的 post-delivery reservation 转成 PlannerBridge 约束。"""
+        constraints: list[TruckReservationConstraint] = []
+        hard_states = {
+            TrainingDroneState.RETURN_TO_RENDEZVOUS,
+        }
+        strong_hard_states = {
+            TrainingDroneState.WAITING_FOR_TRUCK,
+        }
+        for drone_id, reservation in sorted(self._reservations.items()):
+            drone_state = self._drone_state.get(drone_id)
+            if drone_state in strong_hard_states:
+                reservation_state = ReservationConstraintState.STRONG_HARD
+            elif drone_state in hard_states:
+                reservation_state = ReservationConstraintState.HARD
+            else:
+                continue
+
+            commit = self._dispatch_commit.get(drone_id)
+            eta_ref = (
+                None
+                if commit is None
+                else commit.planned_truck_arrival_time
+            )
+            if eta_ref is None and self._current_coarse_plan is not None:
+                eta_ref = self._current_coarse_plan.truck_eta_map.get(
+                    reservation.recover_node
+                )
+            if eta_ref is None:
+                eta_ref = self._next_backbone_arrival_time_for_node(
+                    reservation.recover_node,
+                    runtime_state.t_now,
+                    include_current=True,
+                )
+            if eta_ref is None:
+                continue
+
+            constraints.append(
+                TruckReservationConstraint(
+                    reservation_id=(
+                        f"{drone_id}:{reservation.recover_node}:"
+                        f"{float(reservation.issued_at):.6f}"
+                    ),
+                    drone_id=drone_id,
+                    node_id=reservation.recover_node,
+                    state=reservation_state,
+                    eta_ref=float(eta_ref),
+                    max_eta_drift_sec=float(
+                        self._cfg.reservation_drift_eta_abs_threshold_sec
+                    ),
+                    issued_at=float(reservation.issued_at),
+                    related_order_id=(
+                        None if commit is None else commit.order_id
+                    ),
+                )
+            )
+        return tuple(constraints)
+
+    def _apply_planner_reservation_outcomes(
+        self,
+        *,
+        coarse_plan: CoarsePlanView,
+        reservation_constraints: tuple[TruckReservationConstraint, ...],
+        t_now: float,
+    ) -> None:
+        constraints_by_id = {
+            constraint.reservation_id: constraint
+            for constraint in reservation_constraints
+        }
+        for reservation_id, outcome in coarse_plan.reservation_outcomes.items():
+            if outcome.status != ReservationPlanStatus.INVALIDATED:
+                continue
+            constraint = constraints_by_id.get(reservation_id)
+            if constraint is None:
+                continue
+            drone_id = constraint.drone_id
+            if drone_id not in self._reservations:
+                continue
+            self._release_reservation(
+                drone_id,
+                cause=FALLBACK_CAUSE_PLANNER_INVALIDATED_FOR_TRUCK_ORDER,
+            )
+            commit = self._dispatch_commit.get(drone_id)
+            if commit is not None:
+                self._dispatch_commit[drone_id] = replace(
+                    commit,
+                    selected_recover_node=None,
+                )
+            if self._drone_state.get(drone_id) in {
+                TrainingDroneState.RETURN_TO_RENDEZVOUS,
+                TrainingDroneState.WAITING_FOR_TRUCK,
+            }:
+                if not self._enter_fallback_recovery(
+                    drone_id,
+                    start_time=float(t_now),
+                    cause=FALLBACK_CAUSE_PLANNER_INVALIDATED_FOR_TRUCK_ORDER,
+                ):
+                    self._mark_hard_failure(drone_id)
+
+    def _apply_dynamic_truck_plan(
+        self,
+        truck_plan_stops: tuple[TruckPlanStopView, ...],
+    ) -> None:
+        if not truck_plan_stops:
+            return
+
+        anchor = PlannedStop(
+            seq=0,
+            node_type="truck_current",
+            node_id="truck_current",
+            position=self._truck_position_at_time(self._t_now),
+            order_id=None,
+            arrival_time=float(self._t_now),
+            departure_time=float(self._t_now),
+        )
+        planned_stops = [anchor]
+        planned_segments: list[PlannedTruckSegment] = []
+        prev_stop = anchor
+        for idx, stop_view in enumerate(truck_plan_stops, start=1):
+            position = self._resolve_truck_plan_stop_position(stop_view)
+            planned_stop = PlannedStop(
+                seq=idx,
+                node_type=stop_view.node_type,
+                node_id=stop_view.node_id,
+                position=position,
+                order_id=stop_view.order_id,
+                arrival_time=float(stop_view.arrival_time),
+                departure_time=float(stop_view.departure_time),
+            )
+            geometry = self._build_truck_road_route_geometry(
+                from_pos=prev_stop.position,
+                to_pos=position,
+            )
+            distance_m = _polyline_distance_2d(geometry)
+            planned_segments.append(
+                PlannedTruckSegment(
+                    segment_id=len(planned_segments),
+                    from_node_id=prev_stop.node_id,
+                    to_node_id=planned_stop.node_id,
+                    from_node_type=prev_stop.node_type,
+                    to_node_type=planned_stop.node_type,
+                    start_time=float(prev_stop.departure_time),
+                    end_time=float(planned_stop.arrival_time),
+                    distance_m=float(distance_m),
+                    geometry=geometry,
+                    cumulative_distances_m=_build_cumulative_distances(geometry),
+                )
+            )
+            planned_stops.append(planned_stop)
+            prev_stop = planned_stop
+
+        self._planned_route_stops = planned_stops
+        self._planned_route_segments = planned_segments
+        self._planned_route_stop_i = 1
+        self._full_backbone_cache = [
+            BackboneVisit(
+                node_id=stop.node_id,
+                arrival_time=float(stop.arrival_time),
+                departure_time=float(stop.departure_time) + _BACKBONE_DEPARTURE_EPS,
+            )
+            for stop in planned_stops[1:]
+            if stop.node_type in {"station", "depot"}
+        ]
+        self._truck_route_version += 1
+        self._append_patrol_loop_if_needed()
+        if len(self._planned_route_stops) >= 2:
+            self._bind_truck_route()
+
+    def _resolve_truck_plan_stop_position(
+        self,
+        stop: TruckPlanStopView,
+    ) -> Position3D:
+        if stop.node_type == "customer":
+            order = self._require_order_manager().pending_orders.get(stop.order_id or "")
+            if order is None:
+                order = self._require_order_manager().assigned_orders.get(
+                    stop.order_id or ""
+                )
+            if order is None:
+                raise RuntimeError(f"truck plan 缺少 customer order: {stop.order_id}")
+            return _clone_position(order.delivery_loc)
+
+        fixed_node = self._resolve_fixed_node(stop.node_id)
+        return _clone_position(fixed_node.get_location(float(stop.arrival_time)))
+
+    def _estimate_truck_road_travel_time(
+        self,
+        from_pos: Position3D,
+        to_pos: Position3D,
+    ) -> float:
+        """按 OSM 路网最短路径估算卡车行驶时间。"""
+        geometry = self._build_truck_road_route_geometry(
+            from_pos=from_pos,
+            to_pos=to_pos,
+        )
+        distance_m = _polyline_distance_2d(geometry)
+        return distance_m / max(_TIME_EPS, float(self._require_truck().speed))
+
+    def _build_truck_road_route_geometry(
+        self,
+        *,
+        from_pos: Position3D,
+        to_pos: Position3D,
+    ) -> tuple[Position3D, ...]:
+        key = (
+            round(float(from_pos.x), 2),
+            round(float(from_pos.y), 2),
+            round(float(to_pos.x), 2),
+            round(float(to_pos.y), 2),
+        )
+        cached = self._truck_road_route_geometry_cache.get(key)
+        if cached is not None:
+            return tuple(_clone_position(pos) for pos in cached)
+
+        road_graph, road_nodes = self._require_road_graph()
+        geometry = _build_route_geometry_between_positions(
+            from_pos=from_pos,
+            to_pos=to_pos,
+            road_graph=road_graph,
+            road_nodes=road_nodes,
+            nearest_cache={},
+        )
+        self._truck_road_route_geometry_cache[key] = tuple(
+            _clone_position(pos) for pos in geometry
+        )
+        return geometry
 
     def _build_planner_trigger_context(
         self,
@@ -1468,12 +1873,31 @@ class TrainingEnvAdapter:
         expected_count = 0
         total_backbone_count = 0
         if self._current_coarse_plan is not None:
-            backlog_new_orders = sum(
+            planned_truck_only_orders = {
+                str(stop.order_id)
+                for stop in self._current_coarse_plan.truck_plan_stops
+                if stop.node_type == "customer" and stop.order_id is not None
+            }
+            uav_backlog_count = sum(
                 1
                 for order_id, order in runtime_state.pending_orders.items()
                 if self._is_uav_primary_order(order)
                 and not self._current_coarse_plan.is_order_authorized(order_id)
             )
+            truck_only_backlog_count = sum(
+                1
+                for order_id, order in runtime_state.pending_orders.items()
+                if (
+                    self._is_truck_only_order(order)
+                    and order_id not in planned_truck_only_orders
+                )
+            )
+            backlog_new_orders = uav_backlog_count
+            if truck_only_backlog_count:
+                backlog_new_orders = max(
+                    backlog_new_orders,
+                    self._cfg.coarse_new_order_trigger,
+                )
             total_backbone_count = len(self._current_coarse_plan.route_drift_ref)
             if total_backbone_count > 0:
                 expected_count = sum(
@@ -1825,6 +2249,11 @@ class TrainingEnvAdapter:
         merged_info = dict(info)
         if self._last_reward_breakdown:
             merged_info["reward_breakdown"] = dict(self._last_reward_breakdown)
+        if self._fallback_leg:
+            merged_info["active_fallback_causes_by_drone"] = {
+                str(drone_id): str(leg.cause)
+                for drone_id, leg in self._fallback_leg.items()
+            }
         merged_info["system_context_stats"] = self.build_system_context_stats()
         return EnvStepResult(
             reward=float(reward),
@@ -1855,11 +2284,24 @@ class TrainingEnvAdapter:
             return
 
         self._episode_dispatch_decision_count += 1
-        legal_mode_c_nodes = {
-            str(action.recover_node_id)
-            for action in dispatch_actions
-            if action.mode == PolicyMode.C and action.recover_node_id is not None
-        }
+        entity_mgr = self._require_entity_manager()
+        legal_mode_c_nodes: set[str] = set()
+        for action in dispatch_actions:
+            if action.mode != PolicyMode.C:
+                continue
+            order = decision_context.runtime_state.pending_orders.get(action.order_id)
+            if order is None:
+                continue
+            drone = entity_mgr.drones.get(decision_context.deciding_drone_id)
+            if drone is None:
+                continue
+            legal_mode_c_nodes.update(
+                self._iter_feasible_mode_c_recovery_nodes(
+                    drone=drone,
+                    order=order,
+                    coarse_plan=decision_context.coarse_plan,
+                )
+            )
         self._episode_feasible_mode_c_recover_node_count_total += len(legal_mode_c_nodes)
         if legal_mode_c_nodes:
             self._episode_dispatch_decision_with_legal_mode_c_count += 1
@@ -1933,6 +2375,7 @@ class TrainingEnvAdapter:
 
         event_reward = 0.0
         delivery_reward = 0.0
+        mode_c_selection_reward = 0.0
         hard_failure_reward = 0.0
         hard_overdue_reward = 0.0
         reservation_timeout_reward = 0.0
@@ -1948,14 +2391,18 @@ class TrainingEnvAdapter:
 
         # 2. UAV 订单送达 / mode A 背景完成（只记系统上下文统计，不进 PPO reward）
         for drone_id, leg in delivery_ready:
-            bonus = self._process_delivery_event(drone_id, leg)
-            delivery_reward += bonus
+            delivery_bonus, service_bonus = self._process_delivery_event(drone_id, leg)
+            delivery_reward += delivery_bonus
+            mode_c_selection_reward += service_bonus
             # 送达奖励归因给完成送达的无人机
             self._agent_cost_accum[drone_id] = (
-                self._agent_cost_accum.get(drone_id, 0.0) + bonus
+                self._agent_cost_accum.get(drone_id, 0.0) + delivery_bonus
             )
         for drone_id, service_leg in delivery_service_ready:
-            self._process_delivery_service_event(drone_id, service_leg)
+            mode_c_selection_reward += self._process_delivery_service_event(
+                drone_id,
+                service_leg,
+            )
         for stop in truck_stops:
             if stop.node_type == "customer" and stop.order_id:
                 if stop.order_id in self._background_mode_a_pending:
@@ -1973,10 +2420,14 @@ class TrainingEnvAdapter:
                             "departure_time_sec": float(stop.departure_time),
                         }
                     )
+                else:
+                    self._complete_truck_only_order_at_stop(stop)
 
-        event_reward += delivery_reward + hard_failure_reward
+        event_reward += delivery_reward + hard_failure_reward + mode_c_selection_reward
         if delivery_reward:
             reward_breakdown["delivery_bonus"] = delivery_reward
+        if mode_c_selection_reward:
+            reward_breakdown["mode_c_attempt_bonus"] = mode_c_selection_reward
         if hard_failure_reward:
             reward_breakdown["hard_failure"] = hard_failure_reward
 
@@ -2100,7 +2551,41 @@ class TrainingEnvAdapter:
     # Event processing
     # ---------------------------------------------------------------------
 
-    def _process_delivery_event(self, drone_id: str, leg: FlightLeg) -> float:
+    def _complete_truck_only_order_at_stop(self, stop: PlannedStop) -> None:
+        if not stop.order_id:
+            return
+        order_mgr = self._require_order_manager()
+        order = order_mgr.pending_orders.pop(stop.order_id, None)
+        if order is None:
+            return
+        if not self._is_truck_only_order(order):
+            order_mgr.pending_orders[order.order_id] = order
+            return
+
+        order.assigned_vehicle_id = self._require_truck().truck_id
+        order.assigned_mode = "A"
+        if order.status == TaskStatus.PENDING:
+            order.update_status(TaskStatus.ASSIGNED)
+        if order.status == TaskStatus.ASSIGNED:
+            order.update_status(TaskStatus.PICKED_UP)
+        if order.status == TaskStatus.PICKED_UP:
+            order.update_status(TaskStatus.DELIVERING)
+        order.actual_deliver_time = float(stop.arrival_time)
+        if order.status in {TaskStatus.DELIVERING, TaskStatus.TIMEOUT}:
+            order.update_status(TaskStatus.COMPLETED)
+        order_mgr.completed_orders.append(order)
+        self._truck_background_order_completion_events.append(
+            {
+                "order_id": str(stop.order_id),
+                "stop_seq": int(stop.seq),
+                "node_id": str(stop.node_id),
+                "arrival_time_sec": float(stop.arrival_time),
+                "departure_time_sec": float(stop.departure_time),
+                "truck_only_dynamic": True,
+            }
+        )
+
+    def _process_delivery_event(self, drone_id: str, leg: FlightLeg) -> tuple[float, float]:
         """处理一次送达事件，并立即衔接送达后的执行层转移。"""
         entity_mgr = self._require_entity_manager()
         order_mgr = self._require_order_manager()
@@ -2123,7 +2608,7 @@ class TrainingEnvAdapter:
 
         service_duration = float(self._scene_solver_params().drone_service_time_order_s)
         if service_duration <= _TIME_EPS:
-            self._process_delivery_service_event(
+            service_bonus = self._process_delivery_service_event(
                 drone_id,
                 DeliveryServiceLeg(
                     order_id=commit.order_id,
@@ -2132,7 +2617,7 @@ class TrainingEnvAdapter:
                     service_pos=_clone_position(leg.target_pos),
                 ),
             )
-            return self._cfg.R_delivery_bonus
+            return self._cfg.R_delivery_bonus, service_bonus
 
         self._delivery_service_legs[drone_id] = DeliveryServiceLeg(
             order_id=commit.order_id,
@@ -2141,13 +2626,13 @@ class TrainingEnvAdapter:
             service_pos=_clone_position(leg.target_pos),
         )
 
-        return self._cfg.R_delivery_bonus
+        return self._cfg.R_delivery_bonus, 0.0
 
     def _process_delivery_service_event(
         self,
         drone_id: str,
         service_leg: DeliveryServiceLeg,
-    ) -> None:
+    ) -> float:
         """处理客户点 delivery service 结束后的后续转移。"""
         self._delivery_service_legs.pop(drone_id, None)
         drone = self._require_entity_manager().drones[drone_id]
@@ -2162,7 +2647,7 @@ class TrainingEnvAdapter:
             )
             if target is None:
                 self._mark_hard_failure(drone_id)
-                return
+                return 0.0
             if isinstance(target, Depot):
                 self._schedule_mode_b_return_to_depot(
                     drone_id,
@@ -2177,39 +2662,94 @@ class TrainingEnvAdapter:
                 )
             else:
                 raise TypeError(f"不支持的 mode B 返程宿主类型: {type(target)!r}")
-            return
+            return 0.0
 
         selected_node = commit.selected_recover_node
-        checks = {key: False for key in _MODE_C_REVALIDATION_REASON_KEYS}
-        if selected_node:
+        if selected_node is not None:
             is_valid, checks = self._revalidate_mode_c_recover_node(
                 drone_id=drone_id,
                 node_id=selected_node,
                 t_now=service_leg.finish_time,
             )
-        else:
-            is_valid = False
-        if is_valid:
+            if is_valid:
+                self._schedule_return_to_rendezvous(
+                    drone_id,
+                    selected_node,
+                    start_time=service_leg.finish_time,
+                )
+                return 0.0
+
+            self._episode_mode_c_post_delivery_revalidation_fail_count += 1
+            for reason_key, passed in checks.items():
+                if not passed:
+                    self._episode_mode_c_post_delivery_revalidation_fail_reasons[
+                        reason_key
+                    ] += 1
+            self._release_reservation(
+                drone_id,
+                cause=FALLBACK_CAUSE_C_REVALIDATION_FAILED,
+            )
+            if not self._enter_fallback_recovery(
+                drone_id,
+                start_time=service_leg.finish_time,
+                cause=FALLBACK_CAUSE_C_REVALIDATION_FAILED,
+            ):
+                self._mark_hard_failure(drone_id)
+            return 0.0
+
+        selection = self._select_post_delivery_mode_c_recover_node(
+            drone_id=drone_id,
+            t_now=service_leg.finish_time,
+        )
+        if selection is not None:
+            selected_node = selection.recover_node_id
+            self._dispatch_commit[drone_id] = replace(
+                commit,
+                selected_recover_node=selected_node,
+                planned_truck_arrival_time=selection.planned_truck_arrival_time,
+                planned_uav_arrival_time_lb=selection.planned_uav_arrival_time,
+                planned_execution_slack_sec=selection.planned_execution_slack_sec,
+            )
+            self._record_mode_c_selection_metrics(
+                recover_node_id=selected_node,
+                planned_truck_arrival_time=selection.planned_truck_arrival_time,
+                planned_uav_arrival_time_lb=selection.planned_uav_arrival_time,
+                planned_execution_slack_sec=selection.planned_execution_slack_sec,
+                t_now=service_leg.finish_time,
+            )
+            self._acquire_reservation(
+                drone_id=drone_id,
+                recover_node_id=selected_node,
+            )
             self._schedule_return_to_rendezvous(
                 drone_id,
                 selected_node,
                 start_time=service_leg.finish_time,
             )
-            return
+            bonus = float(self._cfg.mode_c_attempt_bonus)
+            if bonus > 0.0:
+                self._agent_cost_accum[drone_id] = (
+                    self._agent_cost_accum.get(drone_id, 0.0) + bonus
+                )
+            return bonus
 
         self._episode_mode_c_post_delivery_revalidation_fail_count += 1
-        for reason_key, passed in checks.items():
-            if not passed:
-                self._episode_mode_c_post_delivery_revalidation_fail_reasons[
-                    reason_key
-                ] += 1
+        for reason_key in _MODE_C_REVALIDATION_REASON_KEYS:
+            self._episode_mode_c_post_delivery_revalidation_fail_reasons[
+                reason_key
+            ] += 1
 
-        self._release_reservation(drone_id)
+        self._release_reservation(
+            drone_id,
+            cause=FALLBACK_CAUSE_NO_POST_DELIVERY_C_NODE,
+        )
         if not self._enter_fallback_recovery(
             drone_id,
             start_time=service_leg.finish_time,
+            cause=FALLBACK_CAUSE_NO_POST_DELIVERY_C_NODE,
         ):
             self._mark_hard_failure(drone_id)
+        return 0.0
 
     def _process_non_delivery_arrival(self, drone_id: str, leg: FlightLeg) -> None:
         """处理除送达以外的飞行到达事件。"""
@@ -2226,10 +2766,14 @@ class TrainingEnvAdapter:
                 include_current=True,
             )
             if next_truck_arrival is None:
-                self._release_reservation(drone_id)
+                self._release_reservation(
+                    drone_id,
+                    cause=FALLBACK_CAUSE_ENERGY_OR_NODE_INVALID,
+                )
                 if not self._enter_fallback_recovery(
                     drone_id,
                     start_time=leg.arrival_time,
+                    cause=FALLBACK_CAUSE_ENERGY_OR_NODE_INVALID,
                 ):
                     self._mark_hard_failure(drone_id)
                 return
@@ -2270,7 +2814,7 @@ class TrainingEnvAdapter:
             recovered.append(drone_id)
 
         for drone_id in recovered:
-            self._release_reservation(drone_id)
+            self._release_reservation(drone_id, cause="rendezvous_success")
             self._rendezvous_wait_started_at.pop(drone_id, None)
             self._drone_state[drone_id] = TrainingDroneState.CHARGING_ON_TRUCK
             self._episode_mode_c_success_count += 1
@@ -2487,6 +3031,78 @@ class TrainingEnvAdapter:
             float(planned_execution_slack_sec),
         )
 
+    def _select_post_delivery_mode_c_recover_node(
+        self,
+        *,
+        drone_id: str,
+        t_now: float,
+    ) -> ModeCPostDeliverySelection | None:
+        """送达并完成 service 后，基于当前 future backbone 规则选择 C 回收点。"""
+        entity_mgr = self._require_entity_manager()
+        drone = entity_mgr.drones[drone_id]
+        t_select = float(t_now)
+        candidates: list[tuple[float, float, str, float, float, float]] = []
+        future_visits = self._dedup_backbone_visits(
+            self._future_backbone_visits(t_select)
+        )
+        for visit in future_visits:
+            node_id = str(visit.node_id)
+            if node_id not in entity_mgr.stations and node_id not in entity_mgr.depots:
+                continue
+            truck_eta = float(visit.arrival_time)
+            host = self._resolve_fixed_node(node_id)
+            host_pos = host.get_location(t_select)
+            if not self._can_reach_from(
+                drone=drone,
+                from_pos=drone.current_loc,
+                to_pos=host_pos,
+                payload=0.0,
+                safe_margin=drone.safe_margin_j,
+                battery_current=drone.battery_current,
+            ):
+                continue
+            uav_flight_time = self._estimate_flight_time(
+                drone=drone,
+                from_pos=drone.current_loc,
+                to_pos=host_pos,
+            )
+            uav_arrival = t_select + float(uav_flight_time)
+            wait_time = truck_eta - uav_arrival
+            if wait_time < -_TIME_EPS:
+                continue
+            if (
+                uav_arrival + float(self._cfg.rendezvous_execution_margin_sec)
+                > truck_eta + _TIME_EPS
+            ):
+                continue
+            if wait_time > float(self._cfg.rendezvous_max_wait_sec) + _TIME_EPS:
+                continue
+            score = float(wait_time) + 0.25 * float(uav_flight_time)
+            candidates.append(
+                (
+                    score,
+                    float(uav_flight_time),
+                    node_id,
+                    truck_eta,
+                    uav_arrival,
+                    wait_time,
+                )
+            )
+
+        if not candidates:
+            return None
+
+        candidates.sort(key=lambda item: (item[0], item[1], item[2]))
+        _score, uav_flight_time, node_id, truck_eta, uav_arrival, wait_time = candidates[0]
+        return ModeCPostDeliverySelection(
+            recover_node_id=node_id,
+            planned_truck_arrival_time=float(truck_eta),
+            planned_uav_arrival_time=float(uav_arrival),
+            planned_execution_slack_sec=float(wait_time),
+            uav_flight_time_sec=float(uav_flight_time),
+            wait_time_sec=float(wait_time),
+        )
+
     def _record_mode_c_selection_metrics(
         self,
         *,
@@ -2494,10 +3110,12 @@ class TrainingEnvAdapter:
         planned_truck_arrival_time: float | None,
         planned_uav_arrival_time_lb: float | None,
         planned_execution_slack_sec: float | None,
+        t_now: float | None = None,
     ) -> None:
         reservation_count = int(self._reservation_count.get(recover_node_id, 0))
+        metric_t_now = float(self._t_now if t_now is None else t_now)
         truck_eta_remaining = (
-            max(0.0, float(planned_truck_arrival_time) - float(self._t_now))
+            max(0.0, float(planned_truck_arrival_time) - metric_t_now)
             if planned_truck_arrival_time is not None
             else 0.0
         )
@@ -2540,6 +3158,7 @@ class TrainingEnvAdapter:
         drone_id: str,
         *,
         start_time: float | None = None,
+        cause: str | None = None,
     ) -> bool:
         """让 UAV 进入 fallback_recovery，并建立对应账本。
 
@@ -2550,6 +3169,7 @@ class TrainingEnvAdapter:
             return False
 
         effective_start_time = float(self._t_now if start_time is None else start_time)
+        normalized_cause = _normalize_fallback_cause(cause)
         self._record_mode_c_fallback_from_state(self._drone_state.get(drone_id))
         drone = self._require_entity_manager().drones[drone_id]
         target_pos = _clone_position(host.get_location(effective_start_time))
@@ -2562,8 +3182,16 @@ class TrainingEnvAdapter:
             host_node_id=_host_id(host),
             host_node_type=_node_type_of_host(host),
             arrival_time=float(arrival_time),
+            cause=normalized_cause,
         )
         self._episode_fallback_count += 1
+        self._episode_fallback_cause_counts[normalized_cause] = (
+            self._episode_fallback_cause_counts.get(normalized_cause, 0) + 1
+        )
+        if _is_ppo_attributed_fallback_cause(normalized_cause):
+            self._episode_ppo_attributed_fallback_count += 1
+        else:
+            self._episode_system_attributed_fallback_count += 1
         self._drone_state[drone_id] = TrainingDroneState.FALLBACK_RECOVERY
         self._fallback_event_times.append(effective_start_time)
         self._schedule_flight_leg(
@@ -2587,7 +3215,7 @@ class TrainingEnvAdapter:
         if not self._cfg.reservation_enabled:
             return
 
-        self._release_reservation(drone_id)
+        self._release_reservation(drone_id, cause="new_reservation_replace")
         reservation = ReservationState(
             recover_node=recover_node_id,
             issued_at=float(self._t_now),
@@ -2595,12 +3223,16 @@ class TrainingEnvAdapter:
         self._reservations[drone_id] = reservation
         self._reservation_count[recover_node_id] = self._reservation_count.get(recover_node_id, 0) + 1
 
-    def _release_reservation(self, drone_id: str) -> None:
+    def _release_reservation(self, drone_id: str, *, cause: str | None = None) -> None:
         """释放某架 UAV 当前 reservation，并回写节点计数。"""
         self._rendezvous_wait_started_at.pop(drone_id, None)
         reservation = self._reservations.pop(drone_id, None)
         if reservation is None:
             return
+        release_cause = str(cause or FALLBACK_CAUSE_NONE)
+        self._episode_reservation_release_cause_counts[release_cause] = (
+            self._episode_reservation_release_cause_counts.get(release_cause, 0) + 1
+        )
         node_id = reservation.recover_node
         current = self._reservation_count.get(node_id, 0)
         if current <= 1:
@@ -2620,7 +3252,10 @@ class TrainingEnvAdapter:
                 continue
             self._record_mode_c_timeout_from_state(self._drone_state.get(drone_id))
 
-            self._release_reservation(drone_id)
+            self._release_reservation(
+                drone_id,
+                cause=FALLBACK_CAUSE_RENDEZVOUS_WAIT_TIMEOUT,
+            )
             commit = self._dispatch_commit.get(drone_id)
             if commit is not None:
                 self._dispatch_commit[drone_id] = DispatchCommit(
@@ -2642,7 +3277,11 @@ class TrainingEnvAdapter:
                 self._agent_cost_accum.get(drone_id, 0.0) + timeout_penalty
             )
             if self._drone_state.get(drone_id) == TrainingDroneState.WAITING_FOR_TRUCK:
-                if not self._enter_fallback_recovery(drone_id, start_time=t_now):
+                if not self._enter_fallback_recovery(
+                    drone_id,
+                    start_time=t_now,
+                    cause=FALLBACK_CAUSE_RENDEZVOUS_WAIT_TIMEOUT,
+                ):
                     hard_penalty = self._mark_hard_failure(drone_id)
                     reward += hard_penalty
                     self._agent_cost_accum[drone_id] = (
@@ -2781,12 +3420,16 @@ class TrainingEnvAdapter:
                 drone.release_order()
             self._flight_legs.pop(drone_id, None)
             self._delivery_service_legs.pop(drone_id, None)
-            self._release_reservation(drone_id)
+            self._release_reservation(drone_id, cause="hard_overdue")
             self._dispatch_commit.pop(drone_id, None)
             self._mode_b_pending_depot_return.pop(drone_id, None)
             if self._drone_state.get(drone_id) != TrainingDroneState.AIRBORNE_ENERGY_FAILURE:
                 self._drone_state[drone_id] = TrainingDroneState.DELIVERED
-                if not self._enter_fallback_recovery(drone_id, start_time=t_now):
+                if not self._enter_fallback_recovery(
+                    drone_id,
+                    start_time=t_now,
+                    cause=FALLBACK_CAUSE_HARD_FAILURE_FALLBACK,
+                ):
                     return -self._cfg.hard_overdue_penalty_sec + self._mark_hard_failure(drone_id)
 
         return -self._cfg.hard_overdue_penalty_sec
@@ -2845,6 +3488,8 @@ class TrainingEnvAdapter:
         idle_wait_dt_total = 0.0
         queue_dt_total = 0.0
         fallback_dt_total = 0.0
+        ppo_fallback_dt_total = 0.0
+        system_fallback_dt_total = 0.0
 
         for drone_id, state in self._drone_state.items():
             if state == TrainingDroneState.WAITING_FOR_TRUCK:
@@ -2873,17 +3518,27 @@ class TrainingEnvAdapter:
                 )
                 queue_dt_total += dt
             elif state == TrainingDroneState.FALLBACK_RECOVERY:
-                # T_fallback：fallback 的无人机自己承担
-                penalty = -self._cfg.lambda_miss * dt
-                self._agent_cost_accum[drone_id] = (
-                    self._agent_cost_accum.get(drone_id, 0.0) + penalty
+                fallback_cause = (
+                    self._fallback_leg[drone_id].cause
+                    if drone_id in self._fallback_leg
+                    else FALLBACK_CAUSE_HARD_FAILURE_FALLBACK
                 )
+                if _is_ppo_attributed_fallback_cause(fallback_cause):
+                    penalty = -self._cfg.lambda_miss * dt
+                    self._agent_cost_accum[drone_id] = (
+                        self._agent_cost_accum.get(drone_id, 0.0) + penalty
+                    )
+                    ppo_fallback_dt_total += dt
+                else:
+                    system_fallback_dt_total += dt
                 fallback_dt_total += dt
 
         self._episode_wait_time_sec += wait_dt_total
         self._episode_idle_time_sec += idle_wait_dt_total
         self._episode_queue_time_sec += queue_dt_total
         self._episode_fallback_time_sec += fallback_dt_total
+        self._episode_ppo_attributed_fallback_time_sec += ppo_fallback_dt_total
+        self._episode_system_attributed_fallback_time_sec += system_fallback_dt_total
 
         if wait_dt_total > _TIME_EPS:
             penalty = -self._cfg.lambda_wait * wait_dt_total
@@ -2901,6 +3556,14 @@ class TrainingEnvAdapter:
             penalty = -self._cfg.lambda_miss * fallback_dt_total
             global_reward += penalty
             breakdown["fallback"] = penalty
+        if ppo_fallback_dt_total > _TIME_EPS:
+            breakdown["fallback_ppo_attributed"] = (
+                -self._cfg.lambda_miss * ppo_fallback_dt_total
+            )
+        if system_fallback_dt_total > _TIME_EPS:
+            breakdown["fallback_system_attributed"] = (
+                -self._cfg.lambda_miss * system_fallback_dt_total
+            )
 
         return global_reward, breakdown
 
@@ -3197,6 +3860,10 @@ class TrainingEnvAdapter:
     def _is_uav_primary_order(self, order: Order) -> bool:
         """判断订单是否属于 UAV 主指标统计范围。"""
         return float(order.payload_weight) <= self._heavy_payload_capacity + _TIME_EPS
+
+    def _is_truck_only_order(self, order: Order) -> bool:
+        """判断订单是否只能由卡车侧粗规划处理。"""
+        return float(order.payload_weight) > self._heavy_payload_capacity + _TIME_EPS
 
     # ---------------------------------------------------------------------
     # Position / time helpers
@@ -3619,7 +4286,14 @@ class TrainingEnvAdapter:
                     hard_failure_count_in_window=forced_ctx.hard_failure_count_in_window,
                     route_drift_ratio=forced_ctx.route_drift_ratio,
                 )
-                coarse_plan = self._planner_bridge.maybe_replan(runtime_state, forced_ctx)
+                reservation_constraints = self._build_truck_reservation_constraints(
+                    runtime_state
+                )
+                coarse_plan = self._planner_bridge.maybe_replan(
+                    runtime_state,
+                    forced_ctx,
+                    reservation_constraints=reservation_constraints,
+                )
                 if (
                     self._current_coarse_plan is None
                     or coarse_plan.plan_version >= self._current_coarse_plan.plan_version
@@ -3628,6 +4302,13 @@ class TrainingEnvAdapter:
                         self._current_coarse_plan is None
                         or coarse_plan.plan_version > self._current_coarse_plan.plan_version
                     ):
+                        if coarse_plan.truck_plan_stops:
+                            self._apply_dynamic_truck_plan(coarse_plan.truck_plan_stops)
+                        self._apply_planner_reservation_outcomes(
+                            coarse_plan=coarse_plan,
+                            reservation_constraints=reservation_constraints,
+                            t_now=float(runtime_state.t_now),
+                        )
                         self._completed_backbone_nodes_since_plan.clear()
                     self._current_coarse_plan = coarse_plan
                     self._active_launch_stations = set(coarse_plan.launch_candidate_stations)
@@ -3950,7 +4631,7 @@ class TrainingEnvAdapter:
         self._mode_b_pending_depot_return.pop(drone_id, None)
         self._truck_charge_until.pop(drone_id, None)
         self._active_wait_resume.pop(drone_id, None)
-        self._release_reservation(drone_id)
+        self._release_reservation(drone_id, cause=FALLBACK_CAUSE_HARD_FAILURE_FALLBACK)
         self._decision_queue = [
             item for item in self._decision_queue if item.drone_id != drone_id
         ]
@@ -4245,6 +4926,9 @@ def _load_env_yaml(config_path: Path) -> _YamlConfig:
         reservation_alpha=float(reservation["alpha"]),
         reservation_beta=float(reservation["beta"]),
         reservation_gamma=float(reservation["gamma"]),
+        reservation_drift_eta_abs_threshold_sec=float(
+            reservation["drift_eta_abs_threshold_sec"]
+        ),
         lambda_wait=float(reward["lambda_wait"]),
         wait_idle_penalty_coef=float(reward["wait_idle_penalty_coef"]),
         wait_opportunity_penalty_coef=float(
@@ -4255,6 +4939,7 @@ def _load_env_yaml(config_path: Path) -> _YamlConfig:
         lambda_res_timeout=float(reward["lambda_res_timeout"]),
         lambda_overdue=float(reward["lambda_overdue"]),
         R_delivery_bonus=float(reward["R_delivery_bonus"]),
+        mode_c_attempt_bonus=float(reward.get("mode_c_attempt_bonus", 0.0)),
         max_overdue_sec=float(reward["max_overdue_sec"]),
         hard_overdue_penalty_sec=float(reward["hard_overdue_penalty_sec"]),
         hard_failure_penalty_sec=float(reward["hard_failure_penalty_sec"]),
