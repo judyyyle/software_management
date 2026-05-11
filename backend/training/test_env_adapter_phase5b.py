@@ -110,8 +110,8 @@ class TestTrainingEnvAdapterPhase5b(unittest.TestCase):
             ),
             BackboneVisit(
                 node_id=station_ids[1],
-                arrival_time=t_deliver + 600.0,
-                departure_time=t_deliver + 600.0 + 1e-6,
+                arrival_time=t_deliver + 350.0,
+                departure_time=t_deliver + 350.0 + 1e-6,
             ),
         ]
 
@@ -192,7 +192,7 @@ class TestTrainingEnvAdapterPhase5b(unittest.TestCase):
         self.assertEqual(env._drone_state[drone_id], TrainingDroneState.IDLE)
         self.assertNotIn(drone_id, env._flight_legs)
 
-    def test_coarse_plan_recovery_pool_scans_future_backbone_then_selects_top_k(self) -> None:
+    def test_coarse_plan_recovery_pool_exposes_future_backbone_nodes(self) -> None:
         env, _drone_id = self._reset_controlled_env()
         entity_mgr = env._require_entity_manager()
         station_ids = sorted(entity_mgr.stations)
@@ -226,15 +226,11 @@ class TestTrainingEnvAdapterPhase5b(unittest.TestCase):
         coarse_plan = env._build_coarse_plan_view(env._t_now)
         recovery_nodes = coarse_plan.recovery_pool[order.order_id]
 
-        self.assertEqual(len(recovery_nodes), env._cfg.max_candidate_recovery_per_order)
+        self.assertEqual(recovery_nodes, tuple(station_ids[:5]))
         self.assertIn(
             preferred_station_id,
             recovery_nodes,
-            "后续 backbone 上更优的 rendezvous 节点应能进入 recovery_pool",
-        )
-        self.assertNotEqual(
-            recovery_nodes,
-            tuple(station_ids[: env._cfg.max_candidate_recovery_per_order]),
+            "coarse plan 应暴露卡车未来会经过的固定节点，具体可行性由 CandidateBuilder 过滤",
         )
 
     def test_post_delivery_revalidation_failure_enters_fallback(self) -> None:
@@ -248,8 +244,8 @@ class TestTrainingEnvAdapterPhase5b(unittest.TestCase):
         env._full_backbone_cache = [
             BackboneVisit(
                 node_id=recover_node_id,
-                arrival_time=t_deliver + 600.0,
-                departure_time=t_deliver + 600.0 + 1e-6,
+                arrival_time=t_deliver + 450.0,
+                departure_time=t_deliver + 450.0 + 1e-6,
             )
         ]
         env._enqueue_decision(drone_id, "test_idle", None)
@@ -331,8 +327,8 @@ class TestTrainingEnvAdapterPhase5b(unittest.TestCase):
             ),
             BackboneVisit(
                 node_id=station_ids[1],
-                arrival_time=t_deliver + 600.0,
-                departure_time=t_deliver + 600.0 + 1e-6,
+                arrival_time=t_deliver + 350.0,
+                departure_time=t_deliver + 350.0 + 1e-6,
             ),
         ]
         env._decision_queue.clear()

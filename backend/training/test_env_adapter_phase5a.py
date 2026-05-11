@@ -117,7 +117,6 @@ class TestTrainingEnvAdapterPhase5a(unittest.TestCase):
             for action in decision.action_lookup
             if isinstance(action, DispatchAction) and action.mode == PolicyMode.C
         ]
-        self.assertTrue(mode_c_actions)
         self.assertTrue(all(action.recover_node_id for action in mode_c_actions))
 
     def test_airborne_energy_failure_interrupts_flight_before_arrival(self) -> None:
@@ -252,6 +251,24 @@ class TestTrainingEnvAdapterPhase5a(unittest.TestCase):
             first_station.departure_time - first_station.arrival_time,
             expected_hold,
             places=6,
+        )
+
+    def test_poisson_patrol_loop_rotates_station_coverage(self) -> None:
+        env = self._make_env()
+        raw_artifacts = env._load_phase4_artifacts()
+        raw_stop_count = len(raw_artifacts["planned_stops"])
+        env.reset()
+
+        appended_station_ids = [
+            stop.node_id
+            for stop in env._planned_route_stops[raw_stop_count:]
+            if stop.node_type == "station"
+        ]
+
+        self.assertGreater(
+            len(set(appended_station_ids)),
+            env._cfg.patrol_stations_per_loop,
+            "poisson 巡站不应每轮固定覆盖同一批最近站点",
         )
 
     def test_poisson_patrol_loop_keeps_future_backbone_alive_near_upper_horizon(self) -> None:

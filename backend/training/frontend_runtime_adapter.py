@@ -656,10 +656,6 @@ class OnlinePolicyRuntimePlayer:
     def _is_online_done_locked(self) -> bool:
         """在线播放结束条件：订单结束 + 设备回仓 + 无执行链路。"""
         env = self._require_env_locked()
-        runtime_state = env.build_runtime_state_view()
-        if runtime_state.t_now >= env._cfg.upper_horizon_sec - 1e-6:
-            return True
-
         order_mgr = env._require_order_manager()
         if order_mgr.pending_orders or order_mgr.assigned_orders:
             return False

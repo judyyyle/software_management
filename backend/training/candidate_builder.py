@@ -52,6 +52,8 @@ class _CandidateConfig:
     max_candidate_actions: int
     station_wait_threshold_sec: float
     rendezvous_filter_margin_sec: float
+    rendezvous_execution_margin_sec: float
+    rendezvous_max_wait_sec: float
     upper_horizon_sec: float
 
 
@@ -404,10 +406,10 @@ class CandidateBuilder:
                 from_pos=deliver_pos,
                 to_pos=node_state.position,
             )
-            rendezvous_margin = float(t_arrive_truck) - (
-                t_arrive_uav + self._cfg.rendezvous_filter_margin_sec
-            )
-            if rendezvous_margin < -_TIME_EPS:
+            planned_wait = float(t_arrive_truck) - float(t_arrive_uav)
+            if planned_wait < self._cfg.rendezvous_execution_margin_sec - _TIME_EPS:
+                continue
+            if planned_wait > self._cfg.rendezvous_max_wait_sec + _TIME_EPS:
                 continue
             if not _can_reach(
                 drone_view=drone_view,
@@ -428,7 +430,9 @@ class CandidateBuilder:
                     y=float(node_state.position.y),
                     z=float(node_state.position.z),
                     truck_eta=float(t_arrive_truck),
-                    rendezvous_margin=float(rendezvous_margin),
+                    rendezvous_margin=float(
+                        planned_wait - self._cfg.rendezvous_execution_margin_sec
+                    ),
                     reservation_count=int(
                         runtime_state.reservation_count.get(node_id, 0)
                     ),
@@ -806,7 +810,7 @@ def _padding_recovery_feature() -> RecoveryFeatures:
 def _load_candidate_config(config_path: Path) -> _CandidateConfig:
     raw = _load_yaml(config_path)
     candidate = _require_mapping(raw, "candidate")
-    return _CandidateConfig(
+    cfg = _CandidateConfig(
         max_candidate_orders=int(candidate["max_candidate_orders"]),
         max_candidate_recovery_per_order=int(
             candidate["max_candidate_recovery_per_order"]
@@ -819,8 +823,31 @@ def _load_candidate_config(config_path: Path) -> _CandidateConfig:
                 candidate.get("rendezvous_eta_safe_margin_sec"),
             )
         ),
+        rendezvous_execution_margin_sec=float(
+            candidate.get(
+                "rendezvous_execution_margin_sec",
+                candidate.get(
+                    "rendezvous_filter_margin_sec",
+                    candidate.get("rendezvous_eta_safe_margin_sec"),
+                ),
+            )
+        ),
+        rendezvous_max_wait_sec=float(
+            candidate.get(
+                "rendezvous_max_wait_sec",
+                candidate["station_wait_threshold_sec"],
+            )
+        ),
         upper_horizon_sec=float(_require_mapping(raw, "planner")["upper_horizon_sec"]),
     )
+    if cfg.rendezvous_execution_margin_sec < 0.0:
+        raise ValueError("candidate.rendezvous_execution_margin_sec 不能为负数")
+    if cfg.rendezvous_max_wait_sec < cfg.rendezvous_execution_margin_sec:
+        raise ValueError(
+            "candidate.rendezvous_max_wait_sec 不能小于 "
+            "rendezvous_execution_margin_sec"
+        )
+    return cfg
 
 
 def _load_yaml(config_path: Path) -> Mapping[str, Any]:

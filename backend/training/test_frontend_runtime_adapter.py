@@ -11,6 +11,7 @@ import time
 import unittest
 from pathlib import Path
 
+from core.entities.order import Order
 from core.entities.primitives import Position3D
 from training.env_adapter import (
     DeliveryServiceLeg,
@@ -311,6 +312,48 @@ class TestFrontendRuntimeAdapter(unittest.TestCase):
             stop_on_training_done=False,
         )
         self.assertAlmostEqual(online_result.runtime_state.t_now, target_time, places=6)
+
+    def test_online_advance_can_continue_beyond_training_horizon(self) -> None:
+        env = self._build_env_with_orders_cleared()
+        env._t_now = env._cfg.upper_horizon_sec - 1.0
+        env._require_order_manager().pending_orders["ORDER-HORIZON-PROBE"] = Order(
+            order_id="ORDER-HORIZON-PROBE",
+            create_time=env._t_now,
+            deadline=env._cfg.upper_horizon_sec + 100.0,
+            delivery_loc=Position3D(
+                x=env._require_depot().location.x,
+                y=env._require_depot().location.y,
+                z=env._require_depot().location.z,
+            ),
+            payload_weight=999.0,
+        )
+        target_time = env._cfg.upper_horizon_sec + 5.0
+
+        default_result = env.advance_to_time(target_time)
+        self.assertAlmostEqual(
+            default_result.runtime_state.t_now,
+            env._cfg.upper_horizon_sec,
+            places=6,
+        )
+
+        env._t_now = env._cfg.upper_horizon_sec - 1.0
+        env._decision_queue.clear()
+        online_result = env.advance_to_time(
+            target_time,
+            stop_on_training_done=False,
+        )
+        self.assertAlmostEqual(online_result.runtime_state.t_now, target_time, places=6)
+
+    def test_online_done_does_not_stop_at_training_horizon(self) -> None:
+        env = self._build_env_with_orders_cleared()
+        runtime = self._runtime_shell(env)
+        env._t_now = env._cfg.upper_horizon_sec + 1.0
+        env._require_order_manager()._scheduled_dynamic = [
+            {"spawn_sim_s": env._cfg.upper_horizon_sec + 10.0}
+        ]
+        env._require_order_manager()._scheduled_dynamic_i = 0
+
+        self.assertFalse(runtime._is_online_done_locked())
 
     def test_online_done_requires_orders_home_and_closed_execution_chain(self) -> None:
         env = self._build_env_with_orders_cleared()

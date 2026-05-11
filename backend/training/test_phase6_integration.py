@@ -176,7 +176,7 @@ class TestPhase6Integration(unittest.TestCase):
         self.assertIn(station_2.station_id, env._active_launch_stations)
         self.assertNotIn(station_1.station_id, env._active_launch_stations)
 
-    def test_planner_bridge_recovery_pool_scans_future_backbone_then_selects_top_k(self) -> None:
+    def test_planner_bridge_recovery_pool_exposes_future_backbone_nodes(self) -> None:
         env, _drone_id = self._reset_controlled_env()
         entity_mgr = env._require_entity_manager()
         station_ids = sorted(entity_mgr.stations)
@@ -221,15 +221,11 @@ class TestPhase6Integration(unittest.TestCase):
         )
         recovery_nodes = coarse_plan.recovery_pool[order.order_id]
 
-        self.assertEqual(len(recovery_nodes), env._cfg.max_candidate_recovery_per_order)
+        self.assertEqual(recovery_nodes, tuple(station_ids[:5]))
         self.assertIn(
             preferred_station_id,
             recovery_nodes,
-            "PlannerBridge 应与 env 内联 coarse plan 一致，允许后续优质节点进入 recovery_pool",
-        )
-        self.assertNotEqual(
-            recovery_nodes,
-            tuple(station_ids[: env._cfg.max_candidate_recovery_per_order]),
+            "PlannerBridge 应与 env 内联 coarse plan 一致，暴露卡车未来会经过的固定节点",
         )
 
     def test_poisson_planner_bridge_rejects_empty_backbone(self) -> None:
@@ -296,6 +292,18 @@ class TestPhase6Integration(unittest.TestCase):
             ),
         )
         t_deliver = env._estimate_delivery_arrival_time(drone, order)
+        t_deliver_finish = t_deliver + env._scene_solver_params().drone_service_time_order_s
+        safe_recover_fly = env._estimate_flight_time(
+            drone=drone,
+            from_pos=order.delivery_loc,
+            to_pos=station_safe.location,
+        )
+        t_safe_truck = (
+            t_deliver_finish
+            + safe_recover_fly
+            + env._cfg.rendezvous_execution_margin_sec
+            + 30.0
+        )
         env._full_backbone_cache = [
             BackboneVisit(
                 node_id=station_fast.station_id,
@@ -304,8 +312,8 @@ class TestPhase6Integration(unittest.TestCase):
             ),
             BackboneVisit(
                 node_id=station_safe.station_id,
-                arrival_time=t_deliver + 600.0,
-                departure_time=t_deliver + 600.0 + 1e-6,
+                arrival_time=t_safe_truck,
+                departure_time=t_safe_truck + 1e-6,
             ),
         ]
 
@@ -433,16 +441,16 @@ class TestPhase6Integration(unittest.TestCase):
             coarse_plan,
             truck_backbone_route=(station_1.station_id, station_2.station_id),
             truck_eta_map={
-                station_1.station_id: runtime_state.t_now + 1800.0,
-                station_2.station_id: runtime_state.t_now + 2400.0,
+                station_1.station_id: runtime_state.t_now + 450.0,
+                station_2.station_id: runtime_state.t_now + 260.0,
             },
             route_drift_ref={
                 station_1.station_id: RouteDriftRef(
-                    eta_ref=runtime_state.t_now + 1800.0,
+                    eta_ref=runtime_state.t_now + 450.0,
                     route_index_ref=0,
                 ),
                 station_2.station_id: RouteDriftRef(
-                    eta_ref=runtime_state.t_now + 2400.0,
+                    eta_ref=runtime_state.t_now + 260.0,
                     route_index_ref=1,
                 ),
             },

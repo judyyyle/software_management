@@ -46,6 +46,7 @@ class RolloutTransition:
     local_decision_index: int = 0
     global_decision_index: int = 0
     decision_context_debug_snapshot: Any | None = None
+    sample_loss_weight: float = 1.0
     rendezvous_arrive_bonus_applied: bool = False
     rendezvous_success_bonus_applied: bool = False
 
@@ -99,6 +100,7 @@ class RolloutBuffer:
         local_decision_index: int = 0,
         global_decision_index: int = 0,
         decision_context_debug_snapshot: Any | None = None,
+        sample_loss_weight: float = 1.0,
     ) -> int:
         if self.size >= self._capacity:
             raise RuntimeError("rollout buffer 已满，不能再 begin_transition")
@@ -118,6 +120,7 @@ class RolloutBuffer:
                 local_decision_index=int(local_decision_index),
                 global_decision_index=int(global_decision_index),
                 decision_context_debug_snapshot=decision_context_debug_snapshot,
+                sample_loss_weight=float(sample_loss_weight),
             )
         )
         return self.size - 1
@@ -160,6 +163,7 @@ class RolloutBuffer:
         local_decision_index: int = 0,
         global_decision_index: int = 0,
         decision_context_debug_snapshot: Any | None = None,
+        sample_loss_weight: float = 1.0,
     ) -> int:
         slot = self.begin_transition(
             observation_batch=observation_batch,
@@ -176,6 +180,7 @@ class RolloutBuffer:
             local_decision_index=local_decision_index,
             global_decision_index=global_decision_index,
             decision_context_debug_snapshot=decision_context_debug_snapshot,
+            sample_loss_weight=sample_loss_weight,
         )
         self.finalize_transition(
             slot,
