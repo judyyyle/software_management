@@ -484,282 +484,571 @@ P5：增加 incremental decode / prefix trace
 
 ---
 
-## 5. 第一阶段：动态 Archive
+## 5. 优化路线总原则：先稳住事件触发重规划，不直接改成持续滚动
 
-### 5.1 新增文件
-
-建议新增：
+当前 `GAMMCESolver.should_replan_unfinished()` 已经固定返回 `True`，新单到达后会进入 `dispatch_replan_current_state()`，本质上已经是“事件触发的滚动重优化”。现在的问题不是没有滚动，而是：
 
 ```text
-backend/solver/ga_mmce/archive.py
+1. 重规划同步执行，阻塞仿真循环。
+2. 3 秒动态预算没有覆盖 precheck / warm start / 初始种群评估。
+3. actual_generations 经常为 0，GA 没有真正进化。
+4. previous_best-only 复用太弱，B/C 结构难以延续。
+5. 每次可行 plan 都可能覆盖卡车后续路线，缺少稳定性门槛。
 ```
 
-职责：
+因此第一版不要直接引入后台持续滚动 GA。后台持续滚动需要额外解决线程安全、快照版本、计划过期、路线安全切换和执行锁等问题，改动面很大，而且可能把“偶发阻塞”变成“频繁抢占”。
+
+推荐改造原则：
 
 ```text
-1. 保存上一轮和历史轮次的优秀 Individual。
-2. 按多种结构保留个体，而不是只按 fitness 排序。
-3. 提供可序列化、可修剪、可去重的 archive。
-4. 为 dynamic_rescheduler 提供 archive seeds。
+先让每次事件触发重规划更轻、更稳、更会复用历史结果；
+再考虑在仿真空闲 tick 做极小时间片的 archive 优化；
+最后才考虑真正后台持续滚动优化器。
 ```
 
-### 5.2 ArchiveEntry 字段
+---
 
-建议结构：
+## 6. 第一阶段：让动态预算真正生效
+
+### 6.1 目标
+
+现有动态配置中 `time_budget_seconds = 3.0`，但 `solver.solve()` 的时间检查主要发生在 generation loop 内。当前顺序是：
 
 ```text
-ArchiveEntry
-  individual: Individual
-  fitness: float
-  cost_total: float
-  a_count: int
-  b_count: int
-  c_count: int
-  waiting_cost: float
-  delay_cost: float
-  repair_penalty: float
-  station_queue_penalty: float
-  source: str
-  generation: int
-  event_time: float
-  order_signature: tuple
-  resource_signature: tuple
+_prepare_distance_context()
+_build_greedy_seed()
+_build_b_precheck_and_seed_data()
+_prepare_warm_start_seeds()
+initialize_population()
+_evaluate_population()
+for generation:
+    if timeout: break
 ```
 
-`order_signature` 和 `resource_signature` 暂时可以用于诊断；第一阶段不必严格作为复用门槛，因为动态适配会再次校验 gene_pool 和 fixed tail。
-
-### 5.3 Archive 修剪策略
-
-不能只保留 top fitness，否则 B/C 结构仍然可能被 A-heavy 个体挤掉。建议分桶保留：
+因此动态预算经常在进入 generation loop 前已经耗尽。第一阶段的核心目标是把时间预算扩展到以下步骤：
 
 ```text
-1. fitness 最低 top N
-2. B-heavy top N
-3. C-heavy top N
-4. B+C-heavy top N
-5. waiting_cost 低 top N
-6. delay_cost 低 top N
-7. 最近若干个体
+B/C precheck
+warm start seed 评估
+初始 population 构造
+初始 population 评估
+generation loop
+fallback 评估
 ```
 
-最终去重签名：
+### 6.2 修改 solver.py：引入 solve deadline
+
+在 `GAMMCESolver.solve()` 开始处，把当前 `started` 和 `_active_time_budget_seconds` 合成一个内部 deadline：
 
 ```text
-(
-  tuple(individual.sequence),
-  tuple(individual.assignment),
-  normalized_rendezvous_tuple,
+self._active_deadline = started + time_budget_seconds
+```
+
+继续保留现有 `_timeout(started)`，但新增更直接的辅助方法：
+
+```text
+_remaining_budget_seconds() -> float | None
+_has_dynamic_budget(min_remaining=0.0) -> bool
+```
+
+需要插入预算检查的位置：
+
+```text
+1. _build_b_precheck_and_seed_data() 每个 order 前后。
+2. _prepare_warm_start_seeds() 每个 seed 前。
+3. _evaluate_population() 每个 individual 前。
+4. generation loop 内每个 child 评估前。
+```
+
+预算耗尽时不抛异常，返回当前已评估的最好结果；若没有任何可用评估结果，则走 fast incumbent / previous_plan fallback。
+
+### 6.3 修改 B precheck：限制组合爆炸
+
+当前 `_best_initial_mode_b()` 会遍历：
+
+```text
+order_id * truck_drone_ids * support_node_ids * support_node_ids
+```
+
+当站点和无人机较多时，这会吞掉动态预算。第一阶段建议新增动态场景专用限制：
+
+```text
+dynamic_b_precheck_max_orders = 8
+dynamic_b_precheck_max_drones_per_order = 4
+dynamic_b_precheck_max_launch_nodes = 4
+dynamic_b_precheck_max_recover_nodes = 4
+dynamic_b_precheck_budget_seconds = 0.8
+```
+
+节点筛选规则先保持简单，按与订单和卡车当前位置的距离排序：
+
+```text
+launch 候选：
+  1. 卡车当前节点/附近站点
+  2. 订单附近站点
+  3. previous_best 中该订单使用过的 launch
+
+recover 候选：
+  1. 订单附近站点
+  2. 卡车当前区域附近站点
+  3. previous_best 中该订单使用过的 recover
+```
+
+如果预算不足，只做 A/C 或跳过 B 全组合，不再让 precheck 阻塞整次重规划。
+
+### 6.4 修改初始种群评估：允许部分评估
+
+当前 `_evaluate_population(population, state, context)` 会完整评估所有个体。动态模式下应改成：
+
+```text
+for individual in population:
+    if timeout:
+        mark remaining as big_m or leave unevaluated
+        break
+    evaluate individual
+```
+
+排序前只使用已经评估过的个体；未评估个体不能成为 best。这样至少可以保证：
+
+```text
+time_budget_seconds 不再被初始种群无限突破；
+actual_generations = 0 时也能明确知道 initial_eval_count；
+日志能区分“没进化”与“初始评估也没完成”。
+```
+
+### 6.5 第一阶段新增诊断字段
+
+写入 `plan.summary`、`logs/ga_dynamic_replan.csv` 和 debug log：
+
+```text
+precheck_elapsed_seconds
+b_precheck_eval_count
+b_precheck_budget_hit
+warm_start_eval_count
+initial_population_eval_count
+initial_population_budget_hit
+actual_generations
+time_budget_hit
+```
+
+---
+
+## 7. 第二阶段：Fast Incumbent，避免 0 代进化直接退化为 A-heavy
+
+### 7.1 目标
+
+动态触发时先不赌完整 GA，而是先从少量历史种子中评估出一个可执行 incumbent：
+
+```text
+previous_best 修补种子
+上一轮 last_population top seeds
+B/C-heavy seeds
+combined B seed
+greedy seed
+truck-only seed
+```
+
+即使后续 `solver.solve()` 被预算截断，也能用 fast incumbent 兜底。
+
+### 7.2 最小实现不改 solver.solve() 签名
+
+第一版可以在 `dynamic_rescheduler.reschedule_on_event()` 中完成：
+
+```text
+warm_starts = build_warm_start_population(...)
+fast_plan = _fast_incumbent_plan(
+    solver=solver,
+    snapshot=snapshot,
+    warm_starts=warm_starts,
+    dynamic_config=dynamic_config,
+    planning_orders=planning_orders,
 )
+ga_plan = solver.solve(...)
 ```
 
-### 5.4 修改 solver.py
+选择逻辑：
+
+```text
+1. ga_plan 不可行，fast_plan 可行：选 fast_plan。
+2. ga_plan 可行，但 time_budget_hit=True 且 actual_generations=0：
+   比较 ga_plan.cost_total 和 fast_plan.cost_total，选更优。
+3. fast_plan 不可行：保持现有 warm_start_repaired -> greedy_insertion -> previous_plan fallback。
+```
+
+这一步不需要大改 `solver.solve()`，风险较低。
+
+### 7.3 fast incumbent 预算
+
+建议新增配置：
+
+```text
+fast_incumbent_enabled = True
+fast_incumbent_eval_count = 8
+fast_incumbent_budget_seconds = 0.3
+```
+
+注意这里的评估对象必须少。不要为了 fast incumbent 再完整评估 30 个个体，否则会把阻塞提前到 `reschedule_on_event()`。
+
+### 7.4 可行性判断
+
+不能只看 `plan.summary["feasible"] == total_orders`。应复用当前已有函数：
+
+```text
+_plan_is_feasible_for_orders(plan, planning_orders)
+_unserved_order_ids(plan, planning_orders)
+```
+
+并额外记录：
+
+```text
+fast_incumbent_found
+fast_incumbent_selected
+fast_incumbent_A_count
+fast_incumbent_B_count
+fast_incumbent_C_count
+```
+
+---
+
+## 8. 第三阶段：保存 last_population 和轻量 Archive
+
+### 8.1 为什么先做轻量 Archive
+
+当前只保存：
+
+```text
+last_best_individual
+last_best_decode_result
+```
+
+这会丢掉上一轮中大量不是 best 但对动态重规划有价值的结构，例如 B-heavy、C-heavy、低等待、低 delay 个体。第一版不需要做复杂持久化 archive，只要先在 solver 生命周期内保留最近若干个体即可。
+
+### 8.2 修改 solver.py
 
 在 `GAMMCESolver.__init__()` 增加：
 
 ```text
-self.last_population = []
-self.dynamic_archive = GAArchive(max_size=config.dynamic_archive_size)
-self.dynamic_plan_generation = 0
+self.last_population: list[Individual] = []
+self.dynamic_archive: list[Individual] = []
 ```
 
-在 `solve()` 中：
+在 `solve()` 中这些位置更新：
 
 ```text
-1. 初始 population 评估后，把 top-K 加入 archive。
-2. 每次 _record_generation() 附近，把当代 top-K 加入 archive。
-3. 最终返回前，把最终 top-K 和 best 加入 archive。
-4. 保存 self.last_population，供下一次动态重规划复用。
+1. 初始 population 部分评估后，保存已评估 top-K。
+2. 每代生成后，保存当代 top-K。
+3. solve 返回前，保存最终 top-K。
 ```
 
-建议新增内部方法：
+第一版建议不新增 `archive.py`，先在 `solver.py` 内部实现：
 
 ```text
-_update_dynamic_archive(population, source, generation, event_time)
+_remember_dynamic_population(population, context, source)
+_dynamic_archive_seeds()
 ```
 
-只在 `dispatch_type == "dynamic_replan"` 或 anytime 优化时更新。
+稳定后再抽成 `backend/solver/ga_mmce/archive.py`。
 
-### 5.5 修改 dynamic_rescheduler.py
+### 8.3 Archive 保留策略
 
-当前 warm start 只有：
+不能只按 fitness 保留，否则 A-heavy 个体会挤掉 B/C 结构。建议保留：
+
+```text
+fitness top N
+B_count top N
+C_count top N
+B+C count top N
+delay_cost 低 top N
+waiting_cost 低 top N
+最近若干个体
+```
+
+每轮最多保留：
+
+```text
+dynamic_archive_size = 60
+dynamic_archive_update_top_k = 12
+dynamic_archive_seed_count = 16
+```
+
+### 8.4 Archive 个体适配规则
+
+历史个体进入当前动态规划前，必须适配：
+
+```text
+1. 删除 completed / locked 订单。
+2. 删除不在当前 planning_orders 中的订单。
+3. 保留仍存在订单的 sequence / assignment / rendezvous。
+4. gene 不在当前 gene_pool 中时降级为 A。
+5. rendezvous 节点不在当前 support_node_ids 中时重新生成。
+6. 新订单按 deadline 或 nearest order 插入。
+7. frozen_future_ids 必须继续调用 enforce_fixed_tail()。
+8. validate_with_context() 失败则丢弃。
+```
+
+这些逻辑可以放在 `dynamic_rescheduler.py`，因为它已经持有：
+
+```text
+completed_ids
+locked_ids
+planning_orders
+reoptimized_ids
+frozen_future_ids
+fixed_tail_gene_by_order
+context.gene_pool
+context.support_node_ids
+```
+
+### 8.5 与现有 warm start 合并
+
+当前已有：
 
 ```text
 build_warm_start_population(previous_best=...)
 ```
 
-建议变成：
+建议扩展为：
 
 ```text
-archive_warm_starts = build_archive_warm_starts(...)
-previous_best_warm_starts = build_warm_start_population(...)
+previous_best_seeds = build_warm_start_population(...)
+archive_seeds = build_archive_warm_starts(...)
 warm_starts = merge_warm_starts(
-    archive_warm_starts,
-    previous_best_warm_starts,
-    max_count=dynamic_config.dynamic_warm_start_limit,
+    previous_best_seeds,
+    archive_seeds,
+    max_count=dynamic_warm_start_limit,
 )
 ```
 
-新增函数：
+去重 key：
 
 ```text
-build_archive_warm_starts()
-adapt_individual_to_dynamic_orders()
-repair_gene_against_current_gene_pool()
-repair_rendezvous_against_current_nodes()
-merge_warm_starts()
-```
-
-### 5.6 Archive 个体适配规则
-
-历史个体不能直接放入当前 population，必须适配：
-
-```text
-1. 删除 completed / locked 订单。
-2. 删除当前 planning_orders 中不存在的订单。
-3. 保留当前仍存在订单的 sequence / assignment / rendezvous。
-4. 如果历史 gene 不在当前 gene_pool 中，则降级为 A。
-5. 如果 rendezvous 节点不在当前 support_node_ids 中，则重新生成 rendezvous。
-6. 对当前新增订单，按策略插入 sequence。
-7. 对 frozen_future_ids，强制套用 fixed_tail_gene_by_order。
-8. validate_with_context() 失败则丢弃。
-```
-
-新增订单插入策略建议按优先级：
-
-```text
-1. 插入 previous_best 中相邻地理位置附近。
-2. 插入所有位置试少量候选，选 local score 最低。
-3. 超预算时直接 append，并用 fast incumbent 修补。
-```
-
-第一阶段可先采用简单 append 或 deadline 排序，后续再增强。
-
----
-
-## 6. 第二阶段：Fast Incumbent
-
-### 6.1 目标
-
-动态触发时不要先赌完整 GA。应先用历史 seeds 快速评估出一个可执行 plan：
-
-```text
-archive seeds + previous_best seeds + combined B seed
-  -> 评估前 K 个
-  -> 得到 best feasible incumbent
-  -> 再进入 solver.solve()
-```
-
-这样即使 `solver.solve()` 里 `actual_generations = 0`，也可以有一个明确的历史 incumbent 作为兜底。
-
-### 6.2 修改 dynamic_rescheduler.py
-
-在调用 `solver.solve()` 前增加：
-
-```text
-fast_plan = _fast_incumbent_plan(
-    solver=solver,
-    snapshot=snapshot,
-    seeds=warm_starts,
-    config=dynamic_config,
-    planning_orders=planning_orders,
-    max_eval=dynamic_config.fast_incumbent_eval_count,
+(
+  tuple(ind.sequence),
+  tuple(ind.assignment),
+  repr(ind.rendezvous),
 )
-```
-
-第一阶段不必改 `solver.solve()` 签名，可以在 `reschedule_on_event()` 中做返回选择：
-
-```text
-如果 ga_plan 不可行，优先 fast_plan。
-如果 ga_plan 可行但 time_budget_hit 且 actual_generations == 0，
-    可以比较 ga_plan.cost_total 和 fast_plan.cost_total，取更优者。
-```
-
-更理想的第二步是扩展 `solver.solve(..., incumbent_plan=fast_plan)`，让 solver 内部把 incumbent 作为 best-so-far。
-
-### 6.3 Fast Incumbent 评价范围
-
-不要评估太多，否则会吃掉动态预算。建议：
-
-```text
-fast_incumbent_eval_count = 8 ~ 12
-fast_incumbent_budget_seconds = 0.2 ~ 0.5
-```
-
-输入 seeds 排序优先级：
-
-```text
-1. previous_best 修补个体
-2. archive fitness elite
-3. B-heavy / C-heavy elite
-4. combined B seed
-5. greedy seed / truck-only seed
 ```
 
 ---
 
-## 7. 第三阶段：Distance Cache
+## 9. 第四阶段：动态窗口选择加入局部性、紧迫性和路线稳定性
 
-### 7.1 修改文件
+### 9.1 当前窗口选择问题
+
+`_select_reoptimization_window()` 当前主要按上一轮 `previous_best.sequence` 中的 rank 和 deadline 排序。它能保留上一轮顺序，但没有显式考虑：
 
 ```text
-backend/solver/ga_mmce/physical_evaluator.py
+订单与当前卡车位置距离
+当前区域订单密度
+订单是否即将超时
+新单是否远离当前服务区域
+短期路线是否已经接近执行
 ```
 
-### 7.2 缓存对象挂载位置
+### 9.2 修改目标
 
-不要挂在每次新建的 evaluator 临时局部上。推荐挂到 solver 长生命周期对象之一：
+`reopt_window_size = 8` 不应简单理解为“上一轮序列前 8 个”。它应该选择最值得在本轮重排的局部窗口：
+
+```text
+新单必须进入 reoptimized_ids；
+即将超时订单优先进入；
+当前卡车附近订单优先进入；
+与当前局部订单簇相近的订单优先进入；
+已经处在短期执行前缀中的订单尽量不被重排。
+```
+
+### 9.3 建议评分
+
+为每个 pending order 计算动态窗口分数：
+
+```text
+score =
+  w_prev_rank * normalized_previous_rank
+  + w_deadline * urgency_score
+  + w_local * distance_to_truck_or_local_cluster
+  + w_density * local_density_bonus
+  + w_stability * short_route_change_penalty
+```
+
+含义：
+
+```text
+urgency_score：deadline - event_time 越小越优先。
+distance_to_truck_or_local_cluster：越近越优先。
+local_density_bonus：周围订单越多越优先。
+short_route_change_penalty：上一轮短期 route 前缀中的订单不轻易挪走。
+```
+
+第一版可以先实现简单版本：
+
+```text
+排序 key = (
+  is_new_or_urgent,
+  distance_to_current_truck_position,
+  previous_rank,
+  deadline - event_time,
+  order_id,
+)
+```
+
+### 9.4 frozen_future 不再无条件参与昂贵评估
+
+当前 `planning_orders = reoptimized_ids + frozen_future_ids`，frozen future 仍会参与 decode。第一版先不改变这个结构，避免大改 decoder；但可以限制它们的扰动：
+
+```text
+1. fixed tail 继续强制保留。
+2. frozen_future 只允许沿用 previous_best gene/rendezvous。
+3. precheck 和 archive 适配只重点处理 reoptimized_ids。
+4. 日志区分 reoptimized_eval_count 与 frozen_tail_eval_count。
+```
+
+中期再考虑真正的 “tail plan splice”，即 frozen future 不进入 GA 个体评估，只在最终 plan 阶段拼接。
+
+---
+
+## 10. 第五阶段：加入计划稳定性和接受门槛
+
+### 10.1 为什么需要接受门槛
+
+当前动态重规划只要返回可行 plan，`DecisionEngine._apply_plan(..., incremental=False)` 就会覆盖卡车路线。这样新 plan 即使只比旧 plan 略好，也可能导致：
+
+```text
+卡车方向频繁变化；
+附近订单反复后移；
+B recover 点把卡车拉到远处；
+无人机未起飞队列被清理或替换；
+```
+
+因此动态重规划不能只看新 plan 是否可行，还要判断是否值得覆盖当前执行计划。
+
+### 10.2 plan acceptance 规则
+
+在 `dynamic_rescheduler.py` 中，`ga_plan / fast_plan / fallback_plan` 选出候选后，增加 `_accept_dynamic_plan()`：
+
+```text
+accept if:
+  1. previous_plan 不存在；
+  2. 新 plan 明显降低 cost_total；
+  3. 新 plan 减少 unserved_order_ids；
+  4. 新 plan 明显减少即将超时订单的 lateness；
+  5. 新 plan 增加 B/C 协同且没有明显增加卡车绕路；
+  6. 当前旧 plan 已经不可行或资源状态发生关键变化。
+
+otherwise:
+  保留 previous_plan 的短期前缀，只合入新单或走 fallback。
+```
+
+建议配置：
+
+```text
+dynamic_accept_min_improvement_ratio = 0.03
+dynamic_accept_lateness_improvement_s = 30.0
+dynamic_accept_max_extra_truck_distance_m = 500.0
+```
+
+### 10.3 稳定性惩罚
+
+在 fitness 中加入动态稳定性 penalty，先放在 `decoder.py` 的 cost breakdown 或 `compute_fitness()` 前后的动态专用逻辑中：
+
+```text
+route_change_penalty：新 truck route 前几个节点与 previous_plan 不一致。
+near_term_order_delay_penalty：上一轮即将执行的订单被推迟太多。
+recover_deviation_penalty：B recover 点远离当前局部订单簇。
+local_cluster_leave_penalty：当前区域仍有高密度订单时，卡车被拉远。
+```
+
+第一版可以不修改全局 `compute_fitness()`，而是在动态 plan 选择时计算稳定性调整分：
+
+```text
+adjusted_dynamic_score = cost_total + stability_penalty
+```
+
+这样对静态 GA 和现有解码逻辑影响更小。
+
+### 10.4 B recover 局部约束
+
+在 `_build_b_precheck_and_seed_data()` 和 random rendezvous 生成前做候选过滤：
+
+```text
+recover 点距离当前局部订单簇过远：降权或剔除；
+recover 点导致 truck_dist_launch_to_recover 明显过大：降权或剔除；
+B 模式节省的 UAV 服务收益小于 truck 绕行成本：不作为 B seed；
+```
+
+第一版先只影响 B seed 和 precheck，不禁止 GA 后续 mutation 产生这些 rendezvous，降低误杀可行解的风险。
+
+---
+
+## 11. 第六阶段：Distance Cache
+
+### 11.1 当前实现注意点
+
+`solver._prepare_distance_context()` 当前会清理 `greedy_helper._road_distance_memo`。这意味着跨轮动态重规划不能复用 road distance 结果。第一版可先改为：
+
+```text
+静态 full solve 可清理；
+dynamic_replan 不清理或只按 bbox/scene_id 变化清理；
+```
+
+### 11.2 缓存挂载位置
+
+优先挂在 solver 生命周期对象上：
 
 ```text
 solver.greedy_helper._ga_distance_cache
-solver.greedy_helper._ga_candidate_cache
 ```
 
-当前 `PhysicalEvaluator` 已经持有 `greedy_helper`，因此可以在 evaluator 初始化时确保缓存存在。
+`PhysicalEvaluator` 已持有 `greedy_helper`，可以通过它读写缓存。
 
-### 7.3 缓存内容
+### 11.3 缓存内容
 
-优先缓存：
+先缓存低风险项：
 
 ```text
 road distance: greedy._road_dist(pos_a, pos_b)
-UAV distance: greedy._dist(pos_a, pos_b)
-truck energy: greedy._truck_energy_wh(distance)
-UAV energy: greedy._uav_energy_wh(drone, pos_a, pos_b, payload)
-flight energy: greedy._flight_energy(drone, pos_a, pos_b, payload)
+UAV straight distance: greedy._dist(pos_a, pos_b)
+truck energy by distance
 nearest support node lookup
 ```
 
-### 7.4 key 设计
-
-距离缓存可以用位置 bucket：
+第二步再缓存：
 
 ```text
-("road", pos_bucket_a, pos_bucket_b)
+UAV energy by drone/payload/segment
+flight energy
+```
+
+### 11.4 key 设计
+
+建议使用位置 bucket，避免浮点坐标无法命中：
+
+```text
+("road", scene_id, pos_bucket_a, pos_bucket_b)
 ("uav_dist", pos_bucket_a, pos_bucket_b)
-("uav_energy", drone_model_sig, pos_bucket_a, pos_bucket_b, payload_bucket)
+("truck_energy", distance_bucket)
+("uav_energy", drone_id_or_model, pos_bucket_a, pos_bucket_b, payload_bucket)
 ```
 
-建议 bucket：
+配置建议：
 
 ```text
-road_position_bucket_m = 10.0
-uav_position_bucket_m = 5.0
-payload_bucket_kg = 0.1
+distance_cache_enabled = True
+distance_cache_size = 50000
+distance_cache_position_bucket_m = 10.0
+distance_cache_payload_bucket_kg = 0.1
 ```
-
-最终 best plan 可做一次严格重评估，避免 bucket 近似带来的误差累积。
 
 ---
 
-## 8. 第四阶段：Candidate Cache
+## 12. 第七阶段：Candidate Cache
 
-### 8.1 修改文件
+### 12.1 实施时机
 
-```text
-backend/solver/ga_mmce/physical_evaluator.py
-```
+Candidate cache 收益大，但风险也高，因为 A/B/C 可行性依赖 `_ga_time`、`_ga_position`、`_ga_energy`、host 状态和当前 config。建议在 Distance Cache 稳定后再做。
 
-包装以下函数：
+### 12.2 包装函数
+
+在 `physical_evaluator.py` 中包装：
 
 ```text
 evaluate_fixed_mode_a()
@@ -767,7 +1056,7 @@ evaluate_fixed_mode_b()
 evaluate_fixed_mode_c()
 ```
 
-将原主体挪为：
+把原主体挪为：
 
 ```text
 _evaluate_fixed_mode_a_uncached()
@@ -775,9 +1064,7 @@ _evaluate_fixed_mode_b_uncached()
 _evaluate_fixed_mode_c_uncached()
 ```
 
-外层先查 cache，miss 再调用 uncached。
-
-### 8.2 candidate key 必须包含动态状态
+### 12.3 candidate key 必须包含状态签名
 
 不能只用：
 
@@ -785,7 +1072,7 @@ _evaluate_fixed_mode_c_uncached()
 (order_id, mode, drone_id, launch, recover)
 ```
 
-必须包含影响可行性和时间的状态签名：
+必须包含：
 
 ```text
 order_sig:
@@ -797,7 +1084,6 @@ truck_sig:
   truck_id
   _ga_time bucket
   _ga_position bucket
-  _ga_node_id
 
 drone_sig:
   drone_id
@@ -810,420 +1096,314 @@ drone_sig:
   _ga_waiting_station_id
 
 config_sig:
-  soft_rendezvous_violation
-  truck_wait_max_s
-  allow_depot_drone_recover_at_station
+  weight_energy
+  weight_delay
+  weight_waiting
   air_ground_mode_reward
-  weight_energy / weight_delay / weight_waiting
+  truck_wait_max_s
+  soft_rendezvous_violation
 ```
 
-### 8.3 复用策略
-
-Candidate cache 有近似风险，建议分层使用：
+### 12.4 复用策略
 
 ```text
-1. 初始 precheck、候选排序、archive seed 快速评价：允许使用 bucket cache。
-2. 最终 best individual：强制 strict decode 一次，可绕过 candidate cache 或使用更细 bucket。
-3. 发现 cache 命中但 plan 出现非法 host/energy 时，自动 invalidate 当前 key。
+1. precheck 和 seed 排序可以使用 candidate cache。
+2. normal decode 可以使用严格 key cache。
+3. 最终 best plan 建议做一次 strict re-evaluation，确认没有 stale cache。
+4. 若发现 energy/host/runtime 状态不一致，清空当前动态轮的 candidate cache。
 ```
 
 ---
 
-## 9. 第五阶段：population.py 动态种群配比
+## 13. 第八阶段：Time-Sliced Archive 优化作为后续可选项
 
-### 9.1 当前逻辑
+### 13.1 不作为第一版目标
 
-`initialize_population()` 当前顺序：
-
-```text
-warm_start
-greedy_seed
-truck_only_seed
-OBL seed
-combined B seed
-single B seeds
-balanced random
-random
-```
-
-这个基础很好，但动态场景应让 archive/warm start 占主要比例，而不是让随机个体和 truck-only seed 占太多预算。
-
-### 9.2 新增配置
-
-在 `GAConfig` 和 `DYNAMIC_GA_CONFIG` 中新增：
+真正持续滚动动态重规划不建议第一版做。原因：
 
 ```text
-dynamic_archive_enabled = True
-dynamic_archive_size = 60
-dynamic_archive_seed_count = 24
-dynamic_archive_update_top_k = 20
-dynamic_warm_start_limit = 30
-dynamic_warm_start_target_ratio = 0.70
-dynamic_random_seed_ratio = 0.20
-dynamic_force_combined_b_seed = True
+1. 当前阻塞主因是单次动态 solve 太重。
+2. runtime 实体状态是可变对象，后台优化容易读到半更新状态。
+3. anytime plan 如果自动应用，会和卡车/无人机执行队列冲突。
+4. 没有 plan generation 和 safe switch point 时，旧 plan 可能覆盖新状态。
 ```
 
-### 9.3 动态初始化策略
+### 13.2 可接受的低风险版本
 
-当 `context.mode == "dynamic"` 或 `dispatch_type == "dynamic_replan"` 时：
-
-```text
-population_size = 30
-
-目标：
-  20 ~ 24 个来自 archive/warm_start
-  1 个 previous_best 修补
-  1 个 combined B seed
-  1 个 greedy seed
-  1 个 truck-only seed
-  剩余 4 ~ 7 个 balanced/random
-```
-
-这样就算没有进化代数，初始 population 中也会含有大量历史 B/C 协同结构。
-
----
-
-## 10. 第六阶段：Time-Sliced Anytime GA
-
-### 10.1 不建议第一版上后台线程
-
-真实后台线程会和仿真状态、实体 route、runtime adapter 竞争可变对象，容易出现状态污染。第一版推荐单线程 time-sliced：
+后续如果要做，只做单线程、小时间片、只更新 archive 的版本：
 
 ```text
 每个仿真 tick：
-  正常推进实体
-  检查动态订单
-  如果没有新动态订单、没有正在应用 dispatch：
-      solver.improve_archive_slice(snapshot, budget=0.03s ~ 0.1s)
+  如果没有新单待调度；
+  如果没有 dispatch 正在应用；
+  如果 solver 是 ga_mmce；
+  clone 当前 state；
+  improve_archive_slice(snapshot, budget=0.03s ~ 0.05s)；
+  只更新 dynamic_archive，不应用 plan。
 ```
 
-### 10.2 新增 solver 方法
-
-在 `backend/solver/ga_mmce/solver.py` 新增：
+### 13.3 新增方法
 
 ```text
-improve_archive_slice(state, config=None, time_budget_seconds=0.05)
+GAMMCESolver.improve_archive_slice(state, time_budget_seconds=0.05)
 ```
 
 职责：
 
 ```text
-1. clone 当前 state。
-2. build_ga_context(mode="dynamic")。
-3. 从 dynamic_archive 构造 seeds。
-4. 小种群初始化。
-5. 跑极少量 generation 或到时间片结束。
-6. 只更新 dynamic_archive，不应用 runtime plan。
-```
-
-### 10.3 外层调用位置
-
-优先考虑：
-
-```text
-backend/environment/state/sim_engine.py::_try_auto_dispatch()
-```
-
-或封装在：
-
-```text
-backend/solver/decision_engine.py
-```
-
-调用原则：
-
-```text
-1. 没有新订单触发时才运行。
-2. 每 tick 时间片必须很小。
-3. 不直接改变实体状态，只更新 solver.dynamic_archive。
-4. 如果当前 solver 不是 ga_mmce，直接跳过。
+1. build dynamic context。
+2. 从 archive 构造小种群。
+3. 跑极少量 generation 或直到预算耗尽。
+4. 只写 solver.dynamic_archive。
+5. 不调用 DecisionEngine._apply_plan()。
 ```
 
 ---
 
-## 11. 第七阶段：Incremental Decode / Prefix Trace
+## 14. 暂不建议第一版实施的内容
 
-这是中长期优化，收益大但改动也最大。
-
-### 11.1 新增 DecodeTrace
-
-建议在 `decoder.py` 或新文件 `decode_trace.py` 中定义：
+以下设计可以保留为远期方向，但不建议放入当前第一轮改造：
 
 ```text
-DecodeTrace
-  sequence
-  assignment
-  rendezvous
-  state_after_index
-  allocations_after_index
-  partial_cost_after_index
-  diagnostics_after_index
+1. 后台线程式持续滚动优化器。
+2. 自动把 anytime plan 覆盖 runtime route。
+3. Incremental Decode / Prefix Trace。
+4. frozen_future 完全从 GA decode 中剥离并做 tail plan splice。
+5. 大规模重写 population.py 的初始化框架。
 ```
 
-每个 elite individual 可保存：
+原因：
 
 ```text
-individual._ga_decode_trace
+这些改动都涉及 decoder、runtime_adapter、DecisionEngine 和实体运行态的一致性；
+在当前已经存在同步阻塞和路线震荡时，先做这些会扩大 bug 面；
+收益也依赖前面预算守卫、archive、稳定性门槛先落地。
 ```
-
-### 11.2 Dirty index
-
-当 child 来自 parent mutation/crossover 时，计算最早变化位置：
-
-```text
-first index where:
-  sequence differs
-  assignment differs
-  rendezvous differs
-```
-
-如果 `dirty_idx > 0` 且 prefix trace 仍匹配，则从 `dirty_idx - 1` 的状态继续 decode，只重算后缀。
-
-### 11.3 限制
-
-B/C 会改变无人机 host、energy、waiting station、truck timing，所以 prefix trace 只能在以下条件下复用：
-
-```text
-1. prefix sequence 完全一致
-2. prefix assignment 完全一致
-3. prefix rendezvous 完全一致
-4. 当前 dynamic snapshot 的 locked/frozen 资源签名未变化
-```
-
-否则必须完整 decode。
 
 ---
 
-## 12. Runtime 安全应用规则
+## 15. 配置新增建议
 
-如果后续 anytime GA 找到了更优 plan，不建议立刻覆盖 runtime route。建议只在安全切换点应用：
-
-```text
-1. 下一次动态订单触发时。
-2. 卡车到达 depot/station，处于可重规划节点。
-3. 无人机没有 flying / carrying / critical recovery。
-4. 新 plan 不改变 completed / locked / already-started 订单。
-5. 新 plan 只改 pending 或 assigned-but-not-started 订单。
-```
-
-涉及文件：
+在 `backend/solver/ga_mmce/config.py` 中新增字段时，应保持默认保守，避免影响静态 GA。
 
 ```text
-backend/solver/ga_mmce/runtime_adapter.py
-backend/environment/state/entity_manager.py
-backend/solver/decision_engine.py
-```
-
-建议给 plan summary 增加：
-
-```text
-plan_generation
-archive_based
-fast_incumbent_used
-anytime_improved
-safe_to_apply_from_time
-locked_order_ids
-frozen_future_order_ids
-```
-
-Runtime apply 时检查 generation，防止旧 plan 覆盖新 plan。
-
----
-
-## 13. 配置新增建议
-
-在 `backend/solver/ga_mmce/config.py` 中扩展 `GAConfig` 和 `DYNAMIC_GA_CONFIG`：
-
-```text
-# Archive
-dynamic_archive_enabled = True
-dynamic_archive_size = 60
-dynamic_archive_seed_count = 24
-dynamic_archive_update_top_k = 20
-dynamic_warm_start_limit = 30
-dynamic_warm_start_target_ratio = 0.70
+# Dynamic budget guard
+dynamic_budget_guard_enabled = True
+dynamic_b_precheck_budget_seconds = 0.8
+dynamic_initial_eval_budget_seconds = 1.2
+dynamic_warm_start_eval_budget_seconds = 0.4
+dynamic_b_precheck_max_drones_per_order = 4
+dynamic_b_precheck_max_launch_nodes = 4
+dynamic_b_precheck_max_recover_nodes = 4
 
 # Fast incumbent
 fast_incumbent_enabled = True
-fast_incumbent_eval_count = 12
-fast_incumbent_budget_seconds = 0.30
+fast_incumbent_eval_count = 8
+fast_incumbent_budget_seconds = 0.3
 
-# Cache
+# Lightweight archive
+dynamic_archive_enabled = True
+dynamic_archive_size = 60
+dynamic_archive_seed_count = 16
+dynamic_archive_update_top_k = 12
+dynamic_warm_start_limit = 24
+
+# Window and stability
+dynamic_local_window_enabled = True
+dynamic_accept_min_improvement_ratio = 0.03
+dynamic_accept_lateness_improvement_s = 30.0
+dynamic_accept_max_extra_truck_distance_m = 500.0
+dynamic_stability_penalty_weight = 1.0
+dynamic_recover_deviation_penalty_weight = 1.0
+
+# Distance cache
 distance_cache_enabled = True
 distance_cache_size = 50000
-candidate_cache_enabled = True
+distance_cache_position_bucket_m = 10.0
+distance_cache_payload_bucket_kg = 0.1
+
+# Candidate cache: later phase
+candidate_cache_enabled = False
 candidate_cache_size = 20000
-cache_time_bucket_s = 10.0
-cache_position_bucket_m = 20.0
-cache_energy_bucket_wh = 10.0
+candidate_cache_time_bucket_s = 10.0
+candidate_cache_energy_bucket_wh = 10.0
 final_strict_reevaluation = True
 
-# Anytime
-anytime_enabled = True
+# Anytime archive slice: later phase
+anytime_archive_slice_enabled = False
 anytime_slice_seconds = 0.05
-anytime_population_size = 12
-anytime_max_generations_per_slice = 2
-
-# Dynamic population mix
-dynamic_random_seed_ratio = 0.20
-dynamic_force_combined_b_seed = True
 ```
 
-注意：第一阶段不要急着增大 `population_size`。更有效的是让已有 `population_size = 30` 中的 20 个以上来自 archive/warm starts。
+注意：第一版不要增大 `population_size`。当前问题不是种群太小，而是 30 个个体都可能评估不完。
 
 ---
 
-## 14. 文件级修改清单
+## 16. 文件级修改清单
 
-### 14.1 新增文件
+### 16.1 第一阶段：预算守卫
+
+修改：
 
 ```text
-backend/solver/ga_mmce/archive.py
+backend/solver/ga_mmce/solver.py
+backend/solver/ga_mmce/config.py
+backend/solver/ga_mmce/dynamic_rescheduler.py
 ```
 
-职责：
+重点：
 
 ```text
-GAArchive
-ArchiveEntry
-archive 去重/剪枝/多桶保留
+1. precheck / warm start / initial population 都检查 budget。
+2. B precheck 限制候选数量。
+3. summary 增加 initial_eval_count、precheck_budget_hit。
+```
+
+### 16.2 第二阶段：Fast Incumbent
+
+修改：
+
+```text
+backend/solver/ga_mmce/dynamic_rescheduler.py
+backend/solver/ga_mmce/config.py
+```
+
+重点：
+
+```text
+1. solver.solve() 前评估少量 warm starts。
+2. ga_plan 0 代或不可行时可选择 fast_plan。
+3. 不改 runtime_adapter。
+```
+
+### 16.3 第三阶段：轻量 Archive
+
+修改：
+
+```text
+backend/solver/ga_mmce/solver.py
+backend/solver/ga_mmce/dynamic_rescheduler.py
+backend/solver/ga_mmce/config.py
 ```
 
 可选新增：
 
 ```text
-backend/solver/ga_mmce/cache.py
-backend/solver/ga_mmce/decode_trace.py
+backend/solver/ga_mmce/archive.py
 ```
 
-第一版可以先把 LRU cache 放在 `physical_evaluator.py` 内，稳定后再抽出。
+建议先不新增文件，等逻辑稳定后再抽出。
 
-### 14.2 修改 solver.py
+### 16.4 第四阶段：窗口与稳定性
+
+修改：
 
 ```text
-1. __init__ 增加 dynamic_archive / last_population。
-2. solve() 评估初始 population 后更新 archive。
-3. 每代记录时更新 archive。
-4. 返回前更新 archive。
-5. 新增 _update_dynamic_archive()。
-6. 新增 improve_archive_slice()。
-7. 可选：solve() 支持 incumbent_plan / incumbent_individual。
+backend/solver/ga_mmce/dynamic_rescheduler.py
+backend/solver/ga_mmce/decoder.py 可选
+backend/solver/ga_mmce/physical_evaluator.py 可选
 ```
 
-### 14.3 修改 dynamic_rescheduler.py
+重点：
 
 ```text
-1. 在 previous_best warm start 前后加入 archive warm starts。
-2. 新增 build_archive_warm_starts()。
-3. 新增 adapt_individual_to_dynamic_orders()。
-4. 新增 merge_warm_starts()。
-5. 新增 _fast_incumbent_plan()。
-6. final_plan 选择时纳入 fast incumbent。
-7. summary/CSV 增加 archive/fast/cache 诊断字段。
+1. _select_reoptimization_window() 加局部性和紧迫性。
+2. final_plan 选择前加 acceptance gate。
+3. B precheck 的 launch/recover 候选按局部性筛选。
 ```
 
-### 14.4 修改 population.py
+### 16.5 第五阶段：Distance Cache
+
+修改：
 
 ```text
-1. 支持 dynamic_warm_start_target_ratio。
-2. 动态模式下优先保留 archive/warm starts。
-3. combined B seed 保底进入 population。
-4. 控制 truck-only / random seed 比例。
+backend/solver/ga_mmce/solver.py
+backend/solver/ga_mmce/physical_evaluator.py
+backend/solver/greedy_mmce_bi.py 或 greedy helper 相关距离函数
 ```
 
-### 14.5 修改 physical_evaluator.py
+重点：
 
 ```text
-1. 增加 distance cache。
-2. 增加 candidate cache。
-3. 包装 evaluate_fixed_mode_a/b/c。
-4. 最终 best 支持 strict reevaluation。
-5. 增加 cache hit/miss 诊断。
+1. dynamic_replan 不要每次清空 road distance memo。
+2. 增加跨轮 distance cache。
+3. 增加 hit/miss 诊断。
 ```
 
-### 14.6 修改 config.py
-
-增加 archive、fast incumbent、cache、anytime、dynamic population mix 配置字段。
-
-### 14.7 修改 sim_engine.py 或 decision_engine.py
+### 16.6 后续阶段
 
 ```text
-1. 在无新单、无 dispatch 应用时调用 improve_archive_slice()。
-2. 控制时间片预算。
-3. 不直接应用 anytime plan，只更新 archive。
-```
-
-### 14.8 修改 runtime_adapter.py
-
-第一阶段不必改。后续若 anytime plan 要自动替换 runtime route，需要加：
-
-```text
-plan_generation 检查
-locked/running order 防覆盖
-safe switch point 检查
+Candidate Cache：physical_evaluator.py
+Anytime Archive Slice：solver.py + sim_engine.py/decision_engine.py
+Incremental Decode：decoder.py + solver.py，远期再做
 ```
 
 ---
 
-## 15. 诊断字段建议
+## 17. 诊断字段建议
 
-为确认滚动优化是否生效，建议在 GA summary 和 debug log 加：
+动态重规划必须先能被观测，否则很难判断优化是否有效。建议记录：
 
 ```text
+event_time
+pending_count
+reoptimized_order_count
+frozen_future_order_count
+warm_start_count
+
+precheck_elapsed_seconds
+b_precheck_eval_count
+b_precheck_budget_hit
+warm_start_eval_count
+initial_population_eval_count
+initial_population_budget_hit
+
+actual_generations
+elapsed_seconds
+time_budget_hit
+
+fast_incumbent_enabled
+fast_incumbent_found
+fast_incumbent_selected
+fast_incumbent_A_count
+fast_incumbent_B_count
+fast_incumbent_C_count
+
 archive_enabled
 archive_size_before
 archive_size_after
 archive_seed_count
 archive_seed_accepted_count
-archive_seed_rejected_count
-archive_best_fitness
-archive_b_heavy_count
-archive_c_heavy_count
 
-fast_incumbent_enabled
-fast_incumbent_eval_count
-fast_incumbent_found
-fast_incumbent_fitness
-fast_incumbent_selected
+plan_acceptance_decision
+plan_acceptance_reason
+stability_penalty
+route_prefix_changed_count
+recover_deviation_penalty
 
 distance_cache_hit
 distance_cache_miss
 candidate_cache_hit
 candidate_cache_miss
 
-anytime_slice_used
-anytime_slice_seconds
-anytime_archive_improved
-
-actual_generations
-time_budget_hit
-initial_best_modes
-final_best_modes
+final_A_count
+final_B_count
+final_C_count
+unserved_order_ids
 ```
 
-这些字段可以写入：
+写入位置：
 
 ```text
+plan.summary
 logs/ga_dynamic_replan.csv
 backend/solver/ga_mmce_debug_log
-plan.summary
 ```
 
 ---
 
-## 16. 验证计划
+## 18. 验证计划
 
-### 16.1 单元级
-
-```text
-1. archive 去重和多桶保留。
-2. archive individual 适配当前 order_ids/gene_pool。
-3. fixed tail 强制不被 archive 覆盖。
-4. distance cache key 稳定。
-5. candidate cache 不跨错误 host/energy 状态复用。
-```
-
-### 16.2 脚本级
+### 18.1 脚本级回归
 
 继续使用：
 
@@ -1231,154 +1411,143 @@ plan.summary
 python backend/scripts/test_ga_dynamic_rescheduler.py
 ```
 
+新增断言方向：
+
+```text
+1. 动态重规划返回仍可行。
+2. time_budget_seconds 不再被 initial population 大幅突破。
+3. initial_population_eval_count <= population_size。
+4. actual_generations = 0 时 fast_incumbent 参与选择。
+5. warm_start / archive seed 不破坏 fixed_tail。
+```
+
+### 18.2 日志级验证
+
 重点观察：
 
 ```text
-DYNAMIC_MODES 不应稳定退化为 {'A': all}
-actual_generations = 0 时仍能有 B/C 或至少有 archive seed 参与
-time_budget_hit = True 时 final plan 仍来自 fast incumbent 或 archive seed
+elapsed_seconds 是否从 20s+ 降到接近动态预算。
+actual_generations 是否从长期 0 变成偶尔能进入进化。
+b_precheck_budget_hit 是否可控。
+initial_population_eval_count 是否被预算限制。
+final_B_count / final_C_count 是否不再长期接近 0。
+plan_acceptance_reason 是否能解释路线为何被覆盖或保留。
 ```
 
-### 16.3 日志级
+### 18.3 行为级验证
 
-检查：
+在仿真中观察：
 
 ```text
-archive_seed_count > 0
-archive_seed_accepted_count > 0
-fast_incumbent_found = True
-candidate_cache_hit 随多次动态重规划上升
-distance_cache_hit 随多次动态重规划上升
+1. 新单到达时前端冻结时间明显缩短。
+2. 卡车不会因为单个远处订单频繁改变方向。
+3. 当前区域附近订单更倾向于连续完成。
+4. B recover 点不再频繁把卡车拉离当前订单簇。
+5. 无人机 route queue 不被无意义清理。
 ```
 
-### 16.4 回归风险
+### 18.4 回归风险
 
 重点防：
 
 ```text
-1. archive 个体引用旧 gene_pool 中已经不可用的无人机。
-2. archive 个体改变 locked/running 订单。
-3. candidate cache 用旧 _ga_host_type 或旧 energy 得出错误可行性。
-4. anytime slice 意外修改 runtime 实体状态。
-5. fast incumbent 可行性判断只看订单数量，不看 unserved / penalty。
+1. 预算中断后没有任何 evaluated individual，导致 best 为空。
+2. archive 个体引用旧 gene_pool 或旧 rendezvous 节点。
+3. fixed tail 被 archive 或 mutation 破坏。
+4. acceptance gate 过严，导致新单长期不被接收。
+5. B precheck 过滤过严，误杀本来可行的 B 协同。
+6. distance cache 因 scene/bbox 变化复用错误路线距离。
+7. candidate cache 用旧 host/energy 状态得出错误可行性。
 ```
 
 ---
 
-## 17. 推荐实施顺序
+## 19. 推荐实施顺序
 
-### Step 1：Archive 复用
-
-修改：
-
-```text
-archive.py
-solver.py
-dynamic_rescheduler.py
-config.py
-```
+### Step 1：预算守卫和 B precheck 限流
 
 目标：
 
 ```text
-动态重规划从 previous_best-only 变为 archive + previous_best。
+动态重规划 elapsed_seconds 接近 time_budget_seconds；
+不再出现 3 秒预算却阻塞 20 秒以上。
 ```
 
 ### Step 2：Fast Incumbent
 
-修改：
+目标：
 
 ```text
-dynamic_rescheduler.py
-solver.py 可选
+actual_generations = 0 时仍有历史可行方案兜底；
+0 代不再天然等价于 A-heavy。
 ```
+
+### Step 3：last_population / 轻量 Archive
 
 目标：
 
 ```text
-0 代进化时也有历史可行解兜底。
+动态重规划从 previous_best-only 变成 previous_best + 历史 top-K + B/C-heavy seeds。
 ```
 
-### Step 3：Distance Cache
-
-修改：
-
-```text
-physical_evaluator.py
-```
+### Step 4：局部窗口和计划接受门槛
 
 目标：
 
 ```text
-减少 road/uav distance 和 energy 重复计算。
+减少路线震荡；
+提升当前区域订单连续服务；
+避免 B recover 把卡车拉到不合适区域。
 ```
 
-### Step 4：Candidate Cache
-
-修改：
-
-```text
-physical_evaluator.py
-```
+### Step 5：Distance Cache
 
 目标：
 
 ```text
-减少 A/B/C 候选重复评估。
+减少重复距离和能耗计算；
+提高动态预算内可评估个体数量。
 ```
 
-### Step 5：Anytime Slice
-
-修改：
-
-```text
-solver.py
-sim_engine.py 或 decision_engine.py
-```
+### Step 6：Candidate Cache
 
 目标：
 
 ```text
-没有新单时持续优化 archive。
+减少 A/B/C 候选重复评估；
+但必须等状态签名和 strict reevaluation 机制稳定后再做。
 ```
 
-### Step 6：Incremental Decode
-
-修改：
-
-```text
-decoder.py
-physical_evaluator.py
-solver.py
-archive.py
-```
+### Step 7：Time-Sliced Archive Slice
 
 目标：
 
 ```text
-只从变化点后重新 decode。
+在无新单时小步优化 archive；
+不直接应用 plan，不碰 runtime route。
 ```
 
 ---
 
-## 18. 最小可落地版本
+## 20. 最小可落地版本
 
 如果只做一版最小但有效的改造，建议范围是：
 
 ```text
-1. archive.py
-2. solver.py 保存并更新 dynamic_archive
-3. dynamic_rescheduler.py 从 archive 构造 warm starts
-4. dynamic_rescheduler.py 增加 fast incumbent
-5. config.py 增加 archive/fast 配置
+1. solver.py：预算守卫，B precheck 限流，初始 population 部分评估。
+2. dynamic_rescheduler.py：fast incumbent，final_plan 选择逻辑增强。
+3. solver.py：保存 last_population，给 dynamic_rescheduler 提供 archive-like seeds。
+4. dynamic_rescheduler.py：archive seeds 适配当前 planning_orders/gene_pool/fixed_tail。
+5. config.py：增加预算、fast incumbent、轻量 archive 配置。
+6. 日志：增加 precheck / initial eval / fast incumbent / archive 诊断。
 ```
 
-这一版即可解决最核心问题：
+这一版解决最核心问题：
 
 ```text
-动态重规划不再只依赖 previous_best；
-时间预算不足时，仍可从历史优秀种群中拿到 B/C 协同结构；
-actual_generations = 0 不再天然等价于全 A。
+动态重规划不再长期突破预算；
+0 代进化时仍有可解释的 incumbent；
+历史 B/C 协同结构能跨动态轮次复用；
+路线覆盖开始有接受门槛；
+后续再做 cache 和 anytime 时有诊断基础。
 ```
-
-随后再做 distance cache 和 candidate cache，用于解决计算成本问题。
