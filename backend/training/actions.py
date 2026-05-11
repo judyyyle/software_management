@@ -26,8 +26,6 @@ class DispatchAction:
             raise ValueError(f"dispatch_action.mode 仅允许 B/C，实际={self.mode}")
         if self.mode == "B" and self.recover_node_id is not None:
             raise ValueError("mode B 不应携带 recover_node_id")
-        if self.mode == "C" and not self.recover_node_id:
-            raise ValueError("mode C 必须携带 recover_node_id")
 
 
 @dataclass(frozen=True)

@@ -83,6 +83,18 @@ data:
   poisson_burst_multiplier: 1.0
   poisson_max_orders_per_episode: 64
 
+  # Mode C 两阶段改造第一步：在 PPO 训练的动态流中加入极少量 truck-only 订单。
+  # 这些订单 payload 必须超过 heavy UAV 承载上限，因此不会进入 PPO 可授权订单集合；
+  # deadline 刻意显著长于普通 UAV 动态订单，仅作为后续卡车动态重排的结构性扰动。
+  truck_only_dynamic_enabled: true
+  truck_only_dynamic_orders_per_episode: 2
+  truck_only_dynamic_spawn_start_s: 600
+  truck_only_dynamic_spawn_end_s: 2400
+  truck_only_dynamic_weight_min_kg: 10.5
+  truck_only_dynamic_weight_max_kg: 12.0
+  truck_only_dynamic_deadline_window_min_min: 80
+  truck_only_dynamic_deadline_window_max_min: 120
+
   # stochastic 验证的标准强度档。
   stochastic_eval_arrival_rate_per_min:
     low: 0.20
@@ -121,6 +133,7 @@ planner:
   #   Run08 显式提高到 5，用更大的沿路站点覆盖率放大 mode C rendezvous 机会率。
   patrol_min_remaining_sec: 600
   patrol_stations_per_loop: 5
+  beam_width: 8
 
   # 可选退化开关：仅建议在 benchmark / hybrid 等不追加巡站循环的验证路径中显式开启。
   # 开启后，若卡车未来骨架自然耗尽，允许 `_build_coarse_plan_view()` 继续构造空骨架退化对象：
@@ -328,8 +341,6 @@ training:
   #   - huber：优先用于当前高方差 reward / return 场景
   #   - mse：保留为回退选项
   entropy_coef: 0.10
-  # Run12: recovery head 样本本就稀疏，不再额外降权；否则几乎总是塌到第一个候选节点。
-  recovery_entropy_coef: 1.0
   # Run16: 配合更宽的 Huber 二次区，适度提高 critic loss 权重。
   value_loss_coef: 0.10
   value_loss_type: huber

@@ -19,6 +19,7 @@ from .contracts import PolicyMode
 from .env_adapter import (
     BackboneVisit,
     DispatchAction,
+    FALLBACK_CAUSE_PLANNER_INVALIDATED_FOR_TRUCK_ORDER,
     TrainingDroneState,
     TrainingEnvAdapter,
 )
@@ -120,12 +121,28 @@ class TestTrainingEnvAdapterPhase5b(unittest.TestCase):
             drone_id=drone_id,
             coarse_plan=coarse_plan,
         )
-        mode_c_nodes = {
-            action.recover_node_id
+        mode_c_actions = [
+            action
             for action in action_lookup
             if isinstance(action, DispatchAction) and action.mode == PolicyMode.C
+        ]
+        candidate_out = env._candidate_builder.build(
+            runtime_state=env.build_runtime_state_view(),
+            coarse_plan=coarse_plan,
+            deciding_drone_id=drone_id,
+            trigger_type="test_idle",
+            trigger_station_id=None,
+            last_seen_plan_version=coarse_plan.plan_version,
+        )
+        mode_c_nodes = {
+            feature.recover_node_id
+            for row in candidate_out.candidate_features.recovery_features
+            for feature in row
+            if feature.is_valid
         }
 
+        self.assertEqual(len(mode_c_actions), 1)
+        self.assertIsNone(mode_c_actions[0].recover_node_id)
         self.assertNotIn(station_ids[0], mode_c_nodes)
         self.assertIn(station_ids[1], mode_c_nodes)
 
@@ -257,7 +274,6 @@ class TestTrainingEnvAdapterPhase5b(unittest.TestCase):
             mode=PolicyMode.C,
             recover_node_id=recover_node_id,
         )
-        self.assertIn(action, decision.action_lookup)
 
         env._apply_dispatch_action(trigger, action)
         deliver_leg = env._flight_legs[drone_id]
@@ -434,6 +450,50 @@ class TestTrainingEnvAdapterPhase5b(unittest.TestCase):
         )
         self.assertAlmostEqual(
             env._last_reward_breakdown["fallback"],
+            -env._cfg.lambda_miss * delta_t,
+            places=6,
+        )
+
+    def test_planner_invalidated_fallback_does_not_charge_ppo_reward(self) -> None:
+        env, drone_id = self._reset_controlled_env()
+        drone = env._require_entity_manager().drones[drone_id]
+        depot = env._require_depot()
+
+        drone.current_loc = Position3D(
+            x=depot.location.x + 300.0,
+            y=depot.location.y,
+            z=depot.location.z,
+        )
+        env._drone_state[drone_id] = TrainingDroneState.DELIVERED
+        env._planned_route_stop_i = len(env._planned_route_stops)
+
+        entered = env._enter_fallback_recovery(
+            drone_id,
+            cause=FALLBACK_CAUSE_PLANNER_INVALIDATED_FOR_TRUCK_ORDER,
+        )
+        self.assertTrue(entered)
+
+        leg = env._fallback_leg[drone_id]
+        delta_t = min(5.0, max(1.0, (leg.arrival_time - env._t_now) / 2.0))
+        reward = env._advance_to_event(env._t_now + delta_t)
+
+        self.assertAlmostEqual(reward, -env._cfg.lambda_miss * delta_t, places=6)
+        self.assertAlmostEqual(env._agent_cost_accum.get(drone_id, 0.0), 0.0, places=6)
+        self.assertEqual(env._episode_system_attributed_fallback_count, 1)
+        self.assertEqual(env._episode_ppo_attributed_fallback_count, 0)
+        self.assertAlmostEqual(
+            env._episode_system_attributed_fallback_time_sec,
+            delta_t,
+            places=6,
+        )
+        self.assertEqual(
+            env._episode_fallback_cause_counts[
+                FALLBACK_CAUSE_PLANNER_INVALIDATED_FOR_TRUCK_ORDER
+            ],
+            1,
+        )
+        self.assertAlmostEqual(
+            env._last_reward_breakdown["fallback_system_attributed"],
             -env._cfg.lambda_miss * delta_t,
             places=6,
         )

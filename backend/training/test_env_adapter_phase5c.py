@@ -20,6 +20,7 @@ from .env_adapter import (
     BackboneVisit,
     DecisionTrigger,
     DispatchAction,
+    FALLBACK_CAUSE_NO_POST_DELIVERY_C_NODE,
     TrainingDroneState,
     TrainingEnvAdapter,
     WAIT_ACTION,
@@ -187,6 +188,110 @@ class TestTrainingEnvAdapterPhase5c(unittest.TestCase):
             expected_truck_arrival - expected_uav_arrival_lb,
             places=6,
         )
+
+    def test_mode_c_dispatch_without_node_selects_recovery_after_delivery_service(self) -> None:
+        env, drone_id = self._reset_controlled_env()
+        entity_mgr = env._require_entity_manager()
+        drone = entity_mgr.drones[drone_id]
+        station_id = sorted(entity_mgr.stations)[0]
+        depot_id = env._require_depot().depot_id
+
+        order = self._inject_order(env, drone_id=drone_id, order_id="ORDER-P5C-POST-01")
+        t_deliver = env._estimate_delivery_arrival_time(drone, order)
+        t_service_finish = (
+            t_deliver + env._scene_solver_params().drone_service_time_order_s
+        )
+        depot = env._require_depot()
+        depot_uav_arrival = t_service_finish + env._estimate_flight_time(
+            drone=drone,
+            from_pos=order.delivery_loc,
+            to_pos=depot.get_location(t_service_finish),
+        )
+        depot_truck_eta = (
+            depot_uav_arrival + env._cfg.rendezvous_execution_margin_sec + 60.0
+        )
+        env._full_backbone_cache = [
+            BackboneVisit(
+                node_id=station_id,
+                arrival_time=t_service_finish + 1.0,
+                departure_time=t_service_finish + 1.0 + 1e-6,
+            ),
+            BackboneVisit(
+                node_id=depot_id,
+                arrival_time=depot_truck_eta,
+                departure_time=depot_truck_eta + 1e-6,
+            ),
+        ]
+        env._enqueue_decision(drone_id, "test_idle", None)
+
+        trigger = env._decision_queue.pop(0)
+        env._apply_dispatch_action(
+            trigger,
+            DispatchAction(order_id=order.order_id, mode=PolicyMode.C),
+        )
+        self.assertIsNone(env._dispatch_commit[drone_id].selected_recover_node)
+        self.assertNotIn(drone_id, env._reservations)
+
+        deliver_leg = env._flight_legs[drone_id]
+        env._advance_to_event(deliver_leg.arrival_time)
+        service_finish_time = env._delivery_service_legs[drone_id].finish_time
+        reward_before_service = env._agent_cost_accum.get(drone_id, 0.0)
+        env._advance_to_event(service_finish_time)
+
+        commit = env._dispatch_commit[drone_id]
+        self.assertEqual(commit.selected_recover_node, depot_id)
+        self.assertAlmostEqual(commit.planned_truck_arrival_time, depot_truck_eta, places=6)
+        self.assertIn(drone_id, env._reservations)
+        self.assertEqual(env._reservations[drone_id].recover_node, depot_id)
+        self.assertEqual(env._drone_state[drone_id], TrainingDroneState.RETURN_TO_RENDEZVOUS)
+        self.assertEqual(env._flight_legs[drone_id].target_node_id, depot_id)
+        self.assertAlmostEqual(
+            env._agent_cost_accum.get(drone_id, 0.0) - reward_before_service,
+            env._cfg.mode_c_attempt_bonus,
+            places=6,
+        )
+
+    def test_mode_c_dispatch_without_post_delivery_node_enters_fallback(self) -> None:
+        env, drone_id = self._reset_controlled_env()
+        entity_mgr = env._require_entity_manager()
+        drone = entity_mgr.drones[drone_id]
+        station_id = sorted(entity_mgr.stations)[0]
+
+        order = self._inject_order(env, drone_id=drone_id, order_id="ORDER-P5C-POST-FAIL")
+        t_deliver = env._estimate_delivery_arrival_time(drone, order)
+        t_service_finish = (
+            t_deliver + env._scene_solver_params().drone_service_time_order_s
+        )
+        env._full_backbone_cache = [
+            BackboneVisit(
+                node_id=station_id,
+                arrival_time=t_service_finish + 1.0,
+                departure_time=t_service_finish + 1.0 + 1e-6,
+            )
+        ]
+        env._enqueue_decision(drone_id, "test_idle", None)
+
+        trigger = env._decision_queue.pop(0)
+        env._apply_dispatch_action(
+            trigger,
+            DispatchAction(order_id=order.order_id, mode=PolicyMode.C),
+        )
+
+        deliver_leg = env._flight_legs[drone_id]
+        env._advance_to_event(deliver_leg.arrival_time)
+        service_finish_time = env._delivery_service_legs[drone_id].finish_time
+        env._advance_to_event(service_finish_time)
+
+        self.assertEqual(env._drone_state[drone_id], TrainingDroneState.FALLBACK_RECOVERY)
+        self.assertNotIn(drone_id, env._reservations)
+        self.assertIsNone(env._dispatch_commit[drone_id].selected_recover_node)
+        self.assertEqual(env._episode_mode_c_post_delivery_revalidation_fail_count, 1)
+        self.assertEqual(env._fallback_leg[drone_id].cause, FALLBACK_CAUSE_NO_POST_DELIVERY_C_NODE)
+        self.assertEqual(
+            env._episode_fallback_cause_counts[FALLBACK_CAUSE_NO_POST_DELIVERY_C_NODE],
+            1,
+        )
+        self.assertEqual(env._episode_ppo_attributed_fallback_count, 1)
 
     def test_mode_c_riding_launch_commitment_uses_decision_time_truck_eta(self) -> None:
         env = self._make_env()

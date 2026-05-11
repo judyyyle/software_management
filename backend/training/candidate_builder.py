@@ -226,8 +226,7 @@ class CandidateBuilder:
         recovery_features: list[tuple[RecoveryFeatures, ...]] = []
         order_mask: list[bool] = []
         mode_mask: list[tuple[bool, bool]] = []
-        recovery_mask: list[tuple[bool, ...]] = []
-        dispatch_actions: dict[tuple[int, int, int | None], DispatchAction] = {}
+        dispatch_actions: dict[tuple[int, int], DispatchAction] = {}
 
         for order_slot, item in enumerate(actionable_orders):
             order_features.append(item["order_feature"])
@@ -238,28 +237,24 @@ class CandidateBuilder:
             mode_mask.append((has_mode_b, has_mode_c))
 
             if has_mode_b:
-                dispatch_actions[(order_slot, _MODE_B_IDX, None)] = DispatchAction(
+                dispatch_actions[(order_slot, _MODE_B_IDX)] = DispatchAction(
                     order_id=item["order_id"],
                     mode=PolicyMode.B,
                 )
-
-            padded_recovery_features: list[RecoveryFeatures] = []
-            padded_recovery_mask: list[bool] = []
-            for recovery_slot, recovery_feature in enumerate(recovery_rows):
-                padded_recovery_features.append(recovery_feature)
-                padded_recovery_mask.append(True)
-                dispatch_actions[(order_slot, _MODE_C_IDX, recovery_slot)] = DispatchAction(
+            if has_mode_c:
+                dispatch_actions[(order_slot, _MODE_C_IDX)] = DispatchAction(
                     order_id=item["order_id"],
                     mode=PolicyMode.C,
-                    recover_node_id=recovery_feature.recover_node_id,
                 )
+
+            padded_recovery_features: list[RecoveryFeatures] = []
+            for recovery_feature in recovery_rows:
+                padded_recovery_features.append(recovery_feature)
 
             while len(padded_recovery_features) < self._cfg.max_candidate_recovery_per_order:
                 padded_recovery_features.append(_padding_recovery_feature())
-                padded_recovery_mask.append(False)
 
             recovery_features.append(tuple(padded_recovery_features))
-            recovery_mask.append(tuple(padded_recovery_mask))
 
         while len(order_features) < self._cfg.max_candidate_orders:
             order_features.append(_padding_order_feature())
@@ -271,9 +266,6 @@ class CandidateBuilder:
             )
             order_mask.append(False)
             mode_mask.append((False, False))
-            recovery_mask.append(
-                tuple(False for _ in range(self._cfg.max_candidate_recovery_per_order))
-            )
 
         action_count = 1 + len(dispatch_actions)
         if action_count > self._cfg.max_candidate_actions:
@@ -299,7 +291,6 @@ class CandidateBuilder:
             has_wait_action=True,
             order_mask=tuple(order_mask),
             mode_mask=tuple(mode_mask),
-            recovery_mask=tuple(recovery_mask),
             factorized_action_schema=FactorizedActionSchema(
                 root_branch_order=("WAIT", "DISPATCH"),
                 mode_order=("B", "C"),
@@ -394,18 +385,19 @@ class CandidateBuilder:
             recovery_pool = coarse_plan.get_recovery_candidates(order.order_id)
 
         safe_margin = self._safe_margin_j_by_drone[drone_view.drone_id]
-        candidates: list[RecoveryFeatures] = []
+        scored_candidates: list[tuple[float, float, RecoveryFeatures]] = []
         for node_id in recovery_pool:
             node_state = runtime_state.node_states.get(node_id)
             t_arrive_truck = coarse_plan.truck_eta_map.get(node_id)
             if node_state is None or t_arrive_truck is None:
                 continue
 
-            t_arrive_uav = t_deliver_finish + _estimate_flight_time(
+            uav_flight_time = _estimate_flight_time(
                 drone_view=drone_view,
                 from_pos=deliver_pos,
                 to_pos=node_state.position,
             )
+            t_arrive_uav = t_deliver_finish + uav_flight_time
             planned_wait = float(t_arrive_truck) - float(t_arrive_uav)
             if planned_wait < self._cfg.rendezvous_execution_margin_sec - _TIME_EPS:
                 continue
@@ -421,41 +413,41 @@ class CandidateBuilder:
             ):
                 continue
 
-            candidates.append(
-                RecoveryFeatures(
-                    order_id=order.order_id,
-                    recover_node_id=node_id,
-                    recover_node_type=str(node_state.node_type),
-                    x=float(node_state.position.x),
-                    y=float(node_state.position.y),
-                    z=float(node_state.position.z),
-                    truck_eta=float(t_arrive_truck),
-                    rendezvous_margin=float(
-                        planned_wait - self._cfg.rendezvous_execution_margin_sec
+            score = float(planned_wait) + 0.25 * float(uav_flight_time)
+            scored_candidates.append(
+                (
+                    score,
+                    float(uav_flight_time),
+                    RecoveryFeatures(
+                        order_id=order.order_id,
+                        recover_node_id=node_id,
+                        recover_node_type=str(node_state.node_type),
+                        x=float(node_state.position.x),
+                        y=float(node_state.position.y),
+                        z=float(node_state.position.z),
+                        truck_eta=float(t_arrive_truck),
+                        rendezvous_margin=float(
+                            planned_wait - self._cfg.rendezvous_execution_margin_sec
+                        ),
+                        reservation_count=int(
+                            runtime_state.reservation_count.get(node_id, 0)
+                        ),
+                        is_valid=True,
                     ),
-                    reservation_count=int(
-                        runtime_state.reservation_count.get(node_id, 0)
-                    ),
-                    is_valid=True,
                 )
             )
 
-        candidates.sort(
+        scored_candidates.sort(
             key=lambda item: (
-                -_exact_mode_c_score(
-                    rendezvous_margin=float(item.rendezvous_margin),
-                    truck_eta_remaining=max(
-                        0.0,
-                        float(item.truck_eta) - float(runtime_state.t_now),
-                    ),
-                    upper_horizon_sec=self._cfg.upper_horizon_sec,
-                ),
-                -item.rendezvous_margin,
-                item.truck_eta,
-                item.recover_node_id,
+                item[0],
+                item[1],
+                str(item[2].recover_node_id),
             )
         )
-        return tuple(candidates[: self._cfg.max_candidate_recovery_per_order])
+        return tuple(
+            item[2]
+            for item in scored_candidates[: self._cfg.max_candidate_recovery_per_order]
+        )
 
     def _summarize_best_mode_c(
         self,
@@ -466,22 +458,7 @@ class CandidateBuilder:
         if not recovery_candidates:
             return None
 
-        best_candidate = max(
-            recovery_candidates,
-            key=lambda item: (
-                _exact_mode_c_score(
-                    rendezvous_margin=float(item.rendezvous_margin),
-                    truck_eta_remaining=max(
-                        0.0,
-                        float(item.truck_eta) - float(t_now),
-                    ),
-                    upper_horizon_sec=self._cfg.upper_horizon_sec,
-                ),
-                float(item.rendezvous_margin),
-                -float(item.truck_eta),
-                str(item.recover_node_id),
-            ),
-        )
+        best_candidate = recovery_candidates[0]
         return {
             "rendezvous_margin": float(best_candidate.rendezvous_margin),
             "node_type": str(best_candidate.recover_node_type),

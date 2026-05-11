@@ -156,21 +156,12 @@ class TestPhase7ModelRuntime(unittest.TestCase):
                 ],
                 dtype=np.bool_,
             ),
-            recovery_mask=np.asarray(
-                [
-                    [True, True],
-                    [True, False],
-                    [False, False],
-                ],
-                dtype=np.bool_,
-            ),
         )
 
     def _build_model(self, device: torch.device) -> SharedPPOActorCritic:
         model = SharedPPOActorCritic(
             uav_feat_dim=4,
             order_feat_dim=5,
-            recovery_feat_dim=6,
             infra_feat_dim=7,
             history_feat_dim=8,
             critic_order_feat_dim=4,
@@ -203,7 +194,6 @@ class TestPhase7ModelRuntime(unittest.TestCase):
             gae_lambda=0.95,
             clip_coef=0.2,
             entropy_coef=0.01,
-            recovery_entropy_coef=0.4,
             rendezvous_arrive_bonus=2.0,
             rendezvous_bonus=0.2,
             mode_c_attempt_bonus=0.0,
@@ -247,7 +237,6 @@ class TestPhase7ModelRuntime(unittest.TestCase):
         self.assertEqual(tuple(single_out.root_branch_logits.shape), (1, 2))
         self.assertEqual(tuple(single_out.order_logits.shape), (1, 3))
         self.assertEqual(tuple(single_out.mode_logits.shape), (1, 3, 2))
-        self.assertEqual(tuple(single_out.recovery_logits.shape), (1, 3, 2))
         self.assertEqual(tuple(single_out.value.shape), (1,))
 
         batched_obs = ObservationBatch(
@@ -298,7 +287,6 @@ class TestPhase7ModelRuntime(unittest.TestCase):
             root_branch_mask=np.stack([action_mask.root_branch_mask, action_mask.root_branch_mask], axis=0),
             order_mask=np.stack([action_mask.order_mask, action_mask.order_mask], axis=0),
             mode_mask=np.stack([action_mask.mode_mask, action_mask.mode_mask], axis=0),
-            recovery_mask=np.stack([action_mask.recovery_mask, action_mask.recovery_mask], axis=0),
         )
 
         batch_out, _ = model.forward(
@@ -310,7 +298,6 @@ class TestPhase7ModelRuntime(unittest.TestCase):
         self.assertEqual(tuple(batch_out.root_branch_logits.shape), (2, 2))
         self.assertEqual(tuple(batch_out.order_logits.shape), (2, 3))
         self.assertEqual(tuple(batch_out.mode_logits.shape), (2, 3, 2))
-        self.assertEqual(tuple(batch_out.recovery_logits.shape), (2, 3, 2))
         self.assertEqual(tuple(batch_out.value.shape), (2,))
 
     def test_forward_and_evaluate_actions_keep_outputs_on_model_device(self) -> None:
@@ -333,7 +320,6 @@ class TestPhase7ModelRuntime(unittest.TestCase):
             "root_branch_idx": torch.as_tensor([1, 0], dtype=torch.long, device=device),
             "order_idx": torch.as_tensor([0, 0], dtype=torch.long, device=device),
             "mode_idx": torch.as_tensor([1, 0], dtype=torch.long, device=device),
-            "recovery_idx": torch.as_tensor([0, 0], dtype=torch.long, device=device),
         }
         batched_obs = ObservationBatch(
             uav_self_token=np.stack([obs.uav_self_token, obs.uav_self_token], axis=0),
@@ -383,7 +369,6 @@ class TestPhase7ModelRuntime(unittest.TestCase):
             root_branch_mask=np.stack([action_mask.root_branch_mask, action_mask.root_branch_mask], axis=0),
             order_mask=np.stack([action_mask.order_mask, action_mask.order_mask], axis=0),
             mode_mask=np.stack([action_mask.mode_mask, action_mask.mode_mask], axis=0),
-            recovery_mask=np.stack([action_mask.recovery_mask, action_mask.recovery_mask], axis=0),
         )
         batch_out, _ = model.forward(
             observation_batch=batched_obs,
@@ -462,11 +447,6 @@ class TestPhase7ModelRuntime(unittest.TestCase):
                 dtype=torch.float32,
                 device=device,
             ),
-            recovery_logits=torch.as_tensor(
-                [[[0.0, 0.0], [0.0, 0.0], [-1e9, -1e9]]],
-                dtype=torch.float32,
-                device=device,
-            ),
             value=torch.as_tensor([0.0], dtype=torch.float32, device=device),
         )
         action_mask = FactorizedActionMask(
@@ -476,16 +456,11 @@ class TestPhase7ModelRuntime(unittest.TestCase):
                 [[[True, True], [True, True], [False, False]]],
                 dtype=np.bool_,
             ),
-            recovery_mask=np.asarray(
-                [[[True, True], [True, True], [False, False]]],
-                dtype=np.bool_,
-            ),
         )
         action_indices = {
             "root_branch_idx": torch.as_tensor([0], dtype=torch.long, device=device),
             "order_idx": torch.as_tensor([0], dtype=torch.long, device=device),
             "mode_idx": torch.as_tensor([0], dtype=torch.long, device=device),
-            "recovery_idx": torch.as_tensor([0], dtype=torch.long, device=device),
         }
 
         _log_prob, entropy = model.evaluate_actions(
@@ -495,10 +470,10 @@ class TestPhase7ModelRuntime(unittest.TestCase):
         )
 
         ln2 = float(np.log(2.0))
-        expected_entropy = ln2 + 0.5 * (ln2 + 0.5 * ln2 + 0.25 * ln2)
+        expected_entropy = ln2 + 0.5 * (ln2 + 0.5 * ln2)
         self.assertAlmostEqual(float(entropy.item()), expected_entropy, places=6)
 
-    def test_evaluate_actions_scales_recovery_entropy_independently(self) -> None:
+    def test_evaluate_actions_entropy_has_no_recovery_component(self) -> None:
         device = torch.device("cpu")
         model = self._build_model(device)
         policy_out = PolicyForwardOutput(
@@ -509,11 +484,6 @@ class TestPhase7ModelRuntime(unittest.TestCase):
                 dtype=torch.float32,
                 device=device,
             ),
-            recovery_logits=torch.as_tensor(
-                [[[0.0, 0.0], [0.0, 0.0], [-1e9, -1e9]]],
-                dtype=torch.float32,
-                device=device,
-            ),
             value=torch.as_tensor([0.0], dtype=torch.float32, device=device),
         )
         action_mask = FactorizedActionMask(
@@ -523,28 +493,26 @@ class TestPhase7ModelRuntime(unittest.TestCase):
                 [[[True, True], [True, True], [False, False]]],
                 dtype=np.bool_,
             ),
-            recovery_mask=np.asarray(
-                [[[True, True], [True, True], [False, False]]],
-                dtype=np.bool_,
-            ),
         )
         action_indices = {
             "root_branch_idx": torch.as_tensor([0], dtype=torch.long, device=device),
             "order_idx": torch.as_tensor([0], dtype=torch.long, device=device),
             "mode_idx": torch.as_tensor([0], dtype=torch.long, device=device),
-            "recovery_idx": torch.as_tensor([0], dtype=torch.long, device=device),
         }
 
         _log_prob, entropy = model.evaluate_actions(
             policy_out=policy_out,
             action_mask=action_mask,
             action_indices=action_indices,
-            recovery_entropy_coef=0.4,
         )
 
         ln2 = float(np.log(2.0))
-        expected_entropy = ln2 + 0.5 * (ln2 + 0.5 * ln2 + 0.4 * 0.25 * ln2)
-        self.assertAlmostEqual(float(entropy.item()), expected_entropy, places=6)
+        expected_entropy = ln2 + 0.5 * (ln2 + 0.5 * ln2)
+        self.assertAlmostEqual(
+            float(entropy.item()),
+            expected_entropy,
+            places=6,
+        )
 
     def test_evaluate_actions_accepts_wait_only_masks_in_batch(self) -> None:
         device = torch.device("cpu")
@@ -568,14 +536,6 @@ class TestPhase7ModelRuntime(unittest.TestCase):
                 dtype=torch.float32,
                 device=device,
             ),
-            recovery_logits=torch.as_tensor(
-                [
-                    [[0.0, 0.0], [0.0, -1e9], [-1e9, -1e9]],
-                    [[0.0, 0.0], [0.0, 0.0], [0.0, 0.0]],
-                ],
-                dtype=torch.float32,
-                device=device,
-            ),
             value=torch.as_tensor([0.0, 0.0], dtype=torch.float32, device=device),
         )
         action_mask = FactorizedActionMask(
@@ -591,19 +551,11 @@ class TestPhase7ModelRuntime(unittest.TestCase):
                 ],
                 dtype=np.bool_,
             ),
-            recovery_mask=np.asarray(
-                [
-                    [[True, True], [True, False], [False, False]],
-                    [[False, False], [False, False], [False, False]],
-                ],
-                dtype=np.bool_,
-            ),
         )
         action_indices = {
             "root_branch_idx": torch.as_tensor([1, 0], dtype=torch.long, device=device),
             "order_idx": torch.as_tensor([0, 0], dtype=torch.long, device=device),
             "mode_idx": torch.as_tensor([0, 0], dtype=torch.long, device=device),
-            "recovery_idx": torch.as_tensor([0, 0], dtype=torch.long, device=device),
         }
 
         log_prob, entropy = model.evaluate_actions(
@@ -672,7 +624,6 @@ class TestPhase7ModelRuntime(unittest.TestCase):
             root_branch_mask=np.stack([action_mask.root_branch_mask, action_mask.root_branch_mask], axis=0),
             order_mask=np.stack([action_mask.order_mask, action_mask.order_mask], axis=0),
             mode_mask=np.stack([action_mask.mode_mask, action_mask.mode_mask], axis=0),
-            recovery_mask=np.stack([action_mask.recovery_mask, action_mask.recovery_mask], axis=0),
         )
         lstm_state = (
             torch.zeros((1, 2, 12), dtype=torch.float32, device=device),
@@ -834,13 +785,6 @@ class TestPhase7ModelRuntime(unittest.TestCase):
                 ],
                 axis=0,
             ),
-            recovery_mask=np.stack(
-                [
-                    np.stack([action_mask.recovery_mask, action_mask.recovery_mask], axis=0),
-                    np.stack([action_mask.recovery_mask, action_mask.recovery_mask], axis=0),
-                ],
-                axis=0,
-            ),
         )
         policy_out, next_state = model.forward_sequence(
             observation_batch=sequence_obs,
@@ -851,7 +795,6 @@ class TestPhase7ModelRuntime(unittest.TestCase):
         self.assertEqual(tuple(policy_out.root_branch_logits.shape), (2, 2, 2))
         self.assertEqual(tuple(policy_out.order_logits.shape), (2, 2, 3))
         self.assertEqual(tuple(policy_out.mode_logits.shape), (2, 2, 3, 2))
-        self.assertEqual(tuple(policy_out.recovery_logits.shape), (2, 2, 3, 2))
         self.assertEqual(tuple(policy_out.value.shape), (2, 2))
         self.assertEqual(tuple(next_state[0].shape), (1, 2, 12))
 
@@ -870,7 +813,6 @@ class TestPhase7ModelRuntime(unittest.TestCase):
                     root_branch_idx=1,
                     order_idx=0,
                     mode_idx=0,
-                    recovery_idx=None,
                 ),
                 log_prob_old=-0.1,
                 value_old=0.5,
@@ -890,7 +832,6 @@ class TestPhase7ModelRuntime(unittest.TestCase):
                     root_branch_idx=0,
                     order_idx=None,
                     mode_idx=None,
-                    recovery_idx=None,
                 ),
                 log_prob_old=-0.2,
                 value_old=0.4,
@@ -910,7 +851,6 @@ class TestPhase7ModelRuntime(unittest.TestCase):
                     root_branch_idx=1,
                     order_idx=1,
                     mode_idx=1,
-                    recovery_idx=0,
                 ),
                 log_prob_old=-0.3,
                 value_old=0.3,
@@ -1004,7 +944,6 @@ class TestPhase7ModelRuntime(unittest.TestCase):
                 root_branch_idx=1,
                 order_idx=0,
                 mode_idx=1,
-                recovery_idx=0,
             ),
             transition_summary=SimpleNamespace(rendezvous_success=True),
             rendezvous_arrive_bonus=2.0,
@@ -1026,7 +965,6 @@ class TestPhase7ModelRuntime(unittest.TestCase):
                 root_branch_idx=1,
                 order_idx=0,
                 mode_idx=1,
-                recovery_idx=0,
             ),
             transition_summary=SimpleNamespace(
                 rendezvous_success=False,
@@ -1040,7 +978,7 @@ class TestPhase7ModelRuntime(unittest.TestCase):
         self.assertFalse(success_bonus_applied)
         self.assertAlmostEqual(shaped_reward, 0.5, places=6)
 
-    def test_shape_post_action_reward_for_rendezvous_adds_attempt_bonus_for_mode_c(self) -> None:
+    def test_shape_post_action_reward_for_rendezvous_does_not_add_attempt_bonus_at_dispatch(self) -> None:
         (
             shaped_reward,
             arrive_bonus_applied,
@@ -1051,7 +989,6 @@ class TestPhase7ModelRuntime(unittest.TestCase):
                 root_branch_idx=1,
                 order_idx=0,
                 mode_idx=1,
-                recovery_idx=0,
             ),
             transition_summary=SimpleNamespace(
                 rendezvous_success=False,
@@ -1059,14 +996,13 @@ class TestPhase7ModelRuntime(unittest.TestCase):
             ),
             rendezvous_arrive_bonus=4.0,
             rendezvous_bonus=12.0,
-            mode_c_attempt_bonus=3.0,
         )
 
         self.assertFalse(arrive_bonus_applied)
         self.assertFalse(success_bonus_applied)
-        self.assertAlmostEqual(shaped_reward, 1.5, places=6)
+        self.assertAlmostEqual(shaped_reward, -1.5, places=6)
 
-    def test_shape_post_action_reward_for_rendezvous_does_not_add_attempt_bonus_for_non_mode_c(
+    def test_shape_post_action_reward_for_rendezvous_leaves_non_mode_c_unchanged(
         self,
     ) -> None:
         (
@@ -1079,7 +1015,6 @@ class TestPhase7ModelRuntime(unittest.TestCase):
                 root_branch_idx=1,
                 order_idx=0,
                 mode_idx=0,
-                recovery_idx=0,
             ),
             transition_summary=SimpleNamespace(
                 rendezvous_success=False,
@@ -1087,7 +1022,6 @@ class TestPhase7ModelRuntime(unittest.TestCase):
             ),
             rendezvous_arrive_bonus=4.0,
             rendezvous_bonus=12.0,
-            mode_c_attempt_bonus=3.0,
         )
 
         self.assertFalse(arrive_bonus_applied)
@@ -1103,7 +1037,6 @@ class TestPhase7ModelRuntime(unittest.TestCase):
                 root_branch_idx=1,
                 order_idx=0,
                 mode_idx=1,
-                recovery_idx=0,
             ),
             log_prob_old=-0.1,
             value_old=0.5,
@@ -1142,7 +1075,6 @@ class TestPhase7ModelRuntime(unittest.TestCase):
                 root_branch_idx=1,
                 order_idx=0,
                 mode_idx=1,
-                recovery_idx=0,
             ),
             log_prob_old=-0.1,
             value_old=0.5,
@@ -1182,7 +1114,6 @@ class TestPhase7ModelRuntime(unittest.TestCase):
                     root_branch_idx=0,
                     order_idx=0,
                     mode_idx=0,
-                    recovery_idx=0,
                 ),
                 log_prob_old=-0.1,
                 value_old=0.5,
@@ -1224,7 +1155,6 @@ class TestPhase7ModelRuntime(unittest.TestCase):
                     root_branch_idx=1,
                     order_idx=0,
                     mode_idx=1,
-                    recovery_idx=0,
                 ),
                 log_prob_old=-0.1,
                 value_old=0.5,
@@ -1274,7 +1204,6 @@ class TestPhase7ModelRuntime(unittest.TestCase):
                 root_branch_idx=0,
                 order_idx=0,
                 mode_idx=0,
-                recovery_idx=0,
             ),
             log_prob_old=-0.1,
             value_old=0.5,
@@ -1295,7 +1224,6 @@ class TestPhase7ModelRuntime(unittest.TestCase):
                 root_branch_idx=0,
                 order_idx=0,
                 mode_idx=0,
-                recovery_idx=0,
             ),
             log_prob_old=-0.2,
             value_old=0.4,
@@ -1317,7 +1245,6 @@ class TestPhase7ModelRuntime(unittest.TestCase):
                     root_branch_idx=0,
                     order_idx=0,
                     mode_idx=0,
-                    recovery_idx=0,
                 ),
                 log_prob_old=-0.3,
                 value_old=0.3,
@@ -1355,7 +1282,6 @@ class TestPhase7ModelRuntime(unittest.TestCase):
                     root_branch_idx=0,
                     order_idx=0,
                     mode_idx=0,
-                    recovery_idx=0,
                 ),
                 log_prob_old=-0.1,
                 value_old=0.2,
@@ -1376,7 +1302,6 @@ class TestPhase7ModelRuntime(unittest.TestCase):
                     root_branch_idx=0,
                     order_idx=0,
                     mode_idx=0,
-                    recovery_idx=0,
                 ),
                 log_prob_old=-0.1,
                 value_old=0.2,
@@ -1401,7 +1326,6 @@ class TestPhase7ModelRuntime(unittest.TestCase):
                     root_branch_idx=0,
                     order_idx=0,
                     mode_idx=0,
-                    recovery_idx=0,
                 ),
                 log_prob_old=-0.1,
                 value_old=0.2,
@@ -1585,7 +1509,6 @@ class TestPhase7ModelRuntime(unittest.TestCase):
                     root_branch_idx=0,
                     order_idx=0,
                     mode_idx=0,
-                    recovery_idx=0,
                 ),
                 log_prob_old=-0.1,
                 value_old=0.5,
@@ -1608,7 +1531,6 @@ class TestPhase7ModelRuntime(unittest.TestCase):
                         "root_branch_idx": 1,
                         "order_idx": 0,
                         "mode_idx": 0,
-                        "recovery_idx": None,
                     },
                     torch.as_tensor(0.0),
                 )
@@ -1779,8 +1701,8 @@ class TestPhase7ModelRuntime(unittest.TestCase):
                                 tail_bootstrap_values={},
                             )
         self.assertEqual(
-            fake_model.evaluate_actions.call_args.kwargs["recovery_entropy_coef"],
-            train_cfg.recovery_entropy_coef,
+            set(fake_model.evaluate_actions.call_args.kwargs),
+            {"policy_out", "action_mask", "action_indices"},
         )
         fake_optimizer.step.assert_not_called()
         self.assertAlmostEqual(float(stats["approx_kl"]), 1.0, places=6)
@@ -2163,8 +2085,18 @@ class TestPhase7ModelRuntime(unittest.TestCase):
                     "t_idle_sec": 1.0,
                     "t_queue_sec": 2.0,
                     "t_fallback_sec": 4.0,
+                    "t_ppo_attributed_fallback_sec": 4.0,
+                    "t_system_attributed_fallback_sec": 0.0,
                     "t_overdue_sec": 0.0,
                     "t_reservation_timeout_cost_sec": 0.0,
+                    "ppo_attributed_fallback_count": 1,
+                    "system_attributed_fallback_count": 0,
+                    "fallback_cause_counts": {
+                        "rendezvous_wait_timeout": 1,
+                    },
+                    "reservation_release_cause_counts": {
+                        "rendezvous_wait_timeout": 1,
+                    },
                     "dispatch_mode_b_count": 3,
                     "dispatch_mode_c_count": 1,
                     "mode_c_selected_count": 1,
@@ -2194,8 +2126,20 @@ class TestPhase7ModelRuntime(unittest.TestCase):
                     "t_idle_sec": 2.0,
                     "t_queue_sec": 1.0,
                     "t_fallback_sec": 6.0,
+                    "t_ppo_attributed_fallback_sec": 2.0,
+                    "t_system_attributed_fallback_sec": 4.0,
                     "t_overdue_sec": 7.0,
                     "t_reservation_timeout_cost_sec": 8.0,
+                    "ppo_attributed_fallback_count": 1,
+                    "system_attributed_fallback_count": 1,
+                    "fallback_cause_counts": {
+                        "no_post_delivery_c_node": 1,
+                        "planner_invalidated_for_truck_order": 1,
+                    },
+                    "reservation_release_cause_counts": {
+                        "no_post_delivery_c_node": 1,
+                        "planner_invalidated_for_truck_order": 1,
+                    },
                     "dispatch_mode_b_count": 1,
                     "dispatch_mode_c_count": 3,
                     "mode_c_selected_count": 3,
@@ -2232,6 +2176,26 @@ class TestPhase7ModelRuntime(unittest.TestCase):
                 "node_still_valid": 1,
             },
         )
+        self.assertEqual(report["sum_ppo_attributed_fallback_count"], 2)
+        self.assertEqual(report["sum_system_attributed_fallback_count"], 1)
+        self.assertEqual(
+            report["fallback_cause_counts"],
+            {
+                "rendezvous_wait_timeout": 1,
+                "no_post_delivery_c_node": 1,
+                "planner_invalidated_for_truck_order": 1,
+            },
+        )
+        self.assertEqual(
+            report["reservation_release_cause_counts"],
+            {
+                "rendezvous_wait_timeout": 1,
+                "no_post_delivery_c_node": 1,
+                "planner_invalidated_for_truck_order": 1,
+            },
+        )
+        self.assertAlmostEqual(report["sum_t_ppo_attributed_fallback_sec"], 6.0)
+        self.assertAlmostEqual(report["sum_t_system_attributed_fallback_sec"], 4.0)
         self.assertAlmostEqual(report["mean_total_reward"], 12.0)
         self.assertAlmostEqual(report["mode_b_dispatch_ratio"], 0.5)
         self.assertAlmostEqual(report["mode_c_dispatch_ratio"], 0.5)

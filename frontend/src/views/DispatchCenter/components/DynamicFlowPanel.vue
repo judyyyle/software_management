@@ -64,6 +64,36 @@
             <span class="label">可载重</span>
             <span class="value">{{ drone.payload_capacity }} kg</span>
           </div>
+          <div v-if="drone.dispatch_chain" class="detail-row">
+            <span class="label">决策链路</span>
+            <span class="value">{{ formatChainBrief(drone.dispatch_chain) }}</span>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- PPO 决策链路 -->
+    <div class="flow-section">
+      <div class="flow-title">🔗 PPO 决策链路</div>
+      <div v-if="dispatchChains.length === 0" class="flow-empty">暂无执行中决策链路</div>
+      <div v-for="chain in dispatchChains" :key="`${chain.drone_id}-${chain.order_id}`" class="chain-card">
+        <div class="chain-header">
+          <span class="chain-main">{{ chain.drone_id }} · {{ chain.mode }} · {{ chain.order_id }}</span>
+          <span class="chain-stage" :class="`stage-${chain.recovery_stage || 'none'}`">
+            {{ getRecoveryStageLabel(chain.recovery_stage) }}
+          </span>
+        </div>
+        <div class="chain-steps">
+          <span>决策接单</span>
+          <span class="chain-arrow">→</span>
+          <span>{{ getTrainingStateLabel(chain.training_state) }}</span>
+          <span v-if="chain.mode === 'C'" class="chain-arrow">→</span>
+          <span v-if="chain.mode === 'C'">{{ chain.selected_recover_node_id || '送达后选择回收站' }}</span>
+        </div>
+        <div class="chain-meta">
+          <span v-if="chain.reservation_node_id">reservation: {{ chain.reservation_node_id }}</span>
+          <span v-if="chain.active_leg_kind">flight: {{ chain.active_leg_kind }}</span>
+          <span v-if="chain.planned_execution_slack_sec != null">slack: {{ chain.planned_execution_slack_sec.toFixed(1) }}s</span>
         </div>
       </div>
     </div>
@@ -121,6 +151,8 @@ const drones = computed(() => {
   })
 })
 
+const dispatchChains = computed(() => systemStore.dispatchChains)
+
 const statusLabelMap: Record<string, string> = {
   'IDLE': '空闲',
   'DRIVING': '行驶中',
@@ -134,6 +166,43 @@ const statusLabelMap: Record<string, string> = {
 
 function getStatusLabel(status: string): string {
   return statusLabelMap[status] || status
+}
+
+const recoveryStageLabelMap: Record<string, string> = {
+  not_applicable: '无需回收站',
+  pending_post_delivery_selection: '待选回收站',
+  reservation_active: '已预约',
+  rendezvous_selected: '已选回收站',
+}
+
+const trainingStateLabelMap: Record<string, string> = {
+  idle: '空闲',
+  flying_to_deliver: '配送飞行',
+  delivery_service: '客户点服务',
+  delivered: '已送达',
+  return_to_rendezvous: '飞往汇合点',
+  waiting_for_truck: '等待卡车',
+  return_to_station: '返站',
+  return_to_depot: '返仓',
+  fallback_recovery: '兜底回收',
+  charging_or_swap: '充换电',
+  charging_on_truck: '车载充电',
+  riding_with_truck: '随车',
+}
+
+function getRecoveryStageLabel(stage: string | undefined): string {
+  return recoveryStageLabelMap[stage || ''] || stage || '—'
+}
+
+function getTrainingStateLabel(state: string | null | undefined): string {
+  return trainingStateLabelMap[state || ''] || state || '执行中'
+}
+
+function formatChainBrief(chain: any): string {
+  const mode = chain.mode ? `模式${chain.mode}` : '模式—'
+  const order = chain.order_id || '无订单'
+  const recover = chain.selected_recover_node_id || chain.reservation_node_id || '回收站待定'
+  return `${mode} / ${order} / ${recover}`
 }
 
 function statusClass(status: string | undefined): string {
@@ -357,6 +426,75 @@ defineExpose({ addEvent })
   font-size: 0.65rem;
   font-weight: 600;
   color: #0f172a;
+}
+
+.chain-card {
+  background: white;
+  border: 1px solid #cbd5e1;
+  border-radius: 6px;
+  padding: 10px;
+  margin-bottom: 8px;
+}
+
+.chain-header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 8px;
+}
+
+.chain-main {
+  flex: 1;
+  min-width: 0;
+  color: #0f172a;
+  font-weight: 700;
+  overflow-wrap: anywhere;
+}
+
+.chain-stage {
+  padding: 2px 6px;
+  border-radius: 4px;
+  background: #e2e8f0;
+  color: #334155;
+  font-size: 0.72rem;
+  font-weight: 700;
+  white-space: nowrap;
+}
+
+.stage-reservation_active {
+  background: #dcfce7;
+  color: #166534;
+}
+
+.stage-pending_post_delivery_selection {
+  background: #fef3c7;
+  color: #92400e;
+}
+
+.stage-rendezvous_selected {
+  background: #dbeafe;
+  color: #1d4ed8;
+}
+
+.chain-steps,
+.chain-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  align-items: center;
+  color: #475569;
+  font-size: 0.78rem;
+  line-height: 1.35;
+}
+
+.chain-arrow {
+  color: #94a3b8;
+}
+
+.chain-meta {
+  margin-top: 6px;
+  color: #64748b;
+  font-family: 'Monaco', 'Courier New', monospace;
 }
 
 /* 事件日志 */

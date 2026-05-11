@@ -110,14 +110,13 @@ class TestTrainingEnvAdapterPhase5a(unittest.TestCase):
         decision = result.decision_context
         self.assertIsNotNone(decision)
 
-        # 5a 虽未做 mode C 精细过滤，但接口形状必须已经固定：
-        # mode C 动作必须显式携带 recover_node_id。
+        # mode C 动作只表达 C intent，实际 recovery node 在送达 service 后选择。
         mode_c_actions = [
             action
             for action in decision.action_lookup
             if isinstance(action, DispatchAction) and action.mode == PolicyMode.C
         ]
-        self.assertTrue(all(action.recover_node_id for action in mode_c_actions))
+        self.assertTrue(all(action.recover_node_id is None for action in mode_c_actions))
 
     def test_airborne_energy_failure_interrupts_flight_before_arrival(self) -> None:
         env = self._make_env()

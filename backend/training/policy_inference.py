@@ -98,7 +98,6 @@ def load_trained_policy(
     model = SharedPPOActorCritic(
         uav_feat_dim=int(np.asarray(bootstrap_observation.uav_self_token).shape[-1]),
         order_feat_dim=int(np.asarray(bootstrap_observation.order_tokens).shape[-1]),
-        recovery_feat_dim=int(np.asarray(bootstrap_observation.recovery_tokens).shape[-1]),
         infra_feat_dim=int(np.asarray(bootstrap_observation.infra_tokens).shape[-1]),
         history_feat_dim=int(np.asarray(bootstrap_observation.history_tokens).shape[-1]),
         critic_order_feat_dim=int(np.asarray(bootstrap_critic.global_order_pool_tokens).shape[-1]),
@@ -230,7 +229,6 @@ def run_policy_episode(
             root_branch_idx=action_indices.root_branch_idx,
             order_idx=action_indices.order_idx,
             mode_idx=action_indices.mode_idx,
-            recovery_idx=action_indices.recovery_idx,
         )
         step_result = env.step(env_action)
         if on_step is not None:

@@ -33,7 +33,6 @@ if torch is not None:  # pragma: no cover
         root_branch_logits: Tensor
         order_logits: Tensor
         mode_logits: Tensor
-        recovery_logits: Tensor
         value: Tensor
 
 
@@ -45,7 +44,6 @@ if torch is not None:  # pragma: no cover
             *,
             uav_feat_dim: int,
             order_feat_dim: int,
-            recovery_feat_dim: int,
             infra_feat_dim: int,
             history_feat_dim: int,
             critic_order_feat_dim: int,
@@ -65,7 +63,6 @@ if torch is not None:  # pragma: no cover
 
             self.uav_proj = nn.Linear(uav_feat_dim, d_model)
             self.order_proj = nn.Linear(order_feat_dim, d_model)
-            self.recovery_proj = nn.Linear(recovery_feat_dim, d_model)
             self.infra_proj = nn.Linear(infra_feat_dim, d_model)
             self.history_proj = nn.Linear(history_feat_dim, d_model)
 
@@ -100,12 +97,6 @@ if torch is not None:  # pragma: no cover
                 nn.ReLU(),
                 nn.Linear(ff_dim, 2),
             )
-            self.recovery_head = nn.Sequential(
-                nn.Linear(d_model * 3, ff_dim),
-                nn.ReLU(),
-                nn.Linear(ff_dim, 1),
-            )
-
             critic_token_dim = d_model * 4 + critic_plan_feat_dim + critic_sys_feat_dim
             self.critic_order_proj = nn.Linear(critic_order_feat_dim, d_model)
             self.critic_uav_proj = nn.Linear(critic_uav_feat_dim, d_model)
@@ -137,7 +128,6 @@ if torch is not None:  # pragma: no cover
                     root_branch_logits=policy_out.root_branch_logits.squeeze(1),
                     order_logits=policy_out.order_logits.squeeze(1),
                     mode_logits=policy_out.mode_logits.squeeze(1),
-                    recovery_logits=policy_out.recovery_logits.squeeze(1),
                     value=policy_out.value.squeeze(1),
                 ),
                 next_lstm_state,
@@ -162,11 +152,6 @@ if torch is not None:  # pragma: no cover
                 single_rank=2,
                 name="observation_batch.order_tokens",
             )
-            recovery_tokens = _ensure_sequence_dim(
-                _to_float_tensor(observation_batch.recovery_tokens, device=device),
-                single_rank=3,
-                name="observation_batch.recovery_tokens",
-            )
             infra_tokens = _ensure_sequence_dim(
                 _to_float_tensor(observation_batch.infra_tokens, device=device),
                 single_rank=2,
@@ -182,11 +167,6 @@ if torch is not None:  # pragma: no cover
                 single_rank=1,
                 name="observation_batch.padding_mask",
             )
-            recovery_padding_mask = _ensure_sequence_dim(
-                _to_bool_tensor(observation_batch.recovery_padding_mask, device=device),
-                single_rank=2,
-                name="observation_batch.recovery_padding_mask",
-            )
             history_padding_mask = _ensure_sequence_dim(
                 _to_bool_tensor(observation_batch.history_padding_mask, device=device),
                 single_rank=1,
@@ -197,7 +177,6 @@ if torch is not None:  # pragma: no cover
             batch_size, seq_len = uav_self.shape[:2]
             uav_embed = self.uav_proj(uav_self)
             order_embed = self.order_proj(order_tokens)
-            recovery_embed = self.recovery_proj(recovery_tokens)
             infra_embed = self.infra_proj(infra_tokens)
             history_embed = self.history_proj(history_tokens)
 
@@ -231,25 +210,6 @@ if torch is not None:  # pragma: no cover
             ).squeeze(-1)
 
             mode_logits = self.mode_head(torch.cat([context_per_order, order_embed], dim=-1))
-
-            context_per_recovery = context.unsqueeze(2).unsqueeze(3).expand(
-                -1,
-                -1,
-                order_embed.size(2),
-                recovery_embed.size(3),
-                -1,
-            )
-            order_per_recovery = order_embed.unsqueeze(3).expand(
-                -1,
-                -1,
-                -1,
-                recovery_embed.size(3),
-                -1,
-            )
-            recovery_logits = self.recovery_head(
-                torch.cat([context_per_recovery, order_per_recovery, recovery_embed], dim=-1)
-            ).squeeze(-1)
-            recovery_logits = recovery_logits.masked_fill(recovery_padding_mask, -1e9)
 
             critic_order = self.critic_order_proj(
                 _ensure_sequence_dim(
@@ -319,7 +279,6 @@ if torch is not None:  # pragma: no cover
                     root_branch_logits=root_branch_logits,
                     order_logits=order_logits,
                     mode_logits=mode_logits,
-                    recovery_logits=recovery_logits,
                     value=value,
                 ),
                 next_lstm_state,
@@ -348,11 +307,6 @@ if torch is not None:  # pragma: no cover
                 single_rank=2,
                 name="action_mask.mode_mask",
             )
-            recovery_mask = _ensure_batch_dim(
-                _to_bool_tensor(action_mask.recovery_mask, device=device),
-                single_rank=2,
-                name="action_mask.recovery_mask",
-            )
 
             root_logits = _masked_logits(policy_out.root_branch_logits, root_mask)
             root_dist = torch.distributions.Categorical(logits=root_logits)
@@ -364,7 +318,6 @@ if torch is not None:  # pragma: no cover
                 "root_branch_idx": int(root_idx[0].item()),
                 "order_idx": None,
                 "mode_idx": None,
-                "recovery_idx": None,
             }
             if batch != 1:
                 raise ValueError("当前 sample_action 仅支持 batch_size=1")
@@ -385,19 +338,6 @@ if torch is not None:  # pragma: no cover
             log_prob = log_prob + mode_dist.log_prob(mode_idx)
             result["mode_idx"] = int(mode_idx[0].item())
 
-            if int(mode_idx[0].item()) == 1:
-                recovery_logits = policy_out.recovery_logits[torch.arange(batch), order_idx]
-                chosen_recovery_mask = recovery_mask[torch.arange(batch), order_idx]
-                recovery_logits = _masked_logits(recovery_logits, chosen_recovery_mask)
-                recovery_dist = torch.distributions.Categorical(logits=recovery_logits)
-                recovery_idx = (
-                    torch.argmax(recovery_logits, dim=-1)
-                    if deterministic
-                    else recovery_dist.sample()
-                )
-                log_prob = log_prob + recovery_dist.log_prob(recovery_idx)
-                result["recovery_idx"] = int(recovery_idx[0].item())
-
             return result, log_prob.squeeze(0)
 
         def evaluate_actions(
@@ -406,7 +346,6 @@ if torch is not None:  # pragma: no cover
             policy_out: PolicyForwardOutput,
             action_mask: Any,
             action_indices: dict[str, Tensor],
-            recovery_entropy_coef: float = 1.0,
         ) -> tuple[Tensor, Tensor]:
             device = policy_out.root_branch_logits.device
             root_mask = _ensure_batch_dim(
@@ -424,11 +363,6 @@ if torch is not None:  # pragma: no cover
                 single_rank=2,
                 name="action_mask.mode_mask",
             )
-            recovery_mask = _ensure_batch_dim(
-                _to_bool_tensor(action_mask.recovery_mask, device=device),
-                single_rank=2,
-                name="action_mask.recovery_mask",
-            )
 
             root_logits = _masked_logits(policy_out.root_branch_logits, root_mask)
             root_dist = torch.distributions.Categorical(logits=root_logits)
@@ -436,13 +370,9 @@ if torch is not None:  # pragma: no cover
             log_prob = root_dist.log_prob(root_idx)
 
             # True joint entropy:
-            #   H(root)
-            #   + P(dispatch) * [ H(order)
-            #                   + E_o H(mode|o)
-            #                   + E_o P(mode=C|o) * H(recovery|o) ]
-            #
+            #   H(root) + P(dispatch) * [H(order) + E_o H(mode|o)]
             # 这里必须对 order 分布取期望，而不是沿用 action_indices["order_idx"]。
-            # 否则 WAIT 样本里被占位成 0 的 order_idx 会把 mode/recovery 熵错误地压到
+            # 否则 WAIT 样本里被占位成 0 的 order_idx 会把 mode 熵错误地压到
             # 第 0 个订单分支，导致其他订单分支几乎没有熵正则。
             p_dispatch = root_dist.probs[:, 1]
             entropy = root_dist.entropy()
@@ -481,31 +411,6 @@ if torch is not None:  # pragma: no cover
             )
             expected_mode_entropy = (order_probs * mode_entropy).sum(dim=-1)
             entropy = entropy + p_dispatch * expected_mode_entropy
-
-            recovery_logits = policy_out.recovery_logits[torch.arange(batch), order_idx]
-            chosen_recovery_mask = recovery_mask[torch.arange(batch), order_idx]
-            recovery_logits, recovery_has_valid = _safe_masked_logits(
-                recovery_logits,
-                chosen_recovery_mask,
-            )
-            recovery_dist = torch.distributions.Categorical(logits=recovery_logits)
-            recovery_idx = action_indices["recovery_idx"]
-            recovery_dispatch_mask = dispatch_mask & (mode_idx == 1)
-            log_prob = log_prob + recovery_dist.log_prob(recovery_idx) * (
-                recovery_dispatch_mask & recovery_has_valid
-            )
-            _recovery_probs, recovery_entropy = _masked_categorical_probs_entropy(
-                policy_out.recovery_logits,
-                recovery_mask,
-            )
-            p_recovery_mode = mode_probs[..., 1]
-            expected_recovery_entropy = (order_probs * p_recovery_mode * recovery_entropy).sum(
-                dim=-1
-            )
-            entropy = (
-                entropy
-                + p_dispatch * float(recovery_entropy_coef) * expected_recovery_entropy
-            )
 
             return log_prob, entropy
 
@@ -617,7 +522,6 @@ else:
         root_branch_logits: Any
         order_logits: Any
         mode_logits: Any
-        recovery_logits: Any
         value: Any
 
 

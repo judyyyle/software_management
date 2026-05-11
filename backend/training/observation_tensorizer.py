@@ -212,7 +212,6 @@ class ObservationTensorizer:
             root_branch_mask=np.asarray(candidate_out.root_branch_mask, dtype=_BOOL_DTYPE),
             order_mask=np.asarray(candidate_out.order_mask, dtype=_BOOL_DTYPE),
             mode_mask=np.asarray(candidate_out.mode_mask, dtype=_BOOL_DTYPE),
-            recovery_mask=np.asarray(candidate_out.recovery_mask, dtype=_BOOL_DTYPE),
         )
 
     def build(
@@ -288,14 +287,11 @@ class ObservationTensorizer:
             dispatch_mode = (
                 candidate_out.factorized_action_schema.mode_order[action_indices.mode_idx]
             )
-            if dispatch_mode == "C" and action_indices.recovery_idx is not None:
-                recovery_feature = candidate_out.candidate_features.recovery_features[
-                    action_indices.order_idx
-                ][action_indices.recovery_idx]
+            if dispatch_mode == "C":
                 selected_rendezvous_margin_norm = self._norm_time_signed(
-                    recovery_feature.rendezvous_margin
+                    order_feature.best_mode_c_rendezvous_margin
                 )
-                selected_recover_node_type = recovery_feature.recover_node_type
+                selected_recover_node_type = order_feature.best_mode_c_node_type
 
         queue_after_norm = self._infer_queue_after_norm(
             runtime_state=step_result.runtime_state,
@@ -308,6 +304,13 @@ class ObservationTensorizer:
             or post_drone.training_state == "airborne_energy_failure"
         )
         fallback_started = post_drone.training_state == "fallback_recovery"
+        fallback_cause = "none"
+        active_fallback_causes = step_result.info.get(
+            "active_fallback_causes_by_drone",
+            {},
+        )
+        if isinstance(active_fallback_causes, dict):
+            fallback_cause = str(active_fallback_causes.get(actor_id, "none"))
         rendezvous_success = post_drone.training_state in {"charging_on_truck", "riding_with_truck"}
         queue_entered = post_drone.training_state == "queueing_at_host"
         service_completed = (
@@ -344,6 +347,7 @@ class ObservationTensorizer:
             hard_failure=bool(hard_failure),
             queue_entered=bool(queue_entered),
             service_completed=bool(service_completed),
+            fallback_cause=fallback_cause if fallback_started else "none",
         )
 
     def _build_uav_self_token(self, uav_self: Any) -> np.ndarray:
@@ -419,12 +423,12 @@ class ObservationTensorizer:
         padding_mask = np.ones((order_count, recovery_count), dtype=_BOOL_DTYPE)
         t_now = float(decision_context.t_decision)
         for order_idx, row in enumerate(recovery_features):
-            for recovery_idx, item in enumerate(row):
+            for recovery_slot, item in enumerate(row):
                 if not bool(item.is_valid):
                     continue
-                padding_mask[order_idx, recovery_idx] = False
+                padding_mask[order_idx, recovery_slot] = False
                 eta_remaining = max(0.0, float(item.truck_eta) - t_now)
-                tokens[order_idx, recovery_idx, :] = np.asarray(
+                tokens[order_idx, recovery_slot, :] = np.asarray(
                     [
                         1.0,
                         self._code_norm(_HOST_TYPE_CODE, str(item.recover_node_type)),
