@@ -1,0 +1,363 @@
+# HiveLogix — RH-ALNS + CMRAPPO 离线训练/验证算法专属配置
+# =============================================================================
+# 适用范围：
+#   - default_scene（约 4.0km × 4.0km）
+#   - 1 个 depot，10 个充换电站，1 辆卡车，12 架无人机
+#   - RH-ALNS 负责低频粗规划，CMRAPPO 负责高频局部决策
+#
+# 设计原则：
+#   1. 与共享物理参数解耦：物理/能耗/服务时长继续来自 drone_params.yaml
+#   2. 与当前真实资产对齐：默认值依据 4×4km 地图、10 站点、真实 benchmark 动态单强度设定
+#   3. 优先保证可复现：训练、benchmark、stochastic 的订单源与随机种子显式固定
+#   4. 优先保证语义稳定：动作空间、候选集预算、reward 口径在本文件中集中冻结
+#
+# 标定依据摘要（对应 docs/ppo算法方案/algorithm_scheme_parameter_adjustment_4km_10stations_poisson_modifying.md）：
+#   - 地图尺度：约 4011.5m × 4011.5m
+#   - 站点最近邻间距：均值约 949m
+#   - 订单到最近站点距离：均值约 500m
+#   - benchmark 动态订单强度：约 0.33~0.37 单/分钟
+#   - 首轮默认泊松强度：取 0.35 单/分钟，偏保守，便于先跑稳训练闭环
+# =============================================================================
+
+scene:
+  scene_id: default_test_4x4km
+  region: shanghai_pudong
+
+  # 固定离线训练/验证阶段的主输入来源，保证只看本配置即可定位场景数据。
+  scene_bundle_dir: backend/test_data/default_scene
+  scene_config_file: scene_config.json
+  entities_file: entities.json
+  orders_file: orders.json
+  osm_network_file: osm_network.geojson
+  osm_network_format: geojson
+
+  # 运行时优先从 scene_config.json.bounds 派生地图尺寸；下面的数值用于校验和审计。
+  derive_map_size_from_bbox: true
+  map_width_m_ref: 4011.5
+  map_height_m_ref: 4011.5
+
+  # 资产规模基线，用于后续加载阶段做一致性断言。
+  expected_depot_count: 1
+  expected_station_count: 10
+  expected_truck_count: 1
+  expected_drone_count: 12
+
+  # 4×4km / 10 站点下，1.2km 支撑半径可覆盖最近邻站点与主要订单簇，
+  # 同时不会把大部分站点都放进同一个候选局部视野。
+  default_support_radius_km: 1.2
+
+  # 训练阶段泊松订单的 deadline 生成窗口，需与 OrderManager._create_order 语义对齐。
+  # Run09 追加：先收紧到 15~40 分钟，给 mode B 制造适度时效压力，
+  # 但避免直接收得过紧导致大面积 timeout。
+  order_window_min_min: 15
+  order_window_max_min: 40
+
+data:
+  # 统一订单源模式：
+  #   benchmark: static_orders + dynamic_orders, arrival_rate = 0
+  #   poisson:   static_orders 仅作卡车骨架 / mode A 背景，动态订单纯泊松生成
+  #   hybrid:    static_orders + dynamic_orders + 泊松流
+  order_source_mode: poisson
+
+  # benchmark 模式使用 fixed dynamic_orders 回放，作为 PPO 主验证订单。
+  benchmark_use_dynamic_orders: true
+  benchmark_replay_arrival_rate: 0.0
+  # 额外的 C-sensitive replay split：
+  #   - 仍然是 deterministic replay，不引入新的订单生成机制
+  #   - 从 orders.json.dynamic_orders 中筛出“对满电 depot-home UAV 在 spawn 时刻
+  #     存在合法 mode C 回收点”的动态单子集
+  #   - 作为独立 eval split 输出，用于 postmortem 观察 mode C 能力
+  c_sensitive_eval_enabled: true
+  c_sensitive_eval_seed: 20260426
+  c_sensitive_eval_min_legal_mode_c_recovery_nodes: 1
+
+  # 训练主输入：泊松流。
+  # 依据当前 benchmark 的 0.33~0.37 单/分钟强度，首轮取 0.35/min，
+  # 以减少训练初期的候选截断和排队爆炸风险。
+  # 单位固定为 单/分钟，与 Phase 1 文档口径保持一致。
+  poisson_arrival_rate: 0.35
+  poisson_weight_min_kg: 0.5
+  poisson_weight_max_kg: 10.0
+  poisson_geo_mode: bbox_uniform
+  poisson_burst_enabled: false
+  poisson_burst_multiplier: 1.0
+  poisson_max_orders_per_episode: 64
+
+  # stochastic 验证的标准强度档。
+  stochastic_eval_arrival_rate_per_min:
+    low: 0.20
+    medium: 0.40
+    high: 0.60
+
+  # hybrid 模式仅用于后续随机扩展验证；训练主循环不应启用。
+  hybrid_background_dynamic_orders: true
+
+  # 复现实验的订单源随机种子。
+  poisson_seed: 20260424
+  benchmark_eval_seed: 20260425
+  stochastic_eval_seed_base: 20260501
+
+planner:
+  # 低频粗规划触发参数。420s 约等于 7 分钟，
+  # 对 4km 场景足以避免高频全局重算，同时不会让 coarse plan 过旧。
+  coarse_replan_interval_sec: 420
+  coarse_new_order_trigger: 3
+  route_drift_trigger_ratio: 0.18
+  fallback_burst_trigger_count: 2
+  fallback_burst_window_sec: 300
+  hard_failure_trigger_count: 1
+
+  # Phase 4 卡车骨架路线至少保留的 future fixed nodes 数量。
+  phase4_min_future_fixed_nodes: 3
+
+  # 单个 episode 的时间上限；与当前 benchmark 动态单的 0~1740s 分布相容，
+  # 同时给返程、排队、fallback 留足尾部时间。
+  upper_horizon_sec: 3600
+
+  # 卡车循环巡站参数（仅 poisson 训练模式生效）。
+  # patrol_min_remaining_sec：卡车回仓后距 episode 结束的剩余时间低于此值时，
+  #   不再追加巡站循环，避免生成极短的无意义路段。
+  # patrol_stations_per_loop：每次巡站循环选取的充换电站数量上限。
+  #   Run08 显式提高到 5，用更大的沿路站点覆盖率放大 mode C rendezvous 机会率。
+  patrol_min_remaining_sec: 600
+  patrol_stations_per_loop: 5
+
+  # 可选退化开关：仅建议在 benchmark / hybrid 等不追加巡站循环的验证路径中显式开启。
+  # 开启后，若卡车未来骨架自然耗尽，允许 `_build_coarse_plan_view()` 继续构造空骨架退化对象：
+  #   truck_backbone_route=()
+  #   recovery_pool={}
+  #   launch_candidate_stations=()
+  #   policy_mode_mask 收缩为 {B}
+  # 默认保持严格契约，空骨架仍视为错误。
+  allow_empty_backbone_route: false
+
+  # WAIT 动作推进量上限（idle 状态下）。
+  # 防止极长空窗把一次 WAIT 的 T_idle 惩罚拉得过大，影响训练稳定性。
+  # 首轮建议 60s，与 coarse_replan_interval_sec=420s 相比不会太碎，也不会太粗。
+  max_wait_decision_gap_sec: 60
+
+  # 增量派单节流参数，为后续 planner_bridge 实现预留。
+  incremental_dispatch_min_interval_s: 2.0
+  incremental_dispatch_debounce_s: 0.0
+  incremental_dispatch_max_wait_s: 5.0
+
+  # `launch_candidate_stations` 筛选参数。
+  support_radius_km: 1.2
+  min_orders_to_trigger: 1
+
+candidate:
+  # 对 4×4km / 10 站点规模，32 个订单候选已足以覆盖单轮局部决策的高价值区域，
+  # 同时控制 attention 成本与 action mask 稳定性。
+  max_candidate_orders: 32
+
+  # 每单最多保留 4 个回收候选：
+  #   1~2 个 truck future station
+  #   1 个 depot
+  #   1 个最近安全 station
+  max_candidate_recovery_per_order: 4
+
+  # recovery pool 不再只看骨架前 K 个点，而是先扫描更长 future backbone，
+  # 再按确定性 score 选出 top-K，避免“前 4 个点恰好都不合适”时过早裁掉更优 rendezvous。
+  recovery_pool_future_scan_limit: 8
+
+  # `resolved_action_lookup` 展开规模的保护性预算，不是 PPO 主训练路径的 flat logits 维度；
+  # 主训练路径张量 shape 由 max_candidate_orders / max_candidate_recovery_per_order 冻结。
+  max_candidate_actions: 128
+
+  # 240s 相比 4×4km 场景下 station 最近邻切换时间（47~99s）已经明显过长，
+  # 超过该阈值继续把节点留在候选集里通常不划算。
+  station_wait_threshold_sec: 240
+
+  # rendezvous 与能量安全边际。
+  rendezvous_eta_safe_margin_sec: 15
+  energy_safe_margin_ratio: 0.10
+
+  # 候选集排序和裁剪的稳定化开关。
+  enable_order_pre_score_truncation: true
+  enable_recovery_quality_truncation: true
+  always_keep_wait_action: true
+
+action_space:
+  type: factorized
+
+  # head 顺序固定，不允许在实验间变动。
+  factorized_head_order:
+    - order
+    - mode
+    - recovery
+
+  enable_wait_action: true
+  wait_action_name: WAIT
+  include_mode_a_in_policy: false
+
+  # actor 仅暴露 WAIT / B / C；A 由 truck-side coarse planner 管理。
+  policy_modes:
+    - WAIT
+    - B
+    - C
+
+  # 上层语义边界允许 A / B / C。
+  planner_modes:
+    - A
+    - B
+    - C
+
+reservation:
+  enable: true
+  exclusive: false
+
+  # CCT 映射参数：tau_res = alpha * (truck_eta - t_decision) + beta * history + gamma * queue
+  alpha: 1.5
+  beta: 1.2
+  gamma: 0.3
+
+  # 历史统计窗口与 route drift 判定阈值。
+  history_window: 64
+  drift_eta_abs_threshold_sec: 60
+  drift_eta_rel_threshold_ratio: 0.15
+
+  # timeout 后的局部损失通过 reward.lambda_res_timeout 统一结算；
+  # 下面三项保留为后续课程学习或 warmup 调参预留，当前默认不启用动态衰减。
+  timeout_penalty_init: 0.10
+  timeout_penalty_final: 0.10
+  timeout_penalty_decay: 1.0
+
+policy:
+  shared_policy: true
+  encoder_type: attn_lstm_lite
+
+  # d_model=128, nhead=8 -> 每头 16 维，属于稳定的标准配置。
+  d_model: 128
+  nhead: 8
+  ff_dim: 256
+  dropout: 0.10
+
+  # LSTM 建模最近 6 个局部决策事件步，而非固定时间步。
+  lstm_hidden: 128
+  lstm_layers: 1
+  hist_len: 6
+
+  critic_mode: centralized_train_only
+  inference_mode: greedy
+
+  # 为后续实现留出的规范字段。
+  use_plan_version_delta: true
+  use_is_riding_truck_flag: true
+  use_drone_source_type_flag: true
+  max_order_tokens: 32
+  max_recovery_tokens: 4
+
+  critic_schema_name: CriticTensorSchemaV1
+  critic_schema_version: v1
+  max_global_orders: 64
+  max_global_uavs: 16
+  max_global_stations: 11
+
+  # Critic 归一化基准必须来自固定配置/场景量，不允许按 batch/rollout 动态统计。
+  queue_norm_cap: 8.0
+  energy_norm_strategy: per_uav_battery_max
+
+reward:
+  # UAV-scope 主指标权重：仅评价无人机可配送订单。
+  lambda_wait: 0.25
+  wait_idle_penalty_coef: 0.25
+  lambda_queue: 0.10
+  lambda_miss: 0.15
+  lambda_res_timeout: 0.10
+  lambda_overdue: 0.15
+
+  # 正奖励仅保留送达奖励，避免 reward 结构过于混杂。
+  R_delivery_bonus: 100
+  # Rendezvous 分段塑形：
+  # 1. 到达 recover 节点时先给一个确定性小奖励，缩短 credit assignment 路径；
+  # 2. 真正被卡车回收上车时再给更大的成功奖励。
+  # Run09: 进一步拉开 mode C 成功与 mode B 的奖励差，并给 mode C 初始探索正反馈。
+  rendezvous_arrive_bonus: 15.0
+  rendezvous_bonus: 40.0
+  mode_c_attempt_bonus: 3.0
+
+  # 超时强制移除与硬失败惩罚。
+  max_overdue_sec: 600
+  hard_overdue_penalty_sec: 600
+  hard_failure_penalty_sec: 1200
+
+  # 指标口径开关：显式固定，避免后续实现偏离 Phase 1 文档约束。
+  include_mode_a_in_primary_metrics: false
+  include_mode_a_in_system_context_report: true
+  primary_metrics_scope: uav_only
+
+training:
+  # 复现性：单环境、固定训练随机种子、强制 deterministic。
+  training_seed: 20260424
+  device: auto
+  num_envs: 1
+  torch_deterministic: true
+  cudnn_benchmark: false
+  mixed_precision: false
+
+  # PPO 核心超参数。
+  total_timesteps: 1500000
+  # Run09 critic 稳定化：进一步下调 PPO 学习率，抑制高方差 return 下的 value 振荡。
+  ppo_learning_rate: 0.0001
+  rollout_steps: 4096
+  recurrent_ppo: true
+  sequence_len: 16
+  burn_in_len: 0
+  train_len: 16
+  sequence_minibatch_size: 32
+  target_minibatch_timesteps: 512
+  # 兼容旧字段；在 recurrent PPO 下只允许作为 target_minibatch_timesteps 的过渡别名。
+  batch_size: 512
+  ppo_epochs: 4
+  gamma: 0.99
+  gae_lambda: 0.95
+  clip_coef: 0.20
+  # vf_clip_coef 已禁用：max(vl_unclipped, vl_clipped) 在 return 未归一化时
+  # 始终选 clipped（更大的 loss），梯度方向错误，导致 value 收敛极慢。
+  # critic loss 当前改为显式可配置：
+  #   - huber：优先用于当前高方差 reward / return 场景
+  #   - mse：保留为回退选项
+  entropy_coef: 0.10
+  # Recovery entropy 单独降权，避免 mode C 因多一层 recovery 选择而承受过强熵惩罚。
+  recovery_entropy_coef: 0.4
+  value_loss_coef: 0.10
+  value_loss_type: huber
+  value_huber_delta: 5.0
+  max_grad_norm: 1.0
+  normalize_advantage: true
+  target_kl: 0.05
+
+  # 训练/评估过程控制。
+  log_interval_updates: 1
+  save_interval_updates: 25
+  eval_interval_updates: 10
+  benchmark_eval_episodes: 3
+  stochastic_eval_seeds: 5
+  checkpoint_keep_last: 5
+
+  # Run05：checkpoint / early-stop 稳态版。
+  # 目标：
+  #   1. best checkpoint 以 stochastic_high / stochastic_medium 为主排序目标
+  #   2. benchmark 仅作 guardrail：优先无 timeout 且 all_orders_cleared，不参与 patience
+  #   3. 当 stochastic_high 长时间无提升，且 value_loss 未出现新低时提前停训
+  early_stop_enabled: true
+  early_stop_min_evals: 8
+  early_stop_stochastic_high_patience: 10
+  early_stop_value_loss_window: 5
+  early_stop_value_loss_min_delta: 0.01
+
+  # 训练阶段强制只允许 poisson 订单源。
+  allowed_train_order_source_mode:
+    - poisson
+
+curriculum:
+  # 首轮全部关闭，先保证静态语义和奖励闭环正确。
+  enabled: false
+  station_queue_noise: 0.0
+  truck_delay_noise: 0.0
+  uav_failure_prob: 0.0
+  swap_time_noise: 0.0
+
+  # reward curriculum 预留位，当前默认冻结。
+  enable_wait_penalty_decay: false
+  enable_timeout_penalty_decay: false
