@@ -18,6 +18,8 @@ from __future__ import annotations
 
 import logging
 import math
+import json
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 from config.loader import load_solver_energy_params
@@ -25,7 +27,12 @@ from solver.factory import create_solver, list_solvers
 from solver.greedy_mmce import AllocationResult, DispatchPlan
 from solver.market_based_solver import MarketBasedSolver
 from solver.interfaces import DispatchSolver
-from core.entities.primitives import RouteWaypoint, WaypointAction, SourceType, DroneStatus
+from core.entities.primitives import RouteWaypoint, WaypointAction, SourceType, DroneStatus, Position3D
+
+try:
+    from environment.path_planning.planner import PathPlanner
+except ImportError:
+    PathPlanner = None
 
 if TYPE_CHECKING:
     from entity_manager import EntityManager
@@ -71,13 +78,20 @@ class DispatchDecisionEngine:
             self.solver.bind_order_manager(self.order_mgr)
 
         runtime_cfg = load_solver_energy_params()
+        self.TRUCK_SERVICE_TIME_ORDER = runtime_cfg.truck_service_time_order_s
         self.TRUCK_DRONE_LAUNCH_TIME = runtime_cfg.truck_drone_launch_time_s
         self.TRUCK_DRONE_RECOVER_TIME = runtime_cfg.truck_drone_recover_time_s
+        self.TRUCK_STATION_HOLD_TIME = max(
+            self.TRUCK_DRONE_LAUNCH_TIME,
+            self.TRUCK_DRONE_RECOVER_TIME,
+        )
         # truck 事件先于 drone 事件处理，同拍到站可能漏回收，增加保护缓冲。
         self.RECOVERY_EVENT_GUARD_S = 1.0
         self._truck_energy_wh_per_meter = runtime_cfg.truck_energy_wh_per_meter
         self._cum_cost_total = 0.0
         self._dispatch_count = 0
+        self._active_scene_id: str | None = None
+        self._active_path_planner = None
 
     def set_solver(self, solver_name: str) -> None:
         """按名称切换求解器实例。"""
@@ -91,6 +105,55 @@ class DispatchDecisionEngine:
         if isinstance(self.solver, MarketBasedSolver):
             self.solver.bind_order_manager(self.order_mgr)
         logger.info("[DispatchDecisionEngine] 已切换求解器为 %s", target)
+
+    def _load_buildings_geojson(self, scene_id: str | None) -> dict | None:
+        backend_dir = Path(__file__).resolve().parent.parent
+        candidate_paths: list[Path] = []
+        if scene_id:
+            candidate_paths.append(backend_dir / "test_data" / scene_id / "no_fly_zones.geojson")
+            candidate_paths.append(backend_dir / "test_data" / scene_id / "buildings.geojson")
+            if scene_id == "default_test_4x4km":
+                candidate_paths.append(backend_dir / "test_data" / "default_scene" / "no_fly_zones.geojson")
+                candidate_paths.append(backend_dir / "test_data" / "default_scene" / "buildings.geojson")
+        candidate_paths.append(backend_dir / "test_data" / "default_scene" / "no_fly_zones.geojson")
+        candidate_paths.append(backend_dir / "test_data" / "default_scene" / "buildings.geojson")
+
+        for path in candidate_paths:
+            if not path.exists():
+                continue
+            try:
+                with path.open("r", encoding="utf-8") as f:
+                    data = json.load(f)
+                if isinstance(data, (dict, list)):
+                    num_features = len(data) if isinstance(data, list) else len(data.get("features", []))
+                    logger.info("[DispatchDecisionEngine] 已加载地图数据: %s (features=%d)", path.name, num_features)
+                    return data
+            except Exception:
+                logger.warning("[DispatchDecisionEngine] 建筑缓存读取失败: %s", path)
+        return None
+
+    def _activate_path_planner(self, scene_id: str | None) -> None:
+        self._active_scene_id = scene_id
+        if PathPlanner is None:
+            self._active_path_planner = None
+            return
+
+        buildings_geojson = self._load_buildings_geojson(scene_id)
+        if buildings_geojson is None:
+            self._active_path_planner = None
+            if hasattr(self.solver, "set_path_planner"):
+                try:
+                    self.solver.set_path_planner(None)
+                except Exception:
+                    logger.exception("[DispatchDecisionEngine] 清空求解器 PathPlanner 失败")
+            return
+
+        self._active_path_planner = PathPlanner(buildings_geojson)
+        if hasattr(self.solver, "set_path_planner"):
+            try:
+                self.solver.set_path_planner(self._active_path_planner)
+            except Exception:
+                logger.exception("[DispatchDecisionEngine] 向求解器注入 PathPlanner 失败")
 
     @staticmethod
     def get_available_solvers() -> list[str]:
@@ -124,6 +187,7 @@ class DispatchDecisionEngine:
             )
 
         # 调用求解器，传递 scene_id 以支持使用缓存的 OSM 数据
+        self._activate_path_planner(scene_id)
         plan = self.solver.dispatch(pending, current_time, bbox, scene_id=scene_id)
         plan.summary["solver"] = self.solver_name
         self._normalize_plan_for_runtime(plan)
@@ -185,6 +249,7 @@ class DispatchDecisionEngine:
                 scene_id=scene_id,
             )
 
+        self._activate_path_planner(scene_id)
         plan = self.solver.dispatch_incremental(new_orders, current_time, bbox, scene_id=scene_id)
         plan.summary["solver"] = self.solver_name
         plan.summary["dispatch_type"] = "incremental"
@@ -248,6 +313,7 @@ class DispatchDecisionEngine:
                 },
             )
 
+        self._activate_path_planner(scene_id)
         plan = self.solver.dispatch_replan_current_state(
             planning_pool,
             current_time,
@@ -815,6 +881,129 @@ class DispatchDecisionEngine:
                 updated,
             )
 
+    def _plan_drone_leg(
+        self,
+        start: Position3D,
+        goal: Position3D,
+        altitude: float,
+    ) -> list[Position3D]:
+        if self._active_path_planner is None:
+            return [start, goal]
+        path = self._active_path_planner.plan(start, goal, altitude)
+        if len(path) < 2:
+            return [start, goal]
+        return path
+
+    @staticmethod
+    def _merge_drone_legs(legs: list[list[Position3D]]) -> list[Position3D]:
+        merged: list[Position3D] = []
+        for leg in legs:
+            if not leg:
+                continue
+            if not merged:
+                merged.extend(leg)
+                continue
+            if merged[-1].distance_2d(leg[0]) <= 1e-6:
+                merged.extend(leg[1:])
+            else:
+                merged.extend(leg)
+        return merged
+
+    def _build_uav_polyline(
+        self,
+        launch_loc: Position3D,
+        delivery_loc: Position3D,
+        recovery_loc: Position3D,
+        altitude: float,
+    ) -> tuple[list[Position3D], int]:
+        leg_out = self._plan_drone_leg(launch_loc, delivery_loc, altitude)
+        leg_back = self._plan_drone_leg(delivery_loc, recovery_loc, altitude)
+        polyline = self._merge_drone_legs([leg_out, leg_back])
+        delivery_idx = max(0, len(leg_out) - 1)
+        if polyline and delivery_idx >= len(polyline) - 1:
+            insert_idx = max(0, len(polyline) - 1)
+            polyline.insert(insert_idx, delivery_loc)
+            delivery_idx = insert_idx
+        return polyline, delivery_idx
+
+    @staticmethod
+    def _polyline_distance(polyline: list[Position3D]) -> float:
+        if len(polyline) < 2:
+            return 0.0
+        return sum(polyline[i - 1].distance_2d(polyline[i]) for i in range(1, len(polyline)))
+
+    def _log_uav_path_if_obstacle_avoided(
+        self,
+        alloc: "AllocationResult",
+        polyline: list[Position3D],
+        launch_loc: Position3D,
+        delivery_loc: Position3D,
+        recovery_loc: Position3D,
+        tag: str,
+    ) -> None:
+        if len(polyline) < 2:
+            return
+        direct_dist = launch_loc.distance_2d(delivery_loc) + delivery_loc.distance_2d(recovery_loc)
+        path_dist = self._polyline_distance(polyline)
+        has_detour = len(polyline) > 3 or path_dist > direct_dist + 1.0
+
+        path_utm = [[round(p.x, 2), round(p.y, 2), round(p.z, 2)] for p in polyline]
+        path_wgs84 = []
+        for p in polyline:
+            lon, lat = p.to_wgs84()
+            path_wgs84.append([round(lon, 6), round(lat, 6)])
+
+        log_prefix = "[DispatchDecisionEngine][UAV-AVOID]" if has_detour else "[DispatchDecisionEngine][UAV-DIRECT]"
+
+        logger.info(
+            "%s %s order=%s drone=%s mode=%s points=%d path_dist=%.1f direct=%.1f "
+            "launch=(%.2f,%.2f) delivery=(%.2f,%.2f) recovery=(%.2f,%.2f) path_utm=%s path_wgs84=%s",
+            log_prefix,
+            tag,
+            alloc.order_id,
+            alloc.drone_id,
+            alloc.mode,
+            len(polyline),
+            path_dist,
+            direct_dist,
+            launch_loc.x,
+            launch_loc.y,
+            delivery_loc.x,
+            delivery_loc.y,
+            recovery_loc.x,
+            recovery_loc.y,
+            path_utm,
+            path_wgs84,
+        )
+
+    @staticmethod
+    def _polyline_to_waypoints(
+        polyline: list[Position3D],
+        delivery_idx: int,
+        order_id: str,
+        recovery_id: str,
+    ) -> list[RouteWaypoint]:
+        if not polyline:
+            return []
+        last_idx = len(polyline) - 1
+        waypoints: list[RouteWaypoint] = []
+        for idx, pos in enumerate(polyline):
+            if idx == 0:
+                action = WaypointAction.PICKUP
+                target_id = order_id
+            elif idx == last_idx:
+                action = WaypointAction.DOCK_DEPOT
+                target_id = recovery_id
+            elif idx == delivery_idx:
+                action = WaypointAction.DELIVER
+                target_id = order_id
+            else:
+                # RouteWaypoint 需要动作语义；中间点使用无副作用的 PICKUP 充当过渡点。
+                action = WaypointAction.PICKUP
+                target_id = order_id
+            waypoints.append(RouteWaypoint(pos, action, target_id))
+        return waypoints
+
     def _recalculate_truck_route_timing_for_b_wait(
         self,
         route: "TruckRoute",
@@ -839,8 +1028,6 @@ class DispatchDecisionEngine:
             and alloc.vehicle_id == route.truck_id
             and alloc.recovery_station_id
         ]
-        if not related_allocs:
-            return
 
         allocs_by_recovery: dict[str, list["AllocationResult"]] = {}
         allocs_by_launch: dict[str, list["AllocationResult"]] = {}
@@ -956,8 +1143,11 @@ class DispatchDecisionEngine:
         original_arrivals = [node.arrival_time for node in route.nodes]
         original_departures = [node.departure_time for node in route.nodes]
         base_services = [
-            max(0.0, dep - arr)
-            for arr, dep in zip(original_arrivals, original_departures)
+            self._resolve_truck_route_base_service_time(
+                node_type=node.node_type,
+                original_service_time=max(0.0, dep - arr),
+            )
+            for node, arr, dep in zip(route.nodes, original_arrivals, original_departures)
         ]
         travel_deltas = [0.0]
         for i in range(1, len(route.nodes)):
@@ -994,17 +1184,9 @@ class DispatchDecisionEngine:
                 launch_ops = allocs_by_launch.get(node.node_id, [])
                 recovery_ops = allocs_by_recovery.get(node.node_id, [])
                 runtime_eta = runtime_recovery_eta.get(node.node_id)
+                service_time = base_services[i]
 
-                # 当前批次若未在该 recovery 节点产生任何 B_WAIT 放飞/回收动作，
-                # 保留原服务时长，避免历史锚点等待被误清零。
-                if not launch_ops and not recovery_ops and runtime_eta is None:
-                    service_time = base_services[i]
-                    departure = arrival + service_time
-                    node.arrival_time = arrival
-                    node.departure_time = departure
-                    continue
-
-                needed_departure = arrival
+                needed_departure = arrival + service_time
                 for alloc in recovery_ops:
                     launch_arrival = resolve_launch_arrival(alloc)
                     expected_recovery_time = launch_arrival + alloc.wait_duration + self.RECOVERY_EVENT_GUARD_S
@@ -1014,7 +1196,7 @@ class DispatchDecisionEngine:
                         needed_departure,
                         runtime_eta + self.TRUCK_DRONE_RECOVER_TIME + self.RECOVERY_EVENT_GUARD_S,
                     )
-                service_time = max(0.0, needed_departure - arrival)
+                service_time = max(service_time, needed_departure - arrival)
                 op_hold = 0.0
                 if launch_ops:
                     op_hold = max(op_hold, self.TRUCK_DRONE_LAUNCH_TIME)
@@ -1031,6 +1213,19 @@ class DispatchDecisionEngine:
             departure = arrival + service_time
             node.arrival_time = arrival
             node.departure_time = departure
+
+    def _resolve_truck_route_base_service_time(
+        self,
+        *,
+        node_type: str,
+        original_service_time: float,
+    ) -> float:
+        base_service_time = max(0.0, float(original_service_time))
+        if node_type == "customer":
+            return max(base_service_time, self.TRUCK_SERVICE_TIME_ORDER)
+        if node_type in {"station", "recovery"}:
+            return max(base_service_time, self.TRUCK_STATION_HOLD_TIME)
+        return base_service_time
 
     def _log_detailed_route(self, route: "TruckRoute", allocations: list["AllocationResult"]) -> None:
         """
@@ -1153,18 +1348,36 @@ class DispatchDecisionEngine:
                     if alloc.mode == "B_DYNAMIC":
                         recovery_entity = self.entity_mgr.depots.get(recovery_id)
                     else:
-                        recovery_entity = self.entity_mgr.stations.get(recovery_id)
+                        recovery_entity = (
+                            self.entity_mgr.stations.get(recovery_id)
+                            or self.entity_mgr.depots.get(recovery_id)
+                        )
                     if recovery_entity is None:
                         logger.warning("[DispatchDecisionEngine] 回收点 %s 不存在", recovery_id)
                         continue
 
                     recovery_loc = recovery_entity.location
-
-                    waypoints = [
-                        RouteWaypoint(launch_loc, WaypointAction.PICKUP, alloc.order_id),
-                        RouteWaypoint(delivery_loc, WaypointAction.DELIVER, alloc.order_id),
-                        RouteWaypoint(recovery_loc, WaypointAction.DOCK_DEPOT, recovery_id),
-                    ]
+                    cruise_altitude = float(max(launch_loc.z, delivery_loc.z, recovery_loc.z, drone.current_loc.z))
+                    polyline, delivery_idx = self._build_uav_polyline(
+                        launch_loc=launch_loc,
+                        delivery_loc=delivery_loc,
+                        recovery_loc=recovery_loc,
+                        altitude=cruise_altitude,
+                    )
+                    self._log_uav_path_if_obstacle_avoided(
+                        alloc=alloc,
+                        polyline=polyline,
+                        launch_loc=launch_loc,
+                        delivery_loc=delivery_loc,
+                        recovery_loc=recovery_loc,
+                        tag="setup",
+                    )
+                    waypoints = self._polyline_to_waypoints(
+                        polyline=polyline,
+                        delivery_idx=delivery_idx,
+                        order_id=alloc.order_id,
+                        recovery_id=recovery_id,
+                    )
                     drone.set_route(waypoints)
                     try:
                         drone.assign_order(alloc.order_id, order.payload_weight)
@@ -1218,11 +1431,27 @@ class DispatchDecisionEngine:
                     if is_relay and drone.status.is_flying:
                         # 串联任务：拼接新路径到现有路径末尾
                         relay_origin = getattr(alloc, "_relay_origin", None) or delivery_loc
-                        relay_waypoints = [
-                            RouteWaypoint(relay_origin, WaypointAction.PICKUP, alloc.order_id),
-                            RouteWaypoint(delivery_loc, WaypointAction.DELIVER, alloc.order_id),
-                            RouteWaypoint(depot_loc, WaypointAction.DOCK_DEPOT, alloc.vehicle_id),
-                        ]
+                        cruise_altitude = float(max(relay_origin.z, delivery_loc.z, depot_loc.z, drone.current_loc.z))
+                        relay_polyline, relay_delivery_idx = self._build_uav_polyline(
+                            launch_loc=relay_origin,
+                            delivery_loc=delivery_loc,
+                            recovery_loc=depot_loc,
+                            altitude=cruise_altitude,
+                        )
+                        self._log_uav_path_if_obstacle_avoided(
+                            alloc=alloc,
+                            polyline=relay_polyline,
+                            launch_loc=relay_origin,
+                            delivery_loc=delivery_loc,
+                            recovery_loc=depot_loc,
+                            tag="setup-relay",
+                        )
+                        relay_waypoints = self._polyline_to_waypoints(
+                            polyline=relay_polyline,
+                            delivery_idx=relay_delivery_idx,
+                            order_id=alloc.order_id,
+                            recovery_id=alloc.vehicle_id,
+                        )
                         drone.append_route(relay_waypoints)
                         logger.info(
                             "[DispatchDecisionEngine] 无人机 %s 串联任务：当前任务完成后 → "
@@ -1230,11 +1459,27 @@ class DispatchDecisionEngine:
                             alloc.drone_id, alloc.order_id,
                         )
                     else:
-                        waypoints = [
-                            RouteWaypoint(depot_loc, WaypointAction.PICKUP, alloc.order_id),
-                            RouteWaypoint(delivery_loc, WaypointAction.DELIVER, alloc.order_id),
-                            RouteWaypoint(depot_loc, WaypointAction.DOCK_DEPOT, alloc.vehicle_id),
-                        ]
+                        cruise_altitude = float(max(depot_loc.z, delivery_loc.z, drone.current_loc.z))
+                        polyline, delivery_idx = self._build_uav_polyline(
+                            launch_loc=depot_loc,
+                            delivery_loc=delivery_loc,
+                            recovery_loc=depot_loc,
+                            altitude=cruise_altitude,
+                        )
+                        self._log_uav_path_if_obstacle_avoided(
+                            alloc=alloc,
+                            polyline=polyline,
+                            launch_loc=depot_loc,
+                            delivery_loc=delivery_loc,
+                            recovery_loc=depot_loc,
+                            tag="setup",
+                        )
+                        waypoints = self._polyline_to_waypoints(
+                            polyline=polyline,
+                            delivery_idx=delivery_idx,
+                            order_id=alloc.order_id,
+                            recovery_id=alloc.vehicle_id,
+                        )
                         drone.set_route(waypoints)
                         drone.transport_truck_id = None
                         drone.scheduled_launch_time = 0.0
@@ -1290,6 +1535,9 @@ class DispatchDecisionEngine:
             if order is None:
                 continue
 
+            drone = self.entity_mgr.drones.get(alloc.drone_id)
+            drone_altitude = float(drone.current_loc.z) if drone is not None else 0.0
+
             try:
                 if alloc.mode == "B":
                     # 模式 B：卡-空协同
@@ -1300,29 +1548,31 @@ class DispatchDecisionEngine:
                     launch_loc = truck.get_location(current_time)
                     delivery_loc = order.delivery_loc
                     recovery_id = alloc.recovery_station_id
-                    recovery_station = self.entity_mgr.stations.get(recovery_id)
-                    if recovery_station is None:
+                    recovery_entity = (
+                        self.entity_mgr.stations.get(recovery_id)
+                        or self.entity_mgr.depots.get(recovery_id)
+                    )
+                    if recovery_entity is None:
                         continue
-                    recovery_loc = recovery_station.location
+                    recovery_loc = recovery_entity.location
 
-                    # 构建飞行路径：起点 → 配送点 → 回收点
-                    path = [launch_loc, delivery_loc, recovery_loc]
-                    # 转换为WGS84坐标供前端使用
-                    path_wgs84 = []
-                    for pos in path:
-                        lon, lat = pos.to_wgs84()
-                        path_wgs84.append([lon, lat])
+                    cruise_altitude = float(max(launch_loc.z, delivery_loc.z, recovery_loc.z, drone_altitude))
+                    polyline, _ = self._build_uav_polyline(
+                        launch_loc=launch_loc,
+                        delivery_loc=delivery_loc,
+                        recovery_loc=recovery_loc,
+                        altitude=cruise_altitude,
+                    )
                     
                     drone_route = DroneRoute(
                         drone_id=alloc.drone_id,
                         order_id=alloc.order_id,
-                        path=[],  # 前端使用path_wgs84列表
+                        path=polyline,
                         mode="B",
                         launch_loc=launch_loc,
                         delivery_loc=delivery_loc,
                         recovery_loc=recovery_loc,
                     )
-                    # 添加转换后的path
                     plan.drone_routes[alloc.drone_id] = drone_route
 
                 elif alloc.mode in ("B_WAIT", "B_DYNAMIC"):
@@ -1337,21 +1587,26 @@ class DispatchDecisionEngine:
                     if alloc.mode == "B_DYNAMIC":
                         recovery_entity = self.entity_mgr.depots.get(recovery_id)
                     else:
-                        recovery_entity = self.entity_mgr.stations.get(recovery_id)
+                        recovery_entity = (
+                            self.entity_mgr.stations.get(recovery_id)
+                            or self.entity_mgr.depots.get(recovery_id)
+                        )
                     if recovery_entity is None:
                         continue
                     recovery_loc = recovery_entity.location
 
-                    path = [launch_loc, delivery_loc, recovery_loc]
-                    path_wgs84 = []
-                    for pos in path:
-                        lon, lat = pos.to_wgs84()
-                        path_wgs84.append([lon, lat])
+                    cruise_altitude = float(max(launch_loc.z, delivery_loc.z, recovery_loc.z, drone_altitude))
+                    polyline, _ = self._build_uav_polyline(
+                        launch_loc=launch_loc,
+                        delivery_loc=delivery_loc,
+                        recovery_loc=recovery_loc,
+                        altitude=cruise_altitude,
+                    )
                     
                     drone_route = DroneRoute(
                         drone_id=alloc.drone_id,
                         order_id=alloc.order_id,
-                        path=[],
+                        path=polyline,
                         mode=alloc.mode,
                         launch_loc=launch_loc,
                         delivery_loc=delivery_loc,
@@ -1368,18 +1623,18 @@ class DispatchDecisionEngine:
                     depot_loc = depot.location
                     delivery_loc = order.delivery_loc
 
-                    # 构建飞行路径：仓库 → 配送点 → 仓库
-                    path = [depot_loc, delivery_loc, depot_loc]
-                    # 转换为WGS84坐标供前端使用
-                    path_wgs84 = []
-                    for pos in path:
-                        lon, lat = pos.to_wgs84()
-                        path_wgs84.append([lon, lat])
+                    cruise_altitude = float(max(depot_loc.z, delivery_loc.z, drone_altitude))
+                    polyline, _ = self._build_uav_polyline(
+                        launch_loc=depot_loc,
+                        delivery_loc=delivery_loc,
+                        recovery_loc=depot_loc,
+                        altitude=cruise_altitude,
+                    )
                     
                     drone_route = DroneRoute(
                         drone_id=alloc.drone_id,
                         order_id=alloc.order_id,
-                        path=[],  # 前端使用path_wgs84列表
+                        path=polyline,
                         mode="C",
                         launch_loc=depot_loc,
                         delivery_loc=delivery_loc,

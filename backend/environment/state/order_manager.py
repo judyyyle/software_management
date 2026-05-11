@@ -21,11 +21,10 @@ from __future__ import annotations
 
 import logging
 import random
-import uuid
 from typing import TYPE_CHECKING, Optional
 
 from core.entities.order import Order
-from core.entities.primitives import Position3D, TaskStatus
+from core.entities.primitives import Position3D, SourceType, TaskStatus
 from utils.coord_utils import wgs84_to_utm
 
 if TYPE_CHECKING:
@@ -316,14 +315,17 @@ class OrderManager:
                 )
                 return None
             weight = float(entry.get("payload_weight", 1.0))
-            st = entry.get("source_type")
+            st_raw = entry.get("source_type")
+            source_type = (
+                None if st_raw is None else SourceType(str(st_raw))
+            )
             return Order(
                 order_id=oid,
                 create_time=spawn_t,
                 deadline=deadline,
                 delivery_loc=delivery_loc,
                 pickup_source_id=entry.get("pickup_source_id"),
-                source_type=st,
+                source_type=source_type,
                 payload_weight=weight,
             )
         except Exception as exc:
@@ -370,9 +372,9 @@ class OrderManager:
             float(cfg.get("weight_max", 5.0)),
         )
 
-        # ── 唯一 ID（hex8-seq） ──────────────────────────────────────────
+        # ── 唯一 ID（seed 可复现）──────────────────────────────────────────
         self._order_seq += 1
-        short_hex = uuid.uuid4().hex[:8].upper()
+        short_hex = f"{random.getrandbits(32):08X}"
         order_id  = f"ORD-{short_hex}-{self._order_seq}"
 
         return Order(

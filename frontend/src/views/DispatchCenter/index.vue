@@ -17,26 +17,28 @@
           <span>仿真时钟：<strong>{{ systemStore.simTime.toFixed(2) }} s</strong></span>
           <span class="sc-sep">|</span>
           <span>倍率：× {{ systemStore.speedRatio }}</span>
+          <span class="sc-sep">|</span>
+          <span>运行模式：<strong>{{ systemStore.policyActive ? 'PPO 在线推理' : 'Classic 仿真' }}</strong></span>
+        </div>
+
+        <!-- 实体摘要 -->
+        <div class="sc-entity-row">
+          <div class="sc-ent" :class="{ 'sc-ent--empty': !entityStore.depots.length }">
+            🏭 仓库 <strong>{{ entityStore.depots.length }}</strong>
+          </div>
+          <div class="sc-ent" :class="{ 'sc-ent--empty': !entityStore.stations.length }">
+            ⚡ 充换电站 <strong>{{ entityStore.stations.length }}</strong>
+          </div>
+          <div class="sc-ent" :class="{ 'sc-ent--empty': !entityStore.trucks.length }">
+            🚛 卡车 <strong>{{ entityStore.trucks.length }}</strong>
+          </div>
+          <div class="sc-ent" :class="{ 'sc-ent--empty': !entityStore.drones.length }">
+            🚁 无人机 <strong>{{ entityStore.drones.length }}</strong>
+          </div>
         </div>
 
         <!-- 控制操作行 -->
         <div class="sc-ctrl-row">
-          <!-- 实体摘要 -->
-          <div class="sc-entity-row">
-            <div class="sc-ent" :class="{ 'sc-ent--empty': !entityStore.depots.length }">
-              🏭 仓库 <strong>{{ entityStore.depots.length }}</strong>
-            </div>
-            <div class="sc-ent" :class="{ 'sc-ent--empty': !entityStore.stations.length }">
-              ⚡ 充换电站 <strong>{{ entityStore.stations.length }}</strong>
-            </div>
-            <div class="sc-ent" :class="{ 'sc-ent--empty': !entityStore.trucks.length }">
-              🚛 卡车 <strong>{{ entityStore.trucks.length }}</strong>
-            </div>
-            <div class="sc-ent" :class="{ 'sc-ent--empty': !entityStore.drones.length }">
-              🚁 无人机 <strong>{{ entityStore.drones.length }}</strong>
-            </div>
-          </div>
-
           <!-- 操作按钮 + 速率选择 -->
           <div class="sc-actions-area">
             <!-- bbox 提示 -->
@@ -63,25 +65,104 @@
               <button class="sc-btn sc-btn--reset" @click="doReset">🔄 重置</button>
             </div>
 
+            <div class="sc-policy-card" :class="{ 'sc-policy-card--collapsed': !ppoPanelOpen }">
+              <button
+                class="sc-policy-head"
+                type="button"
+                :aria-expanded="ppoPanelOpen"
+                @click="ppoPanelOpen = !ppoPanelOpen"
+              >
+                <div class="sc-policy-head-main">
+                  <span class="sc-policy-chevron" :class="{ 'sc-policy-chevron--open': ppoPanelOpen }">▾</span>
+                  <span class="sc-policy-title">🤖 PPO 在线推理</span>
+                  <span class="sc-policy-badge" :class="systemStore.policyActive ? 'sc-policy-badge--on' : 'sc-policy-badge--off'">
+                    {{ systemStore.policyActive ? '已激活' : '未激活' }}
+                  </span>
+                </div>
+                <span v-if="!ppoPanelOpen" class="sc-policy-summary sc-policy-summary--collapsed">
+                  {{ systemStore.policyActive ? `当前策略：${systemStore.policyName || 'PPO Policy'}` : '点击展开配置 PPO 运行时' }}
+                </span>
+              </button>
+              <transition name="sc-policy-collapse">
+                <div v-show="ppoPanelOpen" class="sc-policy-body">
+                  <div class="sc-policy-grid">
+                    <label class="sc-policy-field">
+                      <span>策略权重路径</span>
+                      <input v-model="policyPath" type="text" placeholder="weights/.../policy_best.pt" />
+                    </label>
+                    <label class="sc-policy-field">
+                      <span>配置文件路径</span>
+                      <input v-model="policyConfigPath" type="text" placeholder="config/rh_alns_cmrappo.yaml" />
+                    </label>
+                    <label class="sc-policy-field">
+                      <span>场景 ID</span>
+                      <input v-model="policySceneId" type="text" readonly />
+                    </label>
+                    <label class="sc-policy-field">
+                      <span>订单来源</span>
+                      <select v-model="policyOrderSourceMode">
+                        <option value="benchmark">benchmark</option>
+                        <option value="poisson">poisson</option>
+                        <option value="hybrid">hybrid</option>
+                      </select>
+                    </label>
+                  </div>
+                  <div class="sc-policy-options">
+                    <label class="sc-policy-check">
+                      <input v-model="policyDeterministic" type="checkbox" />
+                      <span>确定性推理</span>
+                    </label>
+                    <label class="sc-policy-check">
+                      <input v-model="policyUseCurrentInitPayload" type="checkbox" />
+                      <span>复用当前初始化实体与订单</span>
+                    </label>
+                    <span class="sc-policy-runtime">runtime: {{ systemStore.policyRuntimeType }}</span>
+                    <span class="sc-policy-runtime">init_scene: {{ systemStore.initializedSceneId || '未初始化' }}</span>
+                  </div>
+                  <div class="sc-policy-hint" :class="ppoReadyForActivation ? 'sc-policy-hint--ok' : 'sc-policy-hint--warn'">
+                    {{ ppoCompatibilityMessage }}
+                  </div>
+                  <div class="sc-action-row">
+                    <button class="sc-btn sc-btn--policy"
+                      :disabled="!ppoReadyForActivation || policyLoading || systemStore.policyActive"
+                      @click="doActivatePolicy">
+                      {{ policyLoading ? '⏳ 激活中...' : '🤖 切换到 PPO 在线策略' }}
+                    </button>
+                    <button class="sc-btn sc-btn--policy-off"
+                      :disabled="policyLoading || !systemStore.policyActive"
+                      @click="doDeactivatePolicy">
+                      ↩ 切回 Classic 仿真
+                    </button>
+                    <span class="sc-policy-summary">
+                      {{ systemStore.policyActive ? `当前策略：${systemStore.policyName || 'PPO Policy'}` : '当前未使用策略运行时' }}
+                    </span>
+                  </div>
+                  <div v-if="systemStore.policyCheckpoint" class="sc-policy-checkpoint">
+                    checkpoint：{{ systemStore.policyCheckpoint }}
+                  </div>
+                </div>
+              </transition>
+            </div>
+
             <!-- 调度控制行 -->
             <div class="sc-action-row">
               <button class="sc-btn sc-btn--dispatch"
                 :class="{ 'sc-btn--dispatch-active': dispatchSolver === 'greedy' }"
-                :disabled="!initDone || dispatchLoading"
+                :disabled="!initDone || dispatchLoading || systemStore.policyActive"
                 @click="dispatchSolver = 'greedy'">
                 🧠 贪心（baseline）
               </button>
               <button class="sc-btn sc-btn--dispatch"
                 :class="{ 'sc-btn--dispatch-active': dispatchSolver === 'greedy_mmce' }"
-                :disabled="!initDone || dispatchLoading"
+                :disabled="!initDone || dispatchLoading || systemStore.policyActive"
                 @click="dispatchSolver = 'greedy_mmce'">
                 🧩 贪心（多模式）
               </button>
               <button class="sc-btn sc-btn--dispatch"
                 :class="{ 'sc-btn--dispatch-active': dispatchSolver === 'greedy_mmce_bi' }"
-                :disabled="!initDone || dispatchLoading"
+                :disabled="!initDone || dispatchLoading || systemStore.policyActive"
                 @click="dispatchSolver = 'greedy_mmce_bi'">
-                🧠 贪心（增量）
+                🧩 贪心（增量）
               </button>
               <button class="sc-btn sc-btn--dispatch"
                 :class="{ 'sc-btn--dispatch-active': dispatchSolver === 'ga_mmce' }"
@@ -98,13 +179,27 @@
                 <span>复用上次静态结果</span>
               </label>
               <button class="sc-btn sc-btn--dispatch"
-                :class="{ 'sc-btn--dispatch-active': dispatchSolver === 'market' }"
+                :class="{ 'sc-btn--dispatch-active': dispatchSolver === 'ga_mmce' }"
                 :disabled="!initDone || dispatchLoading"
+                @click="dispatchSolver = 'ga_mmce'">
+                🧬 遗传算法
+              </button>
+              <label v-if="dispatchSolver === 'ga_mmce'" class="dispatch-cache-toggle">
+                <input
+                  v-model="reuseGaStaticPlan"
+                  type="checkbox"
+                  :disabled="dispatchLoading"
+                >
+                <span>复用上次静态结果</span>
+              </label>
+              <button class="sc-btn sc-btn--dispatch"
+                :class="{ 'sc-btn--dispatch-active': dispatchSolver === 'market' }"
+                :disabled="!initDone || dispatchLoading || systemStore.policyActive"
                 @click="dispatchSolver = 'market'">
                 🏷️ 市场拍卖算法
               </button>
               <button class="sc-btn sc-btn--dispatch sc-btn--dispatch-run"
-                :disabled="!initDone || dispatchLoading"
+                :disabled="!initDone || dispatchLoading || systemStore.policyActive"
                 @click="doDispatch">
                 {{ dispatchLoading ? '⏳ 调度中...' : `🎯 批量${dispatchSolverLabel(dispatchSolver)}调度` }}
               </button>
@@ -113,6 +208,9 @@
               </span>
               <span v-if="lastDispatchResult" class="dispatch-quick-stat">
                 ✓ {{ lastDispatchResult.plan.feasible }}/{{ lastDispatchResult.plan.total_orders }} 可行
+              </span>
+              <span v-if="systemStore.policyActive" class="dispatch-quick-stat dispatch-quick-stat--policy">
+                PPO 模式下 classic 调度按钮已禁用
               </span>
               <button class="sc-btn sc-btn--export"
                 :disabled="savingPreset"
@@ -214,7 +312,7 @@
 </template>
 
 <script setup lang="ts">
-import { computed, ref, onMounted, onBeforeUnmount, watch } from 'vue'
+import { computed, ref, onMounted, onBeforeUnmount } from 'vue'
 import PageShell     from '@/components/PageShell/index.vue'
 import SectionCard   from './components/SectionCard.vue'
 import UnifiedMapView from './components/UnifiedMapView.vue'
@@ -236,6 +334,39 @@ const flowPanelRef = ref<InstanceType<typeof DynamicFlowPanel> | null>(null)
 // initDone 从 store 派生，路由切换不丢失 (改用 initialized 标志)
 const initDone    = computed(() => systemStore.initialized)
 const initLoading = ref(false)
+type PolicyOrderSourceMode = 'benchmark' | 'poisson' | 'hybrid'
+const PPO_SCENE_ID = 'default_test_4x4km'
+const policyLoading = ref(false)
+const policyPath = ref('weights/rh_alns_cmrappo/phase7_20260509_run16_recovery_pool_scan/policy_best.pt')
+const policyConfigPath = ref('config/rh_alns_cmrappo.yaml')
+const policySceneId = ref(PPO_SCENE_ID)
+const policyDeterministic = ref(true)
+const policyUseCurrentInitPayload = ref(true)
+const policyOrderSourceMode = ref<PolicyOrderSourceMode>('benchmark')
+const ppoPanelOpen = ref(true)
+const currentSceneId = computed(() => String(sceneStore.context?.scene_id ?? '').trim())
+const ppoCurrentSceneCompatible = computed(() => currentSceneId.value === PPO_SCENE_ID)
+const ppoInitSceneCompatible = computed(() => String(systemStore.initializedSceneId ?? '').trim() === PPO_SCENE_ID)
+const ppoReadyForActivation = computed(() =>
+  systemStore.initialized &&
+  ppoCurrentSceneCompatible.value &&
+  ppoInitSceneCompatible.value
+)
+const ppoCompatibilityMessage = computed(() => {
+  if (!sceneStore.context) {
+    return `请先加载默认预设场景 ${PPO_SCENE_ID}。`
+  }
+  if (!ppoCurrentSceneCompatible.value) {
+    return `当前页面场景为 ${currentSceneId.value}，现有 PPO 权重仅支持 ${PPO_SCENE_ID}。`
+  }
+  if (!systemStore.initialized) {
+    return `请先使用 ${PPO_SCENE_ID} 完成一次初始化。`
+  }
+  if (!ppoInitSceneCompatible.value) {
+    return `最近一次初始化场景为 ${systemStore.initializedSceneId || 'unknown'}，请切回 ${PPO_SCENE_ID} 后重新初始化。`
+  }
+  return `当前页面与最近一次初始化均匹配 ${PPO_SCENE_ID}，可以激活 PPO。`
+})
 
 // 调度相关状态
 const dispatchLoading = ref(false)
@@ -393,6 +524,7 @@ async function doInit() {
       bbox:    bounds,
       sceneId: sceneStore.context?.scene_id,
     })
+    await systemStore.fetchPolicyState().catch(() => {})
     const s = result.summary
     _log('success', `✅ 初始化成功 — 仓库×${s.depots} · 站点×${s.stations} · 卡车×${s.trucks} · 无人机×${s.drones}`)
     
@@ -446,6 +578,7 @@ async function doInit() {
 
 async function doReset() {
   await systemStore.reset().catch(() => {})
+  lastRenderedDecisionEventSeq.value = 0
   totalEnergyCostWh.value = 0
   _log('warn', '🔄 仿真已重置，请重新初始化')
 }
@@ -453,6 +586,49 @@ async function doReset() {
 async function doSetSpeed(ratio: number) {
   await systemStore.setSpeed(ratio)
   _log('info', `⚡ 速率已设为 ×${ratio}`)
+}
+
+async function doActivatePolicy() {
+  if (!ppoReadyForActivation.value) {
+    _log('warn', `⚠️ ${ppoCompatibilityMessage.value}`)
+    return
+  }
+  policyLoading.value = true
+  lastRenderedDecisionEventSeq.value = 0
+  _log('info', `🤖 正在激活 PPO 在线策略：${policyPath.value}`)
+  try {
+    await systemStore.activatePolicy({
+      policy_name: 'rh_alns_cmrappo',
+      policy_path: policyPath.value.trim(),
+      config_path: policyConfigPath.value.trim(),
+      scene_id: policySceneId.value.trim(),
+      deterministic: policyDeterministic.value,
+      speed_ratio: Number(systemStore.speedRatio) || 1,
+      order_source_mode: policyOrderSourceMode.value,
+      use_current_init_payload: policyUseCurrentInitPayload.value,
+    })
+    await systemStore.fetchPolicyState()
+    _log('success', `✅ PPO 已激活：${systemStore.policyName || 'rh_alns_cmrappo'}，点击「启动」即可执行权重推理`)
+  } catch (e: any) {
+    _log('error', `❌ PPO 激活失败：${e.message}`)
+  } finally {
+    policyLoading.value = false
+  }
+}
+
+async function doDeactivatePolicy() {
+  policyLoading.value = true
+  _log('info', '↩ 正在切回 Classic 仿真运行时...')
+  try {
+    await systemStore.deactivatePolicy()
+    lastRenderedDecisionEventSeq.value = 0
+    await systemStore.fetchPolicyState()
+    _log('success', '✅ 已切回 Classic 仿真运行时')
+  } catch (e: any) {
+    _log('error', `❌ 切回 Classic 失败：${e.message}`)
+  } finally {
+    policyLoading.value = false
+  }
 }
 
 async function doDispatch() {
@@ -520,6 +696,7 @@ async function doDispatch() {
       }
 
       mapRef.value?.clearDispatchRoutes?.()
+      mapRef.value?.drawRuntimePaths?.({ trucks: [], drones: [] })
       
       // 调试：打印无人机路线信息便于诊断显示问题
       if (plan.drone_routes && plan.drone_routes.length > 0) {
@@ -632,6 +809,27 @@ function setupRealtimeUpdates() {
         mapRef.value?.updateDrone?.(drone.drone_id, drone.lng, drone.lat, drone.status)
       }
     }
+
+    if (systemStore.policyActive) {
+      mapRef.value?.drawRuntimePaths?.(systemStore.runtimePaths)
+    } else {
+      mapRef.value?.drawRuntimePaths?.({ trucks: [], drones: [] })
+    }
+
+    for (const event of systemStore.decisionEvents) {
+      if (event.event_seq <= lastRenderedDecisionEventSeq.value) continue
+      const mode = event.selected_mode ? ` ${event.selected_mode}` : ''
+      const order = event.selected_order_id ? ` / ${event.selected_order_id}` : ''
+      const latency = event.inference_latency_ms != null ? ` · ${event.inference_latency_ms}ms` : ''
+      if (event.status === 'DECISION_PENDING') {
+        flowPanelRef.value?.addEvent?.('⏳', `PPO 决策待处理 #${event.decision_id} · ${event.drone_id}`)
+      } else if (event.status === 'DECISION_APPLIED') {
+        flowPanelRef.value?.addEvent?.('🤖', `PPO 决策已应用 #${event.decision_id}${mode}${order}${latency}`)
+      } else if (event.status === 'EXECUTION_HARD_FAILED') {
+        flowPanelRef.value?.addEvent?.('⚠️', `PPO 执行硬失败 #${event.decision_id} · ${event.failure_type || 'unknown'}`)
+      }
+      lastRenderedDecisionEventSeq.value = Math.max(lastRenderedDecisionEventSeq.value, event.event_seq)
+    }
     
     // 重绘订单标记（使用最新的订单状态）
     mapRef.value?.drawOrders?.()
@@ -640,6 +838,7 @@ function setupRealtimeUpdates() {
 
 onMounted(() => {
   setupRealtimeUpdates()
+  systemStore.fetchPolicyState().catch(() => {})
   
   // 如果已加载预设场景，自动加载预设的实体配置
   if (sceneStore.context?.scene_id) {
@@ -767,15 +966,17 @@ onBeforeUnmount(() => {
 /* 控制操作行：左实体摘要，右按钮+速率 */
 .sc-ctrl-row {
   display: flex;
-  gap: var(--hl-space-md);
-  align-items: flex-start;
-  flex-wrap: wrap;
+  flex-direction: column;
+  gap: var(--hl-space-sm);
 }
 
 /* 实体摘要 */
-.sc-entity-row { display: flex; gap: 8px; flex-wrap: wrap; flex: 1; min-width: 0; }
+.sc-entity-row {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 8px;
+}
 .sc-ent {
-  flex: 1; min-width: 110px;
   padding: 8px 12px;
   background: var(--hl-card-bg);
   border: 1px solid var(--hl-card-border);
@@ -786,7 +987,12 @@ onBeforeUnmount(() => {
 .sc-ent--empty strong { color: var(--hl-danger); }
 
 /* 操作区：bbox + 按钮行 + 速率 */
-.sc-actions-area { display: flex; flex-direction: column; gap: 8px; flex-shrink: 0; }
+.sc-actions-area {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  min-width: 0;
+}
 
 /* bbox 提示 */
 .sc-bbox-hint {
@@ -868,6 +1074,216 @@ onBeforeUnmount(() => {
   font-size: 12px;
   color: var(--hl-success);
   font-weight: 500;
+}
+.dispatch-quick-stat--policy { color: #b45309; }
+
+.sc-policy-card {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 12px;
+  background: linear-gradient(135deg, #eff6ff, #f8fafc);
+  border: 1px solid #bfdbfe;
+  border-radius: var(--hl-card-radius);
+}
+
+.sc-policy-card--collapsed {
+  gap: 0;
+}
+
+.sc-policy-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+  width: 100%;
+  padding: 0;
+  background: none;
+  border: none;
+  text-align: left;
+  cursor: pointer;
+}
+
+.sc-policy-head-main {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+}
+
+.sc-policy-chevron {
+  font-size: 14px;
+  color: #2563eb;
+  line-height: 1;
+  transform: rotate(-90deg);
+  transition: transform 0.2s ease;
+}
+
+.sc-policy-chevron--open {
+  transform: rotate(0deg);
+}
+
+.sc-policy-title {
+  font-size: 13px;
+  font-weight: 700;
+  color: #1e3a8a;
+}
+
+.sc-policy-badge {
+  display: inline-flex;
+  align-items: center;
+  height: 24px;
+  padding: 0 10px;
+  border-radius: 999px;
+  font-size: 11px;
+  font-weight: 700;
+}
+
+.sc-policy-badge--on {
+  background: #dcfce7;
+  color: #166534;
+}
+
+.sc-policy-badge--off {
+  background: #e2e8f0;
+  color: #475569;
+}
+
+.sc-policy-body {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.sc-policy-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(220px, 1fr));
+  gap: 10px;
+}
+
+.sc-policy-field {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  min-width: 0;
+}
+
+.sc-policy-field span {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--hl-text-secondary);
+}
+
+.sc-policy-field input,
+.sc-policy-field select {
+  width: 100%;
+  height: 34px;
+  padding: 0 10px;
+  border: 1px solid #cbd5e1;
+  border-radius: 8px;
+  background: #fff;
+  color: var(--hl-text);
+  font-size: 12px;
+  outline: none;
+}
+
+.sc-policy-field input:focus,
+.sc-policy-field select:focus {
+  border-color: #3b82f6;
+  box-shadow: 0 0 0 3px rgba(59, 130, 246, 0.12);
+}
+
+.sc-policy-options {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+
+.sc-policy-check {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  color: var(--hl-text-secondary);
+  cursor: pointer;
+}
+
+.sc-policy-check input {
+  accent-color: #2563eb;
+}
+
+.sc-policy-runtime {
+  font-size: 11.5px;
+  color: #475569;
+}
+
+.sc-policy-hint {
+  font-size: 12px;
+  line-height: 1.5;
+  padding: 8px 10px;
+  border-radius: 8px;
+}
+
+.sc-policy-hint--ok {
+  background: #ecfdf5;
+  color: #166534;
+}
+
+.sc-policy-hint--warn {
+  background: #fff7ed;
+  color: #9a3412;
+}
+
+.sc-btn--policy {
+  background: #2563eb;
+  color: #fff;
+  min-width: 180px;
+}
+
+.sc-btn--policy:hover:not(:disabled) {
+  background: #1d4ed8;
+}
+
+.sc-btn--policy-off {
+  background: #fff;
+  color: #334155;
+  border: 1px solid #cbd5e1;
+}
+
+.sc-btn--policy-off:hover:not(:disabled) {
+  background: #f8fafc;
+}
+
+.sc-policy-summary {
+  display: inline-flex;
+  align-items: center;
+  min-height: 34px;
+  font-size: 12px;
+  color: #1e293b;
+}
+
+.sc-policy-summary--collapsed {
+  min-height: auto;
+  color: #475569;
+  white-space: nowrap;
+}
+
+.sc-policy-checkpoint {
+  font-size: 11.5px;
+  color: #475569;
+  word-break: break-all;
+}
+
+.sc-policy-collapse-enter-active,
+.sc-policy-collapse-leave-active {
+  transition: opacity 0.18s ease, transform 0.18s ease;
+}
+
+.sc-policy-collapse-enter-from,
+.sc-policy-collapse-leave-to {
+  opacity: 0;
+  transform: translateY(-4px);
 }
 
 /* 速率选择 */
@@ -993,6 +1409,31 @@ onBeforeUnmount(() => {
   flex-direction: column;
   gap: var(--hl-space-md);
   overflow-y: auto;
+}
+
+@media (max-width: 1080px) {
+  .sc-entity-row {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .sc-policy-head {
+    flex-direction: column;
+    align-items: stretch;
+  }
+
+  .sc-policy-summary--collapsed {
+    white-space: normal;
+  }
+
+  .sc-policy-grid {
+    grid-template-columns: 1fr;
+  }
+}
+
+@media (max-width: 640px) {
+  .sc-entity-row {
+    grid-template-columns: 1fr;
+  }
 }
 
 .detail-hint {
