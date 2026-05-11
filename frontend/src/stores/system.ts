@@ -5,7 +5,7 @@ import { WsClient } from '@/services/websocket'
 import { useEntityStore } from './entity'
 import { useOrderStore } from './order'
 import { useSceneStore } from './scene'
-import type { DecisionEvent, RuntimePaths } from '@/types'
+import type { DecisionEvent, DispatchChain, RuntimePaths } from '@/types'
 
 // ── 调试开关 ────────────────────────────────────────────────────
 const DEBUG_WEBSOCKET = false
@@ -23,6 +23,7 @@ export const useSystemStore = defineStore('system', () => {
   const policyCheckpoint = ref('')      // 当前激活 checkpoint
   const policyRuntimeType = ref<'classic_sim_engine' | 'training_env_adapter_policy'>('classic_sim_engine')
   const runtimePaths     = ref<RuntimePaths>({ trucks: [], drones: [] })
+  const dispatchChains   = ref<DispatchChain[]>([])
   const decisionEvents   = ref<DecisionEvent[]>([])
   const latestEventSeq   = ref(0)
 
@@ -56,6 +57,10 @@ export const useSystemStore = defineStore('system', () => {
       trucks: Array.isArray(raw?.trucks) ? raw.trucks : [],
       drones: Array.isArray(raw?.drones) ? raw.drones : [],
     }
+  }
+
+  function normalizeDispatchChains(raw: any): DispatchChain[] {
+    return Array.isArray(raw) ? raw as DispatchChain[] : []
   }
 
   function mergeDecisionEvents(events: any[]) {
@@ -97,6 +102,7 @@ export const useSystemStore = defineStore('system', () => {
     running.value        = payload.is_running ?? false
     speedRatio.value     = payload.speed_ratio ?? 1
     runtimePaths.value   = normalizeRuntimePaths(payload.paths)
+    dispatchChains.value = normalizeDispatchChains(payload.dispatch_chains)
     mergeDecisionEvents(payload.recent_decision_events)
     latestEventSeq.value = Number(payload.latest_event_seq ?? latestEventSeq.value)
     applyPolicyRuntimeFromStats(payload.stats)
@@ -119,6 +125,9 @@ export const useSystemStore = defineStore('system', () => {
     entityStore.setRuntimeAll(payload.entities ?? {})
     if (payload.paths !== undefined) {
       runtimePaths.value = normalizeRuntimePaths(payload.paths)
+    }
+    if (payload.dispatch_chains !== undefined) {
+      dispatchChains.value = normalizeDispatchChains(payload.dispatch_chains)
     }
     mergeDecisionEvents(payload.recent_decision_events)
     latestEventSeq.value = Number(payload.latest_event_seq ?? latestEventSeq.value)
@@ -235,6 +244,7 @@ export const useSystemStore = defineStore('system', () => {
     initialized.value = false
     initializedSceneId.value = ''
     runtimePaths.value = { trucks: [], drones: [] }
+    dispatchChains.value = []
     decisionEvents.value = []
     latestEventSeq.value = 0
   }
@@ -381,7 +391,7 @@ export const useSystemStore = defineStore('system', () => {
   return {
     running, simTime, speedRatio, simStartWallMs, initialized, initializedSceneId,
     policyActive, policyName, policyCheckpoint, policyRuntimeType,
-    runtimePaths, decisionEvents, latestEventSeq,
+    runtimePaths, dispatchChains, decisionEvents, latestEventSeq,
     initWs, probeBackend, onTick,
     start, pause, reset, setSpeed, initSim, dispatch,
     activatePolicy, deactivatePolicy, fetchPolicyState,

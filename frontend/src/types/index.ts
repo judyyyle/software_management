@@ -109,6 +109,15 @@ export interface Drone extends DroneConfig {
   carrying_order_id?:     string
   cumulative_distance_m?: number
   remaining_range_m?:     number
+  reservation_node_id?:    string | null
+  dispatch_chain?:         DispatchChain | null
+  dispatch_order_id?:      string | null
+  dispatch_mode?:          string | null
+  selected_recover_node_id?: string | null
+  recovery_stage?:         string | null
+  planned_truck_arrival_time?: number | null
+  planned_uav_arrival_time_lb?: number | null
+  planned_execution_slack_sec?: number | null
 }
 
 
@@ -265,6 +274,25 @@ export interface RuntimePaths {
   drones: RuntimePathEntry[]
 }
 
+export interface DispatchChain {
+  drone_id: string
+  order_id: string
+  mode: string
+  trigger_station_id?: string | null
+  selected_recover_node_id?: string | null
+  reservation_node_id?: string | null
+  recovery_stage?: string
+  planned_truck_arrival_time?: number | null
+  planned_uav_arrival_time_lb?: number | null
+  planned_execution_slack_sec?: number | null
+  training_state?: string | null
+  carrying_order_id?: string | null
+  active_leg_kind?: string | null
+  active_leg_target_node_id?: string | null
+  active_leg_target_node_type?: string | null
+  snapshot_time?: number
+}
+
 export interface DecisionEvent {
   decision_id: number
   sim_time: number
@@ -278,6 +306,7 @@ export interface DecisionEvent {
   selected_order_id?: string | null
   selected_mode?: string | null
   selected_recover_node?: string | null
+  recovery_selection_stage?: string | null
   inference_latency_ms?: number | null
   status: 'DECISION_PENDING' | 'DECISION_APPLIED' | 'EXECUTION_HARD_FAILED'
   actor_drone_final_state?: string | null

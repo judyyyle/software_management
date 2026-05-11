@@ -784,11 +784,16 @@ function setupRealtimeUpdates() {
       if (event.event_seq <= lastRenderedDecisionEventSeq.value) continue
       const mode = event.selected_mode ? ` ${event.selected_mode}` : ''
       const order = event.selected_order_id ? ` / ${event.selected_order_id}` : ''
+      const recover = event.selected_recover_node
+        ? ` / 回收点 ${event.selected_recover_node}`
+        : event.recovery_selection_stage === 'pending_post_delivery_selection'
+          ? ' / 回收点送达后选择'
+          : ''
       const latency = event.inference_latency_ms != null ? ` · ${event.inference_latency_ms}ms` : ''
       if (event.status === 'DECISION_PENDING') {
         flowPanelRef.value?.addEvent?.('⏳', `PPO 决策待处理 #${event.decision_id} · ${event.drone_id}`)
       } else if (event.status === 'DECISION_APPLIED') {
-        flowPanelRef.value?.addEvent?.('🤖', `PPO 决策已应用 #${event.decision_id}${mode}${order}${latency}`)
+        flowPanelRef.value?.addEvent?.('🤖', `PPO 决策已应用 #${event.decision_id}${mode}${order}${recover}${latency}`)
       } else if (event.status === 'EXECUTION_HARD_FAILED') {
         flowPanelRef.value?.addEvent?.('⚠️', `PPO 执行硬失败 #${event.decision_id} · ${event.failure_type || 'unknown'}`)
       }

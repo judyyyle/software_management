@@ -468,13 +468,21 @@ function drawRuntimePaths(paths: { trucks?: any[]; drones?: any[] }) {
       .map(([lng, lat]: [number, number]) => [Number(lat), Number(lng)] as [number, number])
       .filter((point: [number, number]) => Number.isFinite(point[0]) && Number.isFinite(point[1]))
     if (coords.length <= 1) return
-    L.polyline(coords, {
+    const line = L.polyline(coords, {
       color,
       weight: dashed ? 3 : 4,
       opacity: dashed ? 0.88 : 0.72,
       dashArray: dashed ? '8,6' : undefined,
       pane: dashed ? 'droneRoutePane' : undefined,
     }).addTo(runtimePathGroup as L.LayerGroup)
+    const title = buildRuntimePathLabel(entry, dashed)
+    if (title) {
+      line.bindTooltip(title, {
+        sticky: true,
+        direction: 'top',
+        className: 'runtime-path-tooltip',
+      })
+    }
   }
 
   for (const truckPath of paths.trucks ?? []) {
@@ -487,6 +495,19 @@ function drawRuntimePaths(paths: { trucks?: any[]; drones?: any[] }) {
       drawPath(dronePath, '#7c3aed', true)
     }
   }
+}
+
+function buildRuntimePathLabel(entry: any, isDronePath: boolean): string {
+  const entity = entry?.entity_id ? String(entry.entity_id) : ''
+  const mode = entry?.motion_mode ? String(entry.motion_mode) : ''
+  if (isDronePath) {
+    const order = entry?.order_id ? ` / 订单 ${entry.order_id}` : ''
+    const target = entry?.target_node_id ? ` / 目标 ${entry.target_node_id}` : ''
+    return `${entity} ${entry?.segment_id || 'flight'}${order}${target}`
+  }
+  const from = entry?.from_node_id ? String(entry.from_node_id) : ''
+  const to = entry?.to_node_id ? String(entry.to_node_id) : ''
+  return `${entity} 卡车路网 ${from} → ${to}${mode ? ` / ${mode}` : ''}`
 }
 
 // ── 生命周期 ──────────────────────────────────────────────────────
@@ -908,6 +929,14 @@ defineExpose({ setFacilities, updateTruck, updateDrone, addOrder, clearDynamic, 
 :deep(.fac-popup__row:last-child) { border-bottom: none; }
 :deep(.fac-popup__row span:first-child) { color: #666; }
 :deep(.fac-popup__row span:last-child) { font-weight: 600; color: #1a1a2e; }
+
+:deep(.runtime-path-tooltip) {
+  border: 1px solid #cbd5e1;
+  border-radius: 4px;
+  color: #0f172a;
+  font-size: 0.75rem;
+  font-weight: 600;
+}
 
 /* ── 动态实体标记（卡车和无人机）── */
 :deep(.dynamic-pin) {

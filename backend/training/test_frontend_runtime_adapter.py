@@ -237,6 +237,9 @@ class TestFrontendRuntimeAdapter(unittest.TestCase):
         self.assertIn("trucks", tick["paths"])
         self.assertGreaterEqual(len(tick["paths"]["trucks"]), 1)
         self.assertIn("path", tick["paths"]["trucks"][0])
+        self.assertIn("dispatch_chains", tick)
+        self.assertEqual(tick["dispatch_chains"], [])
+        self.assertIn("dispatch_chains", snapshot["payload"])
         self.assertEqual(tick["latest_event_seq"], 1)
         self.assertEqual(tick["recent_decision_events"][0]["status"], "DECISION_PENDING")
 

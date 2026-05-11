@@ -30,6 +30,7 @@ if str(BACKEND_DIR) not in sys.path:
 
 
 from core.entities.order import Order
+from config.loader import load_drone_params
 from environment.state.order_manager import OrderManager
 
 from .contracts import BenchmarkMeta, TrainingInputMeta
@@ -242,6 +243,10 @@ def build_order_source(
         mode=selected_mode,
         benchmark_use_dynamic_orders=benchmark_use_dynamic_orders,
         hybrid_background_dynamic_orders=hybrid_background_dynamic_orders,
+        data_cfg=data_cfg,
+        overrides=overrides,
+        seed=selected_seed,
+        upper_horizon_sec=float(_require_mapping(cfg, "planner")["upper_horizon_sec"]),
     )
 
     benchmark = _build_benchmark_meta(
@@ -401,17 +406,176 @@ def _build_scheduled_dynamic_orders(
     mode: OrderSourceMode,
     benchmark_use_dynamic_orders: bool,
     hybrid_background_dynamic_orders: bool,
+    data_cfg: Mapping[str, Any],
+    overrides: Mapping[str, Any],
+    seed: int,
+    upper_horizon_sec: float,
 ) -> tuple[Mapping[str, Any], ...]:
-    if mode == OrderSourceMode.POISSON:
-        return ()
-    if mode == OrderSourceMode.BENCHMARK and not benchmark_use_dynamic_orders:
-        return ()
-    if mode == OrderSourceMode.HYBRID and not hybrid_background_dynamic_orders:
-        return ()
-    return tuple(
-        _normalize_scheduled_dynamic_entry(dynamic_order)
-        for dynamic_order in scene_ctx.dynamic_orders
+    scheduled: list[Mapping[str, Any]] = []
+    if mode != OrderSourceMode.POISSON:
+        if mode == OrderSourceMode.BENCHMARK and benchmark_use_dynamic_orders:
+            scheduled.extend(
+                _normalize_scheduled_dynamic_entry(dynamic_order)
+                for dynamic_order in scene_ctx.dynamic_orders
+            )
+        elif mode == OrderSourceMode.HYBRID and hybrid_background_dynamic_orders:
+            scheduled.extend(
+                _normalize_scheduled_dynamic_entry(dynamic_order)
+                for dynamic_order in scene_ctx.dynamic_orders
+            )
+
+    scheduled.extend(
+        _build_truck_only_dynamic_orders(
+            scene_ctx=scene_ctx,
+            mode=mode,
+            data_cfg=data_cfg,
+            overrides=overrides,
+            seed=seed,
+            upper_horizon_sec=upper_horizon_sec,
+        )
     )
+    return tuple(
+        sorted(
+            scheduled,
+            key=lambda item: (float(item.get("spawn_sim_s", 0.0)), str(item.get("order_id", ""))),
+        )
+    )
+
+
+def _build_truck_only_dynamic_orders(
+    *,
+    scene_ctx: TrainingSceneContext,
+    mode: OrderSourceMode,
+    data_cfg: Mapping[str, Any],
+    overrides: Mapping[str, Any],
+    seed: int,
+    upper_horizon_sec: float,
+) -> tuple[Mapping[str, Any], ...]:
+    """为 PPO 随机动态流生成少量 truck-only 预定义订单。"""
+
+    if mode not in {OrderSourceMode.POISSON, OrderSourceMode.HYBRID}:
+        return ()
+
+    enabled = bool(
+        overrides.get(
+            "truck_only_dynamic_enabled",
+            data_cfg.get("truck_only_dynamic_enabled", False),
+        )
+    )
+    if not enabled:
+        return ()
+
+    count = int(
+        overrides.get(
+            "truck_only_dynamic_orders_per_episode",
+            data_cfg.get("truck_only_dynamic_orders_per_episode", 0),
+        )
+    )
+    if count <= 0:
+        return ()
+
+    bounds = scene_ctx.bounds
+    required_bounds = ("min_lng", "max_lng", "min_lat", "max_lat")
+    missing_bounds = [key for key in required_bounds if key not in bounds]
+    if missing_bounds:
+        raise ValueError(
+            "truck-only 动态订单需要 scene bounds 字段: "
+            + ", ".join(missing_bounds)
+        )
+
+    heavy_payload_capacity = float(load_drone_params().heavy.payload_capacity)
+    weight_min = float(
+        overrides.get(
+            "truck_only_dynamic_weight_min_kg",
+            data_cfg.get(
+                "truck_only_dynamic_weight_min_kg",
+                heavy_payload_capacity + 0.5,
+            ),
+        )
+    )
+    weight_max = float(
+        overrides.get(
+            "truck_only_dynamic_weight_max_kg",
+            data_cfg.get(
+                "truck_only_dynamic_weight_max_kg",
+                max(weight_min, heavy_payload_capacity + 2.0),
+            ),
+        )
+    )
+    if weight_min <= heavy_payload_capacity:
+        raise ValueError(
+            "truck_only_dynamic_weight_min_kg 必须大于 heavy UAV 承载上限 "
+            f"{heavy_payload_capacity:.3f}kg，当前为 {weight_min:.3f}kg"
+        )
+    if weight_max < weight_min:
+        raise ValueError("truck_only_dynamic_weight_max_kg 不能小于 min")
+
+    spawn_start = float(
+        overrides.get(
+            "truck_only_dynamic_spawn_start_s",
+            data_cfg.get("truck_only_dynamic_spawn_start_s", 0.15 * upper_horizon_sec),
+        )
+    )
+    spawn_end = float(
+        overrides.get(
+            "truck_only_dynamic_spawn_end_s",
+            data_cfg.get("truck_only_dynamic_spawn_end_s", 0.70 * upper_horizon_sec),
+        )
+    )
+    if spawn_start < 0.0:
+        raise ValueError("truck_only_dynamic_spawn_start_s 不能为负数")
+    if spawn_end < spawn_start:
+        raise ValueError("truck_only_dynamic_spawn_end_s 不能小于 start")
+
+    deadline_min_min = float(
+        overrides.get(
+            "truck_only_dynamic_deadline_window_min_min",
+            data_cfg.get("truck_only_dynamic_deadline_window_min_min", 80),
+        )
+    )
+    deadline_max_min = float(
+        overrides.get(
+            "truck_only_dynamic_deadline_window_max_min",
+            data_cfg.get("truck_only_dynamic_deadline_window_max_min", 120),
+        )
+    )
+    if deadline_min_min <= 0.0:
+        raise ValueError("truck_only_dynamic_deadline_window_min_min 必须为正数")
+    if deadline_max_min < deadline_min_min:
+        raise ValueError("truck_only_dynamic_deadline_window_max_min 不能小于 min")
+
+    rng = random.Random(int(seed) ^ 0xC0FFEE)
+    entries: list[Mapping[str, Any]] = []
+    for idx in range(count):
+        if count == 1:
+            spawn_t = spawn_start
+        else:
+            ratio = idx / float(count - 1)
+            base_spawn_t = spawn_start + (spawn_end - spawn_start) * ratio
+            jitter_span = max(0.0, (spawn_end - spawn_start) / max(1, count - 1) * 0.20)
+            spawn_t = min(
+                spawn_end,
+                max(spawn_start, base_spawn_t + rng.uniform(-jitter_span, jitter_span)),
+            )
+        deadline_offset_s = rng.uniform(deadline_min_min, deadline_max_min) * 60.0
+        entries.append(
+            {
+                "order_id": f"TRUCKONLY-{int(seed)}-{idx + 1:02d}",
+                "spawn_sim_s": float(round(spawn_t, 6)),
+                "deadline_offset_s": float(round(deadline_offset_s, 6)),
+                "payload_weight": float(round(rng.uniform(weight_min, weight_max), 6)),
+                "delivery_lng": float(
+                    rng.uniform(float(bounds["min_lng"]), float(bounds["max_lng"]))
+                ),
+                "delivery_lat": float(
+                    rng.uniform(float(bounds["min_lat"]), float(bounds["max_lat"]))
+                ),
+                "delivery_z": 0.0,
+                "pickup_source_id": None,
+                "source_type": None,
+            }
+        )
+    return tuple(entries)
 
 
 def _normalize_scheduled_dynamic_entry(
