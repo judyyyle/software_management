@@ -279,7 +279,7 @@ class TestTrainingEnvAdapterPhase5c(unittest.TestCase):
         self.assertIsNotNone(reservation)
         self.assertFalse(hasattr(reservation, "expires_at"))
 
-    def test_reservation_timeout_switches_to_fallback_after_delivery(self) -> None:
+    def test_rendezvous_wait_timeout_switches_to_fallback_after_arrival(self) -> None:
         env, drone_id = self._reset_controlled_env()
         entity_mgr = env._require_entity_manager()
         drone = entity_mgr.drones[drone_id]
@@ -320,7 +320,15 @@ class TestTrainingEnvAdapterPhase5c(unittest.TestCase):
 
         coarse_plan = env._build_coarse_plan_view(env._t_now)
         t_arrive_truck = coarse_plan.truck_eta_map[recover_node_id]
-        timeout_probe_t = t_arrive_truck - env._cfg.rendezvous_execution_margin_sec + 1.0
+        self.assertGreater(
+            t_arrive_truck - rendezvous_leg.arrival_time,
+            env._cfg.rendezvous_max_wait_sec,
+        )
+        timeout_probe_t = (
+            rendezvous_leg.arrival_time
+            + env._cfg.rendezvous_max_wait_sec
+            + 1.0
+        )
         reward = env._advance_to_event(timeout_probe_t)
         expected_wait_penalty = -env._cfg.lambda_wait * (
             timeout_probe_t - rendezvous_leg.arrival_time
@@ -331,6 +339,64 @@ class TestTrainingEnvAdapterPhase5c(unittest.TestCase):
             expected_wait_penalty - env._cfg.lambda_res_timeout * 1.0,
             places=6,
         )
+        self.assertEqual(env._drone_state[drone_id], TrainingDroneState.FALLBACK_RECOVERY)
+        self.assertNotIn(drone_id, env._reservations)
+        self.assertEqual(env._flight_legs[drone_id].kind, "fallback_recovery")
+
+    def test_return_to_rendezvous_does_not_timeout_until_arrival(self) -> None:
+        env, drone_id = self._reset_controlled_env()
+        entity_mgr = env._require_entity_manager()
+        drone = entity_mgr.drones[drone_id]
+        recover_node_id = sorted(entity_mgr.stations)[0]
+
+        order = self._inject_order(env, drone_id=drone_id, order_id="ORDER-P5C-02B")
+        t_deliver = env._estimate_delivery_arrival_time(drone, order)
+        env._full_backbone_cache = [
+            BackboneVisit(
+                node_id=recover_node_id,
+                arrival_time=t_deliver + 600.0,
+                departure_time=t_deliver + 600.0 + 1e-6,
+            ),
+            BackboneVisit(
+                node_id=env._require_depot().depot_id,
+                arrival_time=t_deliver + 1200.0,
+                departure_time=t_deliver + 1200.0 + 1e-6,
+            ),
+        ]
+        env._enqueue_decision(drone_id, "test_idle", None)
+
+        trigger = env._decision_queue.pop(0)
+        env._apply_dispatch_action(
+            trigger,
+            DispatchAction(
+                order_id=order.order_id,
+                mode=PolicyMode.C,
+                recover_node_id=recover_node_id,
+            ),
+        )
+        deliver_leg = env._flight_legs[drone_id]
+        env._advance_to_event(deliver_leg.arrival_time)
+        service_finish_time = env._delivery_service_legs[drone_id].finish_time
+        env._advance_to_event(service_finish_time)
+
+        rendezvous_leg = env._flight_legs[drone_id]
+        missed_truck_arrival = rendezvous_leg.arrival_time - 1.0
+        env._full_backbone_cache = [
+            BackboneVisit(
+                node_id=recover_node_id,
+                arrival_time=missed_truck_arrival,
+                departure_time=missed_truck_arrival + 1e-6,
+            ),
+        ]
+
+        env._advance_to_event(missed_truck_arrival + 0.5)
+        self.assertEqual(
+            env._drone_state[drone_id],
+            TrainingDroneState.RETURN_TO_RENDEZVOUS,
+        )
+        self.assertIn(drone_id, env._reservations)
+
+        env._advance_to_event(rendezvous_leg.arrival_time)
         self.assertEqual(env._drone_state[drone_id], TrainingDroneState.FALLBACK_RECOVERY)
         self.assertNotIn(drone_id, env._reservations)
         self.assertEqual(env._flight_legs[drone_id].kind, "fallback_recovery")
@@ -366,9 +432,21 @@ class TestTrainingEnvAdapterPhase5c(unittest.TestCase):
 
         result = env.step(WAIT_ACTION)
 
+        expected_opportunity_penalty = -env._cfg.wait_opportunity_penalty_coef * 0.1
         self.assertAlmostEqual(
             result.reward,
-            -env._cfg.wait_idle_penalty_coef * env._cfg.max_wait_decision_gap_sec,
+            -env._cfg.wait_idle_penalty_coef * env._cfg.max_wait_decision_gap_sec
+            + expected_opportunity_penalty,
+            places=6,
+        )
+        self.assertAlmostEqual(
+            result.info["wait_opportunity_penalty"],
+            expected_opportunity_penalty,
+            places=6,
+        )
+        self.assertAlmostEqual(
+            result.info["reward_breakdown"]["wait_opportunity"],
+            expected_opportunity_penalty,
             places=6,
         )
         self.assertAlmostEqual(
@@ -429,8 +507,10 @@ class TestTrainingEnvAdapterPhase5c(unittest.TestCase):
 
         result = env.step(WAIT_ACTION)
 
+        expected_opportunity_penalty = -env._cfg.wait_opportunity_penalty_coef * 0.1
         expected_post_action = (
             -env._cfg.wait_idle_penalty_coef * env._cfg.max_wait_decision_gap_sec
+            + expected_opportunity_penalty
         )
         self.assertAlmostEqual(
             result.reward,
@@ -453,6 +533,34 @@ class TestTrainingEnvAdapterPhase5c(unittest.TestCase):
             places=6,
         )
         self.assertNotIn(drone_id, env._agent_cost_accum)
+
+    def test_wait_opportunity_penalty_requires_legal_dispatch(self) -> None:
+        env, drone_id = self._reset_controlled_env()
+        env._planned_route_stop_i = len(env._planned_route_stops)
+        self._inject_order(
+            env,
+            drone_id=drone_id,
+            order_id="ORDER-P5C-WAIT-INFEASIBLE",
+            offset_x=1_000_000.0,
+        )
+        env._decision_queue.append(
+            DecisionTrigger(
+                decision_id=env._next_decision_id,
+                drone_id=drone_id,
+                trigger_type="test_idle",
+                trigger_station_id=None,
+            )
+        )
+        env._next_decision_id += 1
+
+        result = env.step(WAIT_ACTION)
+
+        self.assertNotIn("wait_opportunity_penalty", result.info)
+        self.assertAlmostEqual(
+            result.reward,
+            -env._cfg.wait_idle_penalty_coef * env._cfg.max_wait_decision_gap_sec,
+            places=6,
+        )
 
     def test_consume_terminal_agent_costs_clears_tail_accumulator(self) -> None:
         env, drone_id = self._reset_controlled_env()

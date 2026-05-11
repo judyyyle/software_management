@@ -172,6 +172,8 @@ candidate:
   # Run14: 拆分 filter / execution 两个 margin，避免候选过滤与执行重验共用同一阈值。
   rendezvous_filter_margin_sec: 30
   rendezvous_execution_margin_sec: 10
+  # UAV 到达 rendezvous 点后允许等待卡车的最长时间；用于候选过滤与执行期等待超时。
+  rendezvous_max_wait_sec: 240
   energy_safe_margin_ratio: 0.10
 
   # 候选集排序和裁剪的稳定化开关。
@@ -265,6 +267,9 @@ reward:
   lambda_wait: 0.08
   # Run12: 10m/s 机型下 0.25 会把低密度场景的安全等待几乎全部打成噪声。
   wait_idle_penalty_coef: 0.10
+  # 当 IDLE UAV 在当前确有合法派单动作时仍选择 WAIT，立即施加小额机会成本。
+  # 只惩罚“跳过可执行派单”的 WAIT，避免未接单 pending 超时完全缺少 credit。
+  wait_opportunity_penalty_coef: 2.0
   lambda_queue: 0.10
   lambda_miss: 0.15
   lambda_res_timeout: 0.10
@@ -334,6 +339,20 @@ training:
   max_grad_norm: 1.0
   normalize_advantage: true
   target_kl: 0.05
+  # 降低 WAIT 样本对 recurrent PPO loss 的主导，同时放大稀疏 dispatch/C 信号。
+  # 只改变 loss 贡献，不删除 transition，保持每架 UAV 的时间序列与 GAE 连续。
+  wait_without_dispatch_loss_weight: 0.10
+  wait_with_dispatch_loss_weight: 0.35
+  mode_b_dispatch_loss_weight: 1.25
+  mode_c_dispatch_loss_weight: 1.75
+
+  # 训练订单强度 curriculum：前期仅在 benchmark 附近的 0.35/0.40 训练，
+  # 后续再逐步引入 high=0.60，避免一开始被高压 backlog 主导。
+  train_arrival_curriculum_enabled: true
+  train_arrival_base_rate_per_min: 0.35
+  train_arrival_high_start_update: 40
+  train_arrival_high_full_update: 120
+  train_arrival_high_max_probability: 0.25
 
   # 训练/评估过程控制。
   log_interval_updates: 1

@@ -301,12 +301,14 @@ class _YamlConfig:
     recovery_pool_future_scan_limit: int
     rendezvous_filter_margin_sec: float
     rendezvous_execution_margin_sec: float
+    rendezvous_max_wait_sec: float
     reservation_enabled: bool
     reservation_alpha: float
     reservation_beta: float
     reservation_gamma: float
     lambda_wait: float
     wait_idle_penalty_coef: float
+    wait_opportunity_penalty_coef: float
     lambda_queue: float
     lambda_miss: float
     lambda_res_timeout: float
@@ -397,6 +399,7 @@ class TrainingEnvAdapter:
         self._mode_b_pending_depot_return: dict[DroneId, NodeId] = {}
         self._reservations: dict[DroneId, ReservationState] = {}
         self._reservation_count: dict[NodeId, int] = {}
+        self._rendezvous_wait_started_at: dict[DroneId, float] = {}
         # 车载充换电完成时刻；到点后 charging_on_truck -> riding_with_truck。
         self._truck_charge_until: dict[DroneId, float] = {}
         self._decision_queue: list[DecisionTrigger] = []
@@ -477,6 +480,12 @@ class TrainingEnvAdapter:
     # Public API
     # ---------------------------------------------------------------------
 
+    def set_order_source(self, order_source: OrderSourceConfig) -> None:
+        """更新下一次 reset() 使用的订单源配置。"""
+
+        self._order_source = order_source
+        self._current_episode_order_source_seed = int(order_source.seed)
+
     def reset(self) -> EnvStepResult:
         """重建一个全新的 episode，并返回首个可见状态。
 
@@ -516,6 +525,7 @@ class TrainingEnvAdapter:
         self._mode_b_pending_depot_return.clear()
         self._reservations.clear()
         self._reservation_count.clear()
+        self._rendezvous_wait_started_at.clear()
         self._truck_charge_until.clear()
         self._decision_queue.clear()
         self._next_decision_id = 0
@@ -647,6 +657,10 @@ class TrainingEnvAdapter:
         reward_breakdown["attributed_carry_in"] = applied.carried_reward
         reward_breakdown["attributed_post_action"] = post_action_reward
         reward_breakdown["attributed_total"] = reward
+        if "wait_opportunity_penalty" in info:
+            reward_breakdown["wait_opportunity"] = float(
+                info["wait_opportunity_penalty"]
+            )
 
         self._last_reward_breakdown = reward_breakdown
 
@@ -696,7 +710,8 @@ class TrainingEnvAdapter:
                 info={"event": "advance_to_time", "target_time": target},
             )
 
-        target = min(target, float(self._cfg.upper_horizon_sec))
+        if stop_on_training_done:
+            target = min(target, float(self._cfg.upper_horizon_sec))
         reward_breakdown: dict[str, float] = {}
         while (
             (not stop_on_training_done or not self.is_done())
@@ -710,7 +725,10 @@ class TrainingEnvAdapter:
                 next_time = min(float(next_time), target)
             if next_time <= self._t_now + _TIME_EPS:
                 next_time = min(target, self._t_now + 1.0)
-            self._advance_to_event(next_time)
+            self._advance_to_event(
+                next_time,
+                clamp_to_horizon=stop_on_training_done,
+            )
             _merge_reward_breakdown(reward_breakdown, self._last_reward_breakdown)
 
         self._last_reward_breakdown = reward_breakdown
@@ -1323,7 +1341,7 @@ class TrainingEnvAdapter:
         return CoarsePlanView(
             plan_version=0,
             issued_at=float(t_now),
-            valid_until=float(self._cfg.upper_horizon_sec),
+            valid_until=max(float(t_now), float(self._cfg.upper_horizon_sec)),
             truck_backbone_route=truck_backbone_route,
             truck_eta_map=truck_eta_map,
             authorized_orders=tuple(authorized_orders),
@@ -1510,9 +1528,27 @@ class TrainingEnvAdapter:
         node_id: str,
         t_now: float,
     ) -> float | None:
-        future_visits = self._future_backbone_visits(t_now)
-        for visit in future_visits:
-            if visit.node_id == node_id:
+        return self._next_backbone_arrival_time_for_node(
+            node_id,
+            t_now,
+            include_current=False,
+        )
+
+    def _next_backbone_arrival_time_for_node(
+        self,
+        node_id: str | None,
+        t_now: float,
+        *,
+        include_current: bool,
+    ) -> float | None:
+        """返回某节点在给定时刻之后的下一次卡车到达时间。"""
+        if node_id is None:
+            return None
+        threshold = float(t_now) - (_TIME_EPS if include_current else -_TIME_EPS)
+        for visit in self._full_backbone_cache:
+            if visit.node_id != node_id:
+                continue
+            if float(visit.arrival_time) >= threshold:
                 return float(visit.arrival_time)
         return None
 
@@ -1623,6 +1659,15 @@ class TrainingEnvAdapter:
             current_state = self._drone_state[deciding_drone_id]
             info["applied_action"] = "WAIT"
             if current_state == TrainingDroneState.IDLE:
+                opportunity_penalty = self._compute_wait_opportunity_penalty(
+                    decision=decision
+                )
+                if opportunity_penalty:
+                    self._agent_cost_accum[deciding_drone_id] = (
+                        self._agent_cost_accum.get(deciding_drone_id, 0.0)
+                        + opportunity_penalty
+                    )
+                    info["wait_opportunity_penalty"] = opportunity_penalty
                 delta_wait = self._compute_wait_delta(deciding_drone_id)
                 wait_until = self._t_now + delta_wait
                 self._apply_wait_action(deciding_drone_id)
@@ -1833,12 +1878,20 @@ class TrainingEnvAdapter:
                 next_time = min(self._cfg.upper_horizon_sec, self._t_now + 1.0)
             self._advance_to_event(next_time)
 
-    def _advance_to_event(self, t_next: float) -> float:
+    def _advance_to_event(
+        self,
+        t_next: float,
+        *,
+        clamp_to_horizon: bool = True,
+    ) -> float:
         """推进到给定绝对时刻，并结算该区间内跨过的事件。
 
         返回值为全局事件奖励（仅用于 _last_reward_breakdown 记录）。
         per-dt 成本和事件奖励均已写入 _agent_cost_accum，step() 从中按 drone 取值。
         """
+        t_next = float(t_next)
+        if clamp_to_horizon:
+            t_next = min(t_next, float(self._cfg.upper_horizon_sec))
         if t_next < self._t_now - _TIME_EPS:
             raise ValueError(f"不能回退时间: t_next={t_next}, t_now={self._t_now}")
 
@@ -2004,7 +2057,7 @@ class TrainingEnvAdapter:
         order_mgr.tick(t_next, entity_mgr)
 
         # 6. 生成 decision context / done
-        self._t_now = min(float(t_next), float(self._cfg.upper_horizon_sec))
+        self._t_now = float(t_next)
         station_trigger: str | None = None
         refreshed_runtime_state = self.build_runtime_state_view()
         self._refresh_coarse_plan_if_needed(refreshed_runtime_state)
@@ -2167,7 +2220,21 @@ class TrainingEnvAdapter:
         self._flight_legs.pop(drone_id, None)
 
         if leg.kind == "return_to_rendezvous":
+            next_truck_arrival = self._next_backbone_arrival_time_for_node(
+                leg.target_node_id,
+                leg.arrival_time,
+                include_current=True,
+            )
+            if next_truck_arrival is None:
+                self._release_reservation(drone_id)
+                if not self._enter_fallback_recovery(
+                    drone_id,
+                    start_time=leg.arrival_time,
+                ):
+                    self._mark_hard_failure(drone_id)
+                return
             self._drone_state[drone_id] = TrainingDroneState.WAITING_FOR_TRUCK
+            self._rendezvous_wait_started_at[drone_id] = float(leg.arrival_time)
             return
 
         if leg.kind == "mode_b_return_to_depot":
@@ -2204,6 +2271,7 @@ class TrainingEnvAdapter:
 
         for drone_id in recovered:
             self._release_reservation(drone_id)
+            self._rendezvous_wait_started_at.pop(drone_id, None)
             self._drone_state[drone_id] = TrainingDroneState.CHARGING_ON_TRUCK
             self._episode_mode_c_success_count += 1
             self._truck_charge_until[drone_id] = (
@@ -2529,6 +2597,7 @@ class TrainingEnvAdapter:
 
     def _release_reservation(self, drone_id: str) -> None:
         """释放某架 UAV 当前 reservation，并回写节点计数。"""
+        self._rendezvous_wait_started_at.pop(drone_id, None)
         reservation = self._reservations.pop(drone_id, None)
         if reservation is None:
             return
@@ -2540,7 +2609,7 @@ class TrainingEnvAdapter:
             self._reservation_count[node_id] = current - 1
 
     def _process_reservation_timeouts(self, t_now: float) -> float:
-        """扫描所有 reservation timeout，并执行 5c 兜底转移。
+        """扫描所有 rendezvous 等待 timeout，并执行 5c 兜底转移。
 
         reservation timeout 是 fallback 路径的一部分，归因给持有该 reservation 的无人机。
         """
@@ -2572,11 +2641,7 @@ class TrainingEnvAdapter:
             self._agent_cost_accum[drone_id] = (
                 self._agent_cost_accum.get(drone_id, 0.0) + timeout_penalty
             )
-            if self._drone_state.get(drone_id) in {
-                TrainingDroneState.RETURN_TO_RENDEZVOUS,
-                TrainingDroneState.WAITING_FOR_TRUCK,
-                TrainingDroneState.DELIVERED,
-            }:
+            if self._drone_state.get(drone_id) == TrainingDroneState.WAITING_FOR_TRUCK:
                 if not self._enter_fallback_recovery(drone_id, start_time=t_now):
                     hard_penalty = self._mark_hard_failure(drone_id)
                     reward += hard_penalty
@@ -2596,45 +2661,27 @@ class TrainingEnvAdapter:
         返回非 None 表示 timeout，上层会释放 reservation 并触发 fallback。
         返回 0.0 表示 timeout 但无额外惩罚（如卡车已离开）。
         """
-        if self._drone_state.get(drone_id) not in {
-            TrainingDroneState.DELIVERED,
-            TrainingDroneState.RETURN_TO_RENDEZVOUS,
-            TrainingDroneState.WAITING_FOR_TRUCK,
-        }:
+        if self._drone_state.get(drone_id) != TrainingDroneState.WAITING_FOR_TRUCK:
             return None
 
-        drone = self._require_entity_manager().drones[drone_id]
-        host = self._resolve_fixed_node(reservation.recover_node)
-        host_pos = host.get_location(t_now)
-        coarse_plan = self._build_coarse_plan_view(t_now)
-        t_arrive_truck = coarse_plan.truck_eta_map.get(reservation.recover_node)
-        # 卡车已到站并离开（arrival_time <= t_now），rendezvous 不再可能。
-        # 0 penalty：非无人机过失，fallback 本身已有惩罚。
-        if t_arrive_truck is None:
-            return 0.0
-        t_arrive_uav = t_now + self._estimate_flight_time(
-            drone=drone,
-            from_pos=drone.current_loc,
-            to_pos=host_pos,
+        next_truck_arrival = self._next_backbone_arrival_time_for_node(
+            reservation.recover_node,
+            t_now,
+            include_current=True,
         )
-        if (
-            t_arrive_uav + self._cfg.rendezvous_execution_margin_sec
-            > t_arrive_truck + _TIME_EPS
-        ):
-            return (
-                t_arrive_uav
-                + self._cfg.rendezvous_execution_margin_sec
-                - t_arrive_truck
-            )
-        # 注意：不在此处做能量检查。
-        # RETURN_TO_RENDEZVOUS：飞行段已提交，energy_cost_j 在调度时锁定，
-        #   _effective_battery_current 与 _can_reach_from 数值一致，检查恒为 True，
-        #   若因浮点误差翻转会错误触发 fallback。
-        # WAITING_FOR_TRUCK：无人机已到达回收节点，距离为 0，检查恒为 True。
-        # DELIVERED：_process_delivery_service_event 在同帧更早执行，
-        #   无人机不会以 DELIVERED 状态到达此处。
-        # 能量可行性的正确检查点：_is_mode_c_recovery_feasible（调度时）
-        #   和 _revalidate_mode_c_recover_node（送达后）。
+        if next_truck_arrival is None:
+            return 0.0
+
+        wait_started_at = self._rendezvous_wait_started_at.get(drone_id)
+        if wait_started_at is None:
+            return None
+        wait_overrun = (
+            float(t_now)
+            - float(wait_started_at)
+            - float(self._cfg.rendezvous_max_wait_sec)
+        )
+        if wait_overrun > _TIME_EPS:
+            return wait_overrun
         return None
 
     def _apply_hard_overdue_penalty(self, t_now: float) -> float:
@@ -2678,6 +2725,47 @@ class TrainingEnvAdapter:
         if not self._is_uav_primary_order(order):
             return False
         return (t_now - float(order.deadline)) > self._cfg.max_overdue_sec + _TIME_EPS
+
+    def _compute_wait_opportunity_penalty(self, *, decision: DecisionContext) -> float:
+        """计算 IDLE WAIT 跳过当前合法派单集合时的即时机会成本。
+
+        只基于当前 `action_lookup` 中真实存在的 DispatchAction 计算，避免把
+        当前无人机无法执行的 pending 订单误算进 WAIT 惩罚。
+        """
+        coef = float(self._cfg.wait_opportunity_penalty_coef)
+        if coef <= _TIME_EPS:
+            return 0.0
+
+        dispatch_order_ids = {
+            str(action.order_id)
+            for action in decision.action_lookup
+            if isinstance(action, DispatchAction)
+        }
+        if not dispatch_order_ids:
+            return 0.0
+
+        pending_orders = decision.runtime_state.pending_orders
+        eligible_orders = [
+            pending_orders[order_id]
+            for order_id in sorted(dispatch_order_ids)
+            if order_id in pending_orders
+            and self._is_uav_primary_order(pending_orders[order_id])
+        ]
+        if not eligible_orders:
+            return 0.0
+
+        t_now = float(decision.t_decision)
+        urgency = 0.0
+        for order in eligible_orders:
+            remaining = max(0.0, float(order.deadline) - t_now)
+            window = max(_TIME_EPS, float(order.time_window_seconds))
+            urgency = max(urgency, 1.0 - min(remaining / window, 1.0))
+
+        backlog_factor = min(float(len(eligible_orders)), 5.0) / 5.0
+        pressure = 0.5 * urgency + 0.5 * backlog_factor
+        if pressure <= _TIME_EPS:
+            return 0.0
+        return -coef * pressure
 
     def _force_remove_assigned_order(self, order_id: str, t_now: float) -> float:
         """强制移除已指派但已 hard overdue 的订单。"""
@@ -2902,10 +2990,10 @@ class TrainingEnvAdapter:
             from_pos=deliver_pos,
             to_pos=recover_pos,
         )
-        if (
-            t_arrive_uav + self._cfg.rendezvous_filter_margin_sec
-            > t_arrive_truck + _TIME_EPS
-        ):
+        planned_wait = float(t_arrive_truck) - float(t_arrive_uav)
+        if planned_wait < self._cfg.rendezvous_execution_margin_sec - _TIME_EPS:
+            return False
+        if planned_wait > self._cfg.rendezvous_max_wait_sec + _TIME_EPS:
             return False
 
         return self._can_reach_from(
@@ -3297,17 +3385,23 @@ class TrainingEnvAdapter:
 
     def _next_reservation_timeout_probe_time(self) -> float:
         probe_times: list[float] = []
-        coarse_plan = self._build_coarse_plan_view(self._t_now)
         for drone_id, reservation in self._reservations.items():
             state = self._drone_state.get(drone_id)
             if state != TrainingDroneState.WAITING_FOR_TRUCK:
                 continue
-            t_arrive_truck = coarse_plan.truck_eta_map.get(reservation.recover_node)
-            if t_arrive_truck is None:
+            next_truck_arrival = self._next_backbone_arrival_time_for_node(
+                reservation.recover_node,
+                self._t_now,
+                include_current=True,
+            )
+            if next_truck_arrival is None:
                 probe_times.append(self._t_now + _TIME_EPS)
                 continue
-            trigger_time = float(t_arrive_truck) - float(
-                self._cfg.rendezvous_execution_margin_sec
+            wait_started_at = self._rendezvous_wait_started_at.get(drone_id)
+            if wait_started_at is None:
+                continue
+            trigger_time = float(wait_started_at) + float(
+                self._cfg.rendezvous_max_wait_sec
             )
             if trigger_time > self._t_now + _TIME_EPS:
                 probe_times.append(trigger_time + _TIME_EPS)
@@ -3663,6 +3757,7 @@ class TrainingEnvAdapter:
         seq = self._planned_route_stops[-1].seq
         t_cursor = last_stop.departure_time
         patrol_k = min(len(stations), self._cfg.patrol_stations_per_loop)
+        patrol_offset = 0
         station_hold_time = max(
             float(self._scene_solver_params().truck_drone_launch_time_s),
             float(self._scene_solver_params().truck_drone_recover_time_s),
@@ -3672,19 +3767,22 @@ class TrainingEnvAdapter:
         # 避免 episode 尾段再次出现"未来 backbone 耗尽"的契约破口。
         while t_cursor < self._cfg.upper_horizon_sec:
             current_pos = _clone_position(depot.location)
-            available = list(stations)
+            pending_batch = [
+                stations[(patrol_offset + idx) % len(stations)]
+                for idx in range(patrol_k)
+            ]
+            patrol_offset = (patrol_offset + patrol_k) % len(stations)
             chosen: list[SwapStation] = []
 
-            for _ in range(patrol_k):
-                # 当前实现按文档要求使用最近邻直线距离拼接巡站，不做 OSM 精确规划。
+            while pending_batch:
                 next_station = min(
-                    available,
+                    pending_batch,
                     key=lambda station: (
                         current_pos.distance_2d(station.location),
                         station.station_id,
                     ),
                 )
-                available.remove(next_station)
+                pending_batch.remove(next_station)
                 chosen.append(next_station)
                 current_pos = next_station.location
 
@@ -4111,7 +4209,7 @@ def _load_env_yaml(config_path: Path) -> _YamlConfig:
             "max_candidate_recovery_per_order"
         )
 
-    return _YamlConfig(
+    cfg = _YamlConfig(
         upper_horizon_sec=float(planner["upper_horizon_sec"]),
         patrol_min_remaining_sec=float(planner["patrol_min_remaining_sec"]),
         patrol_stations_per_loop=int(planner["patrol_stations_per_loop"]),
@@ -4137,12 +4235,21 @@ def _load_env_yaml(config_path: Path) -> _YamlConfig:
                 ),
             )
         ),
+        rendezvous_max_wait_sec=float(
+            candidate.get(
+                "rendezvous_max_wait_sec",
+                candidate["station_wait_threshold_sec"],
+            )
+        ),
         reservation_enabled=bool(reservation.get("enable", True)),
         reservation_alpha=float(reservation["alpha"]),
         reservation_beta=float(reservation["beta"]),
         reservation_gamma=float(reservation["gamma"]),
         lambda_wait=float(reward["lambda_wait"]),
         wait_idle_penalty_coef=float(reward["wait_idle_penalty_coef"]),
+        wait_opportunity_penalty_coef=float(
+            reward.get("wait_opportunity_penalty_coef", 0.0)
+        ),
         lambda_queue=float(reward["lambda_queue"]),
         lambda_miss=float(reward["lambda_miss"]),
         lambda_res_timeout=float(reward["lambda_res_timeout"]),
@@ -4152,6 +4259,14 @@ def _load_env_yaml(config_path: Path) -> _YamlConfig:
         hard_overdue_penalty_sec=float(reward["hard_overdue_penalty_sec"]),
         hard_failure_penalty_sec=float(reward["hard_failure_penalty_sec"]),
     )
+    if cfg.rendezvous_execution_margin_sec < 0.0:
+        raise ValueError("candidate.rendezvous_execution_margin_sec 不能为负数")
+    if cfg.rendezvous_max_wait_sec < cfg.rendezvous_execution_margin_sec:
+        raise ValueError(
+            "candidate.rendezvous_max_wait_sec 不能小于 "
+            "rendezvous_execution_margin_sec"
+        )
+    return cfg
 
 
 def _load_json(path: Path) -> dict[str, Any]:

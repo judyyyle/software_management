@@ -758,6 +758,7 @@ class CandidateMeta:
     station_wait_threshold_sec: float
     rendezvous_filter_margin_sec: float
     rendezvous_execution_margin_sec: float
+    rendezvous_max_wait_sec: float
     energy_safe_margin_ratio: float
 
 

@@ -204,9 +204,12 @@ class PlannerBridge:
         return CoarsePlanView(
             plan_version=plan_version,
             issued_at=float(t_now),
-            valid_until=min(
-                float(t_now + self._cfg.coarse_replan_interval_sec),
-                float(self._cfg.upper_horizon_sec),
+            valid_until=max(
+                float(t_now),
+                min(
+                    float(t_now + self._cfg.coarse_replan_interval_sec),
+                    float(self._cfg.upper_horizon_sec),
+                ),
             ),
             truck_backbone_route=truck_backbone_route,
             truck_eta_map=truck_eta_map,
