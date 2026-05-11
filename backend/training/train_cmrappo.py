@@ -97,6 +97,10 @@ class _TrainingConfig:
     max_grad_norm: float
     normalize_advantage: bool
     target_kl: float
+    wait_without_dispatch_loss_weight: float
+    wait_with_dispatch_loss_weight: float
+    mode_b_dispatch_loss_weight: float
+    mode_c_dispatch_loss_weight: float
     training_seed: int
     log_interval_updates: int
     save_interval_updates: int
@@ -125,6 +129,11 @@ class _EvalConfig:
     benchmark_seed: int
     stochastic_seed_base: int
     stochastic_arrival_rates: tuple[tuple[str, float], ...]
+    train_arrival_curriculum_enabled: bool
+    train_arrival_base_rate: float
+    train_arrival_high_start_update: int
+    train_arrival_high_full_update: int
+    train_arrival_high_max_probability: float
     c_sensitive_enabled: bool
     c_sensitive_seed: int
     c_sensitive_min_legal_mode_c_recovery_nodes: int
@@ -140,6 +149,7 @@ class _MaterializedSequence:
     transitions: tuple[RolloutTransition, ...]
     advantages: np.ndarray
     returns: np.ndarray
+    sample_loss_weights: np.ndarray
     valid_timestep_mask: np.ndarray
 
 
@@ -153,6 +163,7 @@ class _SequenceMiniBatch:
     old_values: Any
     returns: Any
     advantages: Any
+    sample_loss_weights: Any
     valid_timestep_mask: Any
     lstm_state_in: Any | None
     sequence_count: int
@@ -448,12 +459,88 @@ class _EpisodeAccumulator:
     episode_id: int
     order_source_mode: str
     order_source_seed: int
+    train_arrival_band: str | None = None
+    train_arrival_rate_per_min: float | None = None
     global_step_start: int | None = None
     global_step_end: int | None = None
     update_start: int | None = None
     update_end: int | None = None
     decision_count: int = 0
     total_reward: float = 0.0
+
+
+def _sample_training_arrival_band(
+    eval_cfg: _EvalConfig,
+    *,
+    update_idx: int = 0,
+) -> tuple[str, float]:
+    if bool(getattr(eval_cfg, "train_arrival_curriculum_enabled", False)):
+        rates = dict(getattr(eval_cfg, "stochastic_arrival_rates", ()))
+        base_rate = float(getattr(eval_cfg, "train_arrival_base_rate"))
+        medium_rate = float(rates.get("medium", base_rate))
+        high_rate = float(rates.get("high", medium_rate))
+        high_start = int(getattr(eval_cfg, "train_arrival_high_start_update", 0))
+        high_full = int(getattr(eval_cfg, "train_arrival_high_full_update", high_start))
+        high_max_p = float(getattr(eval_cfg, "train_arrival_high_max_probability", 0.0))
+        if update_idx < high_start or high_max_p <= 0.0:
+            high_p = 0.0
+        elif high_full <= high_start:
+            high_p = high_max_p
+        else:
+            progress = min(
+                1.0,
+                max(0.0, (float(update_idx) - float(high_start)) / float(high_full - high_start)),
+            )
+            high_p = high_max_p * progress
+
+        if high_p > 0.0 and random.random() < high_p:
+            return "high", high_rate
+        if random.random() < 0.5:
+            return "base", base_rate
+        return "medium", medium_rate
+
+    band_name, arrival_rate = random.choice(tuple(eval_cfg.stochastic_arrival_rates))
+    return str(band_name), float(arrival_rate)
+
+
+def _build_training_episode_order_source(
+    *,
+    scene_ctx: Any,
+    config_path: str | Path,
+    eval_cfg: _EvalConfig,
+    base_order_source: OrderSourceConfig,
+    update_idx: int = 0,
+) -> tuple[str, float, OrderSourceConfig]:
+    band_name, arrival_rate = _sample_training_arrival_band(
+        eval_cfg,
+        update_idx=update_idx,
+    )
+    order_source = build_order_source(
+        scene_ctx,
+        mode=OrderSourceMode.POISSON,
+        seed=base_order_source.seed,
+        overrides={"poisson_arrival_rate": arrival_rate},
+        config_path=config_path,
+    )
+    return band_name, arrival_rate, order_source
+
+
+def _compute_transition_loss_weight(
+    *,
+    train_cfg: _TrainingConfig,
+    action_indices: ResolvedActionIndices,
+    candidate_out: Any,
+) -> float:
+    if int(action_indices.root_branch_idx) == 0:
+        has_dispatch = bool(candidate_out.resolved_action_lookup.dispatch_actions)
+        return (
+            float(train_cfg.wait_with_dispatch_loss_weight)
+            if has_dispatch
+            else float(train_cfg.wait_without_dispatch_loss_weight)
+        )
+    if int(action_indices.mode_idx or 0) == 1:
+        return float(train_cfg.mode_c_dispatch_loss_weight)
+    return float(train_cfg.mode_b_dispatch_loss_weight)
 
 
 def train_cmrappo(
@@ -494,6 +581,18 @@ def train_cmrappo(
     critic_builder = CriticBatchBuilder(scene_ctx=scene_ctx, config_path=config_path)
     critic_schema = critic_builder.default_schema_meta
 
+    global_step = 0
+    update_idx = 0
+    current_train_arrival_band, current_train_arrival_rate, current_train_order_source = (
+        _build_training_episode_order_source(
+            scene_ctx=scene_ctx,
+            config_path=config_path,
+            eval_cfg=eval_cfg,
+            base_order_source=order_source,
+            update_idx=update_idx,
+        )
+    )
+    env.set_order_source(current_train_order_source)
     initial_result = env.reset()
     if initial_result.decision_context is None:
         raise RuntimeError("reset 后没有可用的 decision_context，无法启动训练")
@@ -556,14 +655,14 @@ def train_cmrappo(
     config_snapshot_path = out_dir / "training_config_snapshot.yaml"
     model_version = model_version or datetime.now(timezone.utc).strftime("cmrappo_%Y%m%dT%H%M%SZ")
 
-    global_step = 0
-    update_idx = 0
     current_result = initial_result
     episode_acc = _EpisodeAccumulator(
         phase="train",
         episode_id=episode_id,
         order_source_mode=str(order_source.mode.value),
         order_source_seed=env.current_episode_order_source_seed(),
+        train_arrival_band=current_train_arrival_band,
+        train_arrival_rate_per_min=current_train_arrival_rate,
         global_step_start=0,
         update_start=0,
     )
@@ -575,6 +674,8 @@ def train_cmrappo(
             "episode_id": episode_id,
             "global_step": global_step,
             "update_idx": update_idx,
+            "train_arrival_band": current_train_arrival_band,
+            "train_arrival_rate_per_min": current_train_arrival_rate,
             "env": env,
             "result": current_result,
         },
@@ -628,6 +729,18 @@ def train_cmrappo(
             if current_result.done:
                 if pending_transition_by_drone:
                     raise RuntimeError("episode 已结束，但仍有未 finalize 的 pending transition")
+                (
+                    current_train_arrival_band,
+                    current_train_arrival_rate,
+                    current_train_order_source,
+                ) = _build_training_episode_order_source(
+                    scene_ctx=scene_ctx,
+                    config_path=config_path,
+                    eval_cfg=eval_cfg,
+                    base_order_source=order_source,
+                    update_idx=update_idx,
+                )
+                env.set_order_source(current_train_order_source)
                 current_result = env.reset()
                 episode_id += 1
                 episode_acc = _EpisodeAccumulator(
@@ -635,6 +748,8 @@ def train_cmrappo(
                     episode_id=episode_id,
                     order_source_mode=str(order_source.mode.value),
                     order_source_seed=env.current_episode_order_source_seed(),
+                    train_arrival_band=current_train_arrival_band,
+                    train_arrival_rate_per_min=current_train_arrival_rate,
                     global_step_start=global_step,
                     update_start=update_idx,
                 )
@@ -650,6 +765,8 @@ def train_cmrappo(
                         "episode_id": episode_id,
                         "global_step": global_step,
                         "update_idx": update_idx,
+                        "train_arrival_band": current_train_arrival_band,
+                        "train_arrival_rate_per_min": current_train_arrival_rate,
                         "env": env,
                         "result": current_result,
                     },
@@ -658,6 +775,18 @@ def train_cmrappo(
             if decision_context is None:
                 if pending_transition_by_drone:
                     raise RuntimeError("decision_context 丢失时仍有未 finalize 的 pending transition")
+                (
+                    current_train_arrival_band,
+                    current_train_arrival_rate,
+                    current_train_order_source,
+                ) = _build_training_episode_order_source(
+                    scene_ctx=scene_ctx,
+                    config_path=config_path,
+                    eval_cfg=eval_cfg,
+                    base_order_source=order_source,
+                    update_idx=update_idx,
+                )
+                env.set_order_source(current_train_order_source)
                 current_result = env.reset()
                 episode_id += 1
                 episode_acc = _EpisodeAccumulator(
@@ -665,6 +794,8 @@ def train_cmrappo(
                     episode_id=episode_id,
                     order_source_mode=str(order_source.mode.value),
                     order_source_seed=env.current_episode_order_source_seed(),
+                    train_arrival_band=current_train_arrival_band,
+                    train_arrival_rate_per_min=current_train_arrival_rate,
                     global_step_start=global_step,
                     update_start=update_idx,
                 )
@@ -680,6 +811,8 @@ def train_cmrappo(
                         "episode_id": episode_id,
                         "global_step": global_step,
                         "update_idx": update_idx,
+                        "train_arrival_band": current_train_arrival_band,
+                        "train_arrival_rate_per_min": current_train_arrival_rate,
                         "env": env,
                         "result": current_result,
                     },
@@ -777,6 +910,11 @@ def train_cmrappo(
                 local_decision_index=local_decision_index,
                 global_decision_index=global_step,
                 decision_context_debug_snapshot=decision_context,
+                sample_loss_weight=_compute_transition_loss_weight(
+                    train_cfg=train_cfg,
+                    action_indices=action_indices,
+                    candidate_out=candidate_out,
+                ),
                 rendezvous_arrive_bonus_applied=arrive_bonus_applied,
                 rendezvous_success_bonus_applied=success_bonus_applied,
             )
@@ -1175,6 +1313,12 @@ def _finalize_episode_metrics(
         "update_start": accumulator.update_start,
         "update_end": update_idx_end,
     }
+    if accumulator.train_arrival_band is not None:
+        payload["train_arrival_band"] = str(accumulator.train_arrival_band)
+    if accumulator.train_arrival_rate_per_min is not None:
+        payload["train_arrival_rate_per_min"] = float(
+            accumulator.train_arrival_rate_per_min
+        )
     payload.update(dict(episode_snapshot))
     return payload
 
@@ -1223,7 +1367,11 @@ def _build_c_sensitive_eval_order_source(
 
     selected_order_ids: list[str] = []
     candidate_count_by_order_id: dict[str, int] = {}
+    skipped_after_horizon = 0
     for dynamic_order in scene_ctx.dynamic_orders:
+        if float(dynamic_order.spawn_sim_s) > analysis_env._cfg.upper_horizon_sec:
+            skipped_after_horizon += 1
+            continue
         order_mgr.pending_orders.clear()
         order_mgr.assigned_orders.clear()
         order_mgr.completed_orders.clear()
@@ -1272,6 +1420,7 @@ def _build_c_sensitive_eval_order_source(
             "selected_dynamic_order_legal_mode_c_node_counts": dict(
                 candidate_count_by_order_id
             ),
+            "skipped_dynamic_order_count_after_horizon": int(skipped_after_horizon),
             "c_sensitive_min_legal_mode_c_recovery_nodes": int(
                 eval_cfg.c_sensitive_min_legal_mode_c_recovery_nodes
             ),
@@ -1773,6 +1922,7 @@ def _compute_value_loss_masked(
     valid_mask: Any,
     loss_type: str,
     huber_delta: float,
+    sample_weights: Any | None = None,
 ) -> Any:
     normalized_loss_type = str(loss_type).strip().lower()
     diff = values - returns
@@ -1786,7 +1936,11 @@ def _compute_value_loss_masked(
         per_timestep_loss = torch.where(abs_diff <= delta, quadratic, linear)
     else:
         raise ValueError(f"未知 value_loss_type: {loss_type}")
-    return _masked_mean_tensor(per_timestep_loss, valid_mask)
+    return _masked_weighted_mean_tensor(
+        per_timestep_loss,
+        valid_mask,
+        sample_weights=sample_weights,
+    )
 
 
 def _capture_rng_state() -> dict[str, Any]:
@@ -2015,6 +2169,12 @@ def _ppo_update(
             advantages_flat = advantages_t.reshape(-1)
             valid_mask_flat = valid_mask.reshape(-1)
             values_flat = policy_seq_out.value.reshape(-1)
+            sample_loss_weights = getattr(minibatch, "sample_loss_weights", None)
+            sample_loss_weights_flat = (
+                None
+                if sample_loss_weights is None
+                else sample_loss_weights.reshape(-1)
+            )
 
             ratio = torch.exp(new_log_probs - old_log_probs)
             unclipped = ratio * advantages_flat
@@ -2026,6 +2186,7 @@ def _ppo_update(
             policy_loss = -_masked_mean_tensor(
                 torch.min(unclipped, clipped),
                 valid_mask_flat,
+                sample_weights=sample_loss_weights_flat,
             )
             value_loss = _compute_value_loss_masked(
                 values=values_flat,
@@ -2033,8 +2194,13 @@ def _ppo_update(
                 valid_mask=valid_mask_flat,
                 loss_type=train_cfg.value_loss_type,
                 huber_delta=train_cfg.value_huber_delta,
+                sample_weights=sample_loss_weights_flat,
             )
-            entropy_loss = _masked_mean_tensor(entropy, valid_mask_flat)
+            entropy_loss = _masked_mean_tensor(
+                entropy,
+                valid_mask_flat,
+                sample_weights=sample_loss_weights_flat,
+            )
             approx_kl_t = _compute_masked_approx_kl(
                 old_log_probs=old_log_probs,
                 new_log_probs=new_log_probs,
@@ -2080,6 +2246,20 @@ def _ppo_update(
             )
         ),
         "reward_mean": float(np.mean(batch_view.rewards)),
+        "sample_loss_weight_mean": float(
+            np.mean(
+                np.concatenate(
+                    [
+                        getattr(
+                            sequence,
+                            "sample_loss_weights",
+                            np.ones_like(sequence.advantages, dtype=np.float32),
+                        )[sequence.valid_timestep_mask]
+                        for sequence in sequences
+                    ]
+                )
+            )
+        ),
         "sequence_count": float(len(sequences)),
         "valid_timestep_count": float(total_valid_timesteps),
         "padded_timestep_count": float(total_padded_timesteps),
@@ -2402,6 +2582,13 @@ def _materialize_recurrent_sequences(
             transitions = tuple(batch_view.transitions[i] for i in chunk_indices)
             advantages = drone_advantages[chunk_slice].copy()
             returns = drone_returns[chunk_slice].copy()
+            sample_loss_weights = np.asarray(
+                [
+                    float(batch_view.transitions[i].sample_loss_weight)
+                    for i in chunk_indices
+                ],
+                dtype=np.float32,
+            )
             valid_mask = np.ones((len(chunk_indices),), dtype=np.bool_)
             sequences.append(
                 _MaterializedSequence(
@@ -2413,6 +2600,7 @@ def _materialize_recurrent_sequences(
                     transitions=transitions,
                     advantages=advantages,
                     returns=returns,
+                    sample_loss_weights=sample_loss_weights,
                     valid_timestep_mask=valid_mask,
                 )
             )
@@ -2499,6 +2687,7 @@ def _build_sequence_minibatch(
     old_values = np.zeros((batch_size, seq_len), dtype=np.float32)
     returns = np.zeros((batch_size, seq_len), dtype=np.float32)
     advantages = np.zeros((batch_size, seq_len), dtype=np.float32)
+    sample_loss_weights = np.zeros((batch_size, seq_len), dtype=np.float32)
     valid_timestep_mask = np.zeros((batch_size, seq_len), dtype=np.bool_)
     padded_timesteps = 0
 
@@ -2531,6 +2720,9 @@ def _build_sequence_minibatch(
             old_values[seq_row, step_idx] = float(transition.value_old)
             returns[seq_row, step_idx] = float(sequence.returns[step_idx])
             advantages[seq_row, step_idx] = float(sequence.advantages[step_idx])
+            sample_loss_weights[seq_row, step_idx] = float(
+                sequence.sample_loss_weights[step_idx]
+            )
             valid_timestep_mask[seq_row, step_idx] = bool(sequence.valid_timestep_mask[step_idx])
 
     observation_batch = _stack_sequence_observation_rows(observation_rows)
@@ -2557,6 +2749,7 @@ def _build_sequence_minibatch(
         old_values=torch.as_tensor(old_values, dtype=torch.float32, device=device),
         returns=torch.as_tensor(returns, dtype=torch.float32, device=device),
         advantages=torch.as_tensor(advantages, dtype=torch.float32, device=device),
+        sample_loss_weights=torch.as_tensor(sample_loss_weights, dtype=torch.float32, device=device),
         valid_timestep_mask=torch.as_tensor(valid_timestep_mask, dtype=torch.bool, device=device),
         lstm_state_in=lstm_state_in,
         sequence_count=batch_size,
@@ -2728,8 +2921,28 @@ def _flatten_sequence_action_indices(action_indices: Mapping[str, Any]) -> dict[
     }
 
 
-def _masked_mean_tensor(values: Any, valid_mask: Any) -> Any:
+def _masked_mean_tensor(
+    values: Any,
+    valid_mask: Any,
+    *,
+    sample_weights: Any | None = None,
+) -> Any:
+    return _masked_weighted_mean_tensor(
+        values,
+        valid_mask,
+        sample_weights=sample_weights,
+    )
+
+
+def _masked_weighted_mean_tensor(
+    values: Any,
+    valid_mask: Any,
+    *,
+    sample_weights: Any | None = None,
+) -> Any:
     weights = valid_mask.to(dtype=values.dtype)
+    if sample_weights is not None:
+        weights = weights * sample_weights.to(dtype=values.dtype)
     denom = weights.sum().clamp(min=1.0)
     return (values * weights).sum() / denom
 
@@ -2835,6 +3048,12 @@ def _build_meta_payload(
                         "rendezvous_filter_margin_sec",
                         candidate.get("rendezvous_eta_safe_margin_sec"),
                     ),
+                )
+            ),
+            rendezvous_max_wait_sec=float(
+                candidate.get(
+                    "rendezvous_max_wait_sec",
+                    candidate["station_wait_threshold_sec"],
                 )
             ),
             energy_safe_margin_ratio=float(candidate["energy_safe_margin_ratio"]),
@@ -3287,6 +3506,18 @@ def _load_training_config(config_path: Path) -> _TrainingConfig:
         max_grad_norm=float(training["max_grad_norm"]),
         normalize_advantage=bool(training["normalize_advantage"]),
         target_kl=float(training["target_kl"]),
+        wait_without_dispatch_loss_weight=float(
+            training.get("wait_without_dispatch_loss_weight", 1.0)
+        ),
+        wait_with_dispatch_loss_weight=float(
+            training.get("wait_with_dispatch_loss_weight", 1.0)
+        ),
+        mode_b_dispatch_loss_weight=float(
+            training.get("mode_b_dispatch_loss_weight", 1.0)
+        ),
+        mode_c_dispatch_loss_weight=float(
+            training.get("mode_c_dispatch_loss_weight", 1.0)
+        ),
         training_seed=int(training["training_seed"]),
         log_interval_updates=int(training["log_interval_updates"]),
         save_interval_updates=int(training["save_interval_updates"]),
@@ -3341,6 +3572,14 @@ def _validate_training_config(cfg: _TrainingConfig) -> None:
         raise ValueError("early_stop_value_loss_window 必须为正数")
     if cfg.early_stop_value_loss_min_delta < 0.0:
         raise ValueError("early_stop_value_loss_min_delta 不能为负数")
+    if cfg.wait_without_dispatch_loss_weight < 0.0:
+        raise ValueError("wait_without_dispatch_loss_weight 不能为负数")
+    if cfg.wait_with_dispatch_loss_weight < 0.0:
+        raise ValueError("wait_with_dispatch_loss_weight 不能为负数")
+    if cfg.mode_b_dispatch_loss_weight <= 0.0:
+        raise ValueError("mode_b_dispatch_loss_weight 必须为正数")
+    if cfg.mode_c_dispatch_loss_weight <= 0.0:
+        raise ValueError("mode_c_dispatch_loss_weight 必须为正数")
     normalized_value_loss_type = str(cfg.value_loss_type).strip().lower()
     if normalized_value_loss_type not in {"mse", "huber"}:
         raise ValueError("value_loss_type 仅支持 mse 或 huber")
@@ -3364,6 +3603,7 @@ def _validate_training_config(cfg: _TrainingConfig) -> None:
 def _load_eval_config(config_path: Path) -> _EvalConfig:
     raw = _load_yaml(config_path)
     data = raw["data"]
+    training = raw["training"]
     stochastic_eval = data["stochastic_eval_arrival_rate_per_min"]
     cfg = _EvalConfig(
         benchmark_seed=int(data["benchmark_eval_seed"]),
@@ -3372,6 +3612,21 @@ def _load_eval_config(config_path: Path) -> _EvalConfig:
             ("low", float(stochastic_eval["low"])),
             ("medium", float(stochastic_eval["medium"])),
             ("high", float(stochastic_eval["high"])),
+        ),
+        train_arrival_curriculum_enabled=bool(
+            training.get("train_arrival_curriculum_enabled", False)
+        ),
+        train_arrival_base_rate=float(
+            training.get("train_arrival_base_rate_per_min", data["poisson_arrival_rate"])
+        ),
+        train_arrival_high_start_update=int(
+            training.get("train_arrival_high_start_update", 0)
+        ),
+        train_arrival_high_full_update=int(
+            training.get("train_arrival_high_full_update", 0)
+        ),
+        train_arrival_high_max_probability=float(
+            training.get("train_arrival_high_max_probability", 0.0)
         ),
         c_sensitive_enabled=bool(data.get("c_sensitive_eval_enabled", True)),
         c_sensitive_seed=int(
@@ -3383,6 +3638,14 @@ def _load_eval_config(config_path: Path) -> _EvalConfig:
     )
     if cfg.c_sensitive_min_legal_mode_c_recovery_nodes <= 0:
         raise ValueError("c_sensitive_eval_min_legal_mode_c_recovery_nodes 必须为正数")
+    if cfg.train_arrival_base_rate <= 0.0:
+        raise ValueError("train_arrival_base_rate_per_min 必须为正数")
+    if cfg.train_arrival_high_start_update < 0:
+        raise ValueError("train_arrival_high_start_update 不能为负数")
+    if cfg.train_arrival_high_full_update < 0:
+        raise ValueError("train_arrival_high_full_update 不能为负数")
+    if not 0.0 <= cfg.train_arrival_high_max_probability <= 1.0:
+        raise ValueError("train_arrival_high_max_probability 必须位于 [0, 1]")
     return cfg
 
 

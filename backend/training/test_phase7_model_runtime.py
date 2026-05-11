@@ -24,6 +24,7 @@ from .rollout_buffer import RolloutTransition, compute_gae
 from .train_cmrappo import (
     _EpisodeAccumulator,
     _advance_until_rollout_bootstraps_resolved_after_collection,
+    _build_training_episode_order_source,
     _build_benchmark_guardrail_key,
     _build_eval_selection_key,
     _build_sequence_minibatch,
@@ -39,6 +40,7 @@ from .train_cmrappo import (
     _ppo_update,
     _record_terminal_episode_rewards,
     _run_periodic_evaluation,
+    _sample_training_arrival_band,
     _shape_pending_transition_reward_for_rendezvous,
     _shape_post_action_reward_for_rendezvous,
     _should_stop_early,
@@ -211,6 +213,10 @@ class TestPhase7ModelRuntime(unittest.TestCase):
             max_grad_norm=0.5,
             normalize_advantage=True,
             target_kl=0.02,
+            wait_without_dispatch_loss_weight=0.1,
+            wait_with_dispatch_loss_weight=0.35,
+            mode_b_dispatch_loss_weight=1.25,
+            mode_c_dispatch_loss_weight=1.75,
             training_seed=2026,
             log_interval_updates=1,
             save_interval_updates=1,
@@ -1809,6 +1815,8 @@ class TestPhase7ModelRuntime(unittest.TestCase):
                 episode_id=7,
                 order_source_mode="poisson",
                 order_source_seed=20260424,
+                train_arrival_band="high",
+                train_arrival_rate_per_min=0.6,
                 total_reward=12.5,
                 decision_count=9,
                 global_step_start=128,
@@ -1827,10 +1835,75 @@ class TestPhase7ModelRuntime(unittest.TestCase):
         self.assertEqual(payload["phase"], "train")
         self.assertEqual(payload["episode_id"], 7)
         self.assertEqual(payload["order_source_mode"], "poisson")
+        self.assertEqual(payload["train_arrival_band"], "high")
+        self.assertEqual(payload["train_arrival_rate_per_min"], 0.6)
         self.assertEqual(payload["episode_length_decisions"], 9)
         self.assertEqual(payload["delivery_count"], 4)
         self.assertEqual(payload["global_step_end"], 137)
         self.assertEqual(payload["update_end"], 4)
+
+    def test_build_training_episode_order_source_samples_stochastic_band(self) -> None:
+        base_order_source = SimpleNamespace(seed=20260424)
+        sampled_order_source = SimpleNamespace(seed=20260424, arrival_rate=0.6)
+
+        with mock.patch(
+            "backend.training.train_cmrappo.random.choice",
+            return_value=("high", 0.6),
+        ):
+            with mock.patch(
+                "backend.training.train_cmrappo.build_order_source",
+                return_value=sampled_order_source,
+            ) as build_order_source_mock:
+                band_name, arrival_rate, order_source = _build_training_episode_order_source(
+                    scene_ctx=SimpleNamespace(),
+                    config_path=Path("dummy.yaml"),
+                    eval_cfg=SimpleNamespace(
+                        stochastic_arrival_rates=(
+                            ("low", 0.2),
+                            ("medium", 0.4),
+                            ("high", 0.6),
+                        )
+                    ),
+                    base_order_source=base_order_source,
+                )
+
+        self.assertEqual(band_name, "high")
+        self.assertEqual(arrival_rate, 0.6)
+        self.assertIs(order_source, sampled_order_source)
+        self.assertEqual(build_order_source_mock.call_args.kwargs["seed"], 20260424)
+        self.assertEqual(
+            build_order_source_mock.call_args.kwargs["overrides"],
+            {"poisson_arrival_rate": 0.6},
+        )
+
+    def test_sample_training_arrival_band_curriculum_delays_high_load(self) -> None:
+        eval_cfg = SimpleNamespace(
+            stochastic_arrival_rates=(("low", 0.2), ("medium", 0.4), ("high", 0.6)),
+            train_arrival_curriculum_enabled=True,
+            train_arrival_base_rate=0.35,
+            train_arrival_high_start_update=40,
+            train_arrival_high_full_update=120,
+            train_arrival_high_max_probability=0.25,
+        )
+
+        with mock.patch("backend.training.train_cmrappo.random.random", return_value=0.1):
+            band_name, arrival_rate = _sample_training_arrival_band(
+                eval_cfg,
+                update_idx=0,
+            )
+        self.assertEqual(band_name, "base")
+        self.assertEqual(arrival_rate, 0.35)
+
+        with mock.patch(
+            "backend.training.train_cmrappo.random.random",
+            side_effect=(0.01, 0.9),
+        ):
+            band_name, arrival_rate = _sample_training_arrival_band(
+                eval_cfg,
+                update_idx=120,
+            )
+        self.assertEqual(band_name, "high")
+        self.assertEqual(arrival_rate, 0.6)
 
     def test_run_periodic_evaluation_collapses_benchmark_to_single_effective_episode(self) -> None:
         fake_model = mock.Mock()
