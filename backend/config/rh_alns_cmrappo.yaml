@@ -78,6 +78,19 @@ data:
   poisson_arrival_rate: 0.35
   poisson_weight_min_kg: 0.5
   poisson_weight_max_kg: 10.0
+  # 分段载重采样：当前机队为 9 LightDrone(<=2kg) + 3 HeavyDrone(<=10kg)，
+  # 因此默认让大多数订单可由轻型机处理，同时保留足够重载订单训练 HeavyDrone。
+  # 未配置该字段时，OrderManager 会回退到 [poisson_weight_min_kg, poisson_weight_max_kg]
+  # 均匀采样。
+  poisson_weight_bands:
+    - name: light_uav
+      probability: 0.70
+      weight_min_kg: 0.5
+      weight_max_kg: 2.0
+    - name: heavy_uav
+      probability: 0.30
+      weight_min_kg: 2.0
+      weight_max_kg: 10.0
   poisson_geo_mode: bbox_uniform
   poisson_burst_enabled: false
   poisson_burst_multiplier: 1.0

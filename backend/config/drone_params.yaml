@@ -13,32 +13,41 @@
 # =====================================================================
 
 light_drone:
-  # 气动参数 —— 每次标定后须同步更新
-  k1: 35.0          # W / kg^1.5   (悬停功率主导项)
-  k2: 0.0059        # W / (m/s)^3  (巡航速度阻力项)
+  # 对标实物：FIXAR 007 NG
+
+  # 气动/功耗参数
+  k1: 35.2          # W / kg^1.5
+                   # 基于 MTOW=7kg、巡航速度18m/s、电池25V*27Ah、航时约59min反推
+  k2: 0.0059        # W / (m/s)^3
+                   # 单一公开工况无法唯一反推出 k2，暂保留原经验阻力项
 
   # 飞行性能
-  cruise_speed: 10.0           # m/s，巡航速度
+  cruise_speed: 18.0           # m/s，FIXAR 007 NG 官方巡航速度
   payload_capacity: 2.0        # kg，最大有效载荷
-  empty_weight: 6.5            # kg，机体自重
+  empty_weight: 5.0            # kg，按 MTOW 7kg - payload 2kg 估算，含电池/机体
 
   # 电池参数
-  battery_capacity_j: 1080000  # J，300 Wh ≈ 1,080,000 J
-  # 安全余量：保留总电量的 10% 用于意外情况
-  safe_margin_ratio: 0.10
+  battery_capacity_j: 2430000  # J，25V * 27Ah = 675Wh ≈ 2,430,000J
+  safe_margin_ratio: 0.10      # 保留 10% 电量作为安全余量
+
 
 heavy_drone:
-  # 气动参数
+  # 对标实物：Garuda Aerospace GA-IN-DD-10
+
+  # 气动/功耗参数
   k1: 22.0          # W / kg^1.5
+                   # 保留原重载多旋翼经验值；与约30kg总重、30min续航匹配
   k2: 0.06          # W / (m/s)^3
+                   # 保留原速度阻力项
 
   # 飞行性能
-  cruise_speed: 15.0           # m/s，巡航速度较慢
-  payload_capacity: 10.0       # kg，最大有效载荷
-  empty_weight: 18.0           # kg，机体自重
+  cruise_speed: 10.0           # m/s，Garuda GA-IN-DD-10 官方 Rated Speed
+  payload_capacity: 10.0       # kg，额定载荷
+  empty_weight: 19.64          # kg，按 Gross Weight 29.64kg - Payload 10kg 估算
 
   # 电池参数
-  battery_capacity_j: 2880000  # J，800 Wh ≈ 2,880,000 J
+  battery_capacity_j: 7220000  # J，约 2.01 kWh；
+                               # 按 k1/k2功耗模型 + 30min续航 + 10%安全余量反推
   safe_margin_ratio: 0.10
 
 # 求解器统一评分参数（所有算法共享）
