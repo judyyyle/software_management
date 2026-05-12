@@ -270,17 +270,25 @@ class TestTrainingEnvAdapterPhase5a(unittest.TestCase):
             "poisson 巡站不应每轮固定覆盖同一批最近站点",
         )
 
-    def test_poisson_patrol_loop_keeps_future_backbone_alive_near_upper_horizon(self) -> None:
+    def test_poisson_patrol_loop_filters_future_backbone_after_upper_horizon(self) -> None:
         env = self._make_env()
         env.reset()
 
-        future_visits = env._future_backbone_visits(env._cfg.upper_horizon_sec - 1.0)
+        future_visits = env._future_backbone_visits(0.0)
         self.assertTrue(
             future_visits,
-            "poisson 巡站循环应保证 upper_horizon 前仍存在 future backbone 节点",
+            "poisson 巡站循环应在 upper_horizon 内提供 future backbone 节点",
         )
-        self.assertEqual(future_visits[-1].node_id, env._depot_id)
-        self.assertGreater(future_visits[-1].arrival_time, env._cfg.upper_horizon_sec - 1.0)
+        self.assertTrue(
+            all(
+                visit.arrival_time <= env._cfg.upper_horizon_sec + 1e-6
+                for visit in future_visits
+            )
+        )
+        self.assertEqual(
+            env._future_backbone_visits(env._cfg.upper_horizon_sec - 1.0),
+            (),
+        )
 
 
 if __name__ == "__main__":

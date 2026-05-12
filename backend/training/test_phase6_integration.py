@@ -89,6 +89,22 @@ class TestPhase6Integration(unittest.TestCase):
         env._require_order_manager().pending_orders[order.order_id] = order
         return order
 
+    def test_background_mode_a_pending_is_seeded_from_static_truck_only_orders(self) -> None:
+        env = self._make_env()
+        env.reset()
+
+        expected_order_ids = {
+            order.order_id
+            for order in env._scene_ctx.static_orders
+            if order.payload_weight > env._heavy_payload_capacity
+        }
+
+        self.assertEqual(expected_order_ids, env._background_mode_a_pending)
+        self.assertEqual(
+            len(expected_order_ids),
+            env.build_system_context_stats()["mode_a_background_order_count"],
+        )
+
     def test_stale_cached_plan_does_not_suppress_new_idle_decision(self) -> None:
         env, drone_id = self._reset_controlled_env()
         drone = env._require_entity_manager().drones[drone_id]
@@ -176,7 +192,8 @@ class TestPhase6Integration(unittest.TestCase):
         truck_only_order_id = str(truck_only_entries[0]["order_id"])
         if truck_only_order_id in order_mgr.pending_orders:
             coarse_plan = env._refresh_coarse_plan_if_needed(
-                env.build_runtime_state_view()
+                env.build_runtime_state_view(),
+                allow_truck_route_replan=True,
             )
             self.assertFalse(coarse_plan.is_order_authorized(truck_only_order_id))
             self.assertNotIn(truck_only_order_id, coarse_plan.policy_mode_mask)
@@ -206,7 +223,10 @@ class TestPhase6Integration(unittest.TestCase):
             payload_weight=env._heavy_payload_capacity + 1.0,
         )
 
-        coarse_plan = env._refresh_coarse_plan_if_needed(env.build_runtime_state_view())
+        coarse_plan = env._refresh_coarse_plan_if_needed(
+            env.build_runtime_state_view(),
+            allow_truck_route_replan=True,
+        )
 
         self.assertFalse(coarse_plan.is_order_authorized(order.order_id))
         self.assertNotIn(order.order_id, coarse_plan.policy_mode_mask)
@@ -215,6 +235,105 @@ class TestPhase6Integration(unittest.TestCase):
                 stop.node_type == "customer" and stop.order_id == order.order_id
                 for stop in coarse_plan.truck_plan_stops
             )
+        )
+
+    def test_dynamic_truck_replan_keeps_pending_background_mode_a_order(self) -> None:
+        env, drone_id = self._reset_controlled_env()
+        drone = env._require_entity_manager().drones[drone_id]
+        background_order_id = "ORD-STATIC-07"
+        self.assertTrue(
+            any(
+                order.order_id == background_order_id
+                for order in env._scene_ctx.static_orders
+            )
+        )
+        env._background_mode_a_pending.add(background_order_id)
+
+        truck_only_order = self._inject_order_at(
+            env,
+            order_id="TRUCKONLY-P6-KEEP-BACKGROUND",
+            position=Position3D(
+                x=drone.current_loc.x + 100.0,
+                y=drone.current_loc.y + 50.0,
+                z=drone.current_loc.z,
+            ),
+            payload_weight=env._heavy_payload_capacity + 1.0,
+        )
+
+        coarse_plan = env._refresh_coarse_plan_if_needed(
+            env.build_runtime_state_view(),
+            allow_truck_route_replan=True,
+        )
+        planned_customer_order_ids = {
+            stop.order_id
+            for stop in coarse_plan.truck_plan_stops
+            if stop.node_type == "customer"
+        }
+
+        self.assertIn(background_order_id, planned_customer_order_ids)
+        self.assertIn(truck_only_order.order_id, planned_customer_order_ids)
+        self.assertFalse(coarse_plan.is_order_authorized(background_order_id))
+        self.assertNotIn(background_order_id, coarse_plan.policy_mode_mask)
+        self.assertNotIn(background_order_id, env._require_order_manager().pending_orders)
+
+    def test_truck_only_replan_is_deferred_until_truck_stop(self) -> None:
+        env, drone_id = self._reset_controlled_env()
+        drone = env._require_entity_manager().drones[drone_id]
+        original_route_order_ids = [
+            stop.order_id
+            for stop in env._planned_route_stops
+            if stop.node_type == "customer"
+        ]
+        order = self._inject_order_at(
+            env,
+            order_id="TRUCKONLY-P6-DEFERRED",
+            position=Position3D(
+                x=drone.current_loc.x + 100.0,
+                y=drone.current_loc.y + 50.0,
+                z=drone.current_loc.z,
+            ),
+            payload_weight=env._heavy_payload_capacity + 1.0,
+        )
+
+        deferred_plan = env._refresh_coarse_plan_if_needed(
+            env.build_runtime_state_view()
+        )
+
+        self.assertTrue(env._truck_replan_pending)
+        self.assertNotIn(
+            order.order_id,
+            [stop.order_id for stop in deferred_plan.truck_plan_stops],
+        )
+        self.assertEqual(
+            original_route_order_ids,
+            [
+                stop.order_id
+                for stop in env._planned_route_stops
+                if stop.node_type == "customer"
+            ],
+        )
+
+        applied_plan = env._refresh_coarse_plan_if_needed(
+            env.build_runtime_state_view(),
+            allow_truck_route_replan=True,
+        )
+
+        self.assertFalse(env._truck_replan_pending)
+        self.assertIn(
+            order.order_id,
+            {
+                stop.order_id
+                for stop in applied_plan.truck_plan_stops
+                if stop.node_type == "customer"
+            },
+        )
+        self.assertIn(
+            order.order_id,
+            [
+                stop.order_id
+                for stop in env._planned_route_stops
+                if stop.node_type == "customer"
+            ],
         )
 
     def test_planner_bridge_resets_active_launch_stations_on_replan(self) -> None:
@@ -483,6 +602,357 @@ class TestPhase6Integration(unittest.TestCase):
             constraints[0].related_order_id,
             "ORDER-C-RES-CONSTRAINT",
         )
+
+    def test_future_backbone_visits_exclude_after_upper_horizon(self) -> None:
+        env, _drone_id = self._reset_controlled_env()
+        station_id = sorted(env._require_entity_manager().stations)[0]
+        depot_id = env._require_depot().depot_id
+        in_horizon_t = float(env._cfg.upper_horizon_sec) - 1.0
+        out_of_horizon_t = float(env._cfg.upper_horizon_sec) + 1.0
+        env._full_backbone_cache = [
+            BackboneVisit(
+                node_id=station_id,
+                arrival_time=in_horizon_t,
+                departure_time=in_horizon_t + 1e-6,
+            ),
+            BackboneVisit(
+                node_id=depot_id,
+                arrival_time=out_of_horizon_t,
+                departure_time=out_of_horizon_t + 1e-6,
+            ),
+        ]
+
+        visits = env._future_backbone_visits(0.0)
+
+        self.assertEqual([visit.node_id for visit in visits], [station_id])
+        self.assertEqual(
+            env._next_backbone_arrival_time_for_node(
+                depot_id,
+                0.0,
+                include_current=False,
+            ),
+            None,
+        )
+
+    def test_future_backbone_visits_respect_committed_rendezvous_wait_limit(self) -> None:
+        env, drone_id = self._reset_controlled_env()
+        station_ids = sorted(env._require_entity_manager().stations)
+        recover_node_id = station_ids[0]
+        unrelated_station_id = station_ids[1]
+        planned_truck_eta = 100.0
+        late_recover_eta = (
+            planned_truck_eta + float(env._cfg.rendezvous_max_wait_sec) + 1.0
+        )
+        env._reservations[drone_id] = ReservationState(
+            recover_node=recover_node_id,
+            issued_at=10.0,
+        )
+        env._dispatch_commit[drone_id] = DispatchCommit(
+            order_id="ORDER-C-FUTURE-LIMIT",
+            mode=PolicyMode.C,
+            selected_recover_node=recover_node_id,
+            trigger_station_id=None,
+            planned_truck_arrival_time=planned_truck_eta,
+        )
+        env._full_backbone_cache = [
+            BackboneVisit(
+                node_id=recover_node_id,
+                arrival_time=late_recover_eta,
+                departure_time=late_recover_eta + 1e-6,
+            ),
+            BackboneVisit(
+                node_id=unrelated_station_id,
+                arrival_time=late_recover_eta,
+                departure_time=late_recover_eta + 1e-6,
+            ),
+        ]
+
+        visits = env._future_backbone_visits(0.0)
+
+        self.assertEqual([visit.node_id for visit in visits], [unrelated_station_id])
+        self.assertEqual(
+            env._next_backbone_arrival_time_for_node(
+                recover_node_id,
+                0.0,
+                include_current=False,
+            ),
+            None,
+        )
+
+    def test_advance_to_upper_horizon_does_not_rebuild_empty_backbone_plan(self) -> None:
+        env, drone_id = self._reset_controlled_env()
+        drone = env._require_entity_manager().drones[drone_id]
+        self._inject_order_at(
+            env,
+            order_id="ORDER-P6-HORIZON-PENDING",
+            position=Position3D(
+                x=drone.current_loc.x + 100.0,
+                y=drone.current_loc.y + 50.0,
+                z=drone.current_loc.z,
+            ),
+            deadline_offset=7200.0,
+            payload_weight=1.0,
+        )
+        env._full_backbone_cache = []
+        env._decision_queue.clear()
+        env._t_now = float(env._cfg.upper_horizon_sec) - 1.0
+
+        env._advance_to_event(float(env._cfg.upper_horizon_sec))
+
+        self.assertTrue(env.is_done())
+        self.assertEqual(env._episode_done_reason(), "upper_horizon_reached")
+
+    def test_idle_wait_to_upper_horizon_does_not_resume_decision(self) -> None:
+        env, drone_id = self._reset_controlled_env()
+        entity_mgr = env._require_entity_manager()
+        drone = entity_mgr.drones[drone_id]
+        station_id = sorted(entity_mgr.stations)[0]
+        self._inject_order_at(
+            env,
+            order_id="ORDER-P6-HORIZON-WAIT",
+            position=Position3D(
+                x=drone.current_loc.x + 100.0,
+                y=drone.current_loc.y + 50.0,
+                z=drone.current_loc.z,
+            ),
+            deadline_offset=7200.0,
+            payload_weight=1.0,
+        )
+        env._t_now = float(env._cfg.upper_horizon_sec) - 1.0
+        env._full_backbone_cache = [
+            BackboneVisit(
+                node_id=station_id,
+                arrival_time=float(env._cfg.upper_horizon_sec),
+                departure_time=float(env._cfg.upper_horizon_sec) + 1e-6,
+            )
+        ]
+        env._decision_queue.clear()
+        env._enqueue_decision(drone_id, "test_idle_near_horizon", None)
+        self.assertTrue(env._decision_queue)
+
+        result = env.step(WAIT_ACTION)
+
+        self.assertTrue(result.done)
+        self.assertEqual(env._episode_done_reason(), "upper_horizon_reached")
+        self.assertFalse(env._decision_queue)
+
+    def test_tail_empty_backbone_without_orders_degrades_to_empty_plan(self) -> None:
+        env, _drone_id = self._reset_controlled_env()
+        env._t_now = float(env._cfg.upper_horizon_sec) - 5.0
+        env._full_backbone_cache = []
+
+        coarse_plan = env._refresh_coarse_plan_if_needed(
+            env.build_runtime_state_view(),
+            force_replan=True,
+        )
+
+        self.assertTrue(coarse_plan.allow_empty_backbone_route)
+        self.assertEqual(coarse_plan.truck_backbone_route, ())
+        self.assertEqual(coarse_plan.policy_mode_mask, {})
+
+    def test_empty_backbone_allowed_when_no_orders_and_no_mode_c_obligation(self) -> None:
+        env, _drone_id = self._reset_controlled_env()
+        env._full_backbone_cache = []
+
+        coarse_plan = env._refresh_coarse_plan_if_needed(
+            env.build_runtime_state_view(),
+            force_replan=True,
+        )
+
+        self.assertTrue(coarse_plan.allow_empty_backbone_route)
+        self.assertEqual(coarse_plan.truck_backbone_route, ())
+        self.assertEqual(env._episode_done_reason(), "all_orders_cleared")
+
+    def test_all_orders_cleared_waits_for_active_mode_c_recovery_obligation(self) -> None:
+        env, drone_id = self._reset_controlled_env()
+        recover_node_id = sorted(env._require_entity_manager().stations)[0]
+        env._reservations[drone_id] = ReservationState(
+            recover_node=recover_node_id,
+            issued_at=10.0,
+        )
+        env._dispatch_commit[drone_id] = DispatchCommit(
+            order_id="ORDER-C-ACTIVE-OBLIGATION",
+            mode=PolicyMode.C,
+            selected_recover_node=recover_node_id,
+            trigger_station_id=None,
+            planned_truck_arrival_time=180.0,
+        )
+        env._drone_state[drone_id] = TrainingDroneState.WAITING_FOR_TRUCK
+
+        self.assertIsNone(env._episode_done_reason())
+
+        env._release_reservation(drone_id, cause="test_clear")
+        env._dispatch_commit.pop(drone_id, None)
+        env._drone_state[drone_id] = TrainingDroneState.IDLE
+        self.assertEqual(env._episode_done_reason(), "all_orders_cleared")
+
+    def test_recovery_only_truck_plan_skips_patrol_station_coverage(self) -> None:
+        env, drone_id = self._reset_controlled_env()
+        station_ids = sorted(env._require_entity_manager().stations)
+        recover_node_id = station_ids[0]
+        env._full_backbone_cache = [
+            BackboneVisit(
+                node_id=station_id,
+                arrival_time=100.0 + idx * 100.0,
+                departure_time=100.0 + idx * 100.0 + 1e-6,
+            )
+            for idx, station_id in enumerate(station_ids[1:7], start=1)
+        ]
+        runtime_state = env.build_runtime_state_view()
+        constraint = TruckReservationConstraint(
+            reservation_id=f"{drone_id}:{recover_node_id}:10.0",
+            drone_id=drone_id,
+            node_id=recover_node_id,
+            state=ReservationConstraintState.STRONG_HARD,
+            eta_ref=0.0,
+            max_eta_drift_sec=1.0e9,
+            issued_at=10.0,
+            related_order_id="ORDER-C-RECOVERY-ONLY",
+        )
+        env._planner_bridge.reset_episode(allow_empty_backbone_route=False)
+
+        coarse_plan = env._planner_bridge.maybe_replan(
+            runtime_state,
+            PlannerTriggerContext(
+                t_now=env._t_now,
+                backlog_new_orders=env._cfg.coarse_new_order_trigger,
+                fallback_count_in_window=0,
+                hard_failure_count_in_window=0,
+                route_drift_ratio=0.0,
+            ),
+            reservation_constraints=(constraint,),
+        )
+
+        station_stops = [
+            stop for stop in coarse_plan.truck_plan_stops if stop.node_type == "station"
+        ]
+        self.assertEqual([stop.node_id for stop in station_stops], [recover_node_id])
+        self.assertEqual(coarse_plan.truck_plan_stops[-1].node_type, "depot")
+
+    def test_station_backbone_replan_inserts_stations_before_depot_when_orders_remain(self) -> None:
+        env, drone_id = self._reset_controlled_env()
+        entity_mgr = env._require_entity_manager()
+        truck = env._require_truck()
+        depot = env._require_depot()
+        current_station = entity_mgr.stations[sorted(entity_mgr.stations)[0]]
+        drone = entity_mgr.drones[drone_id]
+        t_now = float(env._cfg.upper_horizon_sec) - 140.0
+        depot_after_horizon_t = float(env._cfg.upper_horizon_sec) + 30.0
+        truck.current_loc = current_station.location
+        env._t_now = t_now
+        self._inject_order_at(
+            env,
+            order_id="ORDER-P6-REBUILD-STATION-BACKBONE",
+            position=Position3D(
+                x=drone.current_loc.x + 100.0,
+                y=drone.current_loc.y + 50.0,
+                z=drone.current_loc.z,
+            ),
+            deadline_offset=7200.0,
+            payload_weight=1.0,
+        )
+        env._planned_route_stops = [
+            PlannedStop(
+                seq=0,
+                node_type="truck_current",
+                node_id="truck_current",
+                position=truck.current_loc,
+                order_id=None,
+                arrival_time=t_now,
+                departure_time=t_now,
+            ),
+            PlannedStop(
+                seq=1,
+                node_type="station",
+                node_id=current_station.station_id,
+                position=current_station.location,
+                order_id=None,
+                arrival_time=t_now,
+                departure_time=t_now + 10.0,
+            ),
+            PlannedStop(
+                seq=2,
+                node_type="depot",
+                node_id=depot.depot_id,
+                position=depot.location,
+                order_id=None,
+                arrival_time=depot_after_horizon_t,
+                departure_time=depot_after_horizon_t,
+            ),
+        ]
+        env._planned_route_segments = []
+        env._planned_route_stop_i = 1
+        env._full_backbone_cache = [
+            BackboneVisit(
+                node_id=current_station.station_id,
+                arrival_time=t_now,
+                departure_time=t_now + 10.0,
+            ),
+            BackboneVisit(
+                node_id=depot.depot_id,
+                arrival_time=depot_after_horizon_t,
+                departure_time=depot_after_horizon_t + 1e-6,
+            ),
+        ]
+        env._planner_bridge.reset_episode(allow_empty_backbone_route=False)
+        env._current_coarse_plan = None
+
+        coarse_plan = env._refresh_coarse_plan_if_needed(
+            env.build_runtime_state_view(),
+            allow_truck_route_replan=True,
+        )
+
+        future_station_stops = [
+            stop
+            for stop in coarse_plan.truck_plan_stops
+            if stop.node_type == "station" and stop.arrival_time > t_now + 1e-6
+        ]
+        self.assertTrue(future_station_stops)
+        self.assertEqual(coarse_plan.truck_plan_stops[-1].node_type, "depot")
+        self.assertTrue(env._future_backbone_visits(t_now))
+
+    def test_deferred_truck_replan_allows_temporary_empty_backbone(self) -> None:
+        env, drone_id = self._reset_controlled_env()
+        drone = env._require_entity_manager().drones[drone_id]
+        normal_order = self._inject_order_at(
+            env,
+            order_id="ORDER-P6-DEFERRED-B-ONLY",
+            position=Position3D(
+                x=drone.current_loc.x + 100.0,
+                y=drone.current_loc.y + 50.0,
+                z=drone.current_loc.z,
+            ),
+            deadline_offset=7200.0,
+            payload_weight=1.0,
+        )
+        truck_only_order = self._inject_order_at(
+            env,
+            order_id="TRUCKONLY-P6-DEFERRED-EMPTY-BACKBONE",
+            position=Position3D(
+                x=drone.current_loc.x + 200.0,
+                y=drone.current_loc.y + 100.0,
+                z=drone.current_loc.z,
+            ),
+            deadline_offset=7200.0,
+            payload_weight=env._heavy_payload_capacity + 1.0,
+        )
+        env._full_backbone_cache = []
+        env._planner_bridge.reset_episode(allow_empty_backbone_route=False)
+        env._current_coarse_plan = None
+
+        coarse_plan = env._refresh_coarse_plan_if_needed(
+            env.build_runtime_state_view(),
+            allow_truck_route_replan=False,
+        )
+
+        self.assertTrue(env._truck_replan_pending)
+        self.assertTrue(coarse_plan.allow_empty_backbone_route)
+        self.assertEqual(coarse_plan.truck_backbone_route, ())
+        self.assertEqual(
+            coarse_plan.policy_mode_mask[normal_order.order_id],
+            frozenset({PolicyMode.B}),
+        )
+        self.assertNotIn(truck_only_order.order_id, coarse_plan.policy_mode_mask)
 
     def test_candidate_builder_keeps_masks_and_lookup_aligned(self) -> None:
         env, drone_id = self._reset_controlled_env()

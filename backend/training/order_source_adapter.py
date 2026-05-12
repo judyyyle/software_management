@@ -17,7 +17,7 @@ import copy
 import hashlib
 import random
 import sys
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from enum import StrEnum
 from pathlib import Path
 from typing import Any, Mapping
@@ -62,6 +62,7 @@ class PoissonOrderGenConfig:
     max_orders_per_episode: int
     window_min_min: int
     window_max_min: int
+    weight_bands: tuple[Mapping[str, Any], ...] = field(default_factory=tuple)
 
     def __post_init__(self) -> None:
         if self.arrival_rate < 0:
@@ -70,6 +71,11 @@ class PoissonOrderGenConfig:
             raise ValueError("weight_min_kg 必须为正数")
         if self.weight_max_kg < self.weight_min_kg:
             raise ValueError("weight_max_kg 不能小于 weight_min_kg")
+        _validate_weight_bands(
+            self.weight_bands,
+            weight_min_kg=self.weight_min_kg,
+            weight_max_kg=self.weight_max_kg,
+        )
         if self.burst_multiplier <= 0:
             raise ValueError("burst_multiplier 必须为正数")
         if self.max_orders_per_episode <= 0:
@@ -82,7 +88,7 @@ class PoissonOrderGenConfig:
     def to_order_manager_config(self) -> dict[str, Any]:
         """转换为 `OrderManager.configure()` 所需配置字典。"""
 
-        return {
+        config = {
             "arrival_rate": self.arrival_rate,
             "weight_min": self.weight_min_kg,
             "weight_max": self.weight_max_kg,
@@ -93,6 +99,9 @@ class PoissonOrderGenConfig:
             "window_min": self.window_min_min,
             "window_max": self.window_max_min,
         }
+        if self.weight_bands:
+            config["weight_bands"] = [dict(band) for band in self.weight_bands]
+        return config
 
 
 @dataclass(frozen=True)
@@ -236,6 +245,7 @@ def build_order_source(
         ),
         window_min_min=order_window_min_min,
         window_max_min=order_window_max_min,
+        weight_bands=_resolve_weight_bands(data_cfg, overrides),
     )
 
     scheduled_dynamic_orders = _build_scheduled_dynamic_orders(
@@ -607,6 +617,74 @@ def _normalize_scheduled_dynamic_entry(
         raw["deadline_offset_s"] = float(dynamic_order.deadline_offset_s or 0.0)
         raw.pop("deadline_sim_s", None)
     return raw
+
+
+def _resolve_weight_bands(
+    data_cfg: Mapping[str, Any],
+    overrides: Mapping[str, Any],
+) -> tuple[Mapping[str, Any], ...]:
+    raw = overrides.get("poisson_weight_bands", data_cfg.get("poisson_weight_bands", ()))
+    if raw is None:
+        return ()
+    if not isinstance(raw, (list, tuple)):
+        raise ValueError("poisson_weight_bands 必须为列表")
+
+    bands: list[Mapping[str, Any]] = []
+    for idx, item in enumerate(raw, start=1):
+        if not isinstance(item, Mapping):
+            raise ValueError(f"poisson_weight_bands[{idx}] 必须为对象")
+        if "weight_min_kg" not in item or "weight_max_kg" not in item:
+            raise ValueError(
+                f"poisson_weight_bands[{idx}] 必须包含 weight_min_kg / weight_max_kg"
+            )
+        if "probability" not in item:
+            raise ValueError(f"poisson_weight_bands[{idx}] 必须包含 probability")
+
+        band: dict[str, Any] = {
+            "weight_min": float(item["weight_min_kg"]),
+            "weight_max": float(item["weight_max_kg"]),
+            "probability": float(item["probability"]),
+        }
+        if "name" in item:
+            band["name"] = str(item["name"])
+        bands.append(band)
+    return tuple(bands)
+
+
+def _validate_weight_bands(
+    bands: tuple[Mapping[str, Any], ...],
+    *,
+    weight_min_kg: float,
+    weight_max_kg: float,
+) -> None:
+    if not bands:
+        return
+
+    probability_sum = 0.0
+    for idx, band in enumerate(bands, start=1):
+        band_min = float(band["weight_min"])
+        band_max = float(band["weight_max"])
+        probability = float(band["probability"])
+        if probability <= 0.0:
+            raise ValueError(f"poisson_weight_bands[{idx}].probability 必须为正数")
+        if band_min <= 0.0:
+            raise ValueError(f"poisson_weight_bands[{idx}].weight_min_kg 必须为正数")
+        if band_max < band_min:
+            raise ValueError(
+                f"poisson_weight_bands[{idx}].weight_max_kg 不能小于 weight_min_kg"
+            )
+        if band_min < weight_min_kg or band_max > weight_max_kg:
+            raise ValueError(
+                "poisson_weight_bands 必须落在 "
+                f"[{weight_min_kg}, {weight_max_kg}] kg 范围内"
+            )
+        probability_sum += probability
+
+    if abs(probability_sum - 1.0) > 1e-6:
+        raise ValueError(
+            "poisson_weight_bands.probability 之和必须等于 1.0，"
+            f"当前为 {probability_sum:.6f}"
+        )
 
 
 def _resolve_arrival_rate(

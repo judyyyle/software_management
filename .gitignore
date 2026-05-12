@@ -57,3 +57,6 @@ backend/solver/market_debug_log*
 # ── misc ─────────────────────────────────────────────────
 *.bak
 *.tmp
+
+# ── 训练权重（不上传）──────────────────────────────────────
+backend/weights/rh_alns_cmrappo/

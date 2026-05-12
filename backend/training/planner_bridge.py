@@ -131,6 +131,7 @@ class PlannerBridge:
         runtime_state: Any,
         trigger_ctx: PlannerTriggerContext,
         reservation_constraints: Sequence[TruckReservationConstraint] = (),
+        allow_empty_backbone_route: bool | None = None,
     ) -> CoarsePlanView:
         if self._current_plan is None:
             self._current_plan = self._build_plan(
@@ -138,6 +139,7 @@ class PlannerBridge:
                 t_now=float(trigger_ctx.t_now),
                 plan_version=0,
                 reservation_constraints=reservation_constraints,
+                allow_empty_backbone_route=allow_empty_backbone_route,
             )
             return self._current_plan
 
@@ -149,6 +151,7 @@ class PlannerBridge:
             t_now=float(trigger_ctx.t_now),
             plan_version=self._current_plan.plan_version + 1,
             reservation_constraints=reservation_constraints,
+            allow_empty_backbone_route=allow_empty_backbone_route,
         )
         return self._current_plan
 
@@ -179,6 +182,7 @@ class PlannerBridge:
         t_now: float,
         plan_version: int,
         reservation_constraints: Sequence[TruckReservationConstraint],
+        allow_empty_backbone_route: bool | None,
     ) -> CoarsePlanView:
         future_visits = self._dedupe_future_backbone(
             self._future_backbone_provider(t_now)
@@ -193,7 +197,11 @@ class PlannerBridge:
             truck_plan_stops
         ) or future_visits
         truck_backbone_route = tuple(visit.node_id for visit in plan_fixed_visits)
-        allow_empty_backbone_route = self._runtime_allow_empty_backbone_route
+        effective_allow_empty_backbone_route = (
+            self._runtime_allow_empty_backbone_route
+            if allow_empty_backbone_route is None
+            else bool(allow_empty_backbone_route)
+        )
         truck_eta_map = {
             visit.node_id: float(visit.arrival_time) for visit in plan_fixed_visits
         }
@@ -288,7 +296,7 @@ class PlannerBridge:
             node_charge_load_budget=node_charge_load_budget,
             route_drift_ref=route_drift_ref,
             launch_candidate_stations=launch_candidate_stations,
-            allow_empty_backbone_route=allow_empty_backbone_route,
+            allow_empty_backbone_route=effective_allow_empty_backbone_route,
             reservation_outcomes=reservation_outcomes,
             truck_plan_stops=truck_plan_stops,
         )
@@ -301,15 +309,15 @@ class PlannerBridge:
         baseline_visits: Sequence[Any],
         reservation_constraints: Sequence[TruckReservationConstraint],
     ) -> tuple[TruckPlanStopView, ...]:
-        truck_only_orders = [
-            (order_id, order)
-            for order_id, order in sorted(
-                runtime_state.pending_orders.items(),
-                key=lambda item: (float(item[1].deadline), item[0]),
-            )
-            if float(order.payload_weight) > self._heavy_payload_capacity
-        ]
-        if not truck_only_orders and not reservation_constraints:
+        truck_only_orders = self._resolve_truck_mandatory_orders(runtime_state)
+        require_station_backbone = bool(
+            getattr(runtime_state, "require_station_backbone", False)
+        )
+        if (
+            not truck_only_orders
+            and not reservation_constraints
+            and not require_station_backbone
+        ):
             return ()
 
         reservation_nodes = self._build_reservation_plan_nodes(
@@ -328,36 +336,59 @@ class PlannerBridge:
             for order_id, order in truck_only_orders
         ]
         mandatory_nodes = tuple(truck_order_nodes + list(reservation_nodes.values()))
-        if not mandatory_nodes:
+        if not mandatory_nodes and not require_station_backbone:
             return ()
 
         start_pos = runtime_state.truck_current_loc
         truck_speed = self._resolve_truck_speed_mps()
-        best = self._search_required_truck_route(
-            start_pos=start_pos,
-            start_time=float(t_now),
-            mandatory_nodes=mandatory_nodes,
-            reservation_constraints=reservation_constraints,
-            truck_speed=truck_speed,
-        )
-        if best is None:
-            return ()
+        if mandatory_nodes:
+            best = self._search_required_truck_route(
+                start_pos=start_pos,
+                start_time=float(t_now),
+                mandatory_nodes=mandatory_nodes,
+                reservation_constraints=reservation_constraints,
+                truck_speed=truck_speed,
+            )
+            if best is None:
+                return ()
+            base_nodes = best.nodes
+        else:
+            base_nodes = ()
 
         depot_node = self._select_depot_node(runtime_state)
-        coverage_nodes = self._select_coverage_nodes(
-            runtime_state=runtime_state,
-            baseline_visits=baseline_visits,
-            selected_nodes={node.node_id for node in best.nodes},
-        )
-        nodes = self._append_station_coverage(
-            base_nodes=best.nodes,
-            coverage_nodes=coverage_nodes,
-            depot_node=depot_node,
-            start_pos=start_pos,
-            start_time=float(t_now),
-            reservation_constraints=reservation_constraints,
-            truck_speed=truck_speed,
-        )
+        if truck_order_nodes:
+            coverage_nodes = self._select_coverage_nodes(
+                runtime_state=runtime_state,
+                baseline_visits=baseline_visits,
+                selected_nodes={node.node_id for node in base_nodes},
+            )
+            nodes = self._append_station_coverage(
+                base_nodes=base_nodes,
+                coverage_nodes=coverage_nodes,
+                depot_node=depot_node,
+                start_pos=start_pos,
+                start_time=float(t_now),
+                reservation_constraints=reservation_constraints,
+                truck_speed=truck_speed,
+            )
+        elif require_station_backbone:
+            coverage_nodes = self._select_station_backbone_nodes(
+                runtime_state=runtime_state,
+                selected_nodes={node.node_id for node in base_nodes},
+            )
+            nodes = self._append_station_coverage(
+                base_nodes=base_nodes,
+                coverage_nodes=coverage_nodes,
+                depot_node=depot_node,
+                start_pos=start_pos,
+                start_time=float(t_now),
+                reservation_constraints=reservation_constraints,
+                truck_speed=truck_speed,
+            )
+        else:
+            # recovery-only route：没有卡车派送订单时，只兑现已锁定的
+            # Mode C rendezvous 节点，然后回仓，不再强制补足巡站覆盖数量。
+            nodes = base_nodes
         if depot_node is not None and (
             not nodes or nodes[-1].node_id != depot_node.node_id
         ):
@@ -369,6 +400,23 @@ class PlannerBridge:
             start_time=float(t_now),
             truck_speed=truck_speed,
         )
+
+    def _resolve_truck_mandatory_orders(self, runtime_state: Any) -> list[tuple[str, Any]]:
+        explicit_orders = getattr(runtime_state, "truck_mandatory_orders", None)
+        if explicit_orders is not None:
+            return sorted(
+                ((str(order_id), order) for order_id, order in explicit_orders.items()),
+                key=lambda item: (float(item[1].deadline), item[0]),
+            )
+
+        return [
+            (order_id, order)
+            for order_id, order in sorted(
+                runtime_state.pending_orders.items(),
+                key=lambda item: (float(item[1].deadline), item[0]),
+            )
+            if float(order.payload_weight) > self._heavy_payload_capacity
+        ]
 
     def _build_reservation_outcomes(
         self,
@@ -728,6 +776,35 @@ class PlannerBridge:
             selected = best_insert[2]
             base_key = best_insert[3]
         return selected
+
+    def _select_station_backbone_nodes(
+        self,
+        *,
+        runtime_state: Any,
+        selected_nodes: set[str],
+    ) -> tuple[_TruckPlanNode, ...]:
+        nodes: list[_TruckPlanNode] = []
+        for node_id, node_state in sorted(runtime_state.node_states.items()):
+            node_id = str(node_id)
+            if node_id in selected_nodes:
+                continue
+            if node_state.node_type != "station":
+                continue
+            if (
+                node_state.position.distance_2d(runtime_state.truck_current_loc)
+                <= _TIME_EPS
+            ):
+                continue
+            nodes.append(
+                _TruckPlanNode(
+                    node_id=node_id,
+                    node_type="station",
+                    order_id=None,
+                    position=node_state.position,
+                    service_time_sec=self._fixed_node_service_time_sec,
+                )
+            )
+        return tuple(nodes)
 
     def _select_coverage_nodes(
         self,
