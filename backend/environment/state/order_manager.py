@@ -367,10 +367,7 @@ class OrderManager:
         deadline     = current_time + window_s
 
         # ── 货物重量 ──────────────────────────────────────────────────────
-        weight = random.uniform(
-            float(cfg.get("weight_min", 0.5)),
-            float(cfg.get("weight_max", 5.0)),
-        )
+        weight = self._sample_payload_weight(cfg)
 
         # ── 唯一 ID（seed 可复现）──────────────────────────────────────────
         self._order_seq += 1
@@ -385,4 +382,44 @@ class OrderManager:
             pickup_source_id=None,
             source_type=None,
             payload_weight=weight,
+        )
+
+    @staticmethod
+    def _sample_payload_weight(cfg: dict) -> float:
+        """按可选分段配置采样载重；未配置时回退到旧的均匀分布。"""
+
+        bands = cfg.get("weight_bands") or ()
+        if bands:
+            draw = random.random()
+            cumulative = 0.0
+            last_valid: dict | None = None
+            for raw_band in bands:
+                band = dict(raw_band)
+                probability = float(band.get("probability", 0.0))
+                if probability <= 0.0:
+                    continue
+                band_floor = cumulative
+                cumulative += probability
+                last_valid = band
+                if draw <= cumulative:
+                    band_min = float(
+                        band.get("weight_min", band.get("weight_min_kg"))
+                    )
+                    band_max = float(
+                        band.get("weight_max", band.get("weight_max_kg"))
+                    )
+                    local_u = min(1.0, max(0.0, (draw - band_floor) / probability))
+                    return band_min + local_u * (band_max - band_min)
+            if last_valid is not None:
+                band_min = float(
+                    last_valid.get("weight_min", last_valid.get("weight_min_kg"))
+                )
+                band_max = float(
+                    last_valid.get("weight_max", last_valid.get("weight_max_kg"))
+                )
+                return band_max
+
+        return random.uniform(
+            float(cfg.get("weight_min", 0.5)),
+            float(cfg.get("weight_max", 5.0)),
         )
