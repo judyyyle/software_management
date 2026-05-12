@@ -2266,9 +2266,9 @@ class TrainingEnvAdapter:
                 if arrival is not None:
                     return max(0.0, arrival - t_now)
         if state == TrainingDroneState.CHARGING_ON_TRUCK:
-            done_time = self._truck_charge_until.get(drone_id)
-            if done_time is not None:
-                return max(0.0, float(done_time) - t_now)
+            eta = self._estimate_truck_charge_remaining_sec(drone_id, t_now)
+            if eta is not None:
+                return eta
         return 0.0
 
     def _future_arrival_time_for_node(
@@ -2419,6 +2419,14 @@ class TrainingEnvAdapter:
                         + opportunity_penalty
                     )
                     info["wait_opportunity_penalty"] = opportunity_penalty
+                if self._try_enter_wait_charging(deciding_drone_id, current_state):
+                    info["wait_mode"] = "charge_or_swap"
+                    return AppliedDecision(
+                        drone_id=deciding_drone_id,
+                        carried_reward=carried_reward,
+                        info=info,
+                        auto_advance_kind="until_decision",
+                    )
                 delta_wait = self._compute_wait_delta(deciding_drone_id)
                 wait_until = self._t_now + delta_wait
                 self._apply_wait_action(deciding_drone_id)
@@ -2437,6 +2445,15 @@ class TrainingEnvAdapter:
                     wait_until=float(wait_until),
                 )
             if current_state == TrainingDroneState.RIDING_WITH_TRUCK:
+                if self._try_enter_wait_charging(deciding_drone_id, current_state):
+                    self._active_wait_until.pop(deciding_drone_id, None)
+                    info["wait_mode"] = "truck_charge_or_swap"
+                    return AppliedDecision(
+                        drone_id=deciding_drone_id,
+                        carried_reward=carried_reward,
+                        info=info,
+                        auto_advance_kind="until_decision",
+                    )
                 self._apply_wait_action(deciding_drone_id)
                 self._active_wait_until.pop(deciding_drone_id, None)
                 info["wait_mode"] = "deferred_riding_with_truck"
@@ -2693,11 +2710,6 @@ class TrainingEnvAdapter:
             if drone_id not in failed_drones
         ]
         delivery_service_ready = self._collect_delivery_service_events(t_next)
-        truck_charge_ready = [
-            drone_id
-            for drone_id, done_time in list(self._truck_charge_until.items())
-            if done_time <= t_next + _TIME_EPS
-        ]
         truck_stops = self._collect_truck_stops(t_next)
 
         event_reward = 0.0
@@ -2774,14 +2786,7 @@ class TrainingEnvAdapter:
         for drone_id, leg in non_delivery_ready:
             self._process_non_delivery_arrival(drone_id, leg)
 
-        for drone_id in truck_charge_ready:
-            self._truck_charge_until.pop(drone_id, None)
-            drone = entity_mgr.drones[drone_id]
-            drone.recharge_to_full()
-            drone.current_loc = _clone_position(truck.current_loc)
-            if drone_id not in truck.docked_drones:
-                truck.docked_drones.append(drone_id)
-            self._drone_state[drone_id] = TrainingDroneState.RIDING_WITH_TRUCK
+        self._process_truck_charge_host(t_next)
 
         for host in list(entity_mgr.stations.values()) + list(entity_mgr.depots.values()):
             completed = host.tick_update(t_next)
@@ -3124,7 +3129,6 @@ class TrainingEnvAdapter:
 
         if leg.kind == "mode_b_return_to_depot":
             self._mode_b_pending_depot_return.pop(drone_id, None)
-            drone.recharge_to_full()
             self._dispatch_commit.pop(drone_id, None)
             self._drone_state[drone_id] = TrainingDroneState.IDLE
             return
@@ -3157,11 +3161,10 @@ class TrainingEnvAdapter:
         for drone_id in recovered:
             self._release_reservation(drone_id, cause="rendezvous_success")
             self._rendezvous_wait_started_at.pop(drone_id, None)
-            self._drone_state[drone_id] = TrainingDroneState.CHARGING_ON_TRUCK
+            self._drone_state[drone_id] = TrainingDroneState.RIDING_WITH_TRUCK
             self._episode_mode_c_success_count += 1
-            self._truck_charge_until[drone_id] = (
-                t_now + self._scene_solver_params().truck_drone_recover_time_s
-            )
+            drone = self._require_entity_manager().drones[drone_id]
+            drone.current_loc = _clone_position(truck.current_loc)
             if drone_id not in truck.docked_drones:
                 truck.docked_drones.append(drone_id)
 
@@ -4362,8 +4365,8 @@ class TrainingEnvAdapter:
         if math.isfinite(failure_time):
             candidates.append(failure_time)
 
-        for done_time in self._truck_charge_until.values():
-            candidates.append(done_time)
+        truck = self._require_truck()
+        candidates.extend(float(done_time) for done_time in truck.serving_drones.values())
 
         for wait_until in self._active_wait_until.values():
             candidates.append(float(wait_until))
@@ -4489,6 +4492,122 @@ class TrainingEnvAdapter:
     # ---------------------------------------------------------------------
     # Charging / queue helpers
     # ---------------------------------------------------------------------
+
+    def _try_enter_wait_charging(
+        self,
+        drone_id: str,
+        current_state: TrainingDroneState,
+    ) -> bool:
+        """WAIT 时，如果当前位置宿主可补能且电量未满，则进入补能队列。"""
+        drone = self._require_entity_manager().drones[drone_id]
+        if drone.battery_current >= float(drone.battery_max) - _TIME_EPS:
+            return False
+
+        if current_state == TrainingDroneState.RIDING_WITH_TRUCK:
+            return self._enter_truck_charging_queue(drone_id, self._t_now)
+
+        if current_state == TrainingDroneState.IDLE:
+            depot = self._depot_at_drone_location(drone_id, self._t_now)
+            if depot is None:
+                return False
+            self._on_arrive_charging_host(drone_id, depot, self._t_now)
+            return True
+
+        return False
+
+    def _depot_at_drone_location(self, drone_id: str, t_now: float) -> Depot | None:
+        """返回无人机当前贴近的 depot；避免 WAIT 补能把无人机传送回仓。"""
+        entity_mgr = self._require_entity_manager()
+        drone = entity_mgr.drones[drone_id]
+        depots = sorted(
+            entity_mgr.depots.values(),
+            key=lambda depot: drone.current_loc.distance_2d(depot.get_location(t_now)),
+        )
+        if not depots:
+            return None
+        depot = depots[0]
+        if drone.current_loc.distance_2d(depot.get_location(t_now)) <= 5.0 + _TIME_EPS:
+            return depot
+        return None
+
+    def _enter_truck_charging_queue(self, drone_id: str, t_now: float) -> bool:
+        """把车载 WAIT 的无人机放入卡车补能队列，完成前不再视为可放飞。"""
+        entity_mgr = self._require_entity_manager()
+        truck = self._require_truck()
+        drone = entity_mgr.drones[drone_id]
+        drone.current_loc = _clone_position(truck.current_loc)
+        if drone_id not in truck.docked_drones:
+            truck.docked_drones.append(drone_id)
+
+        if drone_id in truck.serving_drones or drone_id in truck.wait_queue:
+            self._drone_state[drone_id] = TrainingDroneState.CHARGING_ON_TRUCK
+            return True
+
+        if len(truck.serving_drones) < int(truck.parking_slots):
+            truck.serving_drones[drone_id] = float(t_now) + float(truck.swap_time)
+        else:
+            truck.wait_queue.append(drone_id)
+        self._drone_state[drone_id] = TrainingDroneState.CHARGING_ON_TRUCK
+        return True
+
+    def _process_truck_charge_host(self, t_now: float) -> list[str]:
+        """推进 PPO 训练侧的车载补能；完成后无人机仍停靠在卡车上。"""
+        entity_mgr = self._require_entity_manager()
+        truck = self._require_truck()
+        completed: list[str] = []
+
+        finished = [
+            drone_id
+            for drone_id, finish_time in list(truck.serving_drones.items())
+            if float(finish_time) <= float(t_now) + _TIME_EPS
+        ]
+        for drone_id in finished:
+            truck.serving_drones.pop(drone_id, None)
+            drone = entity_mgr.drones.get(drone_id)
+            if drone is None:
+                continue
+            drone.recharge_to_full()
+            drone.current_loc = _clone_position(truck.current_loc)
+            if drone_id not in truck.docked_drones:
+                truck.docked_drones.append(drone_id)
+            if self._drone_state.get(drone_id) == TrainingDroneState.CHARGING_ON_TRUCK:
+                self._drone_state[drone_id] = TrainingDroneState.RIDING_WITH_TRUCK
+            completed.append(drone_id)
+
+        while truck.wait_queue and len(truck.serving_drones) < int(truck.parking_slots):
+            next_drone_id = truck.wait_queue.pop(0)
+            drone = entity_mgr.drones.get(next_drone_id)
+            if drone is None:
+                continue
+            drone.current_loc = _clone_position(truck.current_loc)
+            if next_drone_id not in truck.docked_drones:
+                truck.docked_drones.append(next_drone_id)
+            if drone.battery_current >= float(drone.battery_max) - _TIME_EPS:
+                if self._drone_state.get(next_drone_id) == TrainingDroneState.CHARGING_ON_TRUCK:
+                    self._drone_state[next_drone_id] = TrainingDroneState.RIDING_WITH_TRUCK
+                continue
+            truck.serving_drones[next_drone_id] = float(t_now) + float(truck.swap_time)
+            self._drone_state[next_drone_id] = TrainingDroneState.CHARGING_ON_TRUCK
+
+        return completed
+
+    def _estimate_truck_charge_remaining_sec(
+        self,
+        drone_id: str,
+        t_now: float,
+    ) -> float | None:
+        """估算车载补能完成剩余时间，供 runtime snapshot 使用。"""
+        truck = self._require_truck()
+        if drone_id in truck.serving_drones:
+            return max(0.0, float(truck.serving_drones[drone_id]) - float(t_now))
+        if drone_id not in truck.wait_queue:
+            return None
+        if truck.serving_drones:
+            first_slot_time = max(0.0, min(truck.serving_drones.values()) - float(t_now))
+        else:
+            first_slot_time = 0.0
+        queue_index = truck.wait_queue.index(drone_id)
+        return first_slot_time + float(queue_index + 1) * float(truck.swap_time)
 
     def _on_arrive_charging_host(
         self,
@@ -4943,6 +5062,8 @@ class TrainingEnvAdapter:
         self._fallback_leg.pop(drone_id, None)
         self._mode_b_pending_depot_return.pop(drone_id, None)
         self._truck_charge_until.pop(drone_id, None)
+        truck.serving_drones.pop(drone_id, None)
+        truck.wait_queue = [item for item in truck.wait_queue if item != drone_id]
         self._active_wait_resume.pop(drone_id, None)
         self._release_reservation(drone_id, cause=FALLBACK_CAUSE_HARD_FAILURE_FALLBACK)
         self._decision_queue = [

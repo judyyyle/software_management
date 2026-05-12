@@ -23,6 +23,7 @@ from .env_adapter import (
     TrainingDroneState,
     TrainingEnvAdapter,
 )
+from .actions import WAIT_ACTION
 
 
 class TestTrainingEnvAdapterPhase5b(unittest.TestCase):
@@ -34,6 +35,12 @@ class TestTrainingEnvAdapterPhase5b(unittest.TestCase):
             if state == TrainingDroneState.IDLE:
                 return drone_id
         self.fail("默认场景中至少应有一架 depot-home 无人机处于 idle")
+
+    def _first_riding_drone_id(self, env: TrainingEnvAdapter) -> str:
+        for drone_id, state in env._drone_state.items():
+            if state == TrainingDroneState.RIDING_WITH_TRUCK:
+                return drone_id
+        self.fail("默认场景中至少应有一架 truck-home 无人机处于 riding_with_truck")
 
     def _reset_controlled_env(self) -> tuple[TrainingEnvAdapter, str]:
         env = self._make_env()
@@ -208,6 +215,82 @@ class TestTrainingEnvAdapterPhase5b(unittest.TestCase):
 
         self.assertEqual(env._drone_state[drone_id], TrainingDroneState.IDLE)
         self.assertNotIn(drone_id, env._flight_legs)
+
+    def test_idle_wait_at_depot_enters_charge_queue_when_battery_not_full(self) -> None:
+        env, drone_id = self._reset_controlled_env()
+        drone = env._require_entity_manager().drones[drone_id]
+        depot = env._require_depot()
+        drone.current_loc = Position3D(
+            x=depot.location.x,
+            y=depot.location.y,
+            z=depot.location.z,
+        )
+        drone.battery_current = drone.battery_max * 0.5
+        self._inject_order(env, drone_id=drone_id, order_id="ORDER-P5B-WAIT-DEPOT")
+        env._decision_queue.clear()
+        env._enqueue_decision(drone_id, "test_idle", None)
+
+        applied = env._apply_decision_core(WAIT_ACTION)
+
+        self.assertEqual(applied.auto_advance_kind, "until_decision")
+        self.assertEqual(env._drone_state[drone_id], TrainingDroneState.CHARGING_OR_SWAP)
+        self.assertIn(drone_id, depot.serving_drones)
+        self.assertLess(drone.battery_current, drone.battery_max)
+
+    def test_riding_wait_enters_truck_charge_queue_and_follows_truck(self) -> None:
+        env = self._make_env()
+        env.reset()
+        order_mgr = env._require_order_manager()
+        order_mgr.pending_orders.clear()
+        order_mgr.assigned_orders.clear()
+        order_mgr.completed_orders.clear()
+        order_mgr._next_order_time = math.inf
+        env._decision_queue.clear()
+        env._planned_route_stops.clear()
+        env._planned_route_segments.clear()
+
+        drone_id = self._first_riding_drone_id(env)
+        drone = env._require_entity_manager().drones[drone_id]
+        truck = env._require_truck()
+        station = next(iter(env._require_entity_manager().stations.values()))
+        truck.current_loc = Position3D(
+            x=station.location.x,
+            y=station.location.y,
+            z=station.location.z,
+        )
+        drone.current_loc = Position3D(
+            x=truck.current_loc.x,
+            y=truck.current_loc.y,
+            z=truck.current_loc.z,
+        )
+        drone.battery_current = drone.battery_max * 0.5
+        self._inject_order_at_position(
+            env,
+            order_id="ORDER-P5B-WAIT-TRUCK",
+            position=truck.current_loc,
+            payload_weight=0.5,
+        )
+        env._enqueue_decision(
+            drone_id,
+            trigger_type="truck_station_arrival",
+            trigger_station_id=station.station_id,
+        )
+
+        applied = env._apply_decision_core(WAIT_ACTION)
+
+        self.assertEqual(applied.auto_advance_kind, "until_decision")
+        self.assertEqual(env._drone_state[drone_id], TrainingDroneState.CHARGING_ON_TRUCK)
+        self.assertNotEqual(env._drone_state[drone_id], TrainingDroneState.RIDING_WITH_TRUCK)
+        self.assertIn(drone_id, truck.serving_drones)
+
+        truck.current_loc = Position3D(
+            x=station.location.x + 123.0,
+            y=station.location.y + 45.0,
+            z=station.location.z,
+        )
+        env._sync_in_transit_positions(env._t_now)
+        self.assertAlmostEqual(drone.current_loc.x, truck.current_loc.x)
+        self.assertAlmostEqual(drone.current_loc.y, truck.current_loc.y)
 
     def test_coarse_plan_recovery_pool_exposes_future_backbone_nodes(self) -> None:
         env, _drone_id = self._reset_controlled_env()

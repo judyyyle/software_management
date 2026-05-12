@@ -79,7 +79,7 @@ solver_energy:
 
   # 业务时长参数（所有算法共享）
   # 卡车配送订单（到达客户点后的服务停留）
-  truck_service_time_order_s: 60
+  truck_service_time_order_s: 30
   # 无人机配送订单（到达客户点后的服务停留）
   drone_service_time_order_s: 30
   # 卡车放飞无人机操作时长
