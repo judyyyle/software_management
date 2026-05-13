@@ -12,7 +12,7 @@
     },
     {
       "arrival_time_sec": 203.257434,
-      "departure_time_sec": 263.257434,
+      "departure_time_sec": 233.257434,
       "nearest_osm_node_id": "11770830110",
       "node_id": "ORD-STATIC-08",
       "node_type": "customer",
@@ -21,8 +21,8 @@
       "snap_distance_m": 21.062956
     },
     {
-      "arrival_time_sec": 439.765453,
-      "departure_time_sec": 449.765453,
+      "arrival_time_sec": 409.765453,
+      "departure_time_sec": 419.765453,
       "nearest_osm_node_id": "11393537553",
       "node_id": "STA-TEST-02",
       "node_type": "station",
@@ -31,8 +31,8 @@
       "snap_distance_m": 38.853532
     },
     {
-      "arrival_time_sec": 511.773906,
-      "departure_time_sec": 571.773906,
+      "arrival_time_sec": 481.773906,
+      "departure_time_sec": 511.773906,
       "nearest_osm_node_id": "7113128125",
       "node_id": "ORD-STATIC-02",
       "node_type": "customer",
@@ -41,8 +41,8 @@
       "snap_distance_m": 85.058173
     },
     {
-      "arrival_time_sec": 700.598696,
-      "departure_time_sec": 760.598696,
+      "arrival_time_sec": 640.598696,
+      "departure_time_sec": 670.598696,
       "nearest_osm_node_id": "11459214575",
       "node_id": "ORD-STATIC-06",
       "node_type": "customer",
@@ -51,8 +51,8 @@
       "snap_distance_m": 83.102197
     },
     {
-      "arrival_time_sec": 864.035942,
-      "departure_time_sec": 874.035942,
+      "arrival_time_sec": 774.035942,
+      "departure_time_sec": 784.035942,
       "nearest_osm_node_id": "859872265",
       "node_id": "STA-TEST-08",
       "node_type": "station",
@@ -61,8 +61,8 @@
       "snap_distance_m": 42.90158
     },
     {
-      "arrival_time_sec": 954.089895,
-      "departure_time_sec": 1014.089895,
+      "arrival_time_sec": 864.089895,
+      "departure_time_sec": 894.089895,
       "nearest_osm_node_id": "7743084366",
       "node_id": "ORD-STATIC-07",
       "node_type": "customer",
@@ -71,8 +71,8 @@
       "snap_distance_m": 27.764065
     },
     {
-      "arrival_time_sec": 1067.088768,
-      "departure_time_sec": 1077.088768,
+      "arrival_time_sec": 947.088768,
+      "departure_time_sec": 957.088768,
       "nearest_osm_node_id": "1601488743",
       "node_id": "STA-TEST-09",
       "node_type": "station",
@@ -81,8 +81,8 @@
       "snap_distance_m": 16.131889
     },
     {
-      "arrival_time_sec": 1273.871568,
-      "departure_time_sec": 1273.871568,
+      "arrival_time_sec": 1153.871568,
+      "departure_time_sec": 1153.871568,
       "nearest_osm_node_id": "13340772659",
       "node_id": "DEP-TEST-01",
       "node_type": "depot",

@@ -15,8 +15,8 @@
 #   - 地图尺度：约 4011.5m × 4011.5m
 #   - 站点最近邻间距：均值约 949m
 #   - 订单到最近站点距离：均值约 500m
-#   - benchmark 动态订单强度：约 0.33~0.37 单/分钟
-#   - 首轮默认泊松强度：取 0.35 单/分钟，偏保守，便于先跑稳训练闭环
+#   - benchmark 动态订单强度：当前 orders.json 约 0.66~0.67 单/分钟
+#   - 首轮默认泊松强度：取 0.67 单/分钟，使训练初始订单流贴近默认场景动态单
 # =============================================================================
 
 scene:
@@ -72,10 +72,10 @@ data:
   c_sensitive_eval_min_legal_mode_c_recovery_nodes: 1
 
   # 训练主输入：泊松流。
-  # 依据当前 benchmark 的 0.33~0.37 单/分钟强度，首轮取 0.35/min，
-  # 以减少训练初期的候选截断和排队爆炸风险。
+  # 依据当前 benchmark orders.json 的约 0.66~0.67 单/分钟强度，首轮取 0.67/min。
+  # 5400s episode 下期望约 60 单，接近默认场景动态订单流的平均 90s 间隔。
   # 单位固定为 单/分钟，与 Phase 1 文档口径保持一致。
-  poisson_arrival_rate: 0.35
+  poisson_arrival_rate: 0.67
   poisson_weight_min_kg: 0.5
   poisson_weight_max_kg: 10.0
   # 分段载重采样：当前机队为 9 LightDrone(<=2kg) + 3 HeavyDrone(<=10kg)，
@@ -94,7 +94,7 @@ data:
   poisson_geo_mode: bbox_uniform
   poisson_burst_enabled: false
   poisson_burst_multiplier: 1.0
-  poisson_max_orders_per_episode: 64
+  poisson_max_orders_per_episode: 80
 
   # Mode C 两阶段改造第一步：在 PPO 训练的动态流中加入极少量 truck-only 订单。
   # 这些订单 payload 必须超过 heavy UAV 承载上限，因此不会进入 PPO 可授权订单集合；
@@ -111,8 +111,8 @@ data:
   # stochastic 验证的标准强度档。
   stochastic_eval_arrival_rate_per_min:
     low: 0.20
-    medium: 0.40
-    high: 0.60
+    medium: 0.67
+    high: 0.90
 
   # hybrid 模式仅用于后续随机扩展验证；训练主循环不应启用。
   hybrid_background_dynamic_orders: true
@@ -135,9 +135,9 @@ planner:
   # Phase 4 卡车骨架路线至少保留的 future fixed nodes 数量。
   phase4_min_future_fixed_nodes: 3
 
-  # 单个 episode 的时间上限；与当前 benchmark 动态单的 0~1740s 分布相容，
+  # 单个 episode 的时间上限；覆盖当前 orders.json 动态单尾部到 4530s 的分布，
   # 同时给返程、排队、fallback 留足尾部时间。
-  upper_horizon_sec: 3600
+  upper_horizon_sec: 5400
 
   # 卡车循环巡站参数（仅 poisson 训练模式生效）。
   # patrol_min_remaining_sec：卡车回仓后距 episode 结束的剩余时间低于此值时，
@@ -370,10 +370,10 @@ training:
   mode_b_dispatch_loss_weight: 1.25
   mode_c_dispatch_loss_weight: 1.75
 
-  # 训练订单强度 curriculum：前期仅在 benchmark 附近的 0.35/0.40 训练，
-  # 后续再逐步引入 high=0.60，避免一开始被高压 backlog 主导。
+  # 训练订单强度 curriculum：前期在 orders.json 附近的 0.67 训练，
+  # 后续再逐步引入 high=0.90，避免一开始被更高压 backlog 主导。
   train_arrival_curriculum_enabled: true
-  train_arrival_base_rate_per_min: 0.35
+  train_arrival_base_rate_per_min: 0.67
   train_arrival_high_start_update: 40
   train_arrival_high_full_update: 120
   train_arrival_high_max_probability: 0.25

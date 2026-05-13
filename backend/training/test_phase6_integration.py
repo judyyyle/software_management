@@ -20,6 +20,7 @@ from .contracts import (
     PlannerTriggerContext,
     PolicyMode,
     ReservationConstraintState,
+    ReservationPlanOutcome,
     ReservationPlanStatus,
     RouteDriftRef,
     TruckReservationConstraint,
@@ -340,13 +341,15 @@ class TestPhase6Integration(unittest.TestCase):
         env, _drone_id = self._reset_controlled_env()
         entity_mgr = env._require_entity_manager()
         station_ids = sorted(entity_mgr.stations)
-        self.assertGreaterEqual(len(station_ids), 2)
+        self.assertGreaterEqual(len(station_ids), 3)
 
         station_1 = entity_mgr.stations[station_ids[0]]
         station_2 = entity_mgr.stations[station_ids[1]]
+        station_3 = entity_mgr.stations[station_ids[2]]
         env._full_backbone_cache = [
             BackboneVisit(node_id=station_1.station_id, arrival_time=60.0, departure_time=60.0 + 1e-6),
             BackboneVisit(node_id=station_2.station_id, arrival_time=120.0, departure_time=120.0 + 1e-6),
+            BackboneVisit(node_id=station_3.station_id, arrival_time=180.0, departure_time=180.0 + 1e-6),
         ]
 
         self._inject_order_at(
@@ -602,6 +605,294 @@ class TestPhase6Integration(unittest.TestCase):
             constraints[0].related_order_id,
             "ORDER-C-RES-CONSTRAINT",
         )
+
+    def test_planner_invalidated_node_not_in_plan_releases_reservation(self) -> None:
+        env, drone_id = self._reset_controlled_env()
+        station_id = sorted(env._require_entity_manager().stations)[0]
+        reservation_id = f"{drone_id}:{station_id}:10.000000"
+        env._reservations[drone_id] = ReservationState(
+            recover_node=station_id,
+            issued_at=10.0,
+        )
+        env._reservation_count[station_id] = 1
+        env._dispatch_commit[drone_id] = DispatchCommit(
+            order_id="ORDER-C-NODE-MISSING",
+            mode=PolicyMode.C,
+            selected_recover_node=station_id,
+            trigger_station_id=None,
+            planned_truck_arrival_time=180.0,
+        )
+        env._drone_state[drone_id] = TrainingDroneState.WAITING_FOR_TRUCK
+        env._rendezvous_wait_started_at[drone_id] = 100.0
+        constraint = TruckReservationConstraint(
+            reservation_id=reservation_id,
+            drone_id=drone_id,
+            node_id=station_id,
+            state=ReservationConstraintState.STRONG_HARD,
+            eta_ref=180.0,
+            max_eta_drift_sec=60.0,
+            issued_at=10.0,
+        )
+        coarse_plan = replace(
+            env._build_coarse_plan_view(120.0),
+            reservation_outcomes={
+                reservation_id: ReservationPlanOutcome(
+                    reservation_id=reservation_id,
+                    node_id=station_id,
+                    old_eta=180.0,
+                    new_eta=None,
+                    eta_drift_sec=None,
+                    status=ReservationPlanStatus.INVALIDATED,
+                    invalidate_cause="node_not_in_truck_plan",
+                )
+            },
+        )
+
+        env._apply_planner_reservation_outcomes(
+            coarse_plan=coarse_plan,
+            reservation_constraints=(constraint,),
+            t_now=120.0,
+        )
+
+        self.assertNotIn(drone_id, env._reservations)
+        self.assertEqual(env._drone_state[drone_id], TrainingDroneState.FALLBACK_RECOVERY)
+        self.assertIsNone(env._dispatch_commit[drone_id].selected_recover_node)
+
+    def test_arrived_before_eta_ref_keeps_reservation_when_uav_can_catch_new_eta(self) -> None:
+        env, drone_id = self._reset_controlled_env()
+        station_id = sorted(env._require_entity_manager().stations)[0]
+        reservation_id = f"{drone_id}:{station_id}:10.000000"
+        env._reservations[drone_id] = ReservationState(
+            recover_node=station_id,
+            issued_at=10.0,
+        )
+        env._reservation_count[station_id] = 1
+        env._schedule_return_to_rendezvous(drone_id, station_id, start_time=0.0)
+        leg = env._flight_legs[drone_id]
+        new_eta = (
+            float(leg.arrival_time)
+            + float(env._cfg.rendezvous_execution_margin_sec)
+            + 5.0
+        )
+        old_eta = new_eta + 30.0
+        env._full_backbone_cache = [
+            BackboneVisit(
+                node_id=station_id,
+                arrival_time=new_eta,
+                departure_time=new_eta + 1e-6,
+            )
+        ]
+        env._dispatch_commit[drone_id] = DispatchCommit(
+            order_id="ORDER-C-ARRIVED-BEFORE",
+            mode=PolicyMode.C,
+            selected_recover_node=station_id,
+            trigger_station_id=None,
+            planned_truck_arrival_time=old_eta,
+            planned_uav_arrival_time_lb=leg.arrival_time,
+            planned_execution_slack_sec=old_eta - leg.arrival_time,
+        )
+        constraint = TruckReservationConstraint(
+            reservation_id=reservation_id,
+            drone_id=drone_id,
+            node_id=station_id,
+            state=ReservationConstraintState.HARD,
+            eta_ref=old_eta,
+            max_eta_drift_sec=60.0,
+            issued_at=10.0,
+        )
+        coarse_plan = replace(
+            env._build_coarse_plan_view(0.0),
+            reservation_outcomes={
+                reservation_id: ReservationPlanOutcome(
+                    reservation_id=reservation_id,
+                    node_id=station_id,
+                    old_eta=old_eta,
+                    new_eta=new_eta,
+                    eta_drift_sec=0.0,
+                    status=ReservationPlanStatus.INVALIDATED,
+                    invalidate_cause="arrived_before_eta_ref",
+                )
+            },
+        )
+
+        env._apply_planner_reservation_outcomes(
+            coarse_plan=coarse_plan,
+            reservation_constraints=(constraint,),
+            t_now=0.0,
+        )
+
+        self.assertIn(drone_id, env._reservations)
+        self.assertNotIn(drone_id, env._fallback_leg)
+        self.assertEqual(env._drone_state[drone_id], TrainingDroneState.RETURN_TO_RENDEZVOUS)
+        self.assertAlmostEqual(
+            env._dispatch_commit[drone_id].planned_truck_arrival_time,
+            new_eta,
+            places=6,
+        )
+
+    def test_eta_late_exceeds_threshold_uses_total_wait_limit_for_waiting_uav(self) -> None:
+        env, drone_id = self._reset_controlled_env()
+        station_id = sorted(env._require_entity_manager().stations)[0]
+        reservation_id = f"{drone_id}:{station_id}:10.000000"
+        wait_started_at = 100.0
+        t_now = 150.0
+        old_eta = 160.0
+        kept_eta = wait_started_at + float(env._cfg.rendezvous_max_wait_sec) - 1.0
+        late_eta = wait_started_at + float(env._cfg.rendezvous_max_wait_sec) + 1.0
+        env._reservations[drone_id] = ReservationState(
+            recover_node=station_id,
+            issued_at=10.0,
+        )
+        env._reservation_count[station_id] = 1
+        env._dispatch_commit[drone_id] = DispatchCommit(
+            order_id="ORDER-C-LATE-RECHECK",
+            mode=PolicyMode.C,
+            selected_recover_node=station_id,
+            trigger_station_id=None,
+            planned_truck_arrival_time=old_eta,
+        )
+        env._drone_state[drone_id] = TrainingDroneState.WAITING_FOR_TRUCK
+        env._rendezvous_wait_started_at[drone_id] = wait_started_at
+        constraint = TruckReservationConstraint(
+            reservation_id=reservation_id,
+            drone_id=drone_id,
+            node_id=station_id,
+            state=ReservationConstraintState.STRONG_HARD,
+            eta_ref=old_eta,
+            max_eta_drift_sec=60.0,
+            issued_at=10.0,
+        )
+
+        coarse_plan = replace(
+            env._build_coarse_plan_view(t_now),
+            reservation_outcomes={
+                reservation_id: ReservationPlanOutcome(
+                    reservation_id=reservation_id,
+                    node_id=station_id,
+                    old_eta=old_eta,
+                    new_eta=kept_eta,
+                    eta_drift_sec=kept_eta - old_eta,
+                    status=ReservationPlanStatus.INVALIDATED,
+                    invalidate_cause="eta_late_exceeds_threshold",
+                )
+            },
+        )
+        env._apply_planner_reservation_outcomes(
+            coarse_plan=coarse_plan,
+            reservation_constraints=(constraint,),
+            t_now=t_now,
+        )
+
+        self.assertIn(drone_id, env._reservations)
+        self.assertNotIn(drone_id, env._fallback_leg)
+        self.assertAlmostEqual(
+            env._dispatch_commit[drone_id].planned_truck_arrival_time,
+            kept_eta,
+            places=6,
+        )
+
+        coarse_plan = replace(
+            coarse_plan,
+            reservation_outcomes={
+                reservation_id: ReservationPlanOutcome(
+                    reservation_id=reservation_id,
+                    node_id=station_id,
+                    old_eta=old_eta,
+                    new_eta=late_eta,
+                    eta_drift_sec=late_eta - old_eta,
+                    status=ReservationPlanStatus.INVALIDATED,
+                    invalidate_cause="eta_late_exceeds_threshold",
+                )
+            },
+        )
+        env._apply_planner_reservation_outcomes(
+            coarse_plan=coarse_plan,
+            reservation_constraints=(constraint,),
+            t_now=t_now,
+        )
+
+        self.assertNotIn(drone_id, env._reservations)
+        self.assertEqual(env._drone_state[drone_id], TrainingDroneState.FALLBACK_RECOVERY)
+
+    def test_planner_replan_event_records_reservation_env_decision(self) -> None:
+        env, drone_id = self._reset_controlled_env()
+        station_id = sorted(env._require_entity_manager().stations)[0]
+        reservation_id = f"{drone_id}:{station_id}:10.000000"
+        env._reservations[drone_id] = ReservationState(
+            recover_node=station_id,
+            issued_at=10.0,
+        )
+        env._reservation_count[station_id] = 1
+        env._dispatch_commit[drone_id] = DispatchCommit(
+            order_id="ORDER-C-REPLAN-LOG",
+            mode=PolicyMode.C,
+            selected_recover_node=station_id,
+            trigger_station_id=None,
+            planned_truck_arrival_time=180.0,
+        )
+        env._drone_state[drone_id] = TrainingDroneState.WAITING_FOR_TRUCK
+        env._rendezvous_wait_started_at[drone_id] = 100.0
+        constraint = TruckReservationConstraint(
+            reservation_id=reservation_id,
+            drone_id=drone_id,
+            node_id=station_id,
+            state=ReservationConstraintState.STRONG_HARD,
+            eta_ref=180.0,
+            max_eta_drift_sec=60.0,
+            issued_at=10.0,
+            related_order_id="ORDER-C-REPLAN-LOG",
+        )
+        coarse_plan = replace(
+            env._build_coarse_plan_view(120.0),
+            reservation_outcomes={
+                reservation_id: ReservationPlanOutcome(
+                    reservation_id=reservation_id,
+                    node_id=station_id,
+                    old_eta=180.0,
+                    new_eta=220.0,
+                    eta_drift_sec=40.0,
+                    status=ReservationPlanStatus.DRIFTED,
+                )
+            },
+        )
+        trigger_ctx = PlannerTriggerContext(
+            t_now=120.0,
+            backlog_new_orders=3,
+            fallback_count_in_window=1,
+            hard_failure_count_in_window=0,
+            route_drift_ratio=0.2,
+        )
+        event_count_before = len(env.build_planner_replan_events_snapshot())
+
+        env_decisions = env._apply_planner_reservation_outcomes(
+            coarse_plan=coarse_plan,
+            reservation_constraints=(constraint,),
+            t_now=120.0,
+        )
+        env._record_planner_replan_event(
+            coarse_plan=coarse_plan,
+            trigger_ctx=trigger_ctx,
+            reservation_constraints=(constraint,),
+            reservation_env_decisions=env_decisions,
+            applied_to_truck_route=False,
+            allow_truck_route_replan=True,
+            truck_route_ready_at=120.0,
+        )
+
+        events = env.build_planner_replan_events_snapshot()
+        self.assertEqual(len(events), event_count_before + 1)
+        self.assertEqual(
+            env.build_episode_metrics_snapshot()["planner_replan_event_count"],
+            event_count_before + 1,
+        )
+        event = events[-1]
+        self.assertEqual(event["plan_version"], coarse_plan.plan_version)
+        self.assertEqual(event["trigger"]["backlog_new_orders"], 3)
+        self.assertEqual(
+            event["reservation_outcomes"][0]["env_decision"],
+            "planner_status_no_env_action",
+        )
+        self.assertEqual(event["reservation_outcomes"][0]["drone_id"], drone_id)
 
     def test_future_backbone_visits_exclude_after_upper_horizon(self) -> None:
         env, _drone_id = self._reset_controlled_env()
@@ -910,6 +1201,142 @@ class TestPhase6Integration(unittest.TestCase):
         self.assertTrue(future_station_stops)
         self.assertEqual(coarse_plan.truck_plan_stops[-1].node_type, "depot")
         self.assertTrue(env._future_backbone_visits(t_now))
+
+    def test_future_station_capacity_trigger_counts_station_only(self) -> None:
+        env, drone_id = self._reset_controlled_env()
+        entity_mgr = env._require_entity_manager()
+        station_ids = sorted(entity_mgr.stations)
+        self.assertGreaterEqual(len(station_ids), 3)
+        depot = env._require_depot()
+        drone = entity_mgr.drones[drone_id]
+        t_now = 100.0
+        env._t_now = t_now
+        self._inject_order_at(
+            env,
+            order_id="ORDER-P6-STATION-CAPACITY-STATION-ONLY",
+            position=Position3D(
+                x=drone.current_loc.x + 100.0,
+                y=drone.current_loc.y + 50.0,
+                z=drone.current_loc.z,
+            ),
+            deadline_offset=7200.0,
+            payload_weight=1.0,
+        )
+        env._full_backbone_cache = [
+            BackboneVisit(
+                node_id=station_ids[0],
+                arrival_time=t_now + 60.0,
+                departure_time=t_now + 60.0 + 1e-6,
+            ),
+            BackboneVisit(
+                node_id=station_ids[1],
+                arrival_time=t_now + 120.0,
+                departure_time=t_now + 120.0 + 1e-6,
+            ),
+            BackboneVisit(
+                node_id=depot.depot_id,
+                arrival_time=t_now + 180.0,
+                departure_time=t_now + 180.0 + 1e-6,
+            ),
+        ]
+        env._truck_replan_pending = False
+        env._truck_replan_pending_reasons.clear()
+
+        require_station_backbone = env._ensure_future_backbone_capacity(
+            env.build_runtime_state_view()
+        )
+
+        self.assertTrue(require_station_backbone)
+        self.assertTrue(env._truck_replan_pending)
+        self.assertIn("future_backbone_capacity", env._truck_replan_pending_reasons)
+        self.assertEqual(len(env._future_station_backbone_visits(t_now)), 2)
+        self.assertEqual(len(env._future_backbone_visits(t_now)), 3)
+
+    def test_truck_replan_after_station_arrival_starts_after_current_stop_service(self) -> None:
+        env, _drone_id = self._reset_controlled_env()
+        entity_mgr = env._require_entity_manager()
+        truck = env._require_truck()
+        depot = env._require_depot()
+        current_station = entity_mgr.stations[sorted(entity_mgr.stations)[0]]
+        t_now = 100.0
+        service_finish = t_now + float(
+            max(
+                env._scene_solver_params().truck_drone_launch_time_s,
+                env._scene_solver_params().truck_drone_recover_time_s,
+            )
+        )
+        truck.current_loc = current_station.location
+        env._t_now = t_now
+        env._planned_route_stops = [
+            PlannedStop(
+                seq=0,
+                node_type="truck_current",
+                node_id="truck_current",
+                position=truck.current_loc,
+                order_id=None,
+                arrival_time=t_now,
+                departure_time=t_now,
+            ),
+            PlannedStop(
+                seq=1,
+                node_type="station",
+                node_id=current_station.station_id,
+                position=current_station.location,
+                order_id=None,
+                arrival_time=t_now,
+                departure_time=service_finish,
+            ),
+            PlannedStop(
+                seq=2,
+                node_type="depot",
+                node_id=depot.depot_id,
+                position=depot.location,
+                order_id=None,
+                arrival_time=env._cfg.upper_horizon_sec + 1.0,
+                departure_time=env._cfg.upper_horizon_sec + 1.0,
+            ),
+        ]
+        env._planned_route_segments = []
+        # Simulate the event loop state after the current station arrival was collected.
+        env._planned_route_stop_i = 2
+        env._full_backbone_cache = [
+            BackboneVisit(
+                node_id=depot.depot_id,
+                arrival_time=env._cfg.upper_horizon_sec + 1.0,
+                departure_time=env._cfg.upper_horizon_sec + 1.0 + 1e-6,
+            )
+        ]
+        self._inject_order_at(
+            env,
+            order_id="ORDER-P6-TRUCK-READY-AFTER-SERVICE",
+            position=current_station.location,
+            deadline_offset=7200.0,
+            payload_weight=env._heavy_payload_capacity + 1.0,
+        )
+        env._planner_bridge.reset_episode(allow_empty_backbone_route=False)
+        env._current_coarse_plan = None
+
+        coarse_plan = env._refresh_coarse_plan_if_needed(
+            env.build_runtime_state_view(),
+            allow_truck_route_replan=True,
+            force_replan=True,
+        )
+
+        self.assertGreaterEqual(
+            coarse_plan.truck_plan_stops[0].arrival_time,
+            service_finish,
+        )
+        self.assertAlmostEqual(
+            coarse_plan.truck_plan_stops[0].departure_time,
+            coarse_plan.truck_plan_stops[0].arrival_time
+            + float(env._scene_solver_params().truck_service_time_order_s),
+            places=6,
+        )
+        self.assertAlmostEqual(
+            env._planned_route_segments[0].start_time,
+            service_finish,
+            places=6,
+        )
 
     def test_deferred_truck_replan_allows_temporary_empty_backbone(self) -> None:
         env, drone_id = self._reset_controlled_env()

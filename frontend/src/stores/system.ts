@@ -22,6 +22,14 @@ export const useSystemStore = defineStore('system', () => {
   const policyName       = ref('')      // 当前激活策略名称
   const policyCheckpoint = ref('')      // 当前激活 checkpoint
   const policyRuntimeType = ref<'classic_sim_engine' | 'training_env_adapter_policy'>('classic_sim_engine')
+  const trainingActive   = ref(false)   // 当前是否正在展示 PPO 训练过程
+  const trainingRunning  = ref(false)
+  const trainingCompleted = ref(false)
+  const trainingOutputDir = ref('')
+  const trainingError    = ref('')
+  const trainingGlobalStep = ref(0)
+  const trainingUpdateIdx = ref(0)
+  const trainingEpisodeId = ref<number | null>(null)
   const runtimePaths     = ref<RuntimePaths>({ trucks: [], drones: [] })
   const dispatchChains   = ref<DispatchChain[]>([])
   const decisionEvents   = ref<DecisionEvent[]>([])
@@ -38,6 +46,25 @@ export const useSystemStore = defineStore('system', () => {
   }
 
   function applyPolicyRuntimeFromStats(stats: any) {
+    const activeTraining = Boolean(stats?.active_training)
+    if (activeTraining) {
+      trainingActive.value = true
+      trainingRunning.value = Boolean(stats?.training_running)
+      trainingCompleted.value = Boolean(stats?.training_completed)
+      trainingOutputDir.value = String(stats?.training_output_dir ?? '')
+      trainingError.value = String(stats?.training_error ?? '')
+      trainingGlobalStep.value = Number(stats?.training_global_step ?? trainingGlobalStep.value)
+      trainingUpdateIdx.value = Number(stats?.training_update_idx ?? trainingUpdateIdx.value)
+      const episodeRaw = stats?.training_episode_id
+      trainingEpisodeId.value = episodeRaw === null || episodeRaw === undefined ? null : Number(episodeRaw)
+      policyActive.value = false
+      policyName.value = ''
+      policyCheckpoint.value = ''
+      policyRuntimeType.value = 'classic_sim_engine'
+      return
+    }
+    trainingActive.value = false
+    trainingRunning.value = false
     const activePolicy = typeof stats?.active_policy === 'string' ? stats.active_policy.trim() : ''
     if (activePolicy) {
       policyActive.value = true
@@ -132,9 +159,15 @@ export const useSystemStore = defineStore('system', () => {
     mergeDecisionEvents(payload.recent_decision_events)
     latestEventSeq.value = Number(payload.latest_event_seq ?? latestEventSeq.value)
     
+    const isTrainingTick = Boolean(payload.stats?.active_training)
     // ── 处理订单状态更新 ─────────────────────────────────────
     const orderStore = useOrderStore()
     if (payload.orders && Array.isArray(payload.orders)) {
+      if (isTrainingTick) {
+        // 训练订单源与前端预览订单不同。这里只清空当前内存视图，
+        // 不调用 clearOrders()，避免删除 localStorage 中的用户预览订单。
+        orderStore.generatedOrders = []
+      }
       // 根据 backend 推送的订单状态更新 frontend 订单
       const completedCount = payload.orders.filter((o: any) => o.status === 'COMPLETED').length
       if (DEBUG_WEBSOCKET && (completedCount > 0 || payload.orders.length > 0)) {
@@ -224,6 +257,7 @@ export const useSystemStore = defineStore('system', () => {
       // 后端未启动或网络不可达，保持本地配置态
     }
     await fetchPolicyState().catch(() => {})
+    await fetchTrainingState().catch(() => {})
   }
 
   // ── 仿真控制 API ────────────────────────────────────────
@@ -247,6 +281,56 @@ export const useSystemStore = defineStore('system', () => {
     dispatchChains.value = []
     decisionEvents.value = []
     latestEventSeq.value = 0
+  }
+
+  async function startPpoTraining(payload: {
+    config_path: string
+    scene_id: string
+    output_dir?: string
+    render_interval_sec: number
+    render_every_n_steps: number
+    require_current_init_scene: boolean
+  }) {
+    const orderStore = useOrderStore()
+    orderStore.generatedOrders = []
+    orderStore.stats = null
+    runtimePaths.value = { trucks: [], drones: [] }
+    dispatchChains.value = []
+    decisionEvents.value = []
+    latestEventSeq.value = 0
+    const result = await http.post<any>('/api/sim/training/start', payload)
+    const runtime = result?.runtime ?? {}
+    trainingActive.value = true
+    trainingRunning.value = Boolean(runtime.running)
+    trainingCompleted.value = Boolean(runtime.completed)
+    trainingError.value = String(runtime.error ?? '')
+    trainingOutputDir.value = String(runtime.output_dir ?? payload.output_dir ?? '')
+    trainingGlobalStep.value = Number(runtime.global_step ?? 0)
+    trainingUpdateIdx.value = Number(runtime.update_idx ?? 0)
+    const episodeRaw = runtime.episode_id
+    trainingEpisodeId.value = episodeRaw === null || episodeRaw === undefined ? null : Number(episodeRaw)
+    return result
+  }
+
+  async function fetchTrainingState() {
+    const result = await http.get<any>('/api/sim/training/state')
+    if (result?.active) {
+      trainingActive.value = true
+      trainingRunning.value = Boolean(result.running)
+      trainingCompleted.value = Boolean(result.completed)
+      trainingError.value = String(result.error ?? '')
+      trainingOutputDir.value = String(result.output_dir ?? '')
+      trainingGlobalStep.value = Number(result.global_step ?? trainingGlobalStep.value)
+      trainingUpdateIdx.value = Number(result.update_idx ?? trainingUpdateIdx.value)
+      const episodeRaw = result.episode_id
+      trainingEpisodeId.value = episodeRaw === null || episodeRaw === undefined ? null : Number(episodeRaw)
+    } else {
+      trainingActive.value = false
+      trainingRunning.value = false
+      trainingCompleted.value = false
+      trainingError.value = ''
+    }
+    return result
   }
 
   async function activatePolicy(payload: {
@@ -391,9 +475,12 @@ export const useSystemStore = defineStore('system', () => {
   return {
     running, simTime, speedRatio, simStartWallMs, initialized, initializedSceneId,
     policyActive, policyName, policyCheckpoint, policyRuntimeType,
+    trainingActive, trainingRunning, trainingCompleted, trainingOutputDir,
+    trainingError, trainingGlobalStep, trainingUpdateIdx, trainingEpisodeId,
     runtimePaths, dispatchChains, decisionEvents, latestEventSeq,
     initWs, probeBackend, onTick,
     start, pause, reset, setSpeed, initSim, dispatch,
     activatePolicy, deactivatePolicy, fetchPolicyState,
+    startPpoTraining, fetchTrainingState,
   }
 })

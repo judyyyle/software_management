@@ -23,6 +23,7 @@ from .env_adapter import (
     TrainingDroneState,
     TrainingEnvAdapter,
 )
+from .uav_path_service import UavPathEstimate
 from .actions import WAIT_ACTION
 
 
@@ -536,6 +537,94 @@ class TestTrainingEnvAdapterPhase5b(unittest.TestCase):
             -env._cfg.lambda_miss * delta_t,
             places=6,
         )
+
+    def test_scheduled_uav_leg_uses_path_service_geometry_for_execution(self) -> None:
+        env, drone_id = self._reset_controlled_env()
+        drone = env._require_entity_manager().drones[drone_id]
+        start_pos = Position3D(
+            x=drone.current_loc.x,
+            y=drone.current_loc.y,
+            z=drone.current_loc.z,
+        )
+        target_pos = Position3D(
+            x=start_pos.x + 100.0,
+            y=start_pos.y + 100.0,
+            z=start_pos.z,
+        )
+        bend_pos = Position3D(
+            x=start_pos.x + 100.0,
+            y=start_pos.y,
+            z=start_pos.z,
+        )
+
+        class BentPathService:
+            has_obstacle_planner = True
+
+            def estimate(self, *, drone, from_pos, to_pos, payload):
+                path = (
+                    Position3D(x=from_pos.x, y=from_pos.y, z=from_pos.z),
+                    Position3D(x=bend_pos.x, y=bend_pos.y, z=bend_pos.z),
+                    Position3D(x=to_pos.x, y=to_pos.y, z=to_pos.z),
+                )
+                return UavPathEstimate(
+                    path_points=path,
+                    cumulative_distances_m=(0.0, 100.0, 200.0),
+                    distance_m=200.0,
+                    flight_time_sec=20.0,
+                    energy_j=1234.0,
+                    motion_mode="uav_avoidance_path",
+                )
+
+            def plan_path(self, *, from_pos, to_pos, altitude=None):
+                return (
+                    Position3D(x=from_pos.x, y=from_pos.y, z=from_pos.z),
+                    Position3D(x=bend_pos.x, y=bend_pos.y, z=bend_pos.z),
+                    Position3D(x=to_pos.x, y=to_pos.y, z=to_pos.z),
+                )
+
+            def path_distance(self, *, from_pos, to_pos, altitude=None):
+                return 200.0
+
+            def can_reach(
+                self,
+                *,
+                drone,
+                from_pos,
+                to_pos,
+                payload,
+                safe_margin,
+                battery_current,
+                altitude=None,
+            ):
+                return True
+
+        env._uav_path_service = BentPathService()
+        env._schedule_flight_leg(
+            drone_id=drone_id,
+            kind="test_bent_leg",
+            target_pos=target_pos,
+            payload=1.0,
+        )
+
+        leg = env._flight_legs[drone_id]
+        self.assertEqual(leg.motion_mode, "uav_avoidance_path")
+        self.assertEqual(len(leg.path_points), 3)
+        self.assertAlmostEqual(leg.distance_m, 200.0, places=6)
+        self.assertAlmostEqual(leg.energy_cost_j, 1234.0, places=6)
+        self.assertAlmostEqual(leg.arrival_time, env._t_now + 20.0, places=6)
+
+        env._sync_in_transit_positions(env._t_now + 10.0)
+        self.assertAlmostEqual(drone.current_loc.x, bend_pos.x, places=6)
+        self.assertAlmostEqual(drone.current_loc.y, bend_pos.y, places=6)
+
+        entry = env._build_active_drone_path_entry(
+            drone_id=drone_id,
+            leg=leg,
+            t_now=env._t_now + 10.0,
+        )
+        self.assertIsNotNone(entry)
+        self.assertEqual(entry["motion_mode"], "uav_avoidance_path")
+        self.assertAlmostEqual(entry["distance_m"], 100.0, places=6)
 
     def test_planner_invalidated_fallback_does_not_charge_ppo_reward(self) -> None:
         env, drone_id = self._reset_controlled_env()
