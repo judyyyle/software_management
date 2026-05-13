@@ -638,6 +638,7 @@ def train_cmrappo(
 
     metrics_path = out_dir / "train_metrics.jsonl"
     episode_metrics_path = out_dir / "episode_metrics.jsonl"
+    planner_replan_events_path = out_dir / "planner_replan_events.jsonl"
     eval_metrics_path = out_dir / "eval_metrics.jsonl"
     benchmark_report_path = out_dir / "benchmark_report.json"
     stochastic_report_path = out_dir / "stochastic_report.json"
@@ -971,6 +972,11 @@ def train_cmrappo(
                     episode_metrics_path,
                     episode_metrics,
                 )
+                _append_planner_replan_events(
+                    planner_replan_events_path,
+                    episode_metrics=episode_metrics,
+                    events=env.build_planner_replan_events_snapshot(),
+                )
                 _emit_event_hook(
                     event_hook,
                     "train_episode_end",
@@ -1259,6 +1265,7 @@ def train_cmrappo(
         "meta_path": str(meta_path),
         "metrics_path": str(metrics_path),
         "episode_metrics_path": str(episode_metrics_path),
+        "planner_replan_events_path": str(planner_replan_events_path),
         "eval_metrics_path": str(eval_metrics_path),
         "benchmark_report_path": str(benchmark_report_path),
         "stochastic_report_path": str(stochastic_report_path),
@@ -3165,6 +3172,26 @@ def _build_meta_payload(
 def _append_metrics(path: Path, payload: Mapping[str, Any]) -> None:
     with path.open("a", encoding="utf-8") as fh:
         fh.write(json.dumps(dict(payload), ensure_ascii=False) + "\n")
+
+
+def _append_planner_replan_events(
+    path: Path,
+    *,
+    episode_metrics: Mapping[str, Any],
+    events: Sequence[Mapping[str, Any]],
+) -> None:
+    prefix = {
+        "phase": str(episode_metrics.get("phase", "")),
+        "episode_id": int(episode_metrics.get("episode_id", -1)),
+        "order_source_mode": str(episode_metrics.get("order_source_mode", "")),
+        "order_source_seed": int(episode_metrics.get("order_source_seed", -1)),
+        "global_step_start": episode_metrics.get("global_step_start"),
+        "global_step_end": episode_metrics.get("global_step_end"),
+        "update_start": episode_metrics.get("update_start"),
+        "update_end": episode_metrics.get("update_end"),
+    }
+    for event in events:
+        _append_metrics(path, {**prefix, **dict(event)})
 
 
 def _emit_event_hook(
