@@ -341,10 +341,13 @@ class PlannerBridge:
 
         start_pos = runtime_state.truck_current_loc
         truck_speed = self._resolve_truck_speed_mps()
+        truck_route_ready_at = float(
+            getattr(runtime_state, "truck_route_ready_at", None) or t_now
+        )
         if mandatory_nodes:
             best = self._search_required_truck_route(
                 start_pos=start_pos,
-                start_time=float(t_now),
+                start_time=truck_route_ready_at,
                 mandatory_nodes=mandatory_nodes,
                 reservation_constraints=reservation_constraints,
                 truck_speed=truck_speed,
@@ -367,7 +370,7 @@ class PlannerBridge:
                 coverage_nodes=coverage_nodes,
                 depot_node=depot_node,
                 start_pos=start_pos,
-                start_time=float(t_now),
+                start_time=truck_route_ready_at,
                 reservation_constraints=reservation_constraints,
                 truck_speed=truck_speed,
             )
@@ -381,7 +384,7 @@ class PlannerBridge:
                 coverage_nodes=coverage_nodes,
                 depot_node=depot_node,
                 start_pos=start_pos,
-                start_time=float(t_now),
+                start_time=truck_route_ready_at,
                 reservation_constraints=reservation_constraints,
                 truck_speed=truck_speed,
             )
@@ -397,7 +400,7 @@ class PlannerBridge:
         return self._simulate_truck_plan_stops(
             nodes=nodes,
             start_pos=start_pos,
-            start_time=float(t_now),
+            start_time=truck_route_ready_at,
             truck_speed=truck_speed,
         )
 
@@ -1030,7 +1033,7 @@ def _load_recovery_pool_drone_cruise_speed() -> float:
 def _load_truck_order_service_time() -> float:
     from config.loader import load_solver_energy_params
 
-    return float(load_solver_energy_params().drone_service_time_order_s)
+    return float(load_solver_energy_params().truck_service_time_order_s)
 
 
 def _load_fixed_node_service_time() -> float:

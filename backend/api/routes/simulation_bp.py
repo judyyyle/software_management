@@ -42,6 +42,11 @@ from training.frontend_runtime_adapter import (
     build_runtime_scene_context_from_payload,
     resolve_scene_context,
 )
+from training.frontend_training_runtime import (
+    DEFAULT_TRAINING_SCENE_ID,
+    FrontendPPOTrainingRuntime,
+    build_frontend_training_activation,
+)
 from utils.coord_utils import utm_to_wgs84
 
 # 导入预设场景模块
@@ -64,6 +69,7 @@ _order_mgr:  OrderManager            = OrderManager()
 _sim_engine: SimulationEngine         = SimulationEngine()
 _dispatch_engine: DispatchDecisionEngine | None = None
 _policy_runtime: OnlinePolicyRuntimePlayer | None = None
+_training_runtime: FrontendPPOTrainingRuntime | None = None
 _last_init_payload: dict | None = None
 
 # 注册 WebSocket 遥测端点，并将 sim_engine 的完整快照构造函数注入 telemetry 模块
@@ -169,12 +175,34 @@ def _shutdown_policy_runtime() -> None:
     _restore_classic_runtime()
 
 
+def _shutdown_training_runtime() -> None:
+    """移除已结束的 PPO 训练遥测运行时；运行中的训练不在此处强停。"""
+    global _training_runtime
+    if _training_runtime is None:
+        return
+    if _training_runtime.is_running:
+        raise RuntimeError("PPO 训练正在运行，不能切换运行时")
+    _training_runtime = None
+    _restore_classic_runtime()
+
+
 def _switch_to_policy_runtime(runtime: OnlinePolicyRuntimePlayer) -> None:
     """将遥测输出切换到 PPO 在线运行时。"""
     global _policy_runtime
     if _policy_runtime is not None and _policy_runtime is not runtime:
         _shutdown_policy_runtime()
     _policy_runtime = runtime
+    set_snapshot_builder(runtime.build_full_snapshot)
+
+
+def _switch_to_training_runtime(runtime: FrontendPPOTrainingRuntime) -> None:
+    """将遥测输出切换到 PPO 训练过程。"""
+    global _training_runtime
+    if _training_runtime is not None and _training_runtime is not runtime:
+        if _training_runtime.is_running:
+            raise RuntimeError("PPO 训练已经在运行")
+        _training_runtime = None
+    _training_runtime = runtime
     set_snapshot_builder(runtime.build_full_snapshot)
 
 
@@ -599,6 +627,7 @@ def sim_init():
 
     # ── 重置并重新初始化 ─────────────────────────────────────────────────────
     try:
+        _shutdown_training_runtime()
         _shutdown_policy_runtime()
         _sim_engine.reset()
 
@@ -637,7 +666,7 @@ def sim_init():
             len(_entity_mgr.drones),
             len(_order_mgr.pending_orders),
         )
-    except (KeyError, ValueError) as exc:
+    except (KeyError, RuntimeError, ValueError) as exc:
         logger.exception("[sim_init] 初始化失败")
         return jsonify({"error": str(exc)}), 422
 
@@ -752,6 +781,74 @@ def sim_orders():
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# POST /training/start
+# ══════════════════════════════════════════════════════════════════════════════
+
+@sim_bp.route("/training/start", methods=["POST"])
+def sim_training_start():
+    """启动默认场景 PPO 训练，并把训练环境遥测推到前端。"""
+    global _training_runtime
+    body = request.get_json(silent=True) or {}
+
+    try:
+        if _training_runtime is not None and _training_runtime.is_running:
+            return jsonify({"error": "PPO 训练已经在运行"}), 409
+
+        activation = build_frontend_training_activation(body)
+        scene_ctx = resolve_scene_context(
+            config_path=activation.config_path,
+            scene_id=activation.scene_id,
+            scene_bundle_dir=None,
+        )
+        if scene_ctx.scene_id != DEFAULT_TRAINING_SCENE_ID:
+            raise ValueError(
+                "第一版 PPO 训练可视化仅支持默认场景: "
+                f"config_default={scene_ctx.scene_id}, supported={DEFAULT_TRAINING_SCENE_ID}"
+            )
+
+        require_current_init = bool(body.get("require_current_init_scene", True))
+        if require_current_init:
+            if _last_init_payload is None:
+                raise ValueError("请先用默认场景初始化前端仿真，再启动 PPO 训练可视化")
+            init_scene_id = str(_last_init_payload.get("scene_id", "")).strip()
+            if init_scene_id != DEFAULT_TRAINING_SCENE_ID:
+                raise ValueError(
+                    "当前前端初始化场景与 PPO 训练场景不一致: "
+                    f"init={init_scene_id or 'unknown'}, required={DEFAULT_TRAINING_SCENE_ID}"
+                )
+
+        if _policy_runtime is not None:
+            _shutdown_policy_runtime()
+        _sim_engine.pause()
+
+        runtime = FrontendPPOTrainingRuntime(activation=activation)
+        _switch_to_training_runtime(runtime)
+        runtime.start()
+
+        return jsonify(
+            {
+                "status": "started",
+                "runtime": runtime.status(),
+            }
+        )
+    except Exception as exc:
+        logger.exception("[sim_training_start] 启动失败")
+        return jsonify({"error": str(exc)}), 422
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# GET /training/state
+# ══════════════════════════════════════════════════════════════════════════════
+
+@sim_bp.route("/training/state", methods=["GET"])
+def sim_training_state():
+    """返回当前 PPO 训练遥测运行时状态。"""
+    if _training_runtime is None:
+        return jsonify({"active": False})
+    return jsonify(_training_runtime.status())
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # POST /policy/activate
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -767,6 +864,8 @@ def sim_policy_activate():
     body = request.get_json(silent=True) or {}
 
     try:
+        if _training_runtime is not None and _training_runtime.is_running:
+            return jsonify({"error": "PPO 训练正在运行，不能激活在线策略"}), 409
         activation = build_policy_activation_config(body)
         base_scene_ctx = resolve_scene_context(
             config_path=activation.config_path,
@@ -920,6 +1019,8 @@ def sim_dispatch():
     """
     if _policy_runtime is not None:
         return jsonify({"error": "当前处于 PPO 在线策略模式，/api/sim/dispatch 不可用"}), 409
+    if _training_runtime is not None and _training_runtime.is_running:
+        return jsonify({"error": "当前处于 PPO 训练可视化模式，/api/sim/dispatch 不可用"}), 409
 
     if not _dispatch_engine:
         return jsonify({"error": "调度引擎未初始化，请先调用 /api/sim/init"}), 409

@@ -3,22 +3,22 @@
     icon="🗺️"
     title="实时指挥中心"
     desc="仿真控制 · 多维 GIS 可视化 · 实时调度干预 · KPI 统计"
-    :badge="systemStore.running ? 'LIVE' : 'READY'"
-    :badge-type="systemStore.running ? 'live' : 'info'"
+    :badge="systemStore.running || systemStore.trainingRunning ? 'LIVE' : 'READY'"
+    :badge-type="systemStore.running || systemStore.trainingRunning ? 'live' : 'info'"
   >
     <div class="dispatch-body">
       <!-- ── 顶部仿真控制栏（迁自 SimulationBox solver tab）── -->
       <div class="dispatch-ctrl">
         <!-- 实时状态 -->
-        <div class="sc-status" :class="systemStore.running ? 'sc-status--on' : 'sc-status--off'">
-          <span class="sc-dot" :class="systemStore.running ? 'sc-dot--live' : 'sc-dot--idle'"></span>
-          <span>{{ systemStore.running ? '仿真运行中' : (initDone ? '已初始化，等待启动' : '未初始化') }}</span>
+        <div class="sc-status" :class="systemStore.running || systemStore.trainingRunning ? 'sc-status--on' : 'sc-status--off'">
+          <span class="sc-dot" :class="systemStore.running || systemStore.trainingRunning ? 'sc-dot--live' : 'sc-dot--idle'"></span>
+          <span>{{ systemStore.trainingRunning ? 'PPO 训练直播中' : (systemStore.running ? '仿真运行中' : (initDone ? '已初始化，等待启动' : '未初始化')) }}</span>
           <span class="sc-sep">|</span>
           <span>仿真时钟：<strong>{{ systemStore.simTime.toFixed(2) }} s</strong></span>
           <span class="sc-sep">|</span>
           <span>倍率：× {{ systemStore.speedRatio }}</span>
           <span class="sc-sep">|</span>
-          <span>运行模式：<strong>{{ systemStore.policyActive ? 'PPO 在线推理' : 'Classic 仿真' }}</strong></span>
+          <span>运行模式：<strong>{{ systemStore.trainingActive ? 'PPO 训练可视化' : (systemStore.policyActive ? 'PPO 在线推理' : 'Classic 仿真') }}</strong></span>
         </div>
 
         <!-- 实体摘要 -->
@@ -53,16 +53,16 @@
             </div>
 
             <div class="sc-action-row">
-              <button class="sc-btn sc-btn--init" :disabled="initLoading" @click="doInit">
+              <button class="sc-btn sc-btn--init" :disabled="initLoading || systemStore.trainingRunning" @click="doInit">
                 {{ initLoading ? '⏳ 初始化中...' : '🚀 初始化并发送到后端' }}
               </button>
               <button class="sc-btn sc-btn--start"
-                :disabled="!initDone || systemStore.running"
+                :disabled="!initDone || systemStore.running || systemStore.trainingRunning"
                 @click="systemStore.start()">▶ 启动</button>
               <button class="sc-btn sc-btn--pause"
                 :disabled="!systemStore.running"
                 @click="systemStore.pause()">⏸ 暂停</button>
-              <button class="sc-btn sc-btn--reset" @click="doReset">🔄 重置</button>
+              <button class="sc-btn sc-btn--reset" :disabled="systemStore.trainingRunning" @click="doReset">🔄 重置</button>
             </div>
 
             <div class="sc-policy-card" :class="{ 'sc-policy-card--collapsed': !ppoPanelOpen }">
@@ -124,7 +124,7 @@
                   </div>
                   <div class="sc-action-row">
                     <button class="sc-btn sc-btn--policy"
-                      :disabled="!ppoReadyForActivation || policyLoading || systemStore.policyActive"
+                      :disabled="!ppoReadyForActivation || policyLoading || systemStore.policyActive || systemStore.trainingRunning"
                       @click="doActivatePolicy">
                       {{ policyLoading ? '⏳ 激活中...' : '🤖 切换到 PPO 在线策略' }}
                     </button>
@@ -144,34 +144,98 @@
               </transition>
             </div>
 
+            <div class="sc-policy-card" :class="{ 'sc-policy-card--collapsed': !trainingPanelOpen }">
+              <button
+                class="sc-policy-head"
+                type="button"
+                :aria-expanded="trainingPanelOpen"
+                @click="trainingPanelOpen = !trainingPanelOpen"
+              >
+                <div class="sc-policy-head-main">
+                  <span class="sc-policy-chevron" :class="{ 'sc-policy-chevron--open': trainingPanelOpen }">▾</span>
+                  <span class="sc-policy-title">🧪 PPO 训练启动</span>
+                  <span class="sc-policy-badge" :class="systemStore.trainingRunning ? 'sc-policy-badge--on' : 'sc-policy-badge--off'">
+                    {{ systemStore.trainingRunning ? '训练中' : (systemStore.trainingCompleted ? '已结束' : '未启动') }}
+                  </span>
+                </div>
+                <span v-if="!trainingPanelOpen" class="sc-policy-summary sc-policy-summary--collapsed">
+                  {{ systemStore.trainingActive ? `step ${systemStore.trainingGlobalStep}` : '点击展开启动默认场景 PPO 训练' }}
+                </span>
+              </button>
+              <transition name="sc-policy-collapse">
+                <div v-show="trainingPanelOpen" class="sc-policy-body">
+                  <div class="sc-policy-grid">
+                    <label class="sc-policy-field">
+                      <span>训练配置文件</span>
+                      <input v-model="trainingConfigPath" type="text" placeholder="config/rh_alns_cmrappo.yaml" />
+                    </label>
+                    <label class="sc-policy-field">
+                      <span>输出目录</span>
+                      <input v-model="trainingOutputDirInput" type="text" placeholder="留空自动创建 weights/.../frontend_train_*" />
+                    </label>
+                    <label class="sc-policy-field">
+                      <span>训练场景 ID</span>
+                      <input v-model="trainingSceneId" type="text" readonly />
+                    </label>
+                    <label class="sc-policy-field">
+                      <span>推流间隔秒</span>
+                      <input v-model.number="trainingRenderIntervalSec" type="number" min="0" step="0.05" />
+                    </label>
+                  </div>
+                  <div class="sc-policy-options">
+                    <span class="sc-policy-runtime">订单源：训练配置 poisson curriculum</span>
+                    <span class="sc-policy-runtime">step：{{ systemStore.trainingGlobalStep }}</span>
+                    <span class="sc-policy-runtime">update：{{ systemStore.trainingUpdateIdx }}</span>
+                    <span class="sc-policy-runtime">episode：{{ systemStore.trainingEpisodeId ?? '尚未开始' }}</span>
+                  </div>
+                  <div class="sc-policy-hint" :class="trainingReady ? 'sc-policy-hint--ok' : 'sc-policy-hint--warn'">
+                    {{ trainingCompatibilityMessage }}
+                  </div>
+                  <div class="sc-action-row">
+                    <button class="sc-btn sc-btn--policy"
+                      :disabled="!trainingReady || trainingLoading || systemStore.trainingRunning || systemStore.policyActive"
+                      @click="doStartPpoTraining">
+                      {{ trainingLoading ? '⏳ 启动中...' : '🧪 启动 PPO 训练并推送前端' }}
+                    </button>
+                    <span class="sc-policy-summary">
+                      {{ systemStore.trainingActive ? `训练输出：${systemStore.trainingOutputDir || '等待后端返回'}` : '当前未启动训练直播' }}
+                    </span>
+                  </div>
+                  <div v-if="systemStore.trainingError" class="sc-policy-checkpoint sc-policy-checkpoint--error">
+                    训练错误：{{ systemStore.trainingError }}
+                  </div>
+                </div>
+              </transition>
+            </div>
+
             <!-- 调度控制行 -->
             <div class="sc-action-row">
               <button class="sc-btn sc-btn--dispatch"
                 :class="{ 'sc-btn--dispatch-active': dispatchSolver === 'greedy' }"
-                :disabled="!initDone || dispatchLoading || systemStore.policyActive"
+                :disabled="!initDone || dispatchLoading || systemStore.policyActive || systemStore.trainingRunning"
                 @click="dispatchSolver = 'greedy'">
                 🧠 贪心（baseline）
               </button>
               <button class="sc-btn sc-btn--dispatch"
                 :class="{ 'sc-btn--dispatch-active': dispatchSolver === 'greedy_mmce' }"
-                :disabled="!initDone || dispatchLoading || systemStore.policyActive"
+                :disabled="!initDone || dispatchLoading || systemStore.policyActive || systemStore.trainingRunning"
                 @click="dispatchSolver = 'greedy_mmce'">
                 🧩 贪心（多模式）
               </button>
               <button class="sc-btn sc-btn--dispatch"
                 :class="{ 'sc-btn--dispatch-active': dispatchSolver === 'greedy_mmce_bi' }"
-                :disabled="!initDone || dispatchLoading || systemStore.policyActive"
+                :disabled="!initDone || dispatchLoading || systemStore.policyActive || systemStore.trainingRunning"
                 @click="dispatchSolver = 'greedy_mmce_bi'">
                 🧩 贪心（增量）
               </button>
               <button class="sc-btn sc-btn--dispatch"
                 :class="{ 'sc-btn--dispatch-active': dispatchSolver === 'market' }"
-                :disabled="!initDone || dispatchLoading || systemStore.policyActive"
+                :disabled="!initDone || dispatchLoading || systemStore.policyActive || systemStore.trainingRunning"
                 @click="dispatchSolver = 'market'">
                 🏷️ 市场拍卖算法
               </button>
               <button class="sc-btn sc-btn--dispatch sc-btn--dispatch-run"
-                :disabled="!initDone || dispatchLoading || systemStore.policyActive"
+                :disabled="!initDone || dispatchLoading || systemStore.policyActive || systemStore.trainingRunning"
                 @click="doDispatch">
                 {{ dispatchLoading ? '⏳ 调度中...' : `🎯 批量${dispatchSolverLabel(dispatchSolver)}调度` }}
               </button>
@@ -183,6 +247,9 @@
               </span>
               <span v-if="systemStore.policyActive" class="dispatch-quick-stat dispatch-quick-stat--policy">
                 PPO 模式下 classic 调度按钮已禁用
+              </span>
+              <span v-if="systemStore.trainingRunning" class="dispatch-quick-stat dispatch-quick-stat--policy">
+                PPO 训练直播中 classic 调度按钮已禁用
               </span>
               <button class="sc-btn sc-btn--export"
                 :disabled="savingPreset"
@@ -316,6 +383,12 @@ const policyDeterministic = ref(true)
 const policyUseCurrentInitPayload = ref(true)
 const policyOrderSourceMode = ref<PolicyOrderSourceMode>('benchmark')
 const ppoPanelOpen = ref(true)
+const trainingPanelOpen = ref(false)
+const trainingLoading = ref(false)
+const trainingConfigPath = ref('config/rh_alns_cmrappo.yaml')
+const trainingOutputDirInput = ref('')
+const trainingSceneId = ref(PPO_SCENE_ID)
+const trainingRenderIntervalSec = ref(0.25)
 const currentSceneId = computed(() => String(sceneStore.context?.scene_id ?? '').trim())
 const ppoCurrentSceneCompatible = computed(() => currentSceneId.value === PPO_SCENE_ID)
 const ppoInitSceneCompatible = computed(() => String(systemStore.initializedSceneId ?? '').trim() === PPO_SCENE_ID)
@@ -338,6 +411,26 @@ const ppoCompatibilityMessage = computed(() => {
     return `最近一次初始化场景为 ${systemStore.initializedSceneId || 'unknown'}，请切回 ${PPO_SCENE_ID} 后重新初始化。`
   }
   return `当前页面与最近一次初始化均匹配 ${PPO_SCENE_ID}，可以激活 PPO。`
+})
+const trainingReady = computed(() =>
+  systemStore.initialized &&
+  ppoCurrentSceneCompatible.value &&
+  ppoInitSceneCompatible.value
+)
+const trainingCompatibilityMessage = computed(() => {
+  if (!sceneStore.context) {
+    return `请先加载默认预设场景 ${PPO_SCENE_ID}。`
+  }
+  if (!ppoCurrentSceneCompatible.value) {
+    return `当前页面场景为 ${currentSceneId.value}，第一版训练直播仅支持 ${PPO_SCENE_ID}。`
+  }
+  if (!systemStore.initialized) {
+    return `请先使用 ${PPO_SCENE_ID} 完成一次初始化，确保前端底图与训练场景一致。`
+  }
+  if (!ppoInitSceneCompatible.value) {
+    return `最近一次初始化场景为 ${systemStore.initializedSceneId || 'unknown'}，请切回 ${PPO_SCENE_ID} 后重新初始化。`
+  }
+  return `训练将使用后端默认场景 ${PPO_SCENE_ID} 和训练配置中的 poisson 订单源。`
 })
 
 // 调度相关状态
@@ -599,6 +692,44 @@ async function doDeactivatePolicy() {
     _log('error', `❌ 切回 Classic 失败：${e.message}`)
   } finally {
     policyLoading.value = false
+  }
+}
+
+async function doStartPpoTraining() {
+  if (!trainingReady.value) {
+    _log('warn', `⚠️ ${trainingCompatibilityMessage.value}`)
+    return
+  }
+  trainingLoading.value = true
+  lastRenderedDecisionEventSeq.value = 0
+  totalEnergyCostWh.value = 0
+  _log('info', `🧪 正在启动 PPO 训练直播：${trainingConfigPath.value}`)
+  try {
+    const payload: {
+      config_path: string
+      scene_id: string
+      output_dir?: string
+      render_interval_sec: number
+      render_every_n_steps: number
+      require_current_init_scene: boolean
+    } = {
+      config_path: trainingConfigPath.value.trim(),
+      scene_id: trainingSceneId.value.trim(),
+      render_interval_sec: Number(trainingRenderIntervalSec.value) || 0.25,
+      render_every_n_steps: 1,
+      require_current_init_scene: true,
+    }
+    const outputDir = trainingOutputDirInput.value.trim()
+    if (outputDir) {
+      payload.output_dir = outputDir
+    }
+    await systemStore.startPpoTraining(payload)
+    await systemStore.fetchTrainingState().catch(() => {})
+    _log('success', `✅ PPO 训练已启动，训练订单将通过前端地图实时展示`)
+  } catch (e: any) {
+    _log('error', `❌ PPO 训练启动失败：${e.message}`)
+  } finally {
+    trainingLoading.value = false
   }
 }
 
@@ -1221,6 +1352,10 @@ onBeforeUnmount(() => {
   font-size: 11.5px;
   color: #475569;
   word-break: break-all;
+}
+
+.sc-policy-checkpoint--error {
+  color: #b91c1c;
 }
 
 .sc-policy-collapse-enter-active,

@@ -52,6 +52,7 @@ from .contracts import (
     PlannerTriggerContext,
     PolicyMode,
     ReservationConstraintState,
+    ReservationPlanOutcome,
     ReservationPlanStatus,
     RouteDriftRef,
     TruckPlanStopView,
@@ -66,6 +67,7 @@ from .order_source_adapter import (
 from .planner_bridge import PlannerBridge
 from .recovery_pool_selector import select_recovery_pool_for_order
 from .scene_loader import DEFAULT_CONFIG_PATH, TrainingSceneContext, load_default_scene
+from .uav_path_service import TrainingUavPathService
 
 
 NodeId: TypeAlias = str
@@ -74,6 +76,7 @@ DroneId: TypeAlias = str
 
 _TIME_EPS = 1e-6
 _BACKBONE_DEPARTURE_EPS = 1e-6
+_MIN_FUTURE_STATION_BACKBONE_VISITS = 3
 _MODE_C_REVALIDATION_REASON_KEYS = (
     "energy_feasible",
     "rendezvous_time_feasible",
@@ -204,6 +207,7 @@ class PlannerRuntimeStateView:
     reservation_count: Mapping[str, int]
     truck_mandatory_orders: Mapping[str, Order]
     require_station_backbone: bool = False
+    truck_route_ready_at: float | None = None
 
 
 @dataclass(frozen=True)
@@ -289,6 +293,8 @@ class FlightLeg:
     start_pos: Position3D
     target_pos: Position3D
     path_points: tuple[Position3D, ...] = ()
+    cumulative_distances_m: tuple[float, ...] = ()
+    distance_m: float = 0.0
     route_version: int = 0
     motion_mode: str = "straight_line"
     order_id: str | None = None
@@ -417,9 +423,11 @@ class TrainingEnvAdapter:
             self._scene_ctx,
             config_path=self._config_path,
         )
+        self._uav_path_service = TrainingUavPathService(scene_ctx=self._scene_ctx)
         self._candidate_builder = candidate_builder or CandidateBuilder(
             scene_ctx=self._scene_ctx,
             config_path=self._config_path,
+            uav_path_service=self._uav_path_service,
         )
         self._phase4_route_dir = (
             Path(phase4_route_dir)
@@ -490,6 +498,7 @@ class TrainingEnvAdapter:
         self._current_coarse_plan: CoarsePlanView | None = None
         self._truck_replan_pending = False
         self._truck_replan_pending_reasons: set[str] = set()
+        self._planner_replan_events: list[dict[str, Any]] = []
         self._active_launch_stations: set[str] = set()
         self._fallback_event_times: list[float] = []
         self._hard_failure_event_times: list[float] = []
@@ -623,6 +632,7 @@ class TrainingEnvAdapter:
         self._current_coarse_plan = None
         self._truck_replan_pending = False
         self._truck_replan_pending_reasons.clear()
+        self._planner_replan_events.clear()
         self._active_launch_stations.clear()
         self._fallback_event_times.clear()
         self._hard_failure_event_times.clear()
@@ -1098,6 +1108,7 @@ class TrainingEnvAdapter:
             "reservation_release_cause_counts": dict(
                 self._episode_reservation_release_cause_counts
             ),
+            "planner_replan_event_count": int(len(self._planner_replan_events)),
             "feasible_mode_c_recover_node_count_total": int(
                 self._episode_feasible_mode_c_recover_node_count_total
             ),
@@ -1137,6 +1148,10 @@ class TrainingEnvAdapter:
             ),
             "system_context_stats": self.build_system_context_stats(),
         }
+
+    def build_planner_replan_events_snapshot(self) -> tuple[dict[str, Any], ...]:
+        """返回当前 episode 的 planner replan 结构化事件。"""
+        return tuple(copy.deepcopy(event) for event in self._planner_replan_events)
 
     def build_visualization_snapshot(self) -> dict[str, Any]:
         """返回供实时可视化使用的轻量级状态快照。"""
@@ -1374,19 +1389,9 @@ class TrainingEnvAdapter:
         if t_now >= leg.arrival_time - _TIME_EPS:
             return None
 
-        if t_now <= leg.start_time + _TIME_EPS:
-            current_pos = _clone_position(leg.start_pos)
-        else:
-            ratio = max(
-                0.0,
-                min(1.0, (t_now - leg.start_time) / max(_TIME_EPS, leg.arrival_time - leg.start_time)),
-            )
-            current_pos = leg.start_pos.interpolate(leg.target_pos, ratio)
-
-        tail_points = tuple(_clone_position(pos) for pos in leg.path_points[1:])
-        if not tail_points:
-            tail_points = (_clone_position(leg.target_pos),)
-        remaining_points = (_clone_position(current_pos),) + tail_points
+        remaining_points = self._flight_leg_remaining_points(leg=leg, t_now=t_now)
+        if not remaining_points:
+            remaining_points = (_clone_position(leg.target_pos),)
         return {
             "entity_id": drone_id,
             "route_version": int(leg.route_version),
@@ -1401,6 +1406,61 @@ class TrainingEnvAdapter:
             "distance_m": float(_polyline_distance_2d(remaining_points)),
             "path_utm": [_position_to_payload(pos) for pos in remaining_points],
         }
+
+    def _flight_leg_geometry(self, leg: FlightLeg) -> tuple[Position3D, ...]:
+        geometry = tuple(_clone_position(pos) for pos in leg.path_points)
+        if len(geometry) >= 2:
+            return geometry
+        return (_clone_position(leg.start_pos), _clone_position(leg.target_pos))
+
+    def _flight_leg_cumulative_distances(self, leg: FlightLeg) -> tuple[float, ...]:
+        geometry = self._flight_leg_geometry(leg)
+        if len(leg.cumulative_distances_m) == len(geometry):
+            return tuple(float(item) for item in leg.cumulative_distances_m)
+        return _build_cumulative_distances(geometry)
+
+    def _flight_leg_traveled_distance(self, *, leg: FlightLeg, t_now: float) -> float:
+        cumulative = self._flight_leg_cumulative_distances(leg)
+        if not cumulative:
+            return 0.0
+        if t_now <= leg.start_time + _TIME_EPS:
+            return 0.0
+        if t_now >= leg.arrival_time - _TIME_EPS:
+            return float(cumulative[-1])
+        ratio = max(
+            0.0,
+            min(
+                1.0,
+                (float(t_now) - float(leg.start_time))
+                / max(_TIME_EPS, float(leg.arrival_time) - float(leg.start_time)),
+            ),
+        )
+        return float(cumulative[-1]) * ratio
+
+    def _flight_leg_position_at(self, *, leg: FlightLeg, t_now: float) -> Position3D:
+        geometry = self._flight_leg_geometry(leg)
+        cumulative = self._flight_leg_cumulative_distances(leg)
+        traveled_m = self._flight_leg_traveled_distance(leg=leg, t_now=t_now)
+        return _interpolate_position_on_geometry(
+            geometry=geometry,
+            cumulative_distances_m=cumulative,
+            traveled_m=traveled_m,
+        )
+
+    def _flight_leg_remaining_points(
+        self,
+        *,
+        leg: FlightLeg,
+        t_now: float,
+    ) -> tuple[Position3D, ...]:
+        geometry = self._flight_leg_geometry(leg)
+        cumulative = self._flight_leg_cumulative_distances(leg)
+        traveled_m = self._flight_leg_traveled_distance(leg=leg, t_now=t_now)
+        return _remaining_geometry_from_distance(
+            geometry=geometry,
+            cumulative_distances_m=cumulative,
+            traveled_m=traveled_m,
+        )
 
     def _build_pending_mode_b_depot_path_entry(
         self,
@@ -1422,13 +1482,20 @@ class TrainingEnvAdapter:
         if drone is None or depot is None:
             return None
         depot_pos = _clone_position(depot.get_location(t_now))
-        path_points = (_clone_position(drone.current_loc), depot_pos)
+        path_points = self._uav_path_service.plan_path(
+            from_pos=_clone_position(drone.current_loc),
+            to_pos=depot_pos,
+        )
         return {
             "entity_id": drone_id,
             "route_version": int(self._drone_path_version.get(drone_id, 0)),
             "segment_id": "mode_b_pending_return_to_depot",
             "status": "active",
-            "motion_mode": "straight_line",
+            "motion_mode": (
+                "uav_avoidance_path"
+                if self._uav_path_service.has_obstacle_planner
+                else "straight_line"
+            ),
             "start_time": float(t_now),
             "end_time": None,
             "target_node_id": str(depot_id),
@@ -1585,6 +1652,15 @@ class TrainingEnvAdapter:
             )
         )
 
+    def _future_station_backbone_visits(self, t_now: float) -> tuple[BackboneVisit, ...]:
+        """返回当前时刻之后仍在未来骨架中的 station 访问记录；不包含 depot。"""
+        station_ids = self._require_entity_manager().stations
+        return tuple(
+            visit
+            for visit in self._future_backbone_visits(t_now)
+            if str(visit.node_id) in station_ids
+        )
+
     def _dedup_backbone_visits(
         self,
         visits: tuple[BackboneVisit, ...],
@@ -1616,6 +1692,9 @@ class TrainingEnvAdapter:
         if self._planner_bridge is None:
             return self._build_coarse_plan_view(self._t_now)
 
+        truck_route_ready_at = self._truck_route_ready_time_for_replan(
+            float(runtime_state.t_now)
+        )
         reservation_constraints = self._build_truck_reservation_constraints(
             runtime_state
         )
@@ -1640,6 +1719,7 @@ class TrainingEnvAdapter:
                 runtime_state=self._build_coarse_only_runtime_state(runtime_state),
                 truck_mandatory_orders={},
                 require_station_backbone=False,
+                truck_route_ready_at=truck_route_ready_at,
             )
             planner_reservation_constraints: tuple[TruckReservationConstraint, ...] = ()
         else:
@@ -1654,6 +1734,7 @@ class TrainingEnvAdapter:
                 runtime_state=runtime_state,
                 truck_mandatory_orders=planning_orders,
                 require_station_backbone=require_station_backbone,
+                truck_route_ready_at=truck_route_ready_at,
             )
             planner_reservation_constraints = reservation_constraints
 
@@ -1693,14 +1774,30 @@ class TrainingEnvAdapter:
             self._current_coarse_plan = coarse_plan
             if coarse_plan.truck_plan_stops:
                 if allow_truck_route_replan:
-                    self._apply_dynamic_truck_plan(coarse_plan.truck_plan_stops)
+                    self._apply_dynamic_truck_plan(
+                        coarse_plan.truck_plan_stops,
+                        route_start_time=truck_route_ready_at,
+                    )
+                    applied_to_truck_route = True
                     self._clear_truck_replan_pending()
                 else:
+                    applied_to_truck_route = False
                     self._mark_truck_replan_pending("truck_plan_deferred")
-            self._apply_planner_reservation_outcomes(
+            else:
+                applied_to_truck_route = False
+            reservation_env_decisions = self._apply_planner_reservation_outcomes(
                 coarse_plan=coarse_plan,
                 reservation_constraints=planner_reservation_constraints,
                 t_now=float(runtime_state.t_now),
+            )
+            self._record_planner_replan_event(
+                coarse_plan=coarse_plan,
+                trigger_ctx=trigger_ctx,
+                reservation_constraints=planner_reservation_constraints,
+                reservation_env_decisions=reservation_env_decisions,
+                applied_to_truck_route=applied_to_truck_route,
+                allow_truck_route_replan=allow_truck_route_replan,
+                truck_route_ready_at=truck_route_ready_at,
             )
             self._active_launch_stations = set(coarse_plan.launch_candidate_stations)
             self._completed_backbone_nodes_since_plan.clear()
@@ -1720,8 +1817,10 @@ class TrainingEnvAdapter:
         if not self._has_unfinished_order_flow(runtime_state):
             return False
 
-        future_fixed_count = len(self._future_backbone_visits(float(runtime_state.t_now)))
-        if future_fixed_count > 1:
+        future_station_count = len(
+            self._future_station_backbone_visits(float(runtime_state.t_now))
+        )
+        if future_station_count >= _MIN_FUTURE_STATION_BACKBONE_VISITS:
             return False
 
         if self._planner_bridge is not None:
@@ -1834,6 +1933,18 @@ class TrainingEnvAdapter:
         self._truck_replan_pending = False
         self._truck_replan_pending_reasons.clear()
 
+    def _truck_route_ready_time_for_replan(self, t_now: float) -> float:
+        """返回卡车完成当前 stop 服务、可驶向新计划首站的时刻。"""
+        current_stop_idx = int(self._planned_route_stop_i) - 1
+        if 0 <= current_stop_idx < len(self._planned_route_stops):
+            stop = self._planned_route_stops[current_stop_idx]
+            if (
+                abs(float(stop.arrival_time) - float(t_now)) <= _TIME_EPS
+                and float(stop.departure_time) > float(t_now) + _TIME_EPS
+            ):
+                return float(stop.departure_time)
+        return float(t_now)
+
     def _build_coarse_only_runtime_state(
         self,
         runtime_state: RuntimeStateView,
@@ -1853,6 +1964,7 @@ class TrainingEnvAdapter:
         runtime_state: RuntimeStateView,
         truck_mandatory_orders: Mapping[str, Order],
         require_station_backbone: bool = False,
+        truck_route_ready_at: float | None = None,
     ) -> PlannerRuntimeStateView:
         """构造 PlannerBridge 专用输入，显式区分 PPO pending 与卡车必经订单。"""
         return PlannerRuntimeStateView(
@@ -1865,6 +1977,9 @@ class TrainingEnvAdapter:
             reservation_count=runtime_state.reservation_count,
             truck_mandatory_orders=dict(truck_mandatory_orders),
             require_station_backbone=bool(require_station_backbone),
+            truck_route_ready_at=(
+                None if truck_route_ready_at is None else float(truck_route_ready_at)
+            ),
         )
 
     def _build_truck_mandatory_order_input(
@@ -1963,19 +2078,37 @@ class TrainingEnvAdapter:
         coarse_plan: CoarsePlanView,
         reservation_constraints: tuple[TruckReservationConstraint, ...],
         t_now: float,
-    ) -> None:
+    ) -> dict[str, str]:
         constraints_by_id = {
             constraint.reservation_id: constraint
             for constraint in reservation_constraints
         }
+        env_decisions: dict[str, str] = {}
         for reservation_id, outcome in coarse_plan.reservation_outcomes.items():
             if outcome.status != ReservationPlanStatus.INVALIDATED:
+                env_decisions[reservation_id] = "planner_status_no_env_action"
                 continue
             constraint = constraints_by_id.get(reservation_id)
             if constraint is None:
+                env_decisions[reservation_id] = "ignored_missing_constraint"
                 continue
             drone_id = constraint.drone_id
             if drone_id not in self._reservations:
+                env_decisions[reservation_id] = "ignored_no_active_reservation"
+                continue
+            if self._can_keep_invalidated_reservation_after_execution_recheck(
+                drone_id=drone_id,
+                constraint=constraint,
+                outcome=outcome,
+                t_now=float(t_now),
+            ):
+                self._update_reservation_commit_for_new_truck_eta(
+                    drone_id=drone_id,
+                    node_id=constraint.node_id,
+                    new_truck_eta=float(outcome.new_eta),
+                    t_now=float(t_now),
+                )
+                env_decisions[reservation_id] = "kept_after_execution_recheck"
                 continue
             self._release_reservation(
                 drone_id,
@@ -1997,14 +2130,253 @@ class TrainingEnvAdapter:
                     cause=FALLBACK_CAUSE_PLANNER_INVALIDATED_FOR_TRUCK_ORDER,
                 ):
                     self._mark_hard_failure(drone_id)
+                    env_decisions[reservation_id] = "released_and_hard_failure"
+                else:
+                    env_decisions[reservation_id] = "released_and_fallback"
+            else:
+                env_decisions[reservation_id] = "released_only"
+        return env_decisions
+
+    def _record_planner_replan_event(
+        self,
+        *,
+        coarse_plan: CoarsePlanView,
+        trigger_ctx: PlannerTriggerContext,
+        reservation_constraints: tuple[TruckReservationConstraint, ...],
+        reservation_env_decisions: Mapping[str, str],
+        applied_to_truck_route: bool,
+        allow_truck_route_replan: bool,
+        truck_route_ready_at: float,
+    ) -> None:
+        constraints_by_id = {
+            constraint.reservation_id: constraint
+            for constraint in reservation_constraints
+        }
+        reservation_outcomes: list[dict[str, Any]] = []
+        for reservation_id, outcome in sorted(coarse_plan.reservation_outcomes.items()):
+            constraint = constraints_by_id.get(reservation_id)
+            reservation_outcomes.append(
+                {
+                    "reservation_id": str(reservation_id),
+                    "drone_id": (
+                        None if constraint is None else str(constraint.drone_id)
+                    ),
+                    "node_id": str(outcome.node_id),
+                    "status": str(outcome.status.value),
+                    "invalidate_cause": (
+                        None
+                        if outcome.invalidate_cause is None
+                        else str(outcome.invalidate_cause)
+                    ),
+                    "old_eta": float(outcome.old_eta),
+                    "new_eta": (
+                        None if outcome.new_eta is None else float(outcome.new_eta)
+                    ),
+                    "eta_drift_sec": (
+                        None
+                        if outcome.eta_drift_sec is None
+                        else float(outcome.eta_drift_sec)
+                    ),
+                    "env_decision": str(
+                        reservation_env_decisions.get(
+                            reservation_id,
+                            "not_evaluated",
+                        )
+                    ),
+                    "constraint_state": (
+                        None if constraint is None else str(constraint.state.value)
+                    ),
+                    "related_order_id": (
+                        None
+                        if constraint is None or constraint.related_order_id is None
+                        else str(constraint.related_order_id)
+                    ),
+                }
+            )
+
+        self._planner_replan_events.append(
+            {
+                "t_now": float(trigger_ctx.t_now),
+                "truck_route_ready_at": float(truck_route_ready_at),
+                "plan_version": int(coarse_plan.plan_version),
+                "applied_to_truck_route": bool(applied_to_truck_route),
+                "allow_truck_route_replan": bool(allow_truck_route_replan),
+                "truck_replan_pending": bool(self._truck_replan_pending),
+                "truck_replan_pending_reasons": tuple(
+                    sorted(self._truck_replan_pending_reasons)
+                ),
+                "trigger": {
+                    "backlog_new_orders": int(trigger_ctx.backlog_new_orders),
+                    "fallback_count_in_window": int(
+                        trigger_ctx.fallback_count_in_window
+                    ),
+                    "hard_failure_count_in_window": int(
+                        trigger_ctx.hard_failure_count_in_window
+                    ),
+                    "route_drift_ratio": float(trigger_ctx.route_drift_ratio),
+                },
+                "truck_backbone_route": tuple(
+                    str(node_id) for node_id in coarse_plan.truck_backbone_route
+                ),
+                "truck_eta_map": {
+                    str(node_id): float(eta)
+                    for node_id, eta in sorted(coarse_plan.truck_eta_map.items())
+                },
+                "truck_plan_stops": tuple(
+                    {
+                        "seq": int(stop.seq),
+                        "node_type": str(stop.node_type),
+                        "node_id": str(stop.node_id),
+                        "order_id": (
+                            None if stop.order_id is None else str(stop.order_id)
+                        ),
+                        "arrival_time": float(stop.arrival_time),
+                        "departure_time": float(stop.departure_time),
+                    }
+                    for stop in coarse_plan.truck_plan_stops
+                ),
+                "reservation_outcomes": tuple(reservation_outcomes),
+            }
+        )
+
+    def _can_keep_invalidated_reservation_after_execution_recheck(
+        self,
+        *,
+        drone_id: str,
+        constraint: TruckReservationConstraint,
+        outcome: ReservationPlanOutcome,
+        t_now: float,
+    ) -> bool:
+        """把 planner 层 invalidated 复核为执行层是否仍可兑现。"""
+        cause = str(outcome.invalidate_cause or "")
+        if cause == "node_not_in_truck_plan":
+            return False
+        if cause not in {"arrived_before_eta_ref", "eta_late_exceeds_threshold"}:
+            return False
+        if outcome.new_eta is None:
+            return False
+
+        reservation = self._reservations.get(drone_id)
+        if reservation is None or reservation.recover_node != constraint.node_id:
+            return False
+
+        new_eta = float(outcome.new_eta)
+        state = self._drone_state.get(drone_id)
+        if state == TrainingDroneState.WAITING_FOR_TRUCK:
+            wait_started_at = self._rendezvous_wait_started_at.get(drone_id)
+            if wait_started_at is None:
+                return False
+            if new_eta < float(t_now) - _TIME_EPS:
+                return False
+            total_wait = new_eta - float(wait_started_at)
+            return total_wait <= float(self._cfg.rendezvous_max_wait_sec) + _TIME_EPS
+
+        uav_arrival = self._estimate_rendezvous_arrival_for_recheck(
+            drone_id=drone_id,
+            node_id=constraint.node_id,
+            t_now=float(t_now),
+        )
+        if uav_arrival is None:
+            return False
+        if (
+            float(uav_arrival) + float(self._cfg.rendezvous_execution_margin_sec)
+            > new_eta + _TIME_EPS
+        ):
+            return False
+        wait_time = new_eta - float(uav_arrival)
+        if cause == "eta_late_exceeds_threshold":
+            return wait_time <= float(self._cfg.rendezvous_max_wait_sec) + _TIME_EPS
+        return True
+
+    def _estimate_rendezvous_arrival_for_recheck(
+        self,
+        *,
+        drone_id: str,
+        node_id: str,
+        t_now: float,
+    ) -> float | None:
+        """按当前状态估计 UAV 到达 reservation 节点的时刻。"""
+        state = self._drone_state.get(drone_id)
+        if state == TrainingDroneState.RETURN_TO_RENDEZVOUS:
+            leg = self._flight_legs.get(drone_id)
+            if (
+                leg is not None
+                and leg.kind == "return_to_rendezvous"
+                and leg.target_node_id == node_id
+            ):
+                return max(float(t_now), float(leg.arrival_time))
+
+        if state == TrainingDroneState.DELIVERY_SERVICE:
+            service_leg = self._delivery_service_legs.get(drone_id)
+            if service_leg is not None:
+                drone = self._require_entity_manager().drones[drone_id]
+                host = self._resolve_fixed_node(node_id)
+                service_finish = float(service_leg.finish_time)
+                return service_finish + self._estimate_flight_time(
+                    drone=drone,
+                    from_pos=service_leg.service_pos,
+                    to_pos=host.get_location(service_finish),
+                )
+
+        if state == TrainingDroneState.DELIVERED:
+            drone = self._require_entity_manager().drones[drone_id]
+            host = self._resolve_fixed_node(node_id)
+            return float(t_now) + self._estimate_flight_time(
+                drone=drone,
+                from_pos=drone.current_loc,
+                to_pos=host.get_location(float(t_now)),
+            )
+
+        return None
+
+    def _update_reservation_commit_for_new_truck_eta(
+        self,
+        *,
+        drone_id: str,
+        node_id: str,
+        new_truck_eta: float,
+        t_now: float,
+    ) -> None:
+        """保留 reservation 时，把 dispatch commit 同步到新的 truck ETA。"""
+        commit = self._dispatch_commit.get(drone_id)
+        if commit is None:
+            return
+
+        if self._drone_state.get(drone_id) == TrainingDroneState.WAITING_FOR_TRUCK:
+            uav_arrival = self._rendezvous_wait_started_at.get(drone_id, float(t_now))
+        else:
+            uav_arrival = self._estimate_rendezvous_arrival_for_recheck(
+                drone_id=drone_id,
+                node_id=node_id,
+                t_now=float(t_now),
+            )
+        planned_execution_slack_sec = (
+            None if uav_arrival is None else float(new_truck_eta) - float(uav_arrival)
+        )
+        self._dispatch_commit[drone_id] = replace(
+            commit,
+            selected_recover_node=node_id,
+            planned_truck_arrival_time=float(new_truck_eta),
+            planned_uav_arrival_time_lb=(
+                commit.planned_uav_arrival_time_lb
+                if uav_arrival is None
+                else float(uav_arrival)
+            ),
+            planned_execution_slack_sec=planned_execution_slack_sec,
+        )
 
     def _apply_dynamic_truck_plan(
         self,
         truck_plan_stops: tuple[TruckPlanStopView, ...],
+        *,
+        route_start_time: float | None = None,
     ) -> None:
         if not truck_plan_stops:
             return
 
+        effective_route_start_time = float(
+            self._t_now if route_start_time is None else route_start_time
+        )
         anchor = PlannedStop(
             seq=0,
             node_type="truck_current",
@@ -2012,7 +2384,7 @@ class TrainingEnvAdapter:
             position=self._truck_position_at_time(self._t_now),
             order_id=None,
             arrival_time=float(self._t_now),
-            departure_time=float(self._t_now),
+            departure_time=effective_route_start_time,
         )
         planned_stops = [anchor]
         planned_segments: list[PlannedTruckSegment] = []
@@ -3192,44 +3564,40 @@ class TrainingEnvAdapter:
         target_order_id: str | None = None,
         target_node_id: str | None = None,
         target_node_type: str | None = None,
-        path_points: tuple[Position3D, ...] | None = None,
     ) -> None:
         """为 UAV 写入一段新的飞行账本。"""
         entity_mgr = self._require_entity_manager()
         drone = entity_mgr.drones[drone_id]
         effective_start_time = float(self._t_now if start_time is None else start_time)
         start_pos = _clone_position(drone.current_loc)
-        energy_cost = self._estimate_energy_needed(
+        estimate = self._uav_path_service.estimate(
             drone=drone,
             from_pos=start_pos,
             to_pos=target_pos,
             payload=payload,
         )
-        flight_time = self._estimate_flight_time(
-            drone=drone,
-            from_pos=start_pos,
-            to_pos=target_pos,
-        )
         route_version = int(self._drone_path_version.get(drone_id, 0) + 1)
         self._drone_path_version[drone_id] = route_version
-        visual_path_points = (
-            tuple(_clone_position(pos) for pos in path_points)
-            if path_points is not None
-            else (start_pos, _clone_position(target_pos))
+        visual_path_points = tuple(
+            _clone_position(pos) for pos in estimate.path_points
         )
         self._flight_legs[drone_id] = FlightLeg(
             kind=kind,
             start_time=effective_start_time,
-            arrival_time=float(effective_start_time + flight_time),
+            arrival_time=float(effective_start_time + estimate.flight_time_sec),
             start_pos=start_pos,
             target_pos=_clone_position(target_pos),
             path_points=visual_path_points,
+            cumulative_distances_m=tuple(
+                float(item) for item in estimate.cumulative_distances_m
+            ),
+            distance_m=float(estimate.distance_m),
             route_version=route_version,
-            motion_mode="straight_line",
+            motion_mode=str(estimate.motion_mode),
             order_id=target_order_id,
             target_node_id=target_node_id,
             target_node_type=target_node_type,
-            energy_cost_j=energy_cost,
+            energy_cost_j=float(estimate.energy_j),
         )
 
     def _schedule_return_to_host(
@@ -3297,7 +3665,6 @@ class TrainingEnvAdapter:
         depot = self._require_depot()
         effective_start_time = float(self._t_now if start_time is None else start_time)
         station_pos = _clone_position(station.get_location(effective_start_time))
-        depot_pos = _clone_position(depot.get_location(effective_start_time))
         self._mode_b_pending_depot_return[drone_id] = depot.depot_id
         self._drone_state[drone_id] = TrainingDroneState.RETURN_TO_STATION
         self._schedule_flight_leg(
@@ -3308,11 +3675,6 @@ class TrainingEnvAdapter:
             start_time=effective_start_time,
             target_node_id=station.station_id,
             target_node_type="station",
-            path_points=(
-                _clone_position(self._require_entity_manager().drones[drone_id].current_loc),
-                station_pos,
-                depot_pos,
-            ),
         )
 
     def _schedule_return_to_rendezvous(
@@ -4077,7 +4439,14 @@ class TrainingEnvAdapter:
             ):
                 continue
             reachable_stations.append(
-                (eval_pos.distance_2d(station_pos), station.station_id, station)
+                (
+                    self._estimate_path_distance(
+                        from_pos=eval_pos,
+                        to_pos=station_pos,
+                    ),
+                    station.station_id,
+                    station,
+                )
             )
 
         if not reachable_stations:
@@ -4164,7 +4533,13 @@ class TrainingEnvAdapter:
                 battery_current=drone.battery_current,
             ):
                 reachable_stations.append(
-                    (drone.current_loc.distance_2d(station_pos), station)
+                    (
+                        self._estimate_path_distance(
+                            from_pos=drone.current_loc,
+                            to_pos=station_pos,
+                        ),
+                        station,
+                    )
                 )
         if not reachable_stations:
             return None
@@ -4338,15 +4713,7 @@ class TrainingEnvAdapter:
 
         for drone_id, leg in self._flight_legs.items():
             drone = entity_mgr.drones[drone_id]
-            if t_now <= leg.start_time + _TIME_EPS:
-                drone.current_loc = _clone_position(leg.start_pos)
-                continue
-            if t_now >= leg.arrival_time - _TIME_EPS:
-                drone.current_loc = _clone_position(leg.target_pos)
-                continue
-            # 对仍在飞行中的 UAV 做线性插值，只用于当前实现的运行时位置可视化。
-            ratio = (t_now - leg.start_time) / max(_TIME_EPS, leg.arrival_time - leg.start_time)
-            drone.current_loc = leg.start_pos.interpolate(leg.target_pos, ratio)
+            drone.current_loc = self._flight_leg_position_at(leg=leg, t_now=t_now)
 
     def _next_event_time(self) -> float:
         """从当前所有已知事件源里取下一个未来事件时刻。"""
@@ -5120,8 +5487,13 @@ class TrainingEnvAdapter:
         from_pos: Position3D,
         to_pos: Position3D,
     ) -> float:
-        """按三维直线距离和巡航速度估算飞行时长。"""
-        return from_pos.distance_3d(to_pos) / max(_TIME_EPS, drone.cruise_speed)
+        """按训练侧 UAV 路径服务估算飞行时长。"""
+        return self._uav_path_service.estimate(
+            drone=drone,
+            from_pos=from_pos,
+            to_pos=to_pos,
+            payload=0.0,
+        ).flight_time_sec
 
     def _estimate_energy_needed(
         self,
@@ -5131,12 +5503,13 @@ class TrainingEnvAdapter:
         to_pos: Position3D,
         payload: float,
     ) -> float:
-        """按当前 Drone 功耗模型估算一段飞行能耗。"""
-        distance = from_pos.distance_3d(to_pos)
-        if distance <= _TIME_EPS:
-            return 0.0
-        power = drone.calculate_power(payload, drone.cruise_speed)
-        return power * (distance / max(_TIME_EPS, drone.cruise_speed))
+        """按训练侧 UAV 路径服务估算一段飞行能耗。"""
+        return self._uav_path_service.estimate(
+            drone=drone,
+            from_pos=from_pos,
+            to_pos=to_pos,
+            payload=payload,
+        ).energy_j
 
     def _can_reach_from(
         self,
@@ -5149,14 +5522,25 @@ class TrainingEnvAdapter:
         battery_current: float,
     ) -> bool:
         """在给定起点和剩余电量假设下判断 UAV 是否可达。"""
-        return battery_current + _TIME_EPS >= (
-            self._estimate_energy_needed(
-                drone=drone,
-                from_pos=from_pos,
-                to_pos=to_pos,
-                payload=payload,
-            )
-            + safe_margin
+        return self._uav_path_service.can_reach(
+            drone=drone,
+            from_pos=from_pos,
+            to_pos=to_pos,
+            payload=payload,
+            safe_margin=safe_margin,
+            battery_current=battery_current,
+        )
+
+    def _estimate_path_distance(
+        self,
+        *,
+        from_pos: Position3D,
+        to_pos: Position3D,
+    ) -> float:
+        """按训练侧 UAV 路径服务估算水平路径距离。"""
+        return self._uav_path_service.path_distance(
+            from_pos=from_pos,
+            to_pos=to_pos,
         )
 
     def _all_return_hosts(self) -> tuple[ChargingHost, ...]:

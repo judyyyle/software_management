@@ -38,6 +38,7 @@ from .contracts import (
     UavSelfFeatures,
 )
 from .scene_loader import DEFAULT_CONFIG_PATH, TrainingSceneContext, load_default_scene
+from .uav_path_service import TrainingUavPathService
 
 
 _TIME_EPS = 1e-6
@@ -65,10 +66,14 @@ class CandidateBuilder:
         *,
         scene_ctx: TrainingSceneContext | None = None,
         config_path: str | Path = DEFAULT_CONFIG_PATH,
+        uav_path_service: TrainingUavPathService | None = None,
     ) -> None:
         self._config_path = Path(config_path)
         self._cfg = _load_candidate_config(self._config_path)
         self._scene_ctx = scene_ctx or load_default_scene(config_path=self._config_path)
+        self._uav_path_service = uav_path_service or TrainingUavPathService(
+            scene_ctx=self._scene_ctx
+        )
         solver_params = load_solver_energy_params()
         self._truck_drone_launch_time_s = float(solver_params.truck_drone_launch_time_s)
         self._drone_service_time_order_s = float(solver_params.drone_service_time_order_s)
@@ -114,20 +119,17 @@ class CandidateBuilder:
             if float(order.payload_weight) > float(drone_view.payload_capacity):
                 continue
 
-            t_deliver_arrive = effective_launch_time + _estimate_flight_time(
-                drone_view=drone_view,
-                from_pos=launch_pos,
-                to_pos=order.delivery_loc,
-            )
-            t_deliver_finish = (
-                t_deliver_arrive + self._drone_service_time_order_s
-            )
-            energy_to_deliver = _estimate_energy_needed(
+            delivery_leg = self._estimate_uav_leg(
                 drone_view=drone_view,
                 from_pos=launch_pos,
                 to_pos=order.delivery_loc,
                 payload=float(order.payload_weight),
             )
+            t_deliver_arrive = effective_launch_time + delivery_leg.flight_time_sec
+            t_deliver_finish = (
+                t_deliver_arrive + self._drone_service_time_order_s
+            )
+            energy_to_deliver = delivery_leg.energy_j
             if energy_to_deliver > float(drone_view.battery_current) + _TIME_EPS:
                 continue
 
@@ -171,7 +173,7 @@ class CandidateBuilder:
                 delivery_x=float(order.delivery_loc.x),
                 delivery_y=float(order.delivery_loc.y),
                 delivery_z=float(order.delivery_loc.z),
-                distance_to_order=launch_pos.distance_3d(order.delivery_loc),
+                distance_to_order=float(delivery_leg.distance_m),
                 order_pre_score=float(coarse_plan.order_pre_score[order_id]),
                 priority_band=int(coarse_plan.order_priority_band[order_id]),
                 has_mode_b_action=mode_b_summary is not None,
@@ -363,6 +365,65 @@ class CandidateBuilder:
             effective_launch_time += self._truck_drone_launch_time_s
         return effective_launch_time
 
+    def _estimate_uav_leg(
+        self,
+        *,
+        drone_view: Any,
+        from_pos: Position3D,
+        to_pos: Position3D,
+        payload: float,
+    ):
+        return self._uav_path_service.estimate(
+            drone=drone_view,
+            from_pos=from_pos,
+            to_pos=to_pos,
+            payload=payload,
+        )
+
+    def _estimate_flight_time(
+        self,
+        *,
+        drone_view: Any,
+        from_pos: Position3D,
+        to_pos: Position3D,
+    ) -> float:
+        return self._estimate_uav_leg(
+            drone_view=drone_view,
+            from_pos=from_pos,
+            to_pos=to_pos,
+            payload=0.0,
+        ).flight_time_sec
+
+    def _can_reach(
+        self,
+        *,
+        drone_view: Any,
+        from_pos: Position3D,
+        to_pos: Position3D,
+        payload: float,
+        safe_margin: float,
+        battery_current: float,
+    ) -> bool:
+        return self._uav_path_service.can_reach(
+            drone=drone_view,
+            from_pos=from_pos,
+            to_pos=to_pos,
+            payload=payload,
+            safe_margin=safe_margin,
+            battery_current=battery_current,
+        )
+
+    def _path_distance(
+        self,
+        *,
+        from_pos: Position3D,
+        to_pos: Position3D,
+    ) -> float:
+        return self._uav_path_service.path_distance(
+            from_pos=from_pos,
+            to_pos=to_pos,
+        )
+
     def _build_mode_c_candidates(
         self,
         *,
@@ -392,7 +453,7 @@ class CandidateBuilder:
             if node_state is None or t_arrive_truck is None:
                 continue
 
-            uav_flight_time = _estimate_flight_time(
+            uav_flight_time = self._estimate_flight_time(
                 drone_view=drone_view,
                 from_pos=deliver_pos,
                 to_pos=node_state.position,
@@ -403,7 +464,7 @@ class CandidateBuilder:
                 continue
             if planned_wait > self._cfg.rendezvous_max_wait_sec + _TIME_EPS:
                 continue
-            if not _can_reach(
+            if not self._can_reach(
                 drone_view=drone_view,
                 from_pos=deliver_pos,
                 to_pos=node_state.position,
@@ -501,7 +562,7 @@ class CandidateBuilder:
         depot_nodes.sort(key=lambda item: str(item.node_id))
         if depot_nodes:
             depot_node = depot_nodes[0]
-            if _can_reach(
+            if self._can_reach(
                 drone_view=drone_view,
                 from_pos=deliver_pos,
                 to_pos=depot_node.position,
@@ -509,7 +570,7 @@ class CandidateBuilder:
                 safe_margin=safe_margin,
                 battery_current=battery_after_delivery,
             ):
-                fly_time = _estimate_flight_time(
+                fly_time = self._estimate_flight_time(
                     drone_view=drone_view,
                     from_pos=deliver_pos,
                     to_pos=depot_node.position,
@@ -527,7 +588,7 @@ class CandidateBuilder:
         for node_state in runtime_state.node_states.values():
             if str(node_state.node_type) != "station":
                 continue
-            if not _can_reach(
+            if not self._can_reach(
                 drone_view=drone_view,
                 from_pos=deliver_pos,
                 to_pos=node_state.position,
@@ -536,7 +597,7 @@ class CandidateBuilder:
                 battery_current=battery_after_delivery,
             ):
                 continue
-            if not _can_reach(
+            if not self._can_reach(
                 drone_view=drone_view,
                 from_pos=node_state.position,
                 to_pos=depot_node.position,
@@ -546,22 +607,31 @@ class CandidateBuilder:
             ):
                 continue
 
-            fly_time = _estimate_flight_time(
+            fly_time = self._estimate_flight_time(
                 drone_view=drone_view,
                 from_pos=deliver_pos,
                 to_pos=node_state.position,
             )
-            depot_fly_time = _estimate_flight_time(
+            depot_fly_time = self._estimate_flight_time(
                 drone_view=drone_view,
                 from_pos=node_state.position,
                 to_pos=depot_node.position,
             )
             queue_time_est = _predicted_queue_time_est(node_state)
             service_time = float(node_state.swap_time)
-            score = t_deliver_finish + fly_time + queue_time_est + service_time + depot_fly_time
+            score = (
+                t_deliver_finish
+                + fly_time
+                + queue_time_est
+                + service_time
+                + depot_fly_time
+            )
             scored_hosts.append(
                 (
-                    deliver_pos.distance_2d(node_state.position),
+                    self._path_distance(
+                        from_pos=deliver_pos,
+                        to_pos=node_state.position,
+                    ),
                     score,
                     queue_time_est,
                     str(node_state.node_id),
@@ -655,52 +725,6 @@ class CandidateBuilder:
             authorized_order_count=len(coarse_plan.authorized_orders),
             node_features=node_features,
         )
-
-
-def _estimate_flight_time(
-    *,
-    drone_view: Any,
-    from_pos: Position3D,
-    to_pos: Position3D,
-) -> float:
-    return from_pos.distance_3d(to_pos) / max(_TIME_EPS, float(drone_view.cruise_speed))
-
-
-def _estimate_energy_needed(
-    *,
-    drone_view: Any,
-    from_pos: Position3D,
-    to_pos: Position3D,
-    payload: float,
-) -> float:
-    distance = from_pos.distance_3d(to_pos)
-    if distance <= _TIME_EPS:
-        return 0.0
-    speed = max(_TIME_EPS, float(drone_view.cruise_speed))
-    power = float(drone_view.k1) * (
-        float(drone_view.empty_weight) + max(0.0, payload)
-    ) ** 1.5 + float(drone_view.k2) * speed**3
-    return power * (distance / speed)
-
-
-def _can_reach(
-    *,
-    drone_view: Any,
-    from_pos: Position3D,
-    to_pos: Position3D,
-    payload: float,
-    safe_margin: float,
-    battery_current: float,
-) -> bool:
-    return battery_current + _TIME_EPS >= (
-        _estimate_energy_needed(
-            drone_view=drone_view,
-            from_pos=from_pos,
-            to_pos=to_pos,
-            payload=payload,
-        )
-        + safe_margin
-    )
 
 
 def _predicted_queue_time_est(node_state: Any) -> float:

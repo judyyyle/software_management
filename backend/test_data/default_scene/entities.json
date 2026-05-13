@@ -8,7 +8,7 @@
       "lng": 121.217426,
       "name": "仓库-中心",
       "parking_slots": 4,
-      "swap_time": 120
+      "swap_time": 1
     }
   ],
   "stations": [
@@ -19,7 +19,7 @@
       "name": "充电站-01",
       "parking_slots": 1,
       "station_id": "STA-TEST-01",
-      "swap_time": 120
+      "swap_time": 1
     },
     {
       "altitude": 0,
@@ -28,7 +28,7 @@
       "name": "充电站-02",
       "parking_slots": 1,
       "station_id": "STA-TEST-02",
-      "swap_time": 120
+      "swap_time": 1
     },
     {
       "altitude": 0,
@@ -37,7 +37,7 @@
       "name": "充电站-03",
       "parking_slots": 1,
       "station_id": "STA-TEST-03",
-      "swap_time": 120
+      "swap_time": 1
     },
     {
       "altitude": 0,
@@ -46,7 +46,7 @@
       "name": "充电站-04",
       "parking_slots": 1,
       "station_id": "STA-TEST-04",
-      "swap_time": 120
+      "swap_time": 1
     },
     {
       "altitude": 0,
@@ -55,7 +55,7 @@
       "name": "充电站-05",
       "parking_slots": 1,
       "station_id": "STA-TEST-05",
-      "swap_time": 120
+      "swap_time": 1
     },
     {
       "altitude": 0,
@@ -64,7 +64,7 @@
       "name": "充电站-06",
       "parking_slots": 1,
       "station_id": "STA-TEST-06",
-      "swap_time": 120
+      "swap_time": 1
     },
     {
       "altitude": 0,
@@ -73,7 +73,7 @@
       "name": "充电站-07",
       "parking_slots": 1,
       "station_id": "STA-TEST-07",
-      "swap_time": 120
+      "swap_time": 1
     },
     {
       "altitude": 0,
@@ -82,7 +82,7 @@
       "name": "充电站-08",
       "parking_slots": 1,
       "station_id": "STA-TEST-08",
-      "swap_time": 120
+      "swap_time": 1
     },
     {
       "altitude": 0,
@@ -91,7 +91,7 @@
       "name": "充电站-09",
       "parking_slots": 1,
       "station_id": "STA-TEST-09",
-      "swap_time": 120
+      "swap_time": 1
     },
     {
       "altitude": 0,
@@ -100,7 +100,7 @@
       "name": "充电站-10",
       "parking_slots": 1,
       "station_id": "STA-TEST-10",
-      "swap_time": 120
+      "swap_time": 1
     }
   ],
   "trucks": [
@@ -110,7 +110,7 @@
       "name": "卡车-01",
       "parking_slots": 3,
       "speed": 16.5,
-      "swap_time": 120,
+      "swap_time": 1,
       "truck_id": "TRK-TEST-01"
     }
   ],
