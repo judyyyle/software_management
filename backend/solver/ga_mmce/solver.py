@@ -720,20 +720,30 @@ class GAMMCESolver:
             self._debug_write("static_plan_cache miss reason=schema_mismatch")
             return None
         cached_signature = payload.get("signature")
+        signature_relaxed = False
         if self._normalized_static_plan_cache_signature(cached_signature) != expected_signature:
             mismatch = self._static_plan_cache_mismatch_reasons(
                 cached_signature,
                 expected_signature,
             )
-            self._debug_write(
-                "static_plan_cache miss reason=signature_mismatch "
-                f"details={mismatch}"
-            )
-            return None
+            if self._allow_explicit_static_plan_cache_reuse(mismatch):
+                signature_relaxed = True
+                self._debug_write(
+                    "static_plan_cache relaxed_hit "
+                    f"ignored_signature_details={mismatch}"
+                )
+            else:
+                self._debug_write(
+                    "static_plan_cache miss reason=signature_mismatch "
+                    f"details={mismatch}"
+                )
+                return None
 
         cached_plan = payload.get("plan")
         if cached_plan is None:
-            self._debug_write("static_plan_cache miss reason=missing_plan")
+            self._debug_write(
+                "static_plan_cache miss reason=missing_plan"
+            )
             return None
 
         cached_best = copy.deepcopy(payload.get("best_individual"))
@@ -752,12 +762,15 @@ class GAMMCESolver:
         plan.summary["static_cache_reused"] = True
         plan.summary["static_cache_path"] = str(path)
         plan.summary["static_cache_saved_at"] = payload.get("saved_at")
+        if signature_relaxed:
+            plan.summary["static_cache_signature_relaxed"] = True
         self._attach_solve_result(plan, cached_best, started)
         self._debug_write(
             "static_plan_cache hit "
             f"path={path} "
             f"saved_at={payload.get('saved_at')} "
-            f"orders={len(context.order_ids)}"
+            f"orders={len(context.order_ids)} "
+            f"signature_relaxed={signature_relaxed}"
         )
         logger.info("[GA-MMCE] 复用静态计划缓存: %s", path)
         self._debug_run_end(plan, cached_best, context, started)
@@ -849,6 +862,11 @@ class GAMMCESolver:
             if key not in expected_signature:
                 reasons.append(f"extra:{key}")
         return reasons
+
+    def _allow_explicit_static_plan_cache_reuse(self, mismatch: list[str]) -> bool:
+        if self._reuse_static_plan_cache_override is not True:
+            return False
+        return set(mismatch) <= {"scene_id"}
 
     def _host_signature(self, hosts: dict[str, Any], host_ids: list[str]) -> tuple[tuple[str, tuple[float, float, float]], ...]:
         rows = []

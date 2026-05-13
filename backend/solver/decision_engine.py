@@ -334,7 +334,20 @@ class DispatchDecisionEngine:
                 )
 
         self._accumulate_plan_metrics(plan)
-        self._apply_plan(plan, current_time, incremental=False)
+        if self.solver_name == "ga_mmce":
+            replace_order_ids = self._ga_dynamic_replace_future_order_ids(plan)
+            logger.info(
+                "[DispatchDecisionEngine] GA 动态重优化使用增量后缀切换，替换未来订单停靠: %s",
+                sorted(replace_order_ids),
+            )
+            self._apply_plan(
+                plan,
+                current_time,
+                incremental=True,
+                replace_future_order_ids=replace_order_ids,
+            )
+        else:
+            self._apply_plan(plan, current_time, incremental=False)
         self._build_drone_routes(plan, current_time)
 
         logger.info(
@@ -352,6 +365,31 @@ class DispatchDecisionEngine:
         from solver.ga_mmce.runtime_adapter import normalize_ga_allocation_modes
 
         normalize_ga_allocation_modes(plan)
+
+    def _ga_dynamic_replace_future_order_ids(self, plan: DispatchPlan) -> set[str]:
+        """Return GA dynamic orders whose future truck stops may be replaced.
+
+        Locked and frozen-tail orders keep their existing runtime route entries;
+        only the reoptimized window is allowed to rewrite the not-yet-executed
+        truck suffix.
+        """
+        summary = plan.summary or {}
+        locked = {str(oid) for oid in (summary.get("locked_ids", []) or [])}
+        frozen = {str(oid) for oid in (summary.get("frozen_future_order_ids", []) or [])}
+        reoptimized = {
+            str(oid)
+            for oid in (summary.get("reoptimized_order_ids", []) or [])
+        }
+        if not reoptimized:
+            reoptimized = {
+                str(getattr(alloc, "order_id", "") or "")
+                for alloc in plan.allocations
+                if getattr(alloc, "feasible", False)
+            }
+        return {
+            oid for oid in reoptimized
+            if oid and oid not in locked and oid not in frozen
+        }
 
     def _accumulate_plan_metrics(self, plan: DispatchPlan) -> None:
         """累计调度成本，用于运行时 KPI 展示。"""
@@ -399,13 +437,21 @@ class DispatchDecisionEngine:
             if current_time >= contract.uav_arrival_time and not drone.status.is_flying():
                 self.solver.fulfill_contract(contract.contract_id)
 
-    def _apply_plan(self, plan: DispatchPlan, current_time: float, incremental: bool = False) -> None:
+    def _apply_plan(
+        self,
+        plan: DispatchPlan,
+        current_time: float,
+        incremental: bool = False,
+        replace_future_order_ids: set[str] | None = None,
+    ) -> None:
         """
         应用分配方案，更新订单和实体状态。
 
         Args:
             incremental: 增量模式。为 True 时保护正在执行中的卡车路由，
-                         仅将新停靠事件追加到已有的时刻表中，不覆盖卡车物理路线。
+                         仅合并未执行后缀，不覆盖已执行/正在执行路线。
+            replace_future_order_ids: 增量模式下，先从未执行后缀移除这些订单的旧停靠，
+                         再插入新计划中的对应停靠。
         """
         for alloc in plan.allocations:
             order = self.order_mgr.pending_orders.get(alloc.order_id)
@@ -474,8 +520,14 @@ class DispatchDecisionEngine:
             self._recalculate_truck_route_timing_for_b_wait(route, plan.allocations, current_time)
 
             if incremental:
-                # 增量模式：保护正在执行的卡车路由，只追加新的停靠事件
-                self._merge_incremental_truck_stops(truck, route, plan.allocations, current_time)
+                # 增量模式：保护正在执行的卡车路由，只合并未执行后缀
+                self._merge_incremental_truck_stops(
+                    truck,
+                    route,
+                    plan.allocations,
+                    current_time,
+                    replace_future_order_ids=replace_future_order_ids,
+                )
                 continue
 
             route_nodes = [node.node_id for node in route.nodes]
@@ -554,13 +606,14 @@ class DispatchDecisionEngine:
         new_route: "TruckRoute",
         allocations: list,
         current_time: float,
+        replace_future_order_ids: set[str] | None = None,
     ) -> None:
-        """增量模式下将新的停靠事件追加到卡车已有时刻表中，不覆盖物理路线。
+        """增量模式下合并卡车未执行后缀，保护已经执行/正在执行的路线。
 
         原则：
           - 保留已执行和正在执行的停靠事件（cursor 之前）
           - 将新的 recovery / customer 停靠按时间顺序插入未执行区间
-          - 不调用 truck.set_route()，卡车继续沿原有几何路径行驶
+          - 后缀重建从卡车当前位置开始，避免把车辆拉回 GA snapshot 路线起点
         """
         existing_stops: list[dict] = getattr(truck, "_planned_route_stops", None) or []
         cursor = int(getattr(truck, "_planned_route_cursor", 0))
@@ -593,6 +646,21 @@ class DispatchDecisionEngine:
 
         # 仅对未执行区间做去重：已执行过的同站点在新批次中应允许再次停靠。
         future_stops = existing_stops[cursor:]
+        replace_ids = {str(oid) for oid in (replace_future_order_ids or set())}
+        if replace_ids:
+            before = len(future_stops)
+            future_stops = [
+                stop for stop in future_stops
+                if str(stop.get("order_id", "") or "") not in replace_ids
+            ]
+            removed = before - len(future_stops)
+            if removed > 0:
+                logger.info(
+                    "[DispatchDecisionEngine] 增量后缀切换：卡车 %s 移除未来旧停靠 %d 个 orders=%s",
+                    truck.truck_id,
+                    removed,
+                    sorted(replace_ids),
+                )
 
         def _stop_key(stop_dict: dict) -> tuple:
             node_type = stop_dict.get("node_type", "")
