@@ -550,6 +550,8 @@ class TrainingEnvAdapter:
         self._episode_system_attributed_fallback_time_sec = 0.0
         self._episode_overdue_time_sec = 0.0
         self._episode_reservation_timeout_cost_sec = 0.0
+        self._runtime_uav_completed_distance_m = 0.0
+        self._runtime_uav_completed_energy_j = 0.0
         self._planner_bridge = (
             planner_bridge
             if planner_bridge is not None
@@ -687,6 +689,8 @@ class TrainingEnvAdapter:
         self._episode_system_attributed_fallback_time_sec = 0.0
         self._episode_overdue_time_sec = 0.0
         self._episode_reservation_timeout_cost_sec = 0.0
+        self._runtime_uav_completed_distance_m = 0.0
+        self._runtime_uav_completed_energy_j = 0.0
 
         artifacts = self._load_phase4_artifacts()
         self._planned_route_stops = list(artifacts["planned_stops"])
@@ -1018,6 +1022,37 @@ class TrainingEnvAdapter:
             ),
         }
 
+    def build_runtime_energy_metrics(self) -> dict[str, float]:
+        """按当前真实执行进度返回运行时总能耗统计。"""
+        truck_distance_m = self._truck_traveled_distance_m(self._t_now)
+        truck_energy_wh = (
+            truck_distance_m * self._scene_solver_params().truck_energy_wh_per_meter
+        )
+
+        active_uav_distance_m = 0.0
+        active_uav_energy_j = 0.0
+        for leg in self._flight_legs.values():
+            ratio = self._flight_leg_progress_ratio(leg=leg, t_now=self._t_now)
+            active_uav_distance_m += max(0.0, float(leg.distance_m)) * ratio
+            active_uav_energy_j += max(0.0, float(leg.energy_cost_j)) * ratio
+
+        uav_distance_m = max(
+            0.0,
+            float(self._runtime_uav_completed_distance_m) + active_uav_distance_m,
+        )
+        uav_energy_wh = max(
+            0.0,
+            (float(self._runtime_uav_completed_energy_j) + active_uav_energy_j) / 3600.0,
+        )
+        total_energy_wh = max(0.0, truck_energy_wh + uav_energy_wh)
+        return {
+            "truck_distance_m": float(max(0.0, truck_distance_m)),
+            "truck_energy_wh": float(max(0.0, truck_energy_wh)),
+            "uav_distance_m": float(uav_distance_m),
+            "uav_energy_wh": float(uav_energy_wh),
+            "total_energy_cost_wh": float(total_energy_wh),
+        }
+
     def build_episode_metrics_snapshot(self) -> dict[str, Any]:
         """返回当前 episode 的聚合指标快照。"""
         order_mgr = self._require_order_manager()
@@ -1048,7 +1083,7 @@ class TrainingEnvAdapter:
             if delivered_primary_orders
             else 0.0
         )
-        return {
+        metrics = {
             "done_reason": self._episode_done_reason(),
             "episode_end_t_sec": float(self._t_now),
             "delivery_count": int(self._episode_delivery_count),
@@ -1148,6 +1183,8 @@ class TrainingEnvAdapter:
             ),
             "system_context_stats": self.build_system_context_stats(),
         }
+        metrics.update(self.build_runtime_energy_metrics())
+        return metrics
 
     def build_planner_replan_events_snapshot(self) -> tuple[dict[str, Any], ...]:
         """返回当前 episode 的 planner replan 结构化事件。"""
@@ -1436,6 +1473,25 @@ class TrainingEnvAdapter:
             ),
         )
         return float(cumulative[-1]) * ratio
+
+    def _flight_leg_progress_ratio(self, *, leg: FlightLeg, t_now: float) -> float:
+        if t_now <= leg.start_time + _TIME_EPS:
+            return 0.0
+        if t_now >= leg.arrival_time - _TIME_EPS:
+            return 1.0
+        return max(
+            0.0,
+            min(
+                1.0,
+                (float(t_now) - float(leg.start_time))
+                / max(_TIME_EPS, float(leg.arrival_time) - float(leg.start_time)),
+            ),
+        )
+
+    def _record_uav_leg_energy(self, *, leg: FlightLeg, progress_ratio: float = 1.0) -> None:
+        ratio = max(0.0, min(1.0, float(progress_ratio)))
+        self._runtime_uav_completed_distance_m += max(0.0, float(leg.distance_m)) * ratio
+        self._runtime_uav_completed_energy_j += max(0.0, float(leg.energy_cost_j)) * ratio
 
     def _flight_leg_position_at(self, *, leg: FlightLeg, t_now: float) -> Position3D:
         geometry = self._flight_leg_geometry(leg)
@@ -3092,8 +3148,12 @@ class TrainingEnvAdapter:
         reservation_timeout_reward = 0.0
 
         # 1. 硬失败事件：半空停电会在到达事件之前截断当前飞行段。
-        for drone_id, _leg, _failure_time in hard_failure_ready:
-            penalty = self._process_airborne_failure_event(drone_id)
+        for drone_id, leg, failure_time in hard_failure_ready:
+            penalty = self._process_airborne_failure_event(
+                drone_id,
+                leg=leg,
+                failure_time=failure_time,
+            )
             hard_failure_reward += penalty
             # 归因给失败的无人机
             self._agent_cost_accum[drone_id] = (
@@ -3311,6 +3371,7 @@ class TrainingEnvAdapter:
         commit = self._dispatch_commit[drone_id]
 
         drone.current_loc = _clone_position(leg.target_pos)
+        self._record_uav_leg_energy(leg=leg)
         drone.battery_current = max(0.0, drone.battery_current - leg.energy_cost_j)
         released_order_id = drone.release_order()
         if released_order_id != commit.order_id:
@@ -3474,6 +3535,7 @@ class TrainingEnvAdapter:
         entity_mgr = self._require_entity_manager()
         drone = entity_mgr.drones[drone_id]
         drone.current_loc = _clone_position(leg.target_pos)
+        self._record_uav_leg_energy(leg=leg)
         drone.battery_current = max(0.0, drone.battery_current - leg.energy_cost_j)
         self._flight_legs.pop(drone_id, None)
 
@@ -3543,9 +3605,19 @@ class TrainingEnvAdapter:
     def _process_airborne_failure_event(
         self,
         drone_id: str,
+        *,
+        leg: FlightLeg,
+        failure_time: float,
     ) -> float:
         """处理一次真实的空中电量耗尽事件。"""
         drone = self._require_entity_manager().drones[drone_id]
+        self._record_uav_leg_energy(
+            leg=leg,
+            progress_ratio=self._flight_leg_progress_ratio(
+                leg=leg,
+                t_now=float(failure_time),
+            ),
+        )
         drone.battery_current = 0.0
         return self._mark_hard_failure(drone_id)
 
@@ -5630,6 +5702,24 @@ class TrainingEnvAdapter:
                 return _clone_position(next_stop.position)
 
         return _clone_position(self._planned_route_stops[-1].position)
+
+    def _truck_traveled_distance_m(self, t_now: float) -> float:
+        """按 planned route segments 统计当前时刻已真实行驶的路网距离。"""
+        traveled = 0.0
+        for segment in self._planned_route_segments:
+            if t_now <= segment.start_time + _TIME_EPS:
+                break
+            if t_now >= segment.end_time - _TIME_EPS:
+                traveled += max(0.0, float(segment.distance_m))
+                continue
+            segment_dt = max(_TIME_EPS, float(segment.end_time) - float(segment.start_time))
+            ratio = max(
+                0.0,
+                min(1.0, (float(t_now) - float(segment.start_time)) / segment_dt),
+            )
+            traveled += max(0.0, float(segment.distance_m)) * ratio
+            break
+        return float(max(0.0, traveled))
 
     def _resolve_heavy_payload_capacity(self) -> float:
         """读取 heavy drone 的载重上限，供 coarse plan 做 mode A 边界判断。"""

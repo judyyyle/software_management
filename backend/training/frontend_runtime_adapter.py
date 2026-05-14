@@ -298,6 +298,7 @@ class TrainingTelemetryBridge:
             }
         )
         stats.update(self._select_episode_stats(env.build_episode_metrics_snapshot()))
+        stats.update(env.build_runtime_energy_metrics())
         return {
             "sim_time": round(float(runtime_state.t_now), 3),
             "entities": entities,
