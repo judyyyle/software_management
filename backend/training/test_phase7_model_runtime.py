@@ -1192,8 +1192,8 @@ class TestPhase7ModelRuntime(unittest.TestCase):
                     }
                 )
             ),
-            rendezvous_arrive_bonus=2.0,
-            rendezvous_bonus=0.2,
+            rendezvous_arrive_bonus=0.02,
+            rendezvous_bonus=0.002,
             reward_scale=0.01,
         )
 
@@ -1313,8 +1313,8 @@ class TestPhase7ModelRuntime(unittest.TestCase):
                     "uav_1": SimpleNamespace(training_state="charging_on_truck"),
                 }
             ),
-            rendezvous_arrive_bonus=2.0,
-            rendezvous_bonus=0.2,
+            rendezvous_arrive_bonus=0.02,
+            rendezvous_bonus=0.002,
             reward_scale=0.01,
         )
 

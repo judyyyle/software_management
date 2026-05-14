@@ -179,14 +179,15 @@ class _BestCheckpointState:
     eval_report: dict[str, Any]
 
 
-def _extract_attributed_step_reward_parts(*, step_result: Any) -> tuple[float, float]:
+def _extract_attributed_step_reward_parts(*, step_result: Any) -> tuple[float, float, float]:
     reward_breakdown = dict(getattr(step_result, "info", {}).get("reward_breakdown", {}))
     carry_in_reward = float(reward_breakdown.get("attributed_carry_in", 0.0))
     if "attributed_post_action" in reward_breakdown:
         post_action_reward = float(reward_breakdown["attributed_post_action"])
     else:
         post_action_reward = float(step_result.reward) - carry_in_reward
-    return carry_in_reward, post_action_reward
+    mode_c_attempt_reward = float(reward_breakdown.get("mode_c_attempt_bonus", 0.0))
+    return carry_in_reward, post_action_reward, mode_c_attempt_reward
 
 
 def _is_rendezvous_success_state(training_state: str) -> bool:
@@ -348,8 +349,8 @@ def _finalize_pending_transition_for_next_decision(
         pending_transition=pending,
         reward_so_far=reward_so_far,
         runtime_state=runtime_state,
-        rendezvous_arrive_bonus=float(rendezvous_arrive_bonus) * reward_scale_value,
-        rendezvous_bonus=float(rendezvous_bonus) * reward_scale_value,
+        rendezvous_arrive_bonus=float(rendezvous_arrive_bonus),
+        rendezvous_bonus=float(rendezvous_bonus),
     )
     finalized = replace(
         pending,
@@ -391,8 +392,8 @@ def _flush_terminal_pending_transitions(
             pending_transition=pending,
             reward_so_far=reward_so_far,
             runtime_state=runtime_state,
-            rendezvous_arrive_bonus=float(rendezvous_arrive_bonus) * reward_scale_value,
-            rendezvous_bonus=float(rendezvous_bonus) * reward_scale_value,
+            rendezvous_arrive_bonus=float(rendezvous_arrive_bonus),
+            rendezvous_bonus=float(rendezvous_bonus),
         )
         finalized = replace(
             pending,
@@ -860,7 +861,11 @@ def train_cmrappo(
                 mode_idx=action_indices.mode_idx,
             )
             step_result = env.step(env_action)
-            carry_in_reward, post_action_reward = _extract_attributed_step_reward_parts(
+            (
+                carry_in_reward,
+                post_action_reward,
+                mode_c_attempt_reward,
+            ) = _extract_attributed_step_reward_parts(
                 step_result=step_result
             )
             _finalize_pending_transition_for_next_decision(
@@ -886,7 +891,15 @@ def train_cmrappo(
                 arrive_bonus_applied,
                 success_bonus_applied,
             ) = _shape_post_action_reward_for_rendezvous(
-                post_action_reward=post_action_reward,
+                post_action_reward=(
+                    post_action_reward * train_cfg.reward_scale
+                    + (
+                        train_cfg.mode_c_attempt_bonus
+                        if mode_c_attempt_reward > 0.0
+                        else 0.0
+                    )
+                    - mode_c_attempt_reward * train_cfg.reward_scale
+                ),
                 action_indices=action_indices,
                 transition_summary=transition_summary,
                 rendezvous_arrive_bonus=train_cfg.rendezvous_arrive_bonus,
@@ -900,7 +913,7 @@ def train_cmrappo(
                 log_prob_old=float(log_prob.detach().cpu().item()),
                 value_old=value_old,
                 critic_schema_hash=critic_schema.schema_hash,
-                reward=shaped_post_action_reward * train_cfg.reward_scale,
+                reward=shaped_post_action_reward,
                 done=True if step_result.done else None,
                 lstm_state_in=_detach_lstm_state(lstm_state=lstm_state_in),
                 lstm_state_out=_detach_lstm_state(lstm_state=next_lstm_state),
@@ -2410,7 +2423,7 @@ def _drain_pending_transitions_after_collection(
             mode_idx=action_indices.mode_idx,
         )
         step_result = env.step(env_action)
-        carry_in_reward, _post_action_reward = _extract_attributed_step_reward_parts(
+        carry_in_reward, _post_action_reward, _mode_c_attempt_reward = _extract_attributed_step_reward_parts(
             step_result=step_result
         )
         _finalize_pending_transition_for_next_decision(
@@ -3546,9 +3559,27 @@ def _load_training_config(config_path: Path) -> _TrainingConfig:
         clip_coef=float(training["clip_coef"]),
         entropy_coef=float(training["entropy_coef"]),
         reward_scale=float(training.get("reward_scale", 1.0)),
-        rendezvous_arrive_bonus=float(reward.get("rendezvous_arrive_bonus", 0.0)),
-        rendezvous_bonus=float(reward.get("rendezvous_bonus", 0.0)),
-        mode_c_attempt_bonus=float(reward.get("mode_c_attempt_bonus", 0.0)),
+        rendezvous_arrive_bonus=float(
+            training.get(
+                "rendezvous_arrive_bonus_scaled",
+                float(reward.get("rendezvous_arrive_bonus", 0.0))
+                * float(training.get("reward_scale", 1.0)),
+            )
+        ),
+        rendezvous_bonus=float(
+            training.get(
+                "rendezvous_bonus_scaled",
+                float(reward.get("rendezvous_bonus", 0.0))
+                * float(training.get("reward_scale", 1.0)),
+            )
+        ),
+        mode_c_attempt_bonus=float(
+            training.get(
+                "mode_c_attempt_bonus_scaled",
+                float(reward.get("mode_c_attempt_bonus", 0.0))
+                * float(training.get("reward_scale", 1.0)),
+            )
+        ),
         value_loss_coef=float(training["value_loss_coef"]),
         value_loss_type=str(training.get("value_loss_type", "mse")),
         value_huber_delta=float(training.get("value_huber_delta", 1.0)),

@@ -334,20 +334,24 @@ training:
   total_timesteps: 1500000
   # Run16: 小幅回升学习率，补偿更大 Huber delta 下 critic 梯度绝对值下降。
   ppo_learning_rate: 0.0001
-  rollout_steps: 4096
+  rollout_steps: 2048
   recurrent_ppo: true
   sequence_len: 16
   burn_in_len: 0
   train_len: 16
-  sequence_minibatch_size: 32
-  target_minibatch_timesteps: 512
+  sequence_minibatch_size: 64
+  target_minibatch_timesteps: 1024
   # 兼容旧字段；在 recurrent PPO 下只允许作为 target_minibatch_timesteps 的过渡别名。
-  batch_size: 512
-  ppo_epochs: 4
+  batch_size: 1024
+  ppo_epochs: 2
   gamma: 0.99
   gae_lambda: 0.95
   clip_coef: 0.20
   reward_scale: 0.01
+  # Mode C shaping bonus 使用训练尺度固定值，不再依赖原始 reward 经过 reward_scale 缩放。
+  mode_c_attempt_bonus_scaled: 0.10
+  rendezvous_arrive_bonus_scaled: 0.30
+  rendezvous_bonus_scaled: 0.80
   # vf_clip_coef 已禁用：max(vl_unclipped, vl_clipped) 在 return 未归一化时
   # 始终选 clipped（更大的 loss），梯度方向错误，导致 value 收敛极慢。
   # critic loss 当前改为显式可配置：
