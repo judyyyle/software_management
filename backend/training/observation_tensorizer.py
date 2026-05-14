@@ -103,16 +103,6 @@ ORDER_TOKEN_FIELDS = (
     "best_mode_c_truck_eta_remaining_norm",
 )
 
-RECOVERY_TOKEN_FIELDS = (
-    "is_valid",
-    "recover_node_type_code_norm",
-    "x_norm",
-    "y_norm",
-    "z_norm",
-    "truck_eta_remaining_norm",
-    "rendezvous_margin_norm",
-)
-
 INFRA_TOKEN_FIELDS = (
     "node_type_code_norm",
     "x_norm",
@@ -174,7 +164,6 @@ class _TensorizerConfig:
     payload_norm_kg: float
     queue_norm_cap: float
     max_order_tokens: int
-    max_recovery_tokens: int
 
 
 @dataclass(frozen=True)
@@ -224,10 +213,6 @@ class ObservationTensorizer:
         features = candidate_out.candidate_features
         uav_self_token = self._build_uav_self_token(features.uav_self)
         order_tokens, order_padding_mask = self._build_order_tokens(features.order_features)
-        recovery_tokens, recovery_padding_mask = self._build_recovery_tokens(
-            features.recovery_features,
-            decision_context=decision_context,
-        )
         infra_tokens = self._build_infra_tokens(
             features.infra_features,
             decision_context=decision_context,
@@ -239,12 +224,10 @@ class ObservationTensorizer:
         return ObservationBatch(
             uav_self_token=uav_self_token,
             order_tokens=order_tokens,
-            recovery_tokens=recovery_tokens,
             infra_tokens=infra_tokens,
             history_tokens=history_tokens,
             history_padding_mask=history_padding_mask,
             padding_mask=order_padding_mask,
-            recovery_padding_mask=recovery_padding_mask,
         )
 
     def build_transition_summary(
@@ -406,40 +389,6 @@ class ObservationTensorizer:
                 ],
                 dtype=_FLOAT_DTYPE,
             )
-        return tokens, padding_mask
-
-    def _build_recovery_tokens(
-        self,
-        recovery_features: Sequence[Sequence[Any]],
-        *,
-        decision_context: Any,
-    ) -> tuple[np.ndarray, np.ndarray]:
-        order_count = len(recovery_features)
-        recovery_count = len(recovery_features[0]) if recovery_features else 0
-        tokens = np.zeros(
-            (order_count, recovery_count, len(RECOVERY_TOKEN_FIELDS)),
-            dtype=_FLOAT_DTYPE,
-        )
-        padding_mask = np.ones((order_count, recovery_count), dtype=_BOOL_DTYPE)
-        t_now = float(decision_context.t_decision)
-        for order_idx, row in enumerate(recovery_features):
-            for recovery_slot, item in enumerate(row):
-                if not bool(item.is_valid):
-                    continue
-                padding_mask[order_idx, recovery_slot] = False
-                eta_remaining = max(0.0, float(item.truck_eta) - t_now)
-                tokens[order_idx, recovery_slot, :] = np.asarray(
-                    [
-                        1.0,
-                        self._code_norm(_HOST_TYPE_CODE, str(item.recover_node_type)),
-                        self._norm_x(float(item.x)),
-                        self._norm_y(float(item.y)),
-                        self._norm_z(float(item.z)),
-                        self._norm_time_nonneg(eta_remaining),
-                        self._norm_time_signed(float(item.rendezvous_margin)),
-                    ],
-                    dtype=_FLOAT_DTYPE,
-                )
         return tokens, padding_mask
 
     def _build_infra_tokens(
@@ -669,14 +618,12 @@ def _load_tensorizer_config(config_path: Path) -> _TensorizerConfig:
     planner = _require_mapping(raw, "planner")
     policy = _require_mapping(raw, "policy")
     data = _require_mapping(raw, "data")
-    candidate = _require_mapping(raw, "candidate")
     return _TensorizerConfig(
         hist_len=int(policy["hist_len"]),
         upper_horizon_sec=float(planner["upper_horizon_sec"]),
         payload_norm_kg=float(data["poisson_weight_max_kg"]),
         queue_norm_cap=float(policy.get("queue_norm_cap", 8.0)),
         max_order_tokens=int(policy["max_order_tokens"]),
-        max_recovery_tokens=int(candidate["max_candidate_recovery_per_order"]),
     )
 
 
@@ -705,6 +652,5 @@ __all__ = [
     "INFRA_TOKEN_FIELDS",
     "ObservationTensorizer",
     "ORDER_TOKEN_FIELDS",
-    "RECOVERY_TOKEN_FIELDS",
     "UAV_SELF_TOKEN_FIELDS",
 ]

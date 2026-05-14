@@ -82,8 +82,9 @@ def health_check():
 
 # ── 入口 ───────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
+    port = 8000
     load_shapefile_async()
-    print("[INFO] HiveLogix 主服务启动: http://localhost:8000")
-    print("[INFO] Geo API:   http://localhost:8000/api/geo/status")
-    print("[INFO] 健康检查:  http://localhost:8000/api/health")
-    app.run(host="0.0.0.0", port=8000, debug=False, use_reloader=False)
+    print(f"[INFO] HiveLogix 主服务启动: http://localhost:{port}")
+    print(f"[INFO] Geo API:   http://localhost:{port}/api/geo/status")
+    print(f"[INFO] 健康检查:  http://localhost:{port}/api/health")
+    app.run(host="0.0.0.0", port=port, debug=False, use_reloader=False)
