@@ -1865,11 +1865,7 @@ class TrainingEnvAdapter:
         self,
         runtime_state: RuntimeStateView,
     ) -> bool:
-        """Poisson 训练流中，订单未结束时保持卡车未来固定节点供给。"""
-        if self._order_source.mode != OrderSourceMode.POISSON:
-            return False
-        if self._allow_empty_backbone_route:
-            return False
+        """订单流未结束时保持卡车未来 station backbone 供给。"""
         if not self._has_unfinished_order_flow(runtime_state):
             return False
 
@@ -1936,7 +1932,8 @@ class TrainingEnvAdapter:
         truck_mandatory_orders: Mapping[str, Order],
     ) -> bool:
         """episode 尾段无卡车强约束时，允许 coarse plan 退化为空骨架。"""
-        if self._allow_empty_backbone_route:
+        has_unfinished_order_flow = self._has_unfinished_order_flow(runtime_state)
+        if self._allow_empty_backbone_route and not has_unfinished_order_flow:
             return True
         if (
             reservation_constraints
@@ -1944,7 +1941,7 @@ class TrainingEnvAdapter:
             or self._has_active_mode_c_recovery_obligation()
         ):
             return False
-        if not self._has_unfinished_order_flow(runtime_state):
+        if not has_unfinished_order_flow:
             return True
         if self._future_backbone_visits(float(runtime_state.t_now)):
             return False

@@ -1252,6 +1252,72 @@ class TestPhase6Integration(unittest.TestCase):
         self.assertEqual(len(env._future_station_backbone_visits(t_now)), 2)
         self.assertEqual(len(env._future_backbone_visits(t_now)), 3)
 
+    def test_future_station_capacity_trigger_is_shared_by_benchmark_flow(self) -> None:
+        scene_ctx = load_default_scene()
+        benchmark_source = build_order_source(
+            scene_ctx,
+            mode=OrderSourceMode.BENCHMARK,
+        )
+        env = TrainingEnvAdapter(
+            scene_ctx=scene_ctx,
+            order_source=benchmark_source,
+        )
+        env.reset()
+
+        order_mgr = env._require_order_manager()
+        order_mgr.pending_orders.clear()
+        order_mgr.assigned_orders.clear()
+        order_mgr.completed_orders.clear()
+        order_mgr._next_order_time = math.inf
+        order_mgr._scheduled_dynamic = []
+        order_mgr._scheduled_dynamic_i = 0
+
+        entity_mgr = env._require_entity_manager()
+        station_ids = sorted(entity_mgr.stations)
+        self.assertGreaterEqual(len(station_ids), 3)
+        depot = env._require_depot()
+        drone_id = self._first_idle_drone_id(env)
+        drone = entity_mgr.drones[drone_id]
+        t_now = 100.0
+        env._t_now = t_now
+        self._inject_order_at(
+            env,
+            order_id="ORDER-P6-BENCHMARK-STATION-CAPACITY",
+            position=Position3D(
+                x=drone.current_loc.x + 100.0,
+                y=drone.current_loc.y + 50.0,
+                z=drone.current_loc.z,
+            ),
+            deadline_offset=7200.0,
+            payload_weight=1.0,
+        )
+        env._full_backbone_cache = [
+            BackboneVisit(
+                node_id=station_ids[0],
+                arrival_time=t_now + 60.0,
+                departure_time=t_now + 60.0 + 1e-6,
+            ),
+            BackboneVisit(
+                node_id=station_ids[1],
+                arrival_time=t_now + 120.0,
+                departure_time=t_now + 120.0 + 1e-6,
+            ),
+            BackboneVisit(
+                node_id=depot.depot_id,
+                arrival_time=t_now + 180.0,
+                departure_time=t_now + 180.0 + 1e-6,
+            ),
+        ]
+        self.assertTrue(env._allow_empty_backbone_route)
+
+        require_station_backbone = env._ensure_future_backbone_capacity(
+            env.build_runtime_state_view()
+        )
+
+        self.assertTrue(require_station_backbone)
+        self.assertTrue(env._truck_replan_pending)
+        self.assertIn("future_backbone_capacity", env._truck_replan_pending_reasons)
+
     def test_truck_replan_after_station_arrival_starts_after_current_stop_service(self) -> None:
         env, _drone_id = self._reset_controlled_env()
         entity_mgr = env._require_entity_manager()
