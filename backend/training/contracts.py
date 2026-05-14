@@ -536,20 +536,6 @@ class OrderFeatures:
 
 
 @dataclass(frozen=True)
-class RecoveryFeatures:
-    order_id: str
-    recover_node_id: str
-    recover_node_type: str
-    x: float
-    y: float
-    z: float
-    truck_eta: float
-    rendezvous_margin: float
-    reservation_count: int
-    is_valid: bool
-
-
-@dataclass(frozen=True)
 class InfraNodeFeatures:
     node_id: str
     node_type: str
@@ -581,7 +567,6 @@ class InfraFeatures:
 class CandidateFeatures:
     uav_self: UavSelfFeatures
     order_features: tuple[OrderFeatures, ...]
-    recovery_features: tuple[tuple[RecoveryFeatures, ...], ...]
     infra_features: InfraFeatures
 
 
@@ -590,7 +575,6 @@ class FactorizedActionSchema:
     root_branch_order: tuple[str, str]
     mode_order: tuple[str, str]
     max_order_slots: int
-    max_recovery_slots: int
 
 
 ResolvedDispatchKey: TypeAlias = tuple[int, int]
@@ -701,12 +685,10 @@ class ObservationBatch:
 
     uav_self_token: Any
     order_tokens: Any
-    recovery_tokens: Any
     infra_tokens: Any
     history_tokens: Any
     history_padding_mask: Any
     padding_mask: Any
-    recovery_padding_mask: Any
 
 
 @dataclass(frozen=True)
@@ -849,7 +831,6 @@ class PolicyMeta:
     lstm_layers: int
     hist_len: int
     max_order_tokens: int
-    max_recovery_tokens: int
     use_plan_version_delta: bool
     use_is_riding_truck_flag: bool
     use_drone_source_type_flag: bool
@@ -1124,7 +1105,6 @@ __all__ = [
     "ReservationConstraintState",
     "ReservationPlanOutcome",
     "ReservationPlanStatus",
-    "RecoveryFeatures",
     "ResolvedActionIndices",
     "ResolvedActionLookup",
     "ResolvedDispatchKey",

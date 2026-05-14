@@ -142,17 +142,19 @@ class TestTrainingEnvAdapterPhase5b(unittest.TestCase):
             trigger_station_id=None,
             last_seen_plan_version=coarse_plan.plan_version,
         )
-        mode_c_nodes = {
-            feature.recover_node_id
-            for row in candidate_out.candidate_features.recovery_features
-            for feature in row
-            if feature.is_valid
-        }
+        order_feature = next(
+            feature
+            for feature in candidate_out.candidate_features.order_features
+            if feature.order_id == order.order_id
+        )
 
         self.assertEqual(len(mode_c_actions), 1)
         self.assertIsNone(mode_c_actions[0].recover_node_id)
-        self.assertNotIn(station_ids[0], mode_c_nodes)
-        self.assertIn(station_ids[1], mode_c_nodes)
+        self.assertTrue(order_feature.has_mode_c_action)
+        self.assertAlmostEqual(
+            order_feature.best_mode_c_truck_eta_remaining,
+            coarse_plan.truck_eta_map[station_ids[1]] - env._t_now,
+        )
 
     def test_mode_b_return_host_prefers_depot_when_reachable(self) -> None:
         env, drone_id = self._reset_controlled_env()
