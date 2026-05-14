@@ -1443,19 +1443,18 @@ class TestPhase6Integration(unittest.TestCase):
         self.assertTrue(candidate_out.mode_mask[0][0], "mode B 应保留")
         self.assertTrue(candidate_out.mode_mask[0][1], "mode C 应保留")
         order_feature = candidate_out.candidate_features.order_features[0]
-        recovery_feature = candidate_out.candidate_features.recovery_features[0][0]
         self.assertTrue(order_feature.has_mode_c_action)
         self.assertAlmostEqual(
             order_feature.best_mode_c_rendezvous_margin,
-            recovery_feature.rendezvous_margin,
+            30.0,
         )
         self.assertEqual(
             order_feature.best_mode_c_node_type,
-            recovery_feature.recover_node_type,
+            "station",
         )
         self.assertAlmostEqual(
             order_feature.best_mode_c_truck_eta_remaining,
-            recovery_feature.truck_eta - runtime_state.t_now,
+            t_safe_truck - runtime_state.t_now,
         )
 
         resolved_wait = candidate_out.resolved_action_lookup.resolve(root_branch_idx=0)
@@ -1542,20 +1541,32 @@ class TestPhase6Integration(unittest.TestCase):
 
         runtime_state = env.build_runtime_state_view()
         coarse_plan = env._build_coarse_plan_view(env._t_now)
+        t_deliver_finish = env._estimate_delivery_finish_time(drone, order)
+        station_1_eta = (
+            t_deliver_finish
+            + env._estimate_flight_time(
+                drone=drone,
+                from_pos=order.delivery_loc,
+                to_pos=station_1.location,
+            )
+            + env._cfg.rendezvous_execution_margin_sec
+            + 30.0
+        )
+        station_2_eta = runtime_state.t_now
         custom_plan = replace(
             coarse_plan,
             truck_backbone_route=(station_1.station_id, station_2.station_id),
             truck_eta_map={
-                station_1.station_id: runtime_state.t_now + 450.0,
-                station_2.station_id: runtime_state.t_now + 260.0,
+                station_1.station_id: station_1_eta,
+                station_2.station_id: station_2_eta,
             },
             route_drift_ref={
                 station_1.station_id: RouteDriftRef(
-                    eta_ref=runtime_state.t_now + 450.0,
+                    eta_ref=station_1_eta,
                     route_index_ref=0,
                 ),
                 station_2.station_id: RouteDriftRef(
-                    eta_ref=runtime_state.t_now + 260.0,
+                    eta_ref=station_2_eta,
                     route_index_ref=1,
                 ),
             },
@@ -1591,27 +1602,27 @@ class TestPhase6Integration(unittest.TestCase):
             last_seen_plan_version=custom_plan.plan_version,
         )
 
-        alias_recovery_nodes = [
-            feature.recover_node_id
-            for feature in candidate_out_alias.candidate_features.recovery_features[0]
-            if feature.is_valid
-        ]
-        internal_recovery_nodes = [
-            feature.recover_node_id
-            for feature in candidate_out_internal.candidate_features.recovery_features[0]
-            if feature.is_valid
-        ]
-        idle_recovery_nodes = [
-            feature.recover_node_id
-            for feature in candidate_out_idle.candidate_features.recovery_features[0]
-            if feature.is_valid
-        ]
-
-        self.assertEqual(alias_recovery_nodes, [station_2.station_id])
-        self.assertEqual(internal_recovery_nodes, [station_2.station_id])
-        self.assertEqual(
-            set(idle_recovery_nodes),
-            {station_1.station_id, station_2.station_id},
+        alias_order_feature = next(
+            feature
+            for feature in candidate_out_alias.candidate_features.order_features
+            if feature.order_id == order.order_id
+        )
+        internal_order_feature = next(
+            feature
+            for feature in candidate_out_internal.candidate_features.order_features
+            if feature.order_id == order.order_id
+        )
+        idle_order_feature = next(
+            feature
+            for feature in candidate_out_idle.candidate_features.order_features
+            if feature.order_id == order.order_id
+        )
+        self.assertFalse(alias_order_feature.has_mode_c_action)
+        self.assertFalse(internal_order_feature.has_mode_c_action)
+        self.assertTrue(idle_order_feature.has_mode_c_action)
+        self.assertAlmostEqual(
+            idle_order_feature.best_mode_c_truck_eta_remaining,
+            station_1_eta - runtime_state.t_now,
         )
 
     def test_riding_with_truck_trigger_requires_station_id(self) -> None:

@@ -187,7 +187,7 @@ candidate:
   recovery_pool_future_scan_limit: 8
 
   # `resolved_action_lookup` 展开规模的保护性预算，不是 PPO 主训练路径的 flat logits 维度；
-  # 主训练路径张量 shape 由 max_candidate_orders / max_candidate_recovery_per_order 冻结。
+  # actor 只选择 order-mode，mode C 回收点由环境规则后置确定性选择。
   max_candidate_actions: 128
 
   # 240s 相比 4×4km 场景下 station 最近邻切换时间（47~99s）已经明显过长，
@@ -275,7 +275,6 @@ policy:
   use_is_riding_truck_flag: true
   use_drone_source_type_flag: true
   max_order_tokens: 32
-  max_recovery_tokens: 4
 
   critic_schema_name: CriticTensorSchemaV1
   critic_schema_version: v1
@@ -348,27 +347,25 @@ training:
   gamma: 0.99
   gae_lambda: 0.95
   clip_coef: 0.20
+  reward_scale: 0.01
   # vf_clip_coef 已禁用：max(vl_unclipped, vl_clipped) 在 return 未归一化时
   # 始终选 clipped（更大的 loss），梯度方向错误，导致 value 收敛极慢。
   # critic loss 当前改为显式可配置：
   #   - huber：优先用于当前高方差 reward / return 场景
   #   - mse：保留为回退选项
   entropy_coef: 0.10
-  # Run16: 配合更宽的 Huber 二次区，适度提高 critic loss 权重。
-  value_loss_coef: 0.10
+  value_loss_coef: 0.50
   value_loss_type: huber
-  # Run16: 当前 return_std 约 40~50，delta=5 使大多数样本停留在线性区；
-  # 提高到 25 以恢复更多样本的自适应二次梯度。
-  value_huber_delta: 25.0
+  value_huber_delta: 1.0
   max_grad_norm: 1.0
   normalize_advantage: true
   target_kl: 0.05
-  # 降低 WAIT 样本对 recurrent PPO loss 的主导，同时放大稀疏 dispatch/C 信号。
-  # 只改变 loss 贡献，不删除 transition，保持每架 UAV 的时间序列与 GAE 连续。
-  wait_without_dispatch_loss_weight: 0.10
-  wait_with_dispatch_loss_weight: 0.35
-  mode_b_dispatch_loss_weight: 1.25
-  mode_c_dispatch_loss_weight: 1.75
+  # 动作类型样本权重当前只作用于 policy loss；critic value loss 与 entropy 不加权。
+  # 先使用稳定性基线 1.0，待收敛稳定后再逐步引入 actor 侧加权。
+  wait_without_dispatch_loss_weight: 1.0
+  wait_with_dispatch_loss_weight: 1.0
+  mode_b_dispatch_loss_weight: 1.0
+  mode_c_dispatch_loss_weight: 1.0
 
   # 训练订单强度 curriculum：前期在 orders.json 附近的 0.67 训练，
   # 后续再逐步引入 high=0.90，避免一开始被更高压 backlog 主导。

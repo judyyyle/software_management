@@ -87,6 +87,7 @@ class _TrainingConfig:
     gae_lambda: float
     clip_coef: float
     entropy_coef: float
+    reward_scale: float
     rendezvous_arrive_bonus: float
     rendezvous_bonus: float
     mode_c_attempt_bonus: float
@@ -327,6 +328,7 @@ def _finalize_pending_transition_for_next_decision(
     decision_context: Any | None = None,
     rendezvous_arrive_bonus: float = 0.0,
     rendezvous_bonus: float = 0.0,
+    reward_scale: float = 1.0,
 ) -> None:
     pending = pending_transition_by_drone.pop(drone_id, None)
     if pending is None:
@@ -337,6 +339,7 @@ def _finalize_pending_transition_for_next_decision(
         if decision_context is not None
         else None
     )
+    reward_scale_value = float(reward_scale)
     (
         reward_so_far,
         arrive_bonus_applied,
@@ -345,12 +348,12 @@ def _finalize_pending_transition_for_next_decision(
         pending_transition=pending,
         reward_so_far=reward_so_far,
         runtime_state=runtime_state,
-        rendezvous_arrive_bonus=rendezvous_arrive_bonus,
-        rendezvous_bonus=rendezvous_bonus,
+        rendezvous_arrive_bonus=float(rendezvous_arrive_bonus) * reward_scale_value,
+        rendezvous_bonus=float(rendezvous_bonus) * reward_scale_value,
     )
     finalized = replace(
         pending,
-        reward=reward_so_far + float(carry_in_reward),
+        reward=reward_so_far + float(carry_in_reward) * reward_scale_value,
         done=False,
         rendezvous_arrive_bonus_applied=arrive_bonus_applied,
         rendezvous_success_bonus_applied=success_bonus_applied,
@@ -375,7 +378,9 @@ def _flush_terminal_pending_transitions(
     runtime_state: Any | None = None,
     rendezvous_arrive_bonus: float = 0.0,
     rendezvous_bonus: float = 0.0,
+    reward_scale: float = 1.0,
 ) -> None:
+    reward_scale_value = float(reward_scale)
     for drone_id, pending in tuple(pending_transition_by_drone.items()):
         reward_so_far = 0.0 if pending.reward is None else float(pending.reward)
         (
@@ -386,12 +391,13 @@ def _flush_terminal_pending_transitions(
             pending_transition=pending,
             reward_so_far=reward_so_far,
             runtime_state=runtime_state,
-            rendezvous_arrive_bonus=rendezvous_arrive_bonus,
-            rendezvous_bonus=rendezvous_bonus,
+            rendezvous_arrive_bonus=float(rendezvous_arrive_bonus) * reward_scale_value,
+            rendezvous_bonus=float(rendezvous_bonus) * reward_scale_value,
         )
         finalized = replace(
             pending,
-            reward=reward_so_far + float(terminal_reward_by_drone.get(drone_id, 0.0)),
+            reward=reward_so_far
+            + float(terminal_reward_by_drone.get(drone_id, 0.0)) * reward_scale_value,
             done=True,
             rendezvous_arrive_bonus_applied=arrive_bonus_applied,
             rendezvous_success_bonus_applied=success_bonus_applied,
@@ -867,6 +873,7 @@ def train_cmrappo(
                 decision_context=decision_context,
                 rendezvous_arrive_bonus=train_cfg.rendezvous_arrive_bonus,
                 rendezvous_bonus=train_cfg.rendezvous_bonus,
+                reward_scale=train_cfg.reward_scale,
             )
             transition_summary = tensorizer.build_transition_summary(
                 decision_context=decision_context,
@@ -893,7 +900,7 @@ def train_cmrappo(
                 log_prob_old=float(log_prob.detach().cpu().item()),
                 value_old=value_old,
                 critic_schema_hash=critic_schema.schema_hash,
-                reward=shaped_post_action_reward,
+                reward=shaped_post_action_reward * train_cfg.reward_scale,
                 done=True if step_result.done else None,
                 lstm_state_in=_detach_lstm_state(lstm_state=lstm_state_in),
                 lstm_state_out=_detach_lstm_state(lstm_state=next_lstm_state),
@@ -926,6 +933,7 @@ def train_cmrappo(
                     runtime_state=step_result.runtime_state,
                     rendezvous_arrive_bonus=train_cfg.rendezvous_arrive_bonus,
                     rendezvous_bonus=train_cfg.rendezvous_bonus,
+                    reward_scale=train_cfg.reward_scale,
                 )
             else:
                 pending_transition_by_drone[drone_id] = current_transition
@@ -942,7 +950,11 @@ def train_cmrappo(
             )
             current_result = step_result
             global_step += 1
-            _record_episode_step(episode_acc, reward=float(step_result.reward))
+            _record_episode_step(
+                episode_acc,
+                reward=float(step_result.reward),
+                reward_scale=train_cfg.reward_scale,
+            )
             _emit_event_hook(
                 event_hook,
                 "train_step",
@@ -961,6 +973,7 @@ def train_cmrappo(
                 _record_terminal_episode_rewards(
                     accumulator=episode_acc,
                     terminal_reward_by_drone=terminal_reward_by_drone,
+                    reward_scale=train_cfg.reward_scale,
                 )
                 episode_metrics = _finalize_episode_metrics(
                     accumulator=episode_acc,
@@ -1276,22 +1289,29 @@ def train_cmrappo(
     }
 
 
-def _record_episode_step(accumulator: _EpisodeAccumulator, *, reward: float) -> None:
+def _record_episode_step(
+    accumulator: _EpisodeAccumulator,
+    *,
+    reward: float,
+    reward_scale: float = 1.0,
+) -> None:
     accumulator.decision_count += 1
-    accumulator.total_reward += float(reward)
+    accumulator.total_reward += float(reward) * float(reward_scale)
 
 
 def _record_terminal_episode_rewards(
     *,
     accumulator: _EpisodeAccumulator,
     terminal_reward_by_drone: Mapping[str, float],
+    reward_scale: float = 1.0,
 ) -> float:
-    """将 episode 结束时残留的尾部归因奖励补记回 episode total_reward。"""
+    """将 episode 结束时残留的尾部归因奖励按训练尺度补记回 total_reward。"""
     terminal_reward_total = 0.0
     for reward in terminal_reward_by_drone.values():
         terminal_reward_total += float(reward)
-    accumulator.total_reward += terminal_reward_total
-    return terminal_reward_total
+    scaled_terminal_reward_total = terminal_reward_total * float(reward_scale)
+    accumulator.total_reward += scaled_terminal_reward_total
+    return scaled_terminal_reward_total
 
 
 def _finalize_episode_metrics(
@@ -1472,6 +1492,7 @@ def _run_periodic_evaluation(
                 device=device,
                 eval_phase="benchmark",
                 episode_id=0,
+                reward_scale=train_cfg.reward_scale,
             )
         ]
         benchmark_report = _summarize_episode_records(
@@ -1506,6 +1527,7 @@ def _run_periodic_evaluation(
                 device=device,
                 eval_phase="c_sensitive",
                 episode_id=0,
+                reward_scale=train_cfg.reward_scale,
             )
             c_sensitive_report = _summarize_episode_records(
                 split="c_sensitive",
@@ -1544,6 +1566,7 @@ def _run_periodic_evaluation(
                         device=device,
                         eval_phase=f"stochastic_{band_name}",
                         episode_id=seed_offset,
+                        reward_scale=train_cfg.reward_scale,
                     )
                 )
             stochastic_reports[band_name] = _summarize_episode_records(
@@ -1593,6 +1616,7 @@ def _evaluate_policy_episode(
     device: Any,
     eval_phase: str,
     episode_id: int,
+    reward_scale: float,
 ) -> dict[str, Any]:
     env = TrainingEnvAdapter(
         scene_ctx=scene_ctx,
@@ -1671,13 +1695,18 @@ def _evaluate_policy_episode(
             lstm_state_by_drone=lstm_state_by_drone,
             recurrent_segment_id_by_drone=recurrent_segment_id_by_drone,
         )
-        _record_episode_step(episode_acc, reward=float(step_result.reward))
+        _record_episode_step(
+            episode_acc,
+            reward=float(step_result.reward),
+            reward_scale=reward_scale,
+        )
         result = step_result
 
     terminal_reward_by_drone = env.consume_terminal_agent_costs()
     _record_terminal_episode_rewards(
         accumulator=episode_acc,
         terminal_reward_by_drone=terminal_reward_by_drone,
+        reward_scale=reward_scale,
     )
     return _finalize_episode_metrics(
         accumulator=episode_acc,
@@ -2212,18 +2241,20 @@ def _ppo_update(
                 valid_mask_flat,
                 sample_weights=sample_loss_weights_flat,
             )
+            # 动作类型样本权重只用于 actor 的 policy 梯度；critic 学 V(s)，
+            # entropy 也先保持原始状态分布上的平均，避免放大特定动作类型。
             value_loss = _compute_value_loss_masked(
                 values=values_flat,
                 returns=returns,
                 valid_mask=valid_mask_flat,
                 loss_type=train_cfg.value_loss_type,
                 huber_delta=train_cfg.value_huber_delta,
-                sample_weights=sample_loss_weights_flat,
+                sample_weights=None,
             )
             entropy_loss = _masked_mean_tensor(
                 entropy,
                 valid_mask_flat,
-                sample_weights=sample_loss_weights_flat,
+                sample_weights=None,
             )
             approx_kl_t = _compute_masked_approx_kl(
                 old_log_probs=old_log_probs,
@@ -2334,6 +2365,7 @@ def _drain_pending_transitions_after_collection(
                 runtime_state=current_result.runtime_state,
                 rendezvous_arrive_bonus=train_cfg.rendezvous_arrive_bonus,
                 rendezvous_bonus=train_cfg.rendezvous_bonus,
+                reward_scale=train_cfg.reward_scale,
             )
             return current_result
 
@@ -2391,6 +2423,7 @@ def _drain_pending_transitions_after_collection(
             decision_context=decision_context,
             rendezvous_arrive_bonus=train_cfg.rendezvous_arrive_bonus,
             rendezvous_bonus=train_cfg.rendezvous_bonus,
+            reward_scale=train_cfg.reward_scale,
         )
         history_buffer.append(
             tensorizer.build_transition_summary(
@@ -2779,12 +2812,10 @@ def _stack_observation_batches_from_steps(step_batches: Sequence[Any]) -> Any:
     return cls(
         uav_self_token=np.stack([item.uav_self_token for item in step_batches], axis=0),
         order_tokens=np.stack([item.order_tokens for item in step_batches], axis=0),
-        recovery_tokens=np.stack([item.recovery_tokens for item in step_batches], axis=0),
         infra_tokens=np.stack([item.infra_tokens for item in step_batches], axis=0),
         history_tokens=np.stack([item.history_tokens for item in step_batches], axis=0),
         history_padding_mask=np.stack([item.history_padding_mask for item in step_batches], axis=0),
         padding_mask=np.stack([item.padding_mask for item in step_batches], axis=0),
-        recovery_padding_mask=np.stack([item.recovery_padding_mask for item in step_batches], axis=0),
     )
 
 
@@ -2816,12 +2847,10 @@ def _stack_sequence_observation_rows(rows: Sequence[Any]) -> Any:
     return cls(
         uav_self_token=np.stack([item.uav_self_token for item in rows], axis=0),
         order_tokens=np.stack([item.order_tokens for item in rows], axis=0),
-        recovery_tokens=np.stack([item.recovery_tokens for item in rows], axis=0),
         infra_tokens=np.stack([item.infra_tokens for item in rows], axis=0),
         history_tokens=np.stack([item.history_tokens for item in rows], axis=0),
         history_padding_mask=np.stack([item.history_padding_mask for item in rows], axis=0),
         padding_mask=np.stack([item.padding_mask for item in rows], axis=0),
-        recovery_padding_mask=np.stack([item.recovery_padding_mask for item in rows], axis=0),
     )
 
 
@@ -2853,12 +2882,10 @@ def _zero_observation_batch_like(template: Any) -> Any:
     return cls(
         uav_self_token=np.zeros_like(template.uav_self_token),
         order_tokens=np.zeros_like(template.order_tokens),
-        recovery_tokens=np.zeros_like(template.recovery_tokens),
         infra_tokens=np.zeros_like(template.infra_tokens),
         history_tokens=np.zeros_like(template.history_tokens),
         history_padding_mask=np.ones_like(template.history_padding_mask, dtype=np.bool_),
         padding_mask=np.ones_like(template.padding_mask, dtype=np.bool_),
-        recovery_padding_mask=np.ones_like(template.recovery_padding_mask, dtype=np.bool_),
     )
 
 
@@ -3018,7 +3045,6 @@ def _build_meta_payload(
             lstm_layers=int(policy["lstm_layers"]),
             hist_len=int(policy["hist_len"]),
             max_order_tokens=int(policy["max_order_tokens"]),
-            max_recovery_tokens=int(policy["max_recovery_tokens"]),
             use_plan_version_delta=bool(policy["use_plan_version_delta"]),
             use_is_riding_truck_flag=bool(policy["use_is_riding_truck_flag"]),
             use_drone_source_type_flag=bool(policy["use_drone_source_type_flag"]),
@@ -3519,6 +3545,7 @@ def _load_training_config(config_path: Path) -> _TrainingConfig:
         gae_lambda=float(training["gae_lambda"]),
         clip_coef=float(training["clip_coef"]),
         entropy_coef=float(training["entropy_coef"]),
+        reward_scale=float(training.get("reward_scale", 1.0)),
         rendezvous_arrive_bonus=float(reward.get("rendezvous_arrive_bonus", 0.0)),
         rendezvous_bonus=float(reward.get("rendezvous_bonus", 0.0)),
         mode_c_attempt_bonus=float(reward.get("mode_c_attempt_bonus", 0.0)),
@@ -3602,6 +3629,8 @@ def _validate_training_config(cfg: _TrainingConfig) -> None:
         raise ValueError("mode_b_dispatch_loss_weight 必须为正数")
     if cfg.mode_c_dispatch_loss_weight <= 0.0:
         raise ValueError("mode_c_dispatch_loss_weight 必须为正数")
+    if cfg.reward_scale <= 0.0:
+        raise ValueError("reward_scale 必须为正数")
     normalized_value_loss_type = str(cfg.value_loss_type).strip().lower()
     if normalized_value_loss_type not in {"mse", "huber"}:
         raise ValueError("value_loss_type 仅支持 mse 或 huber")

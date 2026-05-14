@@ -38,6 +38,7 @@ from .train_cmrappo import (
     _latest_value_loss_shows_meaningful_decline,
     _materialize_recurrent_sequences,
     _ppo_update,
+    _record_episode_step,
     _record_terminal_episode_rewards,
     _run_periodic_evaluation,
     _sample_training_arrival_band,
@@ -73,14 +74,6 @@ class TestPhase7ModelRuntime(unittest.TestCase):
                 ],
                 dtype=np.float32,
             ),
-            recovery_tokens=np.asarray(
-                [
-                    [[1.0, 0.1, 0.2, 0.3, 0.4, 0.5], [1.0, 0.6, 0.7, 0.8, 0.9, 0.1]],
-                    [[1.0, 0.2, 0.3, 0.4, 0.5, 0.6], [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]],
-                    [[0.0, 0.0, 0.0, 0.0, 0.0, 0.0], [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]],
-                ],
-                dtype=np.float32,
-            ),
             infra_tokens=np.asarray(
                 [
                     [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7],
@@ -101,14 +94,6 @@ class TestPhase7ModelRuntime(unittest.TestCase):
             ),
             history_padding_mask=np.asarray([True, False, False, False, False, False], dtype=np.bool_),
             padding_mask=np.asarray([False, False, True], dtype=np.bool_),
-            recovery_padding_mask=np.asarray(
-                [
-                    [False, False],
-                    [False, True],
-                    [True, True],
-                ],
-                dtype=np.bool_,
-            ),
         )
 
     def _build_single_critic_batch(self) -> CriticBatch:
@@ -194,6 +179,7 @@ class TestPhase7ModelRuntime(unittest.TestCase):
             gae_lambda=0.95,
             clip_coef=0.2,
             entropy_coef=0.01,
+            reward_scale=1.0,
             rendezvous_arrive_bonus=2.0,
             rendezvous_bonus=0.2,
             mode_c_attempt_bonus=0.0,
@@ -242,15 +228,10 @@ class TestPhase7ModelRuntime(unittest.TestCase):
         batched_obs = ObservationBatch(
             uav_self_token=np.stack([obs.uav_self_token, obs.uav_self_token], axis=0),
             order_tokens=np.stack([obs.order_tokens, obs.order_tokens], axis=0),
-            recovery_tokens=np.stack([obs.recovery_tokens, obs.recovery_tokens], axis=0),
             infra_tokens=np.stack([obs.infra_tokens, obs.infra_tokens], axis=0),
             history_tokens=np.stack([obs.history_tokens, obs.history_tokens], axis=0),
             history_padding_mask=np.stack([obs.history_padding_mask, obs.history_padding_mask], axis=0),
             padding_mask=np.stack([obs.padding_mask, obs.padding_mask], axis=0),
-            recovery_padding_mask=np.stack(
-                [obs.recovery_padding_mask, obs.recovery_padding_mask],
-                axis=0,
-            ),
         )
         batched_critic = CriticBatch(
             global_order_pool_tokens=np.stack(
@@ -324,15 +305,10 @@ class TestPhase7ModelRuntime(unittest.TestCase):
         batched_obs = ObservationBatch(
             uav_self_token=np.stack([obs.uav_self_token, obs.uav_self_token], axis=0),
             order_tokens=np.stack([obs.order_tokens, obs.order_tokens], axis=0),
-            recovery_tokens=np.stack([obs.recovery_tokens, obs.recovery_tokens], axis=0),
             infra_tokens=np.stack([obs.infra_tokens, obs.infra_tokens], axis=0),
             history_tokens=np.stack([obs.history_tokens, obs.history_tokens], axis=0),
             history_padding_mask=np.stack([obs.history_padding_mask, obs.history_padding_mask], axis=0),
             padding_mask=np.stack([obs.padding_mask, obs.padding_mask], axis=0),
-            recovery_padding_mask=np.stack(
-                [obs.recovery_padding_mask, obs.recovery_padding_mask],
-                axis=0,
-            ),
         )
         batched_critic = CriticBatch(
             global_order_pool_tokens=np.stack(
@@ -579,15 +555,10 @@ class TestPhase7ModelRuntime(unittest.TestCase):
         batched_obs = ObservationBatch(
             uav_self_token=np.stack([obs.uav_self_token, obs.uav_self_token], axis=0),
             order_tokens=np.stack([obs.order_tokens, obs.order_tokens], axis=0),
-            recovery_tokens=np.stack([obs.recovery_tokens, obs.recovery_tokens], axis=0),
             infra_tokens=np.stack([obs.infra_tokens, obs.infra_tokens], axis=0),
             history_tokens=np.stack([obs.history_tokens, obs.history_tokens], axis=0),
             history_padding_mask=np.stack([obs.history_padding_mask, obs.history_padding_mask], axis=0),
             padding_mask=np.stack([obs.padding_mask, obs.padding_mask], axis=0),
-            recovery_padding_mask=np.stack(
-                [obs.recovery_padding_mask, obs.recovery_padding_mask],
-                axis=0,
-            ),
         )
         batched_critic = CriticBatch(
             global_order_pool_tokens=np.stack(
@@ -662,13 +633,6 @@ class TestPhase7ModelRuntime(unittest.TestCase):
                 ],
                 axis=0,
             ),
-            recovery_tokens=np.stack(
-                [
-                    np.stack([obs.recovery_tokens, obs.recovery_tokens], axis=0),
-                    np.stack([obs.recovery_tokens, obs.recovery_tokens], axis=0),
-                ],
-                axis=0,
-            ),
             infra_tokens=np.stack(
                 [
                     np.stack([obs.infra_tokens, obs.infra_tokens], axis=0),
@@ -694,13 +658,6 @@ class TestPhase7ModelRuntime(unittest.TestCase):
                 [
                     np.stack([obs.padding_mask, obs.padding_mask], axis=0),
                     np.stack([obs.padding_mask, obs.padding_mask], axis=0),
-                ],
-                axis=0,
-            ),
-            recovery_padding_mask=np.stack(
-                [
-                    np.stack([obs.recovery_padding_mask, obs.recovery_padding_mask], axis=0),
-                    np.stack([obs.recovery_padding_mask, obs.recovery_padding_mask], axis=0),
                 ],
                 axis=0,
             ),
@@ -1195,6 +1152,56 @@ class TestPhase7ModelRuntime(unittest.TestCase):
         self.assertTrue(bool(backlog[0].rendezvous_arrive_bonus_applied))
         self.assertTrue(bool(backlog[0].rendezvous_success_bonus_applied))
 
+    def test_finalize_pending_transition_scales_late_rendezvous_bonus(self) -> None:
+        pending = {
+            "uav_1": RolloutTransition(
+                observation_batch=self._build_single_observation(),
+                critic_batch=self._build_single_critic_batch(),
+                action_mask=self._build_single_action_mask(),
+                action_indices=SimpleNamespace(
+                    root_branch_idx=1,
+                    order_idx=0,
+                    mode_idx=1,
+                ),
+                log_prob_old=-0.1,
+                value_old=0.5,
+                reward=-0.0125,
+                done=None,
+                critic_schema_hash="schema",
+                episode_id=3,
+                actor_drone_id="uav_1",
+                recurrent_segment_id=2,
+                local_decision_index=4,
+                global_decision_index=11,
+            )
+        }
+        backlog: list[RolloutTransition] = []
+        successor_bootstrap_values: dict[tuple[int, str, int], float] = {}
+
+        _finalize_pending_transition_for_next_decision(
+            pending_transition_by_drone=pending,
+            rollout_backlog=backlog,
+            successor_bootstrap_values=successor_bootstrap_values,
+            drone_id="uav_1",
+            carry_in_reward=-0.75,
+            next_value=1.75,
+            decision_context=SimpleNamespace(
+                runtime_state=SimpleNamespace(
+                    drone_states={
+                        "uav_1": SimpleNamespace(training_state="charging_on_truck"),
+                    }
+                )
+            ),
+            rendezvous_arrive_bonus=2.0,
+            rendezvous_bonus=0.2,
+            reward_scale=0.01,
+        )
+
+        self.assertEqual(len(backlog), 1)
+        self.assertAlmostEqual(float(backlog[0].reward), 0.002, places=6)
+        self.assertTrue(bool(backlog[0].rendezvous_arrive_bonus_applied))
+        self.assertTrue(bool(backlog[0].rendezvous_success_bonus_applied))
+
     def test_flush_terminal_pending_transitions_marks_done_and_preserves_order(self) -> None:
         first = RolloutTransition(
             observation_batch=self._build_single_observation(),
@@ -1271,6 +1278,52 @@ class TestPhase7ModelRuntime(unittest.TestCase):
         self.assertTrue(all(item.done for item in backlog[:2]))
         self.assertAlmostEqual(float(backlog[0].reward), 1.0, places=6)
         self.assertAlmostEqual(float(backlog[1].reward), 1.5, places=6)
+
+    def test_flush_terminal_pending_transitions_scales_late_rendezvous_bonus(self) -> None:
+        pending = {
+            "uav_1": RolloutTransition(
+                observation_batch=self._build_single_observation(),
+                critic_batch=self._build_single_critic_batch(),
+                action_mask=self._build_single_action_mask(),
+                action_indices=SimpleNamespace(
+                    root_branch_idx=1,
+                    order_idx=0,
+                    mode_idx=1,
+                ),
+                log_prob_old=-0.1,
+                value_old=0.5,
+                reward=-0.0125,
+                done=None,
+                critic_schema_hash="schema",
+                episode_id=3,
+                actor_drone_id="uav_1",
+                recurrent_segment_id=2,
+                local_decision_index=4,
+                global_decision_index=11,
+            )
+        }
+        backlog: list[RolloutTransition] = []
+
+        _flush_terminal_pending_transitions(
+            pending_transition_by_drone=pending,
+            rollout_backlog=backlog,
+            terminal_reward_by_drone={"uav_1": -0.75},
+            runtime_state=SimpleNamespace(
+                drone_states={
+                    "uav_1": SimpleNamespace(training_state="charging_on_truck"),
+                }
+            ),
+            rendezvous_arrive_bonus=2.0,
+            rendezvous_bonus=0.2,
+            reward_scale=0.01,
+        )
+
+        self.assertFalse(pending)
+        self.assertEqual(len(backlog), 1)
+        self.assertAlmostEqual(float(backlog[0].reward), 0.002, places=6)
+        self.assertTrue(bool(backlog[0].done))
+        self.assertTrue(bool(backlog[0].rendezvous_arrive_bonus_applied))
+        self.assertTrue(bool(backlog[0].rendezvous_success_bonus_applied))
 
     def test_insert_finalized_transition_in_order_uses_global_decision_index(self) -> None:
         backlog = [
@@ -1628,6 +1681,92 @@ class TestPhase7ModelRuntime(unittest.TestCase):
 
         self.assertAlmostEqual(float(mse_loss.item()), 2.0, places=6)
         self.assertAlmostEqual(float(huber_loss.item()), 1.5, places=6)
+
+    def test_ppo_update_weights_policy_loss_only(self) -> None:
+        train_cfg = self._build_training_config()
+        train_cfg = _TrainingConfig(
+            **{
+                **train_cfg.__dict__,
+                "ppo_epochs": 1,
+                "sequence_minibatch_size": 1,
+                "normalize_advantage": False,
+                "target_kl": 10.0,
+                "value_loss_type": "mse",
+            }
+        )
+        fake_sequence = SimpleNamespace(
+            valid_timestep_mask=np.asarray([True, True], dtype=np.bool_),
+            transitions=(SimpleNamespace(), SimpleNamespace()),
+            advantages=np.asarray([1.0, 3.0], dtype=np.float32),
+            returns=np.asarray([0.0, 0.0], dtype=np.float32),
+            sample_loss_weights=np.asarray([10.0, 1.0], dtype=np.float32),
+        )
+        fake_minibatch = SimpleNamespace(
+            observation_batch=SimpleNamespace(),
+            critic_batch=SimpleNamespace(),
+            action_mask=SimpleNamespace(),
+            action_indices={},
+            old_log_probs=torch.as_tensor([[0.0, 0.0]], dtype=torch.float32),
+            old_values=torch.as_tensor([[0.0, 0.0]], dtype=torch.float32),
+            returns=torch.as_tensor([[0.0, 0.0]], dtype=torch.float32),
+            advantages=torch.as_tensor([[1.0, 3.0]], dtype=torch.float32),
+            sample_loss_weights=torch.as_tensor([[10.0, 1.0]], dtype=torch.float32),
+            valid_timestep_mask=torch.as_tensor([[True, True]], dtype=torch.bool),
+            lstm_state_in=None,
+            sequence_count=1,
+            padded_timesteps=0,
+        )
+        value_param = torch.nn.Parameter(torch.as_tensor(0.0, dtype=torch.float32))
+        fake_policy_out = SimpleNamespace(
+            value=torch.stack((value_param * 0.0, value_param + 2.0)).reshape(1, 2)
+        )
+        fake_model = SimpleNamespace(
+            forward_sequence=mock.Mock(return_value=(fake_policy_out, None)),
+            evaluate_actions=mock.Mock(
+                return_value=(
+                    torch.as_tensor([0.0, 0.0], dtype=torch.float32),
+                    torch.as_tensor([1.0, 3.0], dtype=torch.float32),
+                )
+            ),
+            parameters=mock.Mock(return_value=[value_param]),
+        )
+        fake_optimizer = mock.Mock()
+        batch_view = SimpleNamespace(rewards=np.asarray([0.0, 0.0], dtype=np.float32))
+        with mock.patch(
+            "backend.training.train_cmrappo._materialize_recurrent_sequences",
+            return_value=[fake_sequence],
+        ):
+            with mock.patch(
+                "backend.training.train_cmrappo._build_sequence_minibatch",
+                return_value=fake_minibatch,
+            ):
+                with mock.patch(
+                    "backend.training.train_cmrappo._flatten_sequence_policy_output",
+                    return_value=SimpleNamespace(),
+                ):
+                    with mock.patch(
+                        "backend.training.train_cmrappo._flatten_sequence_action_mask",
+                        return_value=SimpleNamespace(),
+                    ):
+                        with mock.patch(
+                            "backend.training.train_cmrappo._flatten_sequence_action_indices",
+                            return_value={},
+                        ):
+                            stats = _ppo_update(
+                                model=fake_model,
+                                optimizer=fake_optimizer,
+                                batch_view=batch_view,
+                                train_cfg=train_cfg,
+                                device=torch.device("cpu"),
+                                tail_bootstrap_values={},
+                            )
+
+        self.assertAlmostEqual(float(stats["policy_loss"]), -13.0 / 11.0, places=6)
+        self.assertAlmostEqual(float(stats["value_loss"]), 1.0, places=6)
+        self.assertAlmostEqual(float(stats["entropy"]), 2.0, places=6)
+        self.assertAlmostEqual(float(stats["sample_loss_weight_mean"]), 5.5, places=6)
+        fake_optimizer.step.assert_called_once()
+
 
     def test_ppo_update_skips_optimizer_step_when_target_kl_exceeded(self) -> None:
         train_cfg = self._build_training_config()
@@ -2432,6 +2571,29 @@ class TestPhase7ModelRuntime(unittest.TestCase):
         self.assertAlmostEqual(terminal_reward_total, 300.0)
         self.assertEqual(accumulator.decision_count, 16)
         self.assertAlmostEqual(accumulator.total_reward, 220.5645005)
+
+    def test_episode_reward_recording_uses_reward_scale(self) -> None:
+        accumulator = _EpisodeAccumulator(
+            phase="train",
+            episode_id=0,
+            order_source_mode="poisson",
+            order_source_seed=20260425,
+            total_reward=-0.5,
+        )
+
+        _record_episode_step(accumulator, reward=100.0, reward_scale=0.01)
+        terminal_reward_total = _record_terminal_episode_rewards(
+            accumulator=accumulator,
+            terminal_reward_by_drone={
+                "UAV-TEST-03": 100.0,
+                "UAV-TEST-10": 50.0,
+            },
+            reward_scale=0.01,
+        )
+
+        self.assertAlmostEqual(terminal_reward_total, 1.5)
+        self.assertEqual(accumulator.decision_count, 1)
+        self.assertAlmostEqual(accumulator.total_reward, 2.0)
 
     def test_validate_meta_payload_before_write_rejects_mismatched_effective_timesteps(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir_str:

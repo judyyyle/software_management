@@ -60,7 +60,6 @@ class TestPhase7SnapshotAndTensorizers(unittest.TestCase):
 
         self.assertEqual(batch.order_tokens.shape[0], len(candidate_out.order_mask))
         self.assertEqual(batch.order_tokens.shape[1], len(ORDER_TOKEN_FIELDS))
-        self.assertEqual(batch.recovery_tokens.shape[:2], batch.recovery_padding_mask.shape)
         self.assertEqual(batch.history_tokens.shape[0], self.tensorizer.history_length)
         self.assertEqual(batch.history_padding_mask.dtype, np.bool_)
         self.assertEqual(action_mask.root_branch_mask.shape, (2,))
