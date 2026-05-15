@@ -337,7 +337,7 @@ class TestPhase6Integration(unittest.TestCase):
             ],
         )
 
-    def test_planner_bridge_resets_active_launch_stations_on_replan(self) -> None:
+    def test_planner_bridge_marks_all_future_stations_as_active_launch(self) -> None:
         env, _drone_id = self._reset_controlled_env()
         entity_mgr = env._require_entity_manager()
         station_ids = sorted(entity_mgr.stations)
@@ -362,8 +362,10 @@ class TestPhase6Integration(unittest.TestCase):
         plan_v0 = env._current_coarse_plan
         self.assertIsNotNone(plan_v0)
         self.assertGreaterEqual(plan_v0.plan_version, 0)
-        self.assertIn(station_1.station_id, env._active_launch_stations)
-        self.assertNotIn(station_2.station_id, env._active_launch_stations)
+        self.assertEqual(
+            env._active_launch_stations,
+            {station_1.station_id, station_2.station_id, station_3.station_id},
+        )
 
         env._require_order_manager().pending_orders.clear()
         self._inject_order_at(
@@ -376,8 +378,10 @@ class TestPhase6Integration(unittest.TestCase):
         runtime_state = env.build_runtime_state_view()
         plan_v1 = env._refresh_coarse_plan_if_needed(runtime_state)
         self.assertGreater(plan_v1.plan_version, plan_v0.plan_version)
-        self.assertIn(station_2.station_id, env._active_launch_stations)
-        self.assertNotIn(station_1.station_id, env._active_launch_stations)
+        self.assertEqual(
+            env._active_launch_stations,
+            {station_1.station_id, station_2.station_id, station_3.station_id},
+        )
 
     def test_planner_bridge_recovery_pool_exposes_future_backbone_nodes(self) -> None:
         env, _drone_id = self._reset_controlled_env()
