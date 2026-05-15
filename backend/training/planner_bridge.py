@@ -941,24 +941,12 @@ class PlannerBridge:
         if not truck_backbone_route:
             return ()
 
-        radius_m = self._cfg.support_radius_km * 1000.0
         launch_nodes: list[str] = []
         for node_id in truck_backbone_route:
             node_state = runtime_state.node_states.get(node_id)
             if node_state is None or node_state.node_type != "station":
                 continue
-            support_count = 0
-            for order in runtime_state.pending_orders.values():
-                if float(order.payload_weight) > self._heavy_payload_capacity:
-                    continue
-                if (
-                    node_state.position.distance_2d(order.delivery_loc)
-                    <= radius_m + _TIME_EPS
-                ):
-                    support_count += 1
-                    if support_count >= self._cfg.min_orders_to_trigger:
-                        launch_nodes.append(node_id)
-                        break
+            launch_nodes.append(node_id)
         return tuple(launch_nodes)
 
     @staticmethod

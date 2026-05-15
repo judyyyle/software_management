@@ -12,6 +12,7 @@ from pathlib import Path
 
 
 CACHE_BASE_DIR = os.path.join(os.path.dirname(__file__), "..", "..", "test_data", "default_scene")
+DEFAULT_PRESET_ORDERS_FILE = "orders_ppo_training_intensity.json"
 
 # 预设场景列表
 PRESET_SCENES = {
@@ -78,8 +79,8 @@ def get_preset_scene(scene_id: str) -> dict | None:
         except Exception as e:
             print(f"[WARN] 加载实体配置失败: {e}")
     
-    # 加载 orders.json
-    orders_path = os.path.join(CACHE_BASE_DIR, "orders.json")
+    # 加载默认前端预设订单；静态订单与动态订单结构均与 orders.json 对齐。
+    orders_path = os.path.join(CACHE_BASE_DIR, DEFAULT_PRESET_ORDERS_FILE)
     if os.path.exists(orders_path):
         try:
             with open(orders_path, "r", encoding="utf-8") as f:
@@ -151,8 +152,8 @@ def save_preset_entities(scene_id: str, entities: dict, orders: dict) -> bool:
             json.dump(entities, f, indent=2, ensure_ascii=False)
         print(f"[SAVE] 实体配置已保存: {entities_path}")
         
-        # 保存 orders.json
-        orders_path = os.path.join(CACHE_BASE_DIR, "orders.json")
+        # 保存当前前端默认预设订单
+        orders_path = os.path.join(CACHE_BASE_DIR, DEFAULT_PRESET_ORDERS_FILE)
         with open(orders_path, "w", encoding="utf-8") as f:
             json.dump(orders, f, indent=2, ensure_ascii=False)
         print(f"[SAVE] 任务点配置已保存: {orders_path}")

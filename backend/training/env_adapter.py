@@ -2734,31 +2734,9 @@ class TrainingEnvAdapter:
             events.pop(0)
 
     def _prune_active_launch_stations(self, runtime_state: RuntimeStateView) -> None:
-        if not self._active_launch_stations:
-            return
-        removable = [
-            node_id
-            for node_id in self._active_launch_stations
-            if not self._station_has_pending_orders(runtime_state, node_id)
-        ]
-        for node_id in removable:
-            self._active_launch_stations.discard(node_id)
-
-    def _station_has_pending_orders(
-        self,
-        runtime_state: RuntimeStateView,
-        station_id: str,
-    ) -> bool:
-        node_state = runtime_state.node_states.get(station_id)
-        if node_state is None:
-            return False
-        radius_m = self._cfg.support_radius_km * 1000.0
-        for order in runtime_state.pending_orders.values():
-            if not self._is_uav_primary_order(order):
-                continue
-            if node_state.position.distance_2d(order.delivery_loc) <= radius_m + _TIME_EPS:
-                return True
-        return False
+        # 新语义：只要 station 在卡车未来骨架中，到站时就必须暴露
+        # riding-with-truck UAV 的放飞/等待决策，不再按附近 pending 订单裁剪。
+        _ = runtime_state
 
     def _build_action_lookup(
         self,
