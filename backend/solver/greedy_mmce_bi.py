@@ -229,6 +229,8 @@ class GreedyMMCEBackboneInsertion(GreedyMMCE):
         for drone in self._get_available_drones():
             if drone.drone_id in allocated_drones:
                 continue
+            if self._drone_reserved_outside_ga_dynamic_scope(drone):
+                continue
             if not self._drone_in_truck_pool(drone.drone_id, truck_id):
                 continue
 
@@ -247,7 +249,129 @@ class GreedyMMCEBackboneInsertion(GreedyMMCE):
         truck_last_pos: dict[str, Position3D],
     ) -> AllocationResult:
         """MMCE-BI 保留仓库直发模式 C。"""
-        return super()._try_mode_c(order, current_time, allocated_drones, truck_last_pos)
+        if not self._is_ga_mmce_dynamic_delegate():
+            return super()._try_mode_c(order, current_time, allocated_drones, truck_last_pos)
+
+        depots = list(self.entity_mgr.depots.values())
+        if not depots:
+            return AllocationResult(
+                order_id=order.order_id,
+                vehicle_id="",
+                mode="C",
+                distance=float("inf"),
+                feasible=False,
+                reason="无可用仓库",
+            )
+
+        depot = depots[0]
+        available_drones = self._get_available_drones()
+        available_drones = [
+            d for d in available_drones
+            if d.drone_id not in allocated_drones
+            and not self._drone_reserved_outside_ga_dynamic_scope(d)
+            and self._is_drone_ready_for_depot_launch(d, depot)
+        ]
+        drone = self._find_capable_drone(order.payload_weight, available_drones)
+        if drone is None:
+            return AllocationResult(
+                order_id=order.order_id,
+                vehicle_id="",
+                mode="C",
+                distance=float("inf"),
+                feasible=False,
+                reason="无位于仓库且载重匹配的可用无人机",
+            )
+
+        energy_out = self._flight_energy(drone, depot.location, order.delivery_loc, order.payload_weight)
+        energy_back = self._flight_energy(drone, order.delivery_loc, depot.location, 0.0)
+        energy_needed = (energy_out + energy_back) * self.ENERGY_SAFETY_FACTOR
+
+        if energy_needed > drone.battery_current:
+            return AllocationResult(
+                order_id=order.order_id,
+                vehicle_id="",
+                mode="C",
+                distance=float("inf"),
+                feasible=False,
+                reason=(
+                    f"仓-空往返电量不足（需 {energy_needed:.0f} J，"
+                    f"剩余 {drone.battery_current:.0f} J）"
+                ),
+            )
+
+        return AllocationResult(
+            order_id=order.order_id,
+            vehicle_id=depot.depot_id,
+            mode="C",
+            distance=self._uav_path_distance(
+                depot.location,
+                order.delivery_loc,
+                altitude=self.UAV_CRUISE_ALTITUDE_M,
+            ),
+            feasible=True,
+            recovery_station_id=depot.depot_id,
+            drone_id=drone.drone_id,
+        )
+
+    def _is_ga_mmce_dynamic_delegate(self) -> bool:
+        """仅 GA-MMCE 动态委托贪心时启用兼容保护。"""
+        return bool(getattr(self, "_ga_mmce_dynamic_delegate", False))
+
+    def _active_ga_mmce_dynamic_order_ids(self) -> set[str]:
+        return {
+            str(order_id)
+            for order_id in (getattr(self, "_ga_mmce_dynamic_order_ids", set()) or set())
+            if str(order_id)
+        }
+
+    def _drone_reserved_outside_ga_dynamic_scope(self, drone: "Drone") -> bool:
+        """GA 动态委托时，排除仍被未重写未来任务预约的无人机。"""
+        if not self._is_ga_mmce_dynamic_delegate():
+            return False
+
+        allowed_order_ids = self._active_ga_mmce_dynamic_order_ids()
+        future_order_ids = self._collect_drone_future_order_ids(drone)
+        blocked_order_ids = sorted(
+            order_id for order_id in future_order_ids
+            if order_id not in allowed_order_ids
+        )
+        if not blocked_order_ids:
+            return False
+
+        logger.debug(
+            "[MMCE-BI] GA动态委托跳过已被未来任务预约的无人机 %s orders=%s",
+            drone.drone_id,
+            blocked_order_ids,
+        )
+        return True
+
+    def _collect_drone_future_order_ids(self, drone: "Drone") -> set[str]:
+        """从运行时航路和 GA segment 中读取无人机尚未完成的订单集合。"""
+        result: set[str] = set()
+        for attr_name in ("carrying_order_id", "pending_release_order_id"):
+            order_id = str(getattr(drone, attr_name, "") or "")
+            if order_id:
+                result.add(order_id)
+
+        route_plan = getattr(drone, "route_plan", None) or []
+        start_idx = int(getattr(drone, "current_waypoint_index", 0) or 0)
+        start_idx = max(0, min(start_idx, len(route_plan)))
+        for wp in route_plan[start_idx:]:
+            if wp.action in (WaypointAction.PICKUP, WaypointAction.DELIVER):
+                order_id = str(wp.target_entity_id or "")
+                if order_id:
+                    result.add(order_id)
+
+        segments = getattr(drone, "_ga_runtime_segments", None) or []
+        for segment in segments:
+            order_id = str(getattr(segment, "order_id", "") or "")
+            if not order_id:
+                continue
+            dock_idx = int(getattr(segment, "dock_idx", -1) or -1)
+            if dock_idx >= start_idx:
+                result.add(order_id)
+
+        return result
 
     def _nearest_station_for_pos(self, pos: Position3D) -> tuple[str, Position3D] | None:
         """返回距离给定位置最近的充电站 (station_id, location)。"""
@@ -693,6 +817,11 @@ class GreedyMMCEBackboneInsertion(GreedyMMCE):
                     station_pos=launch_pos,
                     suggested_idx=b_choice.launch_insert_idx,
                     min_service=self.TRUCK_DRONE_LAUNCH_TIME,
+                    desired_node_type=(
+                        "station" if self._is_ga_mmce_dynamic_delegate() else "recovery"
+                    ),
+                    order_id=order.order_id,
+                    semantic_role="launch",
                 )
                 logger.info(
                     "[MMCE-BI] 订单 %s B_WAIT 放飞站插入: truck=%s station=%s idx=%d (%s) prev=%s next=%s",
@@ -716,6 +845,9 @@ class GreedyMMCEBackboneInsertion(GreedyMMCE):
                         station_pos=recovery_pos,
                         suggested_idx=max(b_choice.recovery_insert_idx, launch_idx + 1),
                         min_service=b_choice.wait_duration,
+                        desired_node_type="recovery",
+                        order_id=order.order_id,
+                        semantic_role="recovery",
                     )
                     logger.info(
                         "[MMCE-BI] 订单 %s B_WAIT 回收站插入: truck=%s station=%s idx=%d (%s) prev=%s next=%s",
@@ -850,6 +982,11 @@ class GreedyMMCEBackboneInsertion(GreedyMMCE):
             if incremental:
                 planned = getattr(truck, "_planned_route_stops", None) or []
                 cursor = int(getattr(truck, "_planned_route_cursor", 0) or 0)
+                planned_solver = str(getattr(truck, "_planned_route_solver", "") or "")
+                protect_ga_static_stops = (
+                    self._is_ga_mmce_dynamic_delegate()
+                    and planned_solver == "ga_mmce"
+                )
                 for stop in planned[cursor:]:
                     node_type = stop.get("node_type", "")
                     if node_type not in ("customer", "recovery", "station"):
@@ -869,15 +1006,19 @@ class GreedyMMCEBackboneInsertion(GreedyMMCE):
                         stop["arrival_time"] = arr
                         stop["departure_time"] = dep
 
-                    seq.append(
-                        {
-                            "node_id": stop.get("node_id", ""),
-                            "node_type": node_type,
-                            "position": position,
-                            "order_id": stop.get("order_id", ""),
-                            "service_time": max(0.0, dep - arr),
-                        }
-                    )
+                    copied_stop = {
+                        "node_id": stop.get("node_id", ""),
+                        "node_type": node_type,
+                        "position": position,
+                        "order_id": stop.get("order_id", ""),
+                        "service_time": max(0.0, dep - arr),
+                    }
+                    if protect_ga_static_stops and node_type in ("station", "recovery"):
+                        copied_stop["_ga_static_stop"] = True
+                        copied_stop["_semantic_role"] = (
+                            "launch" if node_type == "station" else "recovery"
+                        )
+                    seq.append(copied_stop)
             result[truck_id] = seq
         return result
 
@@ -1388,13 +1529,37 @@ class GreedyMMCEBackboneInsertion(GreedyMMCE):
         station_pos: Position3D,
         suggested_idx: int,
         min_service: float,
+        desired_node_type: str = "recovery",
+        order_id: str = "",
+        semantic_role: str = "",
     ) -> int:
         """确保序列中存在 recovery 站点，存在则提升服务时长，不存在则插入。"""
+        desired_node_type = str(desired_node_type or "recovery")
+        order_id = str(order_id or "")
+        semantic_role = semantic_role or ("launch" if desired_node_type == "station" else "recovery")
         for idx, stop in enumerate(stops):
             if stop.get("node_id") != station_id:
                 continue
-            stop["node_type"] = "recovery"
+
+            if self._is_ga_mmce_dynamic_delegate():
+                existing_order_id = str(stop.get("order_id", "") or "")
+                existing_role = str(stop.get("_semantic_role", "") or "")
+                existing_type = str(stop.get("node_type", "") or "")
+                if existing_order_id and order_id and existing_order_id != order_id:
+                    continue
+                if existing_role and existing_role != semantic_role:
+                    continue
+                if existing_order_id and existing_type != desired_node_type:
+                    continue
+                if bool(stop.get("_ga_static_stop", False)) and existing_type != desired_node_type:
+                    continue
+
+            stop["node_type"] = desired_node_type
             stop["position"] = station_pos
+            if order_id and not str(stop.get("order_id", "") or ""):
+                stop["order_id"] = order_id
+            if semantic_role:
+                stop["_semantic_role"] = semantic_role
             stop["service_time"] = max(float(stop.get("service_time", 0.0)), float(min_service))
             return idx
 
@@ -1403,10 +1568,11 @@ class GreedyMMCEBackboneInsertion(GreedyMMCE):
             idx,
             {
                 "node_id": station_id,
-                "node_type": "recovery",
+                "node_type": desired_node_type,
                 "position": station_pos,
-                "order_id": "",
+                "order_id": order_id,
                 "service_time": max(0.0, float(min_service)),
+                "_semantic_role": semantic_role,
             },
         )
         return idx
@@ -1506,6 +1672,10 @@ class GreedyMMCEBackboneInsertion(GreedyMMCE):
         allocations: list[AllocationResult],
     ) -> None:
         """移除当前批次无任务需求的 station/recovery 停靠，减少无效绕行/停留。"""
+        if self._is_ga_mmce_dynamic_delegate():
+            self._prune_nonessential_station_stops_for_ga_dynamic(stops_by_truck, allocations)
+            return
+
         required_by_truck: dict[str, set[str]] = {
             tid: set() for tid in stops_by_truck
         }
@@ -1577,6 +1747,131 @@ class GreedyMMCEBackboneInsertion(GreedyMMCE):
                     removed,
                 )
             stops_by_truck[truck_id] = kept
+
+    def _prune_nonessential_station_stops_for_ga_dynamic(
+        self,
+        stops_by_truck: dict[str, list[dict]],
+        allocations: list[AllocationResult],
+    ) -> None:
+        """GA 动态委托专用：按订单和语义角色保护静态 station/recovery。"""
+        required_keys_by_truck: dict[str, set[tuple[str, str, str]]] = {
+            tid: set() for tid in stops_by_truck
+        }
+
+        def key(node_id: str, node_type: str, order_id: str) -> tuple[str, str, str]:
+            return (str(node_id or ""), str(node_type or ""), str(order_id or ""))
+
+        for alloc in allocations:
+            if not alloc.feasible or alloc.mode not in ("B", "B_WAIT"):
+                continue
+            truck_id = str(alloc.vehicle_id or "")
+            if truck_id not in required_keys_by_truck:
+                continue
+            order_id = str(alloc.order_id or "")
+            if alloc.launch_station_id:
+                required_keys_by_truck[truck_id].add(
+                    key(alloc.launch_station_id, "station", order_id)
+                )
+            if alloc.recovery_station_id and alloc.recovery_station_id in self.entity_mgr.stations:
+                required_keys_by_truck[truck_id].add(
+                    key(alloc.recovery_station_id, "recovery", order_id)
+                )
+
+        for drone in self.entity_mgr.drones.values():
+            owner_truck_id = self._resolve_drone_owner_truck_id(drone)
+            if owner_truck_id not in required_keys_by_truck:
+                continue
+
+            order_id = self._resolve_drone_current_future_order_id(drone)
+            waiting_station_id = str(getattr(drone, "waiting_recovery_station_id", "") or "")
+            if waiting_station_id and waiting_station_id in self.entity_mgr.stations and order_id:
+                required_keys_by_truck[owner_truck_id].add(
+                    key(waiting_station_id, "recovery", order_id)
+                )
+
+            launch_station_id = str(getattr(drone, "launch_station_id", "") or "")
+            transport_truck_id = str(getattr(drone, "transport_truck_id", "") or "")
+            if (
+                transport_truck_id == owner_truck_id
+                and launch_station_id
+                and launch_station_id in self.entity_mgr.stations
+                and order_id
+            ):
+                required_keys_by_truck[owner_truck_id].add(
+                    key(launch_station_id, "station", order_id)
+                )
+
+            route_plan = getattr(drone, "route_plan", None) or []
+            start_idx = int(getattr(drone, "current_waypoint_index", 0) or 0)
+            start_idx = max(0, min(start_idx, len(route_plan)))
+            for wp in route_plan[start_idx:]:
+                if wp.action not in (WaypointAction.DOCK_DEPOT, WaypointAction.DOCK_TRUCK):
+                    continue
+                target_id = str(wp.target_entity_id or "")
+                if target_id in self.entity_mgr.stations and order_id:
+                    required_keys_by_truck[owner_truck_id].add(
+                        key(target_id, "recovery", order_id)
+                    )
+                break
+
+        for truck_id, seq in stops_by_truck.items():
+            required_keys = required_keys_by_truck.get(truck_id, set())
+            if not seq:
+                continue
+
+            kept: list[dict] = []
+            removed = 0
+            for stop in seq:
+                node_type = str(stop.get("node_type", "") or "")
+                if node_type not in ("station", "recovery"):
+                    kept.append(stop)
+                    continue
+
+                if bool(stop.get("_ga_static_stop", False)):
+                    kept.append(stop)
+                    continue
+
+                stop_key = key(
+                    str(stop.get("node_id", "") or ""),
+                    node_type,
+                    str(stop.get("order_id", "") or ""),
+                )
+                if stop_key in required_keys:
+                    kept.append(stop)
+                else:
+                    removed += 1
+
+            if removed > 0:
+                logger.info(
+                    "[MMCE-BI] GA动态委托卡车 %s 移除 %d 个非任务必需站点停靠",
+                    truck_id,
+                    removed,
+                )
+            stops_by_truck[truck_id] = kept
+
+    def _resolve_drone_current_future_order_id(self, drone: "Drone") -> str:
+        for attr_name in ("carrying_order_id", "pending_release_order_id"):
+            order_id = str(getattr(drone, attr_name, "") or "")
+            if order_id:
+                return order_id
+
+        route_plan = getattr(drone, "route_plan", None) or []
+        start_idx = int(getattr(drone, "current_waypoint_index", 0) or 0)
+        start_idx = max(0, min(start_idx, len(route_plan)))
+        for wp in route_plan[start_idx:]:
+            if wp.action in (WaypointAction.PICKUP, WaypointAction.DELIVER):
+                order_id = str(wp.target_entity_id or "")
+                if order_id:
+                    return order_id
+
+        segments = getattr(drone, "_ga_runtime_segments", None) or []
+        for segment in segments:
+            order_id = str(getattr(segment, "order_id", "") or "")
+            start = int(getattr(segment, "start_idx", 0) or 0)
+            dock = int(getattr(segment, "dock_idx", -1) or -1)
+            if order_id and start <= start_idx <= dock:
+                return order_id
+        return ""
 
     def _ensure_terminal_station_stop(self, stops: list[dict]) -> bool:
         """确保路线最后停靠为“最后任务点最近充电站”。"""
