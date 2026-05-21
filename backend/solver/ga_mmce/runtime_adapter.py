@@ -355,10 +355,7 @@ def _build_segment(
     if mode in {"B", "B_WAIT"}:
         truck = entity_mgr.trucks.get(truck_id)
         launch_entity = _resolve_support_entity(entity_mgr, launch_node_id)
-        launch_is_depot = launch_node_id in getattr(entity_mgr, "depots", {})
-        if launch_is_depot and truck is not None:
-            launch_loc = truck.get_location(current_time)
-        elif launch_entity is not None:
+        if launch_entity is not None:
             launch_loc = launch_entity.location
         elif truck is not None:
             launch_loc = truck.get_location(current_time)

@@ -68,7 +68,7 @@ class GAConfig:
     # 若卡车与无人机回收同步失败，是否作为软惩罚而不是直接判死。
     soft_rendezvous_violation: bool = True
 
-    truck_wait_max_s: float = 10.0
+    truck_wait_max_s: float = 60.0
 
     # GA 初始静态调度的虚拟装载状态：卡车出仓时携带 1-8、11 号无人机，
     # 仓库保留 9、10、12 号无人机。该设置只影响 GA 内部 _ga_* 状态。
