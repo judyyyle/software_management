@@ -53,6 +53,7 @@ class GAMMCESolver:
         self.entity_mgr = entity_mgr
         self.config = config or GAConfig()
         self.greedy_helper = self._make_greedy_helper(entity_mgr)
+        self.dynamic_greedy_helper = self._make_dynamic_greedy_helper(entity_mgr)
         self.evaluator = PhysicalEvaluator(entity_mgr, self.greedy_helper, self.config)
         self.decoder = GADecoder(self.config, self.evaluator)
         self.last_best_individual: Individual | None = None
@@ -1528,6 +1529,16 @@ class GAMMCESolver:
             except Exception:
                 from solver.greedy_mmce import GreedyMMCE
         return GreedyMMCE(entity_mgr)
+
+    def _make_dynamic_greedy_helper(self, entity_mgr: Any) -> Any:
+        try:
+            from ..greedy_mmce_bi import GreedyMMCEBackboneInsertion
+        except Exception:
+            try:
+                from greedy_mmce_bi import GreedyMMCEBackboneInsertion
+            except Exception:
+                from solver.greedy_mmce_bi import GreedyMMCEBackboneInsertion
+        return GreedyMMCEBackboneInsertion(entity_mgr)
 
     def _debug_run_start(self, state: Any, context: Any, dispatch_type: str) -> None:
         self._debug_write("")
