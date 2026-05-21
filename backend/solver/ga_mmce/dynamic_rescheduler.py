@@ -56,34 +56,26 @@ DYNAMIC_REPLAN_FIELDS = [
 
 
 def reschedule_on_event(state: Any, new_orders: Any, event_time: float) -> DispatchPlan:
-    """Main dynamic GA entrypoint.
+    """Main dynamic entrypoint for GA-MMCE.
 
-    The function advances or snapshots existing runtime state when such hooks
-    exist, freezes active work through GA-only fields, then runs a small,
-    warm-started GA with fallback layers.
+    Static GA dispatch remains handled by ``GAMMCESolver.solve``.  Dynamic
+    events are delegated to the greedy backbone-insertion solver so new work is
+    inserted into the current suffix without running the dynamic GA path.
     """
     started = time.time()
     advanced_state = _advance_or_snapshot_state(state, event_time)
     solver = _resolve_solver(advanced_state)
-    previous_best = copy.deepcopy(getattr(solver, "last_best_individual", None))
-    previous_decode = getattr(solver, "last_best_decode_result", None)
-    previous_plan = getattr(previous_decode, "plan", None) if previous_decode is not None else None
 
     incoming_new = _normalize_order_mapping(new_orders)
     buckets = _classify_orders(advanced_state, incoming_new, event_time)
     dynamic_config = make_ga_config(DYNAMIC_GA_CONFIG, base=getattr(solver, "config", None))
-    reoptimized_ids, frozen_future_ids = _select_reoptimization_window(
-        previous_best,
-        buckets.pending,
-        buckets.new,
-        dynamic_config,
-        event_time,
-    )
 
-    planning_orders = _ordered_order_mapping(
-        reoptimized_ids + frozen_future_ids,
-        {**buckets.pending, **buckets.new},
-    )
+    planning_orders = _select_greedy_dynamic_orders(advanced_state, buckets)
+    reoptimized_ids = list(planning_orders)
+    frozen_future_ids = [
+        oid for oid in buckets.pending
+        if oid not in set(reoptimized_ids) and oid in _future_planned_order_ids(advanced_state)
+    ]
     if not planning_orders:
         plan = DispatchPlan(
             allocations=[],
@@ -94,99 +86,52 @@ def reschedule_on_event(state: Any, new_orders: Any, event_time: float) -> Dispa
                 "modes": {},
                 "dispatch_type": "dynamic_replan",
                 "solver": "ga_mmce",
-                "ga_feasible": True,
+                "dynamic_solver": "greedy_mmce_bi",
+                "ga_dynamic_skipped": True,
+                "ga_feasible": False,
             },
         )
-        _finalize_and_log(
+        _annotate_dynamic_summary(
             plan,
-            started,
-            event_time,
-            buckets,
-            reoptimized_ids,
-            frozen_future_ids,
+            event_time=event_time,
+            buckets=buckets,
+            reoptimized_ids=reoptimized_ids,
+            frozen_future_ids=frozen_future_ids,
             warm_start_count=0,
             config=dynamic_config,
+            ga_plan=plan,
+            ga_feasible=False,
+            warm_start_feasible=False,
+            greedy_insert_feasible=True,
             fallback_used=False,
-            fallback_level="none",
+            fallback_level="greedy_dynamic_primary",
+            unserved_order_ids=[],
+            elapsed_seconds=time.time() - started,
         )
+        plan.summary["dynamic_solver"] = "greedy_mmce_bi"
+        plan.summary["ga_dynamic_skipped"] = True
+        _write_dynamic_replan_csv(plan.summary)
+        _store_last_stats(plan.summary)
         return plan
 
-    snapshot = _build_dynamic_snapshot(
-        advanced_state,
-        planning_orders,
-        event_time,
-        completed_ids=set(buckets.completed),
-        locked_ids=set(buckets.locked),
-    )
-
-    initial_context = build_ga_context(snapshot, dynamic_config, mode="dynamic")
-    fixed_tail_gene_by_order = _tail_gene_map(previous_best, frozen_future_ids, initial_context.gene_pool)
-    setattr(snapshot, "_ga_fixed_tail_order_ids", list(frozen_future_ids))
-    setattr(snapshot, "_ga_fixed_tail_gene_by_order", fixed_tail_gene_by_order)
-
-    context = build_ga_context(snapshot, dynamic_config, mode="dynamic")
-    warm_starts = build_warm_start_population(
-        previous_best=previous_best,
-        completed_ids=set(buckets.completed),
-        locked_ids=set(buckets.locked),
-        new_order_ids=list(buckets.new),
-        gene_pool=context.gene_pool,
-        depot_ids=context.depot_ids,
-        station_ids=context.station_ids,
-        order_ids=list(planning_orders),
-        reoptimized_order_ids=reoptimized_ids,
-        frozen_future_order_ids=frozen_future_ids,
-        fixed_tail_gene_by_order=fixed_tail_gene_by_order,
-        orders=planning_orders,
-        allow_c_recover_station=dynamic_config.allow_depot_drone_recover_at_station,
-        mutation_count=int(dynamic_config.warm_start_mutations or 0),
-    )
-
-    ga_plan = solver.solve(
-        snapshot,
-        warm_start=warm_starts,
-        config=dynamic_config,
-        time_budget_seconds=dynamic_config.max_runtime_seconds,
-        dispatch_type="dynamic_replan",
-    )
-    ga_feasible = _plan_is_feasible_for_orders(ga_plan, planning_orders)
-
-    fallback_used = False
-    fallback_level = "none"
-    final_plan = ga_plan
-    warm_start_feasible = False
-    greedy_insert_feasible = False
-    unserved_order_ids: list[str] = list(_unserved_order_ids(final_plan, planning_orders))
-
-    if not ga_feasible:
-        warm_plan = _best_feasible_warm_start_plan(
-            solver,
-            snapshot,
-            warm_starts,
-            dynamic_config,
-            planning_orders,
-        )
-        warm_start_feasible = warm_plan is not None
-        if warm_plan is not None:
-            final_plan = warm_plan
-            fallback_used = True
-            fallback_level = "warm_start_repaired"
+    bbox = _read_field(advanced_state, "bbox")
+    if not bbox:
+        final_plan = _unserved_dynamic_plan(planning_orders, reason="missing_bbox")
+        greedy_insert_feasible = False
+    else:
+        helper = _resolve_dynamic_greedy_helper(solver)
+        try:
+            final_plan = helper.dispatch_replan_current_state(
+                planning_orders,
+                float(event_time),
+                bbox,
+                scene_id=_read_field(advanced_state, "scene_id"),
+            )
+        except Exception:
+            final_plan = _unserved_dynamic_plan(planning_orders, reason="greedy_dynamic_failed")
+            greedy_insert_feasible = False
         else:
-            greedy_plan = _greedy_replan_fallback(solver, snapshot, planning_orders, event_time)
-            greedy_insert_feasible = greedy_plan is not None and _plan_is_feasible_for_orders(greedy_plan, planning_orders)
-            if greedy_insert_feasible:
-                final_plan = greedy_plan
-                fallback_used = True
-                fallback_level = "greedy_insertion"
-            else:
-                final_plan = _previous_plan_fallback(
-                    previous_plan,
-                    planning_orders,
-                    new_order_ids=set(buckets.new),
-                    reason="dynamic_ga_failed",
-                )
-                fallback_used = True
-                fallback_level = "previous_plan_unserved_new"
+            greedy_insert_feasible = _plan_is_feasible_for_orders(final_plan, planning_orders)
 
     unserved_order_ids = list(_unserved_order_ids(final_plan, planning_orders))
     _annotate_dynamic_summary(
@@ -195,20 +140,103 @@ def reschedule_on_event(state: Any, new_orders: Any, event_time: float) -> Dispa
         buckets=buckets,
         reoptimized_ids=reoptimized_ids,
         frozen_future_ids=frozen_future_ids,
-        warm_start_count=len(warm_starts),
+        warm_start_count=0,
         config=dynamic_config,
-        ga_plan=ga_plan,
-        ga_feasible=ga_feasible,
-        warm_start_feasible=warm_start_feasible,
+        ga_plan=final_plan,
+        ga_feasible=False,
+        warm_start_feasible=False,
         greedy_insert_feasible=greedy_insert_feasible,
-        fallback_used=fallback_used,
-        fallback_level=fallback_level,
+        fallback_used=False,
+        fallback_level="greedy_dynamic_primary",
         unserved_order_ids=unserved_order_ids,
         elapsed_seconds=time.time() - started,
     )
+    final_plan.summary["dynamic_solver"] = "greedy_mmce_bi"
+    final_plan.summary["ga_dynamic_skipped"] = True
     _write_dynamic_replan_csv(final_plan.summary)
     _store_last_stats(final_plan.summary)
     return final_plan
+
+
+def _resolve_dynamic_greedy_helper(solver: Any) -> Any:
+    helper = getattr(solver, "dynamic_greedy_helper", None)
+    if helper is not None:
+        return helper
+
+    helper = getattr(solver, "greedy_helper", None)
+    if helper is not None:
+        return helper
+
+    try:
+        from ..greedy_mmce_bi import GreedyMMCEBackboneInsertion
+    except Exception:
+        from solver.greedy_mmce_bi import GreedyMMCEBackboneInsertion
+    return GreedyMMCEBackboneInsertion(getattr(solver, "entity_mgr", None))
+
+
+def _select_greedy_dynamic_orders(state: Any, buckets: OrderBuckets) -> dict[str, Any]:
+    if buckets.new:
+        return dict(buckets.new)
+
+    order_mgr = _order_mgr(state)
+    pending_pool = _read_field(order_mgr, "pending_orders", {}) if order_mgr is not None else {}
+    if order_mgr is not None and isinstance(pending_pool, dict):
+        return {
+            oid: order
+            for oid, order in buckets.pending.items()
+            if oid in pending_pool
+        }
+
+    planned_future = _future_planned_order_ids(state)
+    return {
+        oid: order
+        for oid, order in buckets.pending.items()
+        if oid not in planned_future
+    }
+
+
+def _future_planned_order_ids(state: Any) -> set[str]:
+    mgr = _entity_mgr(state)
+    result: set[str] = set()
+    for truck in (_mapping(mgr, "trucks") or {}).values():
+        planned_stops = list(_read_field(truck, "_planned_route_stops", []) or [])
+        cursor = int(_read_field(truck, "_planned_route_cursor", 0) or 0)
+        cursor = max(0, min(cursor, len(planned_stops)))
+        for stop in planned_stops[cursor:]:
+            if str(stop.get("node_type", "") or "") != "customer":
+                continue
+            order_id = str(stop.get("order_id", "") or "")
+            if order_id:
+                result.add(order_id)
+    return result
+
+
+def _unserved_dynamic_plan(planning_orders: dict[str, Any], reason: str) -> DispatchPlan:
+    allocations = [
+        AllocationResult(
+            order_id=order_id,
+            vehicle_id="",
+            mode="UNSERVED",
+            distance=0.0,
+            feasible=False,
+            reason=reason,
+        )
+        for order_id in planning_orders
+    ]
+    return DispatchPlan(
+        allocations=allocations,
+        cost_total=0.0,
+        summary={
+            "total_orders": len(planning_orders),
+            "feasible": 0,
+            "modes": {},
+            "dispatch_type": "dynamic_replan",
+            "solver": "ga_mmce",
+            "dynamic_solver": "greedy_mmce_bi",
+            "ga_dynamic_skipped": True,
+            "ga_feasible": False,
+        },
+    )
 
 
 def build_warm_start(

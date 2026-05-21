@@ -121,9 +121,11 @@ def main() -> None:
 
     assert dynamic_plan.summary.get("dispatch_type") == "dynamic_replan"
     assert dynamic_plan.summary.get("solver") == "ga_mmce"
+    assert dynamic_plan.summary.get("dynamic_solver") == "greedy_mmce_bi"
+    assert dynamic_plan.summary.get("ga_dynamic_skipped") is True
     assert "ORD-DYN-TEST-01" in dynamic_plan.summary.get("new_order_ids", [])
     assert "ORD-DYN-TEST-01" in dynamic_alloc_ids
-    assert dynamic_plan.summary.get("warm_start_count", 0) > 0
+    assert dynamic_plan.summary.get("warm_start_count", 0) == 0
     assert dynamic_plan.summary.get("reoptimized_order_count", 0) > 0
     assert dynamic_plan.summary.get("feasible") == dynamic_plan.summary.get("total_orders")
     assert dynamic_plan.summary.get("unserved_order_ids") == []

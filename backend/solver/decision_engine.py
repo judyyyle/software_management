@@ -292,6 +292,49 @@ class DispatchDecisionEngine:
                 self.order_mgr.pending_orders.pop(oid, None)
                 self.order_mgr.assigned_orders[oid] = order
 
+        if self.solver_name == "ga_mmce":
+            self._activate_path_planner(scene_id)
+            plan = self.solver.dispatch_incremental(
+                new_orders,
+                current_time,
+                bbox,
+                scene_id=scene_id,
+            )
+            plan.summary["solver"] = self.solver_name
+            plan.summary["dispatch_type"] = "dynamic_replan"
+            plan.summary["replanned_assigned_orders"] = 0
+            plan.summary["new_orders"] = len(new_orders)
+            self._normalize_plan_for_runtime(plan)
+
+            bad = [a.order_id for a in plan.allocations if a.mode == "B_DYNAMIC"]
+            if bad:
+                raise RuntimeError(
+                    f"当前求解器={self.solver_name}，但返回了 B_DYNAMIC 分配: {bad}"
+                )
+
+            self._accumulate_plan_metrics(plan)
+            replace_order_ids = self._ga_dynamic_replace_future_order_ids(plan)
+            logger.info(
+                "[DispatchDecisionEngine] GA 动态重优化使用增量后缀切换，替换未来订单停靠: %s",
+                sorted(replace_order_ids),
+            )
+            self._apply_plan(
+                plan,
+                current_time,
+                incremental=True,
+                replace_future_order_ids=replace_order_ids,
+            )
+            self._build_drone_routes(plan, current_time)
+
+            logger.info(
+                "[DispatchDecisionEngine] 动态重优化完成: new=%d 回收旧单=%d 总待分配=%d 可行=%d",
+                len(new_orders),
+                0,
+                plan.summary.get("total_orders", 0),
+                plan.summary.get("feasible", 0),
+            )
+            return plan
+
         # 不在求解前修改订单池：只构造“重优化视图”，避免异常时污染全局状态。
         replannable_assigned: dict[str, object] = {
             oid: order

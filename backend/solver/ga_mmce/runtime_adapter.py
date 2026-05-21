@@ -544,6 +544,18 @@ def _clear_obsolete_ga_drone_routes(*, entity_mgr: Any, plan: Any) -> None:
         ):
             planned_by_drone[str(alloc.drone_id)].add(str(alloc.order_id))
 
+    summary = getattr(plan, "summary", {}) or {}
+    dynamic_scope: set[str] = set()
+    if isinstance(summary, dict) and str(summary.get("dispatch_type", "") or "") in {
+        "dynamic_replan",
+        "incremental",
+    }:
+        dynamic_scope = {
+            str(order_id)
+            for order_id in (summary.get("reoptimized_order_ids", []) or [])
+            if str(order_id)
+        }
+
     for drone_id, drone in getattr(entity_mgr, "drones", {}).items():
         if str(getattr(drone, "_runtime_solver", "") or "").lower() != "ga_mmce":
             continue
@@ -555,6 +567,8 @@ def _clear_obsolete_ga_drone_routes(*, entity_mgr: Any, plan: Any) -> None:
         route_orders = _pending_route_order_ids(drone)
         expected_orders = planned_by_drone.get(str(drone_id), set())
         obsolete_orders = route_orders - expected_orders
+        if dynamic_scope:
+            obsolete_orders &= dynamic_scope
         if not obsolete_orders:
             continue
 
