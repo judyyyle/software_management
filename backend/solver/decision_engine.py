@@ -712,10 +712,10 @@ class DispatchDecisionEngine:
 
         existing_future_keys = {_stop_key(s) for s in future_stops}
 
-        # 提取新路由中需要追加的事件性节点（customer / recovery / station）
+        # 提取新路由中需要追加的事件性节点（customer / recovery / station / depot）
         new_stops = []
         for node in new_route.nodes:
-            if node.node_type in ("customer", "recovery", "station"):
+            if node.node_type in ("customer", "recovery", "station", "depot"):
                 key = _stop_key(
                     {
                         "node_type": node.node_type,
@@ -740,7 +740,7 @@ class DispatchDecisionEngine:
             # 只更新已有 future_stops 的时间，切勿截断其他未来停靠点。
             refreshed_future = [dict(stop) for stop in future_stops]
             for node in new_route.nodes:
-                if node.node_type in ("customer", "recovery", "station"):
+                if node.node_type in ("customer", "recovery", "station", "depot"):
                     node_key = _stop_key({"node_type": node.node_type, "node_id": node.node_id})
                     for stop in refreshed_future:
                         if _stop_key(stop) == node_key:
@@ -788,7 +788,7 @@ class DispatchDecisionEngine:
                 "order_id": node.order_id,
             }
             for node in new_route.nodes
-            if node.node_type in ("customer", "recovery", "station")
+            if node.node_type in ("customer", "recovery", "station", "depot")
         ]
 
         # 稳定增量：保留旧 future 的相对顺序，只插入新停靠，避免前批动态单被后批重排。
@@ -889,7 +889,7 @@ class DispatchDecisionEngine:
                     "order_id": n.order_id,
                 }
                 for n in rebuilt_route.nodes
-                if n.node_type in ("customer", "recovery", "station")
+                if n.node_type in ("customer", "recovery", "station", "depot")
             ]
             truck._planned_route_stops = existing_stops[:cursor] + rebuilt_stops
             try:
@@ -1169,7 +1169,10 @@ class DispatchDecisionEngine:
                 continue
 
             waiting_station_id = getattr(drone, "waiting_recovery_station_id", "")
-            if waiting_station_id and waiting_station_id in self.entity_mgr.stations:
+            if waiting_station_id and (
+                waiting_station_id in self.entity_mgr.stations
+                or waiting_station_id in self.entity_mgr.depots
+            ):
                 eta = current_time
                 runtime_recovery_eta[waiting_station_id] = max(
                     runtime_recovery_eta.get(waiting_station_id, 0.0),
@@ -1184,7 +1187,10 @@ class DispatchDecisionEngine:
             if (
                 transport_truck_id == route.truck_id
                 and launch_station_id
-                and launch_station_id in self.entity_mgr.stations
+                and (
+                    launch_station_id in self.entity_mgr.stations
+                    or launch_station_id in self.entity_mgr.depots
+                )
                 and math.isfinite(scheduled_launch_time)
                 and scheduled_launch_time >= current_time - 1e-6
             ):
@@ -1192,8 +1198,10 @@ class DispatchDecisionEngine:
                 start_idx = int(getattr(drone, "current_waypoint_index", 0) or 0)
                 if 0 <= start_idx < len(route_plan):
                     cur = route_plan[start_idx].loc
-                else:
+                elif launch_station_id in self.entity_mgr.stations:
                     cur = self.entity_mgr.stations[launch_station_id].location
+                else:
+                    cur = self.entity_mgr.depots[launch_station_id].location
 
                 remaining_dist = 0.0
                 extra_service = 0.0
@@ -1205,7 +1213,7 @@ class DispatchDecisionEngine:
                         extra_service += float(getattr(self.entity_mgr, "DRONE_SERVICE_TIME_ORDER", 0.0))
                     if wp.action in (WaypointAction.DOCK_DEPOT, WaypointAction.DOCK_TRUCK):
                         target_id = wp.target_entity_id or ""
-                        if target_id in self.entity_mgr.stations:
+                        if target_id in self.entity_mgr.stations or target_id in self.entity_mgr.depots:
                             dock_station_id = target_id
                         break
 
@@ -1237,7 +1245,7 @@ class DispatchDecisionEngine:
                     extra_service += float(getattr(self.entity_mgr, "DRONE_SERVICE_TIME_ORDER", 0.0))
                 if wp.action in (WaypointAction.DOCK_DEPOT, WaypointAction.DOCK_TRUCK):
                     target_id = wp.target_entity_id or ""
-                    if target_id in self.entity_mgr.stations:
+                    if target_id in self.entity_mgr.stations or target_id in self.entity_mgr.depots:
                         dock_station_id = target_id
                     break
 
@@ -1291,8 +1299,8 @@ class DispatchDecisionEngine:
 
             observed_arrivals.setdefault(node.node_id, []).append(arrival)
 
+            launch_ops = allocs_by_launch.get(node.node_id, [])
             if node.node_type == "recovery":
-                launch_ops = allocs_by_launch.get(node.node_id, [])
                 recovery_ops = allocs_by_recovery.get(node.node_id, [])
                 runtime_eta = runtime_recovery_eta.get(node.node_id)
                 service_time = base_services[i]
@@ -1320,6 +1328,8 @@ class DispatchDecisionEngine:
                     service_time = max(service_time, op_hold)
             else:
                 service_time = base_services[i]
+                if node.node_type in {"station", "depot"} and launch_ops:
+                    service_time = max(service_time, self.TRUCK_DRONE_LAUNCH_TIME)
 
             departure = arrival + service_time
             node.arrival_time = arrival

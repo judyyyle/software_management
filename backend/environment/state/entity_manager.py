@@ -432,7 +432,11 @@ class EntityManager:
                         launch_station = self.stations.get(launch_station_id) if launch_station_id else None
                         if launch_station is not None:
                             launch_loc = launch_station.location
-                        elif drone.has_pending_route:
+                        if launch_loc is None and launch_station_id:
+                            launch_depot = self.depots.get(launch_station_id)
+                            if launch_depot is not None:
+                                launch_loc = launch_depot.location
+                        if launch_loc is None and drone.has_pending_route:
                             launch_idx = drone.current_waypoint_index
                             if 0 <= launch_idx < len(drone.route_plan):
                                 launch_loc = drone.route_plan[launch_idx].loc
@@ -556,7 +560,7 @@ class EntityManager:
         current_time: float,
         order_mgr: Optional["OrderManager"],
     ) -> None:
-        """按时间顺序执行卡车关键节点事件（customer/recovery/station）。"""
+        """按时间顺序执行卡车关键节点事件（customer/recovery/station/depot）。"""
         planned_stops = getattr(truck, "_planned_route_stops", None)
         if not planned_stops:
             return
@@ -566,11 +570,13 @@ class EntityManager:
             stop = planned_stops[cursor]
             node_type = stop.get("node_type", "")
             # recovery 需要等到 departure_time（含等待时长）再执行回收。
-            # GA-MMCE 的 station 节点承载放飞/回收服务，也按服务结束触发；
+            # GA-MMCE 的 station/depot 节点承载放飞/回收服务，也按服务结束触发；
             # customer 保持既有语义：到达即完成订单，随后继续执行服务停留。
-            if node_type == "recovery" or (
-                node_type == "station" and self._is_ga_truck_route(truck)
-            ):
+            ga_service_stop = (
+                self._is_ga_truck_route(truck)
+                and node_type in {"station", "depot"}
+            )
+            if node_type == "recovery" or ga_service_stop:
                 event_time = float(stop.get("departure_time", stop.get("arrival_time", float("inf"))))
             else:
                 event_time = float(stop.get("arrival_time", float("inf")))
@@ -578,7 +584,7 @@ class EntityManager:
             if event_time > current_time + 1e-6:
                 break
             if not self._truck_is_near_stop(truck, stop):
-                if node_type in {"recovery", "station"}:
+                if node_type in {"recovery", "station", "depot"}:
                     departure_time = float(stop.get("departure_time", event_time))
                     overdue_s = current_time - departure_time
                     if overdue_s >= self.STALE_RECOVERY_SKIP_S:
@@ -599,7 +605,7 @@ class EntityManager:
         truck._planned_route_cursor = cursor
 
     def _get_truck_wait_stop(self, truck: Truck, current_time: float) -> Optional[dict]:
-        """返回当前时刻卡车应等待的节点；GA-MMCE 额外支持 station 服务停留。"""
+        """返回当前时刻卡车应等待的节点；GA-MMCE 额外支持 station/depot 服务停留。"""
         planned_stops = getattr(truck, "_planned_route_stops", None)
         if not planned_stops:
             return None
@@ -607,6 +613,7 @@ class EntityManager:
         wait_node_types = {"customer", "recovery"}
         if self._is_ga_truck_route(truck):
             wait_node_types.add("station")
+            wait_node_types.add("depot")
 
         for stop in planned_stops:
             node_type = stop.get("node_type", "")
@@ -633,7 +640,7 @@ class EntityManager:
             return False
         node_type = str(stop.get("node_type", ""))
         speed = float(getattr(truck, "speed", 0.0))
-        if node_type in {"recovery", "station"}:
+        if node_type in {"recovery", "station", "depot"}:
             tol_m = max(self.RECOVERY_PROXIMITY_BASE_M, speed * self.RECOVERY_PROXIMITY_SPEED_FACTOR)
         else:
             tol_m = max(self.STOP_PROXIMITY_BASE_M, speed * self.STOP_PROXIMITY_SPEED_FACTOR)
@@ -659,7 +666,7 @@ class EntityManager:
                 )
             return
 
-        if node_type in {"recovery", "station"}:
+        if node_type in {"recovery", "station", "depot"}:
             station_id = stop.get("node_id", "")
             if station_id:
                 self._recover_drones_from_station_to_truck(truck, station_id, current_time)
