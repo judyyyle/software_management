@@ -120,6 +120,10 @@ def reschedule_on_event(state: Any, new_orders: Any, event_time: float) -> Dispa
         greedy_insert_feasible = False
     else:
         helper = _resolve_dynamic_greedy_helper(solver)
+        prev_delegate = getattr(helper, "_ga_mmce_dynamic_delegate", None)
+        prev_order_ids = getattr(helper, "_ga_mmce_dynamic_order_ids", None)
+        setattr(helper, "_ga_mmce_dynamic_delegate", True)
+        setattr(helper, "_ga_mmce_dynamic_order_ids", set(planning_orders))
         try:
             final_plan = helper.dispatch_replan_current_state(
                 planning_orders,
@@ -132,6 +136,21 @@ def reschedule_on_event(state: Any, new_orders: Any, event_time: float) -> Dispa
             greedy_insert_feasible = False
         else:
             greedy_insert_feasible = _plan_is_feasible_for_orders(final_plan, planning_orders)
+        finally:
+            if prev_delegate is None:
+                try:
+                    delattr(helper, "_ga_mmce_dynamic_delegate")
+                except AttributeError:
+                    pass
+            else:
+                setattr(helper, "_ga_mmce_dynamic_delegate", prev_delegate)
+            if prev_order_ids is None:
+                try:
+                    delattr(helper, "_ga_mmce_dynamic_order_ids")
+                except AttributeError:
+                    pass
+            else:
+                setattr(helper, "_ga_mmce_dynamic_order_ids", prev_order_ids)
 
     unserved_order_ids = list(_unserved_order_ids(final_plan, planning_orders))
     _annotate_dynamic_summary(
