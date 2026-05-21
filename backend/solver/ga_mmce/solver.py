@@ -69,6 +69,8 @@ class GAMMCESolver:
         self._actual_generations: int = 0
         self._active_diagnostics_label: str = "static"
         self._reuse_static_plan_cache_override: bool | None = None
+        self._last_route_bbox: dict | None = None
+        self._last_route_scene_id: str | None = None
 
         if self.config.random_seed is not None:
             random.seed(self.config.random_seed)
@@ -88,6 +90,7 @@ class GAMMCESolver:
         bbox: dict,
         scene_id: str | None = None,
     ) -> DispatchPlan:
+        self._remember_route_context(bbox, scene_id)
         state = GAStateView(
             entity_mgr=self.entity_mgr,
             orders=dict(pending_orders),
@@ -104,6 +107,7 @@ class GAMMCESolver:
         bbox: dict,
         scene_id: str | None = None,
     ) -> DispatchPlan:
+        self._remember_route_context(bbox, scene_id)
         state = GAStateView(
             entity_mgr=self.entity_mgr,
             orders=dict(new_orders),
@@ -121,6 +125,7 @@ class GAMMCESolver:
         bbox: dict,
         scene_id: str | None = None,
     ) -> DispatchPlan:
+        self._remember_route_context(bbox, scene_id)
         state = GAStateView(
             entity_mgr=self.entity_mgr,
             orders=dict(replan_orders),
@@ -139,6 +144,10 @@ class GAMMCESolver:
     ) -> DispatchPlan:
         from .dynamic_rescheduler import reschedule_on_event
 
+        self._remember_route_context(
+            getattr(state, "bbox", None),
+            getattr(state, "scene_id", None),
+        )
         setattr(state, "_ga_solver", self)
         return reschedule_on_event(state, new_orders, event_time)
 
@@ -157,11 +166,65 @@ class GAMMCESolver:
         ordered_stops: list[dict],
         current_time: float,
     ) -> Any:
-        return self.greedy_helper.build_incremental_route_from_stops(
-            truck=truck,
-            ordered_stops=ordered_stops,
-            current_time=current_time,
-        )
+        """Rebuild an execution suffix using the helper that owns the route context.
+
+        Dynamic GA dispatch currently delegates planning to ``dynamic_greedy_helper``
+        (GreedyMMCEBackboneInsertion).  The execution layer later calls this method
+        through the GA solver, so using only ``greedy_helper`` can miss the road
+        graph cache loaded by the dynamic helper and return ``None``.  Try the
+        dynamic helper first, then the static helper as a backup.
+        """
+        for helper in self._incremental_route_helpers():
+            self._ensure_helper_route_context(helper)
+            try:
+                route = helper.build_incremental_route_from_stops(
+                    truck=truck,
+                    ordered_stops=ordered_stops,
+                    current_time=current_time,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "[GA-MMCE] %s 后缀路线重建异常，尝试下一个 helper: %s",
+                    helper.__class__.__name__,
+                    exc,
+                )
+                continue
+            if route is not None:
+                return route
+        return None
+
+    def _remember_route_context(self, bbox: dict | None, scene_id: str | None) -> None:
+        if bbox:
+            self._last_route_bbox = dict(bbox)
+            self._last_route_scene_id = scene_id
+
+    def _incremental_route_helpers(self) -> list[Any]:
+        helpers: list[Any] = []
+        for helper in (
+            getattr(self, "dynamic_greedy_helper", None),
+            getattr(self, "greedy_helper", None),
+        ):
+            if helper is None:
+                continue
+            if any(helper is existing for existing in helpers):
+                continue
+            helpers.append(helper)
+        return helpers
+
+    def _ensure_helper_route_context(self, helper: Any) -> None:
+        if not self._last_route_bbox:
+            return
+        load_graph = getattr(helper, "_load_road_graph", None)
+        if not callable(load_graph):
+            return
+        try:
+            load_graph(self._last_route_bbox, self._last_route_scene_id)
+        except Exception as exc:
+            logger.warning(
+                "[GA-MMCE] %s 路网上下文同步失败: %s",
+                helper.__class__.__name__,
+                exc,
+            )
 
     def solve(
         self,
