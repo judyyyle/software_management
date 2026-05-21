@@ -24,7 +24,7 @@ from typing import TYPE_CHECKING
 
 from config.loader import load_solver_energy_params
 from solver.factory import create_solver, list_solvers
-from solver.greedy_mmce import AllocationResult, DispatchPlan
+from solver.greedy_mmce import AllocationResult, DispatchPlan, TruckRoute, TruckRouteNode
 from solver.market_based_solver import MarketBasedSolver
 from solver.interfaces import DispatchSolver
 from core.entities.primitives import RouteWaypoint, WaypointAction, SourceType, DroneStatus, Position3D
@@ -878,6 +878,20 @@ class DispatchDecisionEngine:
                 e,
             )
 
+        if rebuilt_route is None or len(rebuilt_route.nodes) < 2:
+            rebuilt_route = self._build_direct_incremental_route_from_stops(
+                truck,
+                retimed_future,
+                current_time,
+            )
+            if rebuilt_route is not None:
+                logger.warning(
+                    "[DispatchDecisionEngine] 增量模式卡车 %s OSM 后缀失败，"
+                    "使用直连兜底写入 %d 个未来停靠",
+                    truck.truck_id,
+                    max(0, len(rebuilt_route.nodes) - 1),
+                )
+
         if rebuilt_route is not None and len(rebuilt_route.nodes) >= 2:
             rebuilt_stops = [
                 {
@@ -906,7 +920,7 @@ class DispatchDecisionEngine:
                     e,
                 )
         else:
-            # 兜底：若 OSM 后缀重建失败，保留旧计划避免不可达停靠阻塞后续事件游标。
+            # 最终兜底：没有任何可执行路线时才保留旧计划，避免写入无法移动的停靠。
             logger.warning(
                 "[DispatchDecisionEngine] 增量模式卡车 %s 后缀重建失败，保留旧计划（不写入新停靠）",
                 truck.truck_id,
@@ -920,6 +934,69 @@ class DispatchDecisionEngine:
             "(cursor=%d, 总计 %d 停靠)",
             len(new_stops), truck.truck_id, cursor, len(truck._planned_route_stops),
         )
+
+    def _build_direct_incremental_route_from_stops(
+        self,
+        truck,
+        ordered_stops: list[dict],
+        current_time: float,
+    ) -> TruckRoute | None:
+        """Build a physically executable straight-line suffix if OSM rebuild fails."""
+        if not ordered_stops:
+            return None
+
+        start_pos = truck.get_location(current_time)
+        route = TruckRoute(truck_id=truck.truck_id)
+        route.nodes.append(
+            TruckRouteNode(
+                node_id=f"{truck.truck_id}_origin",
+                node_type="origin",
+                position=start_pos,
+                arrival_time=current_time,
+                departure_time=current_time,
+            )
+        )
+        route.geometry.append(start_pos)
+
+        cur_pos = start_pos
+        cur_time = current_time
+        total_dist = 0.0
+        speed = max(1e-6, float(getattr(truck, "speed", 0.0)))
+        for stop in ordered_stops:
+            stop_pos = stop.get("position")
+            node_id = str(stop.get("node_id", "") or "")
+            node_type = str(stop.get("node_type", "") or "")
+            if stop_pos is None or not node_id or not node_type:
+                continue
+
+            dist = cur_pos.distance_2d(stop_pos)
+            arrival = cur_time + dist / speed
+            prev_arrival = float(stop.get("arrival_time", arrival))
+            prev_departure = float(stop.get("departure_time", prev_arrival))
+            service_time = max(0.0, prev_departure - prev_arrival)
+            departure = arrival + service_time
+
+            route.nodes.append(
+                TruckRouteNode(
+                    node_id=node_id,
+                    node_type=node_type,
+                    position=stop_pos,
+                    arrival_time=arrival,
+                    departure_time=departure,
+                    order_id=str(stop.get("order_id", "") or ""),
+                )
+            )
+            if node_type == "station":
+                route.charging_stop_ids.append(node_id)
+            route.geometry.append(stop_pos)
+            total_dist += dist
+            cur_pos = stop_pos
+            cur_time = departure
+
+        route.total_distance = total_dist
+        if len(route.nodes) < 2:
+            return None
+        return route
 
     def _sync_waiting_drone_launch_times_for_truck(self, truck, current_time: float) -> None:
         """将车上等待起飞无人机的 launch_time 对齐到卡车当前时刻表。"""
