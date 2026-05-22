@@ -982,6 +982,8 @@ class TrainingEnvAdapter:
             and not self._order_manager.pending_orders
             and not self._order_manager.assigned_orders
             and not self._background_mode_a_pending
+            and not self._has_future_order_arrivals()
+            and not self._has_active_mode_c_recovery_obligation()
         ):
             return True
         if self._drone_state and all(
@@ -2058,6 +2060,10 @@ class TrainingEnvAdapter:
         if self._background_mode_a_pending:
             return True
 
+        return self._has_future_order_arrivals()
+
+    def _has_future_order_arrivals(self) -> bool:
+        """是否仍存在尚未进入 pending 池的订单源事件。"""
         order_mgr = self._order_manager
         if order_mgr is None:
             return False
@@ -2077,6 +2083,7 @@ class TrainingEnvAdapter:
                 continue
             state = self._drone_state.get(drone_id)
             if state in {
+                TrainingDroneState.FLYING_TO_DELIVER,
                 TrainingDroneState.DELIVERY_SERVICE,
                 TrainingDroneState.DELIVERED,
                 TrainingDroneState.RETURN_TO_RENDEZVOUS,
@@ -2238,6 +2245,7 @@ class TrainingEnvAdapter:
         """把环境内的 post-delivery reservation 转成 PlannerBridge 约束。"""
         constraints: list[TruckReservationConstraint] = []
         hard_states = {
+            TrainingDroneState.FLYING_TO_DELIVER,
             TrainingDroneState.DELIVERY_SERVICE,
             TrainingDroneState.RETURN_TO_RENDEZVOUS,
         }
@@ -3060,7 +3068,11 @@ class TrainingEnvAdapter:
         elif action.mode == PolicyMode.C:
             self._episode_dispatch_mode_c_count += 1
         self._active_wait_until.pop(deciding_drone_id, None)
-        self._apply_dispatch_action(trigger, action)
+        self._apply_dispatch_action(
+            trigger,
+            action,
+            coarse_plan=decision.coarse_plan,
+        )
         info["applied_action"] = {
             "order_id": action.order_id,
             "mode": action.mode.value,
@@ -3077,6 +3089,8 @@ class TrainingEnvAdapter:
         self,
         trigger: DecisionTrigger,
         action: DispatchAction,
+        *,
+        coarse_plan: CoarsePlanView | None = None,
     ) -> None:
         """把 dispatch 动作落到订单池、无人机绑定和飞行账本上。"""
         entity_mgr = self._require_entity_manager()
@@ -3113,6 +3127,7 @@ class TrainingEnvAdapter:
                 order=order,
                 recover_node_id=action.recover_node_id,
                 launch_time=launch_time,
+                coarse_plan=coarse_plan,
             )
         self._dispatch_commit[drone.drone_id] = DispatchCommit(
             order_id=order.order_id,
@@ -3649,6 +3664,7 @@ class TrainingEnvAdapter:
                 raise TypeError(f"不支持的 mode B 返程宿主类型: {type(target)!r}")
             return 0.0
 
+        had_revalidation_failure = False
         selected_node = commit.selected_recover_node
         if selected_node is not None:
             is_valid, checks = self._revalidate_mode_c_recover_node(
@@ -3662,8 +3678,14 @@ class TrainingEnvAdapter:
                     selected_node,
                     start_time=service_leg.finish_time,
                 )
-                return 0.0
+                bonus = float(self._cfg.mode_c_attempt_bonus)
+                if bonus > 0.0:
+                    self._agent_cost_accum[drone_id] = (
+                        self._agent_cost_accum.get(drone_id, 0.0) + bonus
+                    )
+                return bonus
 
+            had_revalidation_failure = True
             self._episode_mode_c_post_delivery_revalidation_fail_count += 1
             for reason_key, passed in checks.items():
                 if not passed:
@@ -3674,13 +3696,11 @@ class TrainingEnvAdapter:
                 drone_id,
                 cause=FALLBACK_CAUSE_C_REVALIDATION_FAILED,
             )
-            if not self._enter_fallback_recovery(
-                drone_id,
-                start_time=service_leg.finish_time,
-                cause=FALLBACK_CAUSE_C_REVALIDATION_FAILED,
-            ):
-                self._mark_hard_failure(drone_id)
-            return 0.0
+            commit = replace(
+                commit,
+                selected_recover_node=None,
+            )
+            self._dispatch_commit[drone_id] = commit
 
         selection = self._select_post_delivery_mode_c_recover_node(
             drone_id=drone_id,
@@ -3718,11 +3738,12 @@ class TrainingEnvAdapter:
                 )
             return bonus
 
-        self._episode_mode_c_post_delivery_revalidation_fail_count += 1
-        for reason_key in _MODE_C_REVALIDATION_REASON_KEYS:
-            self._episode_mode_c_post_delivery_revalidation_fail_reasons[
-                reason_key
-            ] += 1
+        if not had_revalidation_failure:
+            self._episode_mode_c_post_delivery_revalidation_fail_count += 1
+            for reason_key in _MODE_C_REVALIDATION_REASON_KEYS:
+                self._episode_mode_c_post_delivery_revalidation_fail_reasons[
+                    reason_key
+                ] += 1
 
         self._release_reservation(
             drone_id,
@@ -3983,28 +4004,44 @@ class TrainingEnvAdapter:
         order: Order,
         recover_node_id: str,
         launch_time: float,
+        coarse_plan: CoarsePlanView | None = None,
     ) -> tuple[float, float, float]:
-        coarse_plan = self._build_coarse_plan_view(self._t_now)
-        planned_truck_arrival_time = coarse_plan.truck_eta_map.get(recover_node_id)
+        effective_coarse_plan = (
+            coarse_plan
+            if coarse_plan is not None
+            else self._build_coarse_plan_view(self._t_now)
+        )
+        planned_truck_arrival_time = effective_coarse_plan.truck_eta_map.get(
+            recover_node_id
+        )
         if planned_truck_arrival_time is None:
             raise RuntimeError(
                 "mode C dispatch 缺少 recover node 的 truck ETA: "
                 f"{recover_node_id}"
             )
-        delivery_arrival_time = float(launch_time) + self._estimate_flight_time(
+        launch_pos = _clone_position(drone.current_loc)
+        delivery_estimate = self._uav_path_service.estimate(
             drone=drone,
-            from_pos=drone.current_loc,
+            from_pos=launch_pos,
             to_pos=order.delivery_loc,
+            payload=float(order.payload_weight),
+        )
+        delivery_arrival_time = float(launch_time) + float(
+            delivery_estimate.flight_time_sec
         )
         delivery_finish_time = (
             delivery_arrival_time
             + float(self._scene_solver_params().drone_service_time_order_s)
         )
         recover_host = self._resolve_fixed_node(recover_node_id)
-        planned_uav_arrival_time_lb = delivery_finish_time + self._estimate_flight_time(
+        recover_estimate = self._uav_path_service.estimate(
             drone=drone,
             from_pos=order.delivery_loc,
             to_pos=recover_host.get_location(delivery_finish_time),
+            payload=0.0,
+        )
+        planned_uav_arrival_time_lb = delivery_finish_time + float(
+            recover_estimate.flight_time_sec
         )
         planned_execution_slack_sec = (
             float(planned_truck_arrival_time) - float(planned_uav_arrival_time_lb)
@@ -4025,7 +4062,7 @@ class TrainingEnvAdapter:
         entity_mgr = self._require_entity_manager()
         drone = entity_mgr.drones[drone_id]
         t_select = float(t_now)
-        candidates: list[tuple[float, float, str, float, float, float]] = []
+        candidates: list[tuple[float, float, float, str, float]] = []
         future_visits = self._dedup_backbone_visits(
             self._future_backbone_visits(t_select)
         )
@@ -4061,23 +4098,21 @@ class TrainingEnvAdapter:
                 continue
             if wait_time > float(self._cfg.rendezvous_max_wait_sec) + _TIME_EPS:
                 continue
-            score = float(wait_time) + 0.25 * float(uav_flight_time)
             candidates.append(
                 (
-                    score,
+                    truck_eta,
+                    float(wait_time),
                     float(uav_flight_time),
                     node_id,
-                    truck_eta,
                     uav_arrival,
-                    wait_time,
                 )
             )
 
         if not candidates:
             return None
 
-        candidates.sort(key=lambda item: (item[0], item[1], item[2]))
-        _score, uav_flight_time, node_id, truck_eta, uav_arrival, wait_time = candidates[0]
+        candidates.sort(key=lambda item: (item[0], item[1], item[2], item[3]))
+        truck_eta, wait_time, uav_flight_time, node_id, uav_arrival = candidates[0]
         return ModeCPostDeliverySelection(
             recover_node_id=node_id,
             planned_truck_arrival_time=float(truck_eta),
@@ -4771,9 +4806,11 @@ class TrainingEnvAdapter:
             from_pos=drone.current_loc,
             to_pos=host_pos,
         )
+        wait_time = float(coarse_plan.truck_eta_map[node_id]) - float(t_arrive_uav)
         rendezvous_time_feasible = (
             t_arrive_uav + self._cfg.rendezvous_execution_margin_sec
             <= coarse_plan.truck_eta_map[node_id] + _TIME_EPS
+            and wait_time <= self._cfg.rendezvous_max_wait_sec + _TIME_EPS
         )
         checks = {
             "energy_feasible": energy_feasible,
@@ -5731,6 +5768,7 @@ class TrainingEnvAdapter:
             and not self._order_manager.pending_orders
             and not self._order_manager.assigned_orders
             and not self._background_mode_a_pending
+            and not self._has_future_order_arrivals()
             and not self._has_active_mode_c_recovery_obligation()
         ):
             return "all_orders_cleared"

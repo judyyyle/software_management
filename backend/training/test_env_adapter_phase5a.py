@@ -110,13 +110,16 @@ class TestTrainingEnvAdapterPhase5a(unittest.TestCase):
         decision = result.decision_context
         self.assertIsNotNone(decision)
 
-        # mode C 动作只表达 C intent，实际 recovery node 在送达 service 后选择。
+        # mode C 动作仍只占用 C intent 的模型维度；recover node 是候选阶段
+        # 解析出的确定性执行参数。
         mode_c_actions = [
             action
             for action in decision.action_lookup
             if isinstance(action, DispatchAction) and action.mode == PolicyMode.C
         ]
-        self.assertTrue(all(action.recover_node_id is None for action in mode_c_actions))
+        self.assertTrue(
+            all(action.recover_node_id is not None for action in mode_c_actions)
+        )
 
     def test_airborne_energy_failure_interrupts_flight_before_arrival(self) -> None:
         env = self._make_env()
@@ -143,7 +146,8 @@ class TestTrainingEnvAdapterPhase5a(unittest.TestCase):
         leg = env._flight_legs[drone_id]
         drone.battery_current = leg.energy_cost_j / 2.0
 
-        next_event_time = env._next_event_time()
+        next_event_time = env._compute_airborne_failure_time(drone_id, leg)
+        self.assertIsNotNone(next_event_time)
         self.assertLess(next_event_time, leg.arrival_time)
 
         reward = env._advance_to_event(next_event_time)
