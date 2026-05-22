@@ -197,6 +197,14 @@ class GADecoder:
         if "final_return_penalty" in closure_info.penalties:
             feasible = False
 
+        drone_reuse_penalty, drone_reuse_count = self._compute_static_drone_reuse_penalty(
+            candidates,
+            context,
+        )
+        if drone_reuse_penalty > 0.0:
+            self._add_penalty_cost(penalties, "drone_reuse_penalty", drone_reuse_penalty)
+            self._add_penalty_count(penalty_counts, "drone_reuse_penalty", drone_reuse_count)
+
         truck_routes = self._build_truck_routes_by_given_order(
             state_copy,
             truck_id,
@@ -305,6 +313,29 @@ class GADecoder:
             "c_failure_reasons": dict(failure_reasons.get("C", {})),
         }
 
+    def _compute_static_drone_reuse_penalty(
+        self,
+        candidates: list[GACandidate],
+        context: GAAdapterContext,
+    ) -> tuple[float, int]:
+        """Softly prefer spreading initial GA drone work across different UAVs."""
+        if str(getattr(context, "mode", "") or "").lower() != "static":
+            return 0.0, 0
+
+        factor = float(getattr(self.config, "drone_reuse_penalty_factor", 0.0) or 0.0)
+        if factor <= 0.0:
+            return 0.0, 0
+
+        drone_use_counts = Counter(
+            str(candidate.drone_id or "")
+            for candidate in candidates
+            if candidate.mode in ("B", "C") and str(candidate.drone_id or "")
+        )
+        repeated_count = sum(max(0, count - 1) for count in drone_use_counts.values())
+        if repeated_count <= 0:
+            return 0.0, 0
+        return repeated_count * factor, repeated_count
+
     def _collect_cost_breakdown(
         self,
         candidates: list[GACandidate],
@@ -328,6 +359,7 @@ class GADecoder:
         unserved_penalty = float(penalties.get("unserved_order_penalty", 0.0) or 0.0)
         infeasible_penalty = float(penalties.get("infeasible_penalty", 0.0) or 0.0)
         final_return_penalty = float(penalties.get("final_return_penalty", 0.0) or 0.0)
+        drone_reuse_penalty = float(penalties.get("drone_reuse_penalty", 0.0) or 0.0)
         total = (
             truck_distance_cost
             + uav_distance_cost
@@ -341,6 +373,7 @@ class GADecoder:
             + unserved_penalty
             + infeasible_penalty
             + final_return_penalty
+            + drone_reuse_penalty
             - mode_reward
         )
         residual = float(fitness_total) - total
@@ -361,6 +394,7 @@ class GADecoder:
             "unserved_penalty": unserved_penalty,
             "infeasible_penalty": infeasible_penalty,
             "final_return_penalty": final_return_penalty,
+            "drone_reuse_penalty": drone_reuse_penalty,
             "residual_cost": residual,
             "total_fitness": float(fitness_total),
         }

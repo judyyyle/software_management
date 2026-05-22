@@ -898,10 +898,17 @@ class GreedyMMCEBackboneInsertion(GreedyMMCE):
             allocated_drones.add(c_alloc.drone_id)
 
         # 清理“非任务必需”的 station 节点，避免无意义停靠（如末尾先去站点再回仓）。
-        self._prune_nonessential_station_stops(stops_by_truck, allocations)
+        self._prune_nonessential_station_stops(
+            stops_by_truck,
+            allocations,
+            current_time=current_time,
+            start_from_current_state=start_from_current_state,
+        )
 
         truck_routes: dict[str, TruckRoute] = {}
         route_trucks = changed_trucks if incremental else {tid for tid, s in stops_by_truck.items() if s}
+        if incremental and self._is_ga_mmce_dynamic_delegate():
+            route_trucks = set(route_trucks) | {tid for tid, s in stops_by_truck.items() if s}
 
         for truck_id in route_trucks:
             truck = self.entity_mgr.trucks.get(truck_id)
@@ -1534,6 +1541,28 @@ class GreedyMMCEBackboneInsertion(GreedyMMCE):
         semantic_role: str = "",
     ) -> int:
         """确保序列中存在 recovery 站点，存在则提升服务时长，不存在则插入。"""
+        if not self._is_ga_mmce_dynamic_delegate():
+            for idx, stop in enumerate(stops):
+                if stop.get("node_id") != station_id:
+                    continue
+                stop["node_type"] = "recovery"
+                stop["position"] = station_pos
+                stop["service_time"] = max(float(stop.get("service_time", 0.0)), float(min_service))
+                return idx
+
+            idx = max(0, min(suggested_idx, len(stops)))
+            stops.insert(
+                idx,
+                {
+                    "node_id": station_id,
+                    "node_type": "recovery",
+                    "position": station_pos,
+                    "order_id": "",
+                    "service_time": max(0.0, float(min_service)),
+                },
+            )
+            return idx
+
         desired_node_type = str(desired_node_type or "recovery")
         order_id = str(order_id or "")
         semantic_role = semantic_role or ("launch" if desired_node_type == "station" else "recovery")
@@ -1670,10 +1699,17 @@ class GreedyMMCEBackboneInsertion(GreedyMMCE):
         self,
         stops_by_truck: dict[str, list[dict]],
         allocations: list[AllocationResult],
+        current_time: float | None = None,
+        start_from_current_state: bool = False,
     ) -> None:
         """移除当前批次无任务需求的 station/recovery 停靠，减少无效绕行/停留。"""
         if self._is_ga_mmce_dynamic_delegate():
-            self._prune_nonessential_station_stops_for_ga_dynamic(stops_by_truck, allocations)
+            self._prune_nonessential_station_stops_for_ga_dynamic(
+                stops_by_truck,
+                allocations,
+                current_time=current_time,
+                start_from_current_state=start_from_current_state,
+            )
             return
 
         required_by_truck: dict[str, set[str]] = {
@@ -1752,14 +1788,46 @@ class GreedyMMCEBackboneInsertion(GreedyMMCE):
         self,
         stops_by_truck: dict[str, list[dict]],
         allocations: list[AllocationResult],
+        current_time: float | None = None,
+        start_from_current_state: bool = False,
     ) -> None:
         """GA 动态委托专用：按订单和语义角色保护静态 station/recovery。"""
         required_keys_by_truck: dict[str, set[tuple[str, str, str]]] = {
             tid: set() for tid in stops_by_truck
         }
+        waiting_recovery_by_truck: dict[str, list[tuple[str, str, Position3D]]] = {
+            tid: [] for tid in stops_by_truck
+        }
 
         def key(node_id: str, node_type: str, order_id: str) -> tuple[str, str, str]:
             return (str(node_id or ""), str(node_type or ""), str(order_id or ""))
+
+        def matches_required_key(stop: dict, required_keys: set[tuple[str, str, str]]) -> bool:
+            node_id = str(stop.get("node_id", "") or "")
+            node_type = str(stop.get("node_type", "") or "")
+            order_id = str(stop.get("order_id", "") or "")
+            if key(node_id, node_type, order_id) in required_keys:
+                return True
+            if not order_id:
+                return any(
+                    node_id == required_node_id and node_type == required_type
+                    for required_node_id, required_type, _ in required_keys
+                )
+            return any(
+                node_id == required_node_id
+                and node_type == required_type
+                and not required_order_id
+                for required_node_id, required_type, required_order_id in required_keys
+            )
+
+        def matching_required_order_ids(stop: dict, required_keys: set[tuple[str, str, str]]) -> set[str]:
+            node_id = str(stop.get("node_id", "") or "")
+            node_type = str(stop.get("node_type", "") or "")
+            return {
+                required_order_id
+                for required_node_id, required_type, required_order_id in required_keys
+                if node_id == required_node_id and node_type == required_type and required_order_id
+            }
 
         for alloc in allocations:
             if not alloc.feasible or alloc.mode not in ("B", "B_WAIT"):
@@ -1784,10 +1852,15 @@ class GreedyMMCEBackboneInsertion(GreedyMMCE):
 
             order_id = self._resolve_drone_current_future_order_id(drone)
             waiting_station_id = str(getattr(drone, "waiting_recovery_station_id", "") or "")
-            if waiting_station_id and waiting_station_id in self.entity_mgr.stations and order_id:
+            if waiting_station_id and waiting_station_id in self.entity_mgr.stations:
                 required_keys_by_truck[owner_truck_id].add(
                     key(waiting_station_id, "recovery", order_id)
                 )
+                station = self.entity_mgr.stations.get(waiting_station_id)
+                if station is not None:
+                    waiting_recovery_by_truck.setdefault(owner_truck_id, []).append(
+                        (waiting_station_id, order_id, station.location)
+                    )
 
             launch_station_id = str(getattr(drone, "launch_station_id", "") or "")
             transport_truck_id = str(getattr(drone, "transport_truck_id", "") or "")
@@ -1816,8 +1889,6 @@ class GreedyMMCEBackboneInsertion(GreedyMMCE):
 
         for truck_id, seq in stops_by_truck.items():
             required_keys = required_keys_by_truck.get(truck_id, set())
-            if not seq:
-                continue
 
             kept: list[dict] = []
             removed = 0
@@ -1836,7 +1907,18 @@ class GreedyMMCEBackboneInsertion(GreedyMMCE):
                     node_type,
                     str(stop.get("order_id", "") or ""),
                 )
-                if stop_key in required_keys:
+                existing_order_id = str(stop.get("order_id", "") or "")
+                if node_type == "recovery" and not existing_order_id:
+                    matched_order_ids = matching_required_order_ids(stop, required_keys)
+                    if len(matched_order_ids) == 1:
+                        stop["order_id"] = next(iter(matched_order_ids))
+                        stop["_semantic_role"] = "recovery"
+                        kept.append(stop)
+                        continue
+                    if matched_order_ids:
+                        removed += 1
+                        continue
+                if stop_key in required_keys or matches_required_key(stop, required_keys):
                     kept.append(stop)
                 else:
                     removed += 1
@@ -1847,7 +1929,55 @@ class GreedyMMCEBackboneInsertion(GreedyMMCE):
                     truck_id,
                     removed,
                 )
-            stops_by_truck[truck_id] = kept
+            seq = kept
+            inserted = 0
+            seen_waiting_requests: set[tuple[str, str]] = set()
+            for station_id, order_id, station_pos in waiting_recovery_by_truck.get(truck_id, []):
+                request_key = (station_id, order_id)
+                if request_key in seen_waiting_requests:
+                    continue
+                seen_waiting_requests.add(request_key)
+                if any(
+                    str(stop.get("node_id", "") or "") == station_id
+                    and str(stop.get("node_type", "") or "") == "recovery"
+                    and (
+                        not order_id
+                        or str(stop.get("order_id", "") or "") in ("", order_id)
+                    )
+                    for stop in seq
+                ):
+                    continue
+
+                truck = self.entity_mgr.trucks.get(truck_id)
+                insert_idx = len(seq)
+                if truck is not None and current_time is not None:
+                    insert_idx, _ = self._best_station_insertion(
+                        truck,
+                        seq,
+                        station_pos,
+                        current_time,
+                        start_from_current_state,
+                        return_to_depot=True,
+                    )
+                self._ensure_recovery_stop(
+                    stops=seq,
+                    station_id=station_id,
+                    station_pos=station_pos,
+                    suggested_idx=insert_idx,
+                    min_service=self.TRUCK_DRONE_RECOVER_TIME,
+                    desired_node_type="recovery",
+                    order_id=order_id,
+                    semantic_role="recovery",
+                )
+                inserted += 1
+
+            if inserted > 0:
+                logger.info(
+                    "[MMCE-BI] GA动态委托卡车 %s 补入 %d 个运行时等待无人机回收停靠",
+                    truck_id,
+                    inserted,
+                )
+            stops_by_truck[truck_id] = seq
 
     def _resolve_drone_current_future_order_id(self, drone: "Drone") -> str:
         for attr_name in ("carrying_order_id", "pending_release_order_id"):
@@ -1863,13 +1993,18 @@ class GreedyMMCEBackboneInsertion(GreedyMMCE):
                 order_id = str(wp.target_entity_id or "")
                 if order_id:
                     return order_id
+        for wp in reversed(route_plan[:start_idx]):
+            if wp.action in (WaypointAction.PICKUP, WaypointAction.DELIVER):
+                order_id = str(wp.target_entity_id or "")
+                if order_id:
+                    return order_id
 
         segments = getattr(drone, "_ga_runtime_segments", None) or []
         for segment in segments:
             order_id = str(getattr(segment, "order_id", "") or "")
             start = int(getattr(segment, "start_idx", 0) or 0)
             dock = int(getattr(segment, "dock_idx", -1) or -1)
-            if order_id and start <= start_idx <= dock:
+            if order_id and start <= start_idx <= dock + 1:
                 return order_id
         return ""
 
