@@ -109,7 +109,7 @@
       "max_inventory": 30,
       "name": "卡车-01",
       "parking_slots": 3,
-      "speed": 16.5,
+      "speed": 13.0,
       "swap_time": 1,
       "truck_id": "TRK-TEST-01"
     }
@@ -165,7 +165,7 @@
     },
     {
       "drone_id": "UAV-TEST-09",
-      "drone_type": "LightDrone",
+      "drone_type": "HeavyDrone",
       "home_id": "DEP-TEST-01",
       "home_type": "DEPOT"
     },

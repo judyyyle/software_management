@@ -98,9 +98,14 @@ ORDER_TOKEN_FIELDS = (
     "best_mode_b_host_type_code_norm",
     "best_mode_b_queue_time_est_norm",
     "has_mode_c_action",
+    "mode_c_candidate_count_norm",
     "best_mode_c_rendezvous_margin_norm",
+    "best_mode_c_wait_time_norm",
+    "best_mode_c_uav_flight_time_norm",
+    "best_mode_c_energy_margin_ratio",
     "best_mode_c_node_type_code_norm",
     "best_mode_c_truck_eta_remaining_norm",
+    "best_mode_c_timeout_risk_norm",
 )
 
 INFRA_TOKEN_FIELDS = (
@@ -164,6 +169,7 @@ class _TensorizerConfig:
     payload_norm_kg: float
     queue_norm_cap: float
     max_order_tokens: int
+    max_candidate_recovery_per_order: int
 
 
 @dataclass(frozen=True)
@@ -383,9 +389,17 @@ class ObservationTensorizer:
                     self._code_norm(_HOST_TYPE_CODE, str(item.best_mode_b_host_type)),
                     self._norm_time_nonneg(float(item.best_mode_b_queue_time_est)),
                     self._bool(bool(item.has_mode_c_action)),
+                    self._clip01(
+                        float(item.mode_c_candidate_count)
+                        / max(float(self._cfg.max_candidate_recovery_per_order), 1.0)
+                    ),
                     self._norm_time_signed(float(item.best_mode_c_rendezvous_margin)),
+                    self._norm_time_nonneg(float(item.best_mode_c_wait_time)),
+                    self._norm_time_nonneg(float(item.best_mode_c_uav_flight_time)),
+                    self._clip01(max(0.0, float(item.best_mode_c_energy_margin_ratio))),
                     self._code_norm(_HOST_TYPE_CODE, str(item.best_mode_c_node_type)),
                     self._norm_time_nonneg(float(item.best_mode_c_truck_eta_remaining)),
+                    self._clip01(float(item.best_mode_c_timeout_risk)),
                 ],
                 dtype=_FLOAT_DTYPE,
             )
@@ -618,12 +632,14 @@ def _load_tensorizer_config(config_path: Path) -> _TensorizerConfig:
     planner = _require_mapping(raw, "planner")
     policy = _require_mapping(raw, "policy")
     data = _require_mapping(raw, "data")
+    candidate = _require_mapping(raw, "candidate")
     return _TensorizerConfig(
         hist_len=int(policy["hist_len"]),
         upper_horizon_sec=float(planner["upper_horizon_sec"]),
         payload_norm_kg=float(data["poisson_weight_max_kg"]),
         queue_norm_cap=float(policy.get("queue_norm_cap", 8.0)),
         max_order_tokens=int(policy["max_order_tokens"]),
+        max_candidate_recovery_per_order=int(candidate["max_candidate_recovery_per_order"]),
     )
 
 
