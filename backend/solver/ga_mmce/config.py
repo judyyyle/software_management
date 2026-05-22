@@ -51,6 +51,10 @@ class GAConfig:
     # 鼓励空地协同：每接受一个 B 模式订单，从目标函数中扣减该奖励值。
     air_ground_mode_reward: float = 1000.0
 
+    # 初始静态 GA 中同一架无人机重复承接多单的软惩罚；
+    # 只改变初始全局计划的分布偏好，不禁止后续回收后继续复用无人机。
+    drone_reuse_penalty_factor: float = 1200.0
+
     max_runtime_seconds: float | None = None
     random_seed: int | None = 42
     verbose: bool = False
