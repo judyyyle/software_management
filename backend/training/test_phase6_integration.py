@@ -12,10 +12,15 @@ from __future__ import annotations
 import math
 import unittest
 from dataclasses import replace
+from pathlib import Path
+from types import SimpleNamespace
 
 from core.entities.order import Order
 from core.entities.primitives import Position3D
+from environment.geo.osm_service import build_road_graph, find_nearest_node, shortest_path
+from utils.coord_utils import wgs84_to_utm
 
+from .candidate_builder import CandidateBuilder
 from .contracts import (
     PlannerTriggerContext,
     PolicyMode,
@@ -187,6 +192,29 @@ class TestPhase6Integration(unittest.TestCase):
         ]
         self.assertEqual(len(truck_only_entries), 1)
         self.assertGreater(float(truck_only_entries[0]["payload_weight"]), 10.0)
+        road_graph, road_nodes = build_road_graph(
+            Path(scene_ctx.road_network.xml_path).read_text(encoding="utf-8"),
+            respect_osm_oneway=True,
+        )
+        depot = next(iter(scene_ctx.depots.values()))
+        depot_node = find_nearest_node(
+            road_graph,
+            road_nodes,
+            depot.location.x,
+            depot.location.y,
+        )
+        delivery_x, delivery_y = wgs84_to_utm(
+            float(truck_only_entries[0]["delivery_lng"]),
+            float(truck_only_entries[0]["delivery_lat"]),
+        )
+        delivery_node = find_nearest_node(
+            road_graph,
+            road_nodes,
+            delivery_x,
+            delivery_y,
+        )
+        self.assertTrue(shortest_path(road_graph, depot_node, delivery_node))
+        self.assertTrue(shortest_path(road_graph, delivery_node, depot_node))
 
         env = TrainingEnvAdapter(scene_ctx=scene_ctx, order_source=order_source)
         env.reset()
@@ -1587,6 +1615,69 @@ class TestPhase6Integration(unittest.TestCase):
         self.assertEqual(resolved_mode_c.order_id, order.order_id)
         self.assertEqual(resolved_mode_c.mode, PolicyMode.C)
         self.assertIsNone(resolved_mode_c.recover_node_id)
+
+    def test_candidate_builder_mode_c_prefers_earliest_recovery_time(self) -> None:
+        builder = CandidateBuilder.__new__(CandidateBuilder)
+        builder._cfg = SimpleNamespace(
+            rendezvous_execution_margin_sec=10.0,
+            rendezvous_max_wait_sec=1000.0,
+        )
+        builder._safe_margin_j_by_drone = {"DRN-1": 0.0}
+
+        flight_time_by_node = {
+            "early": 100.0,
+            "late": 400.0,
+        }
+
+        def estimate_leg(*, drone_view, from_pos, to_pos, payload):  # noqa: ANN001
+            del drone_view, from_pos, payload
+            return SimpleNamespace(
+                flight_time_sec=flight_time_by_node[to_pos.node_id],
+                energy_j=10.0,
+            )
+
+        builder._estimate_uav_leg = estimate_leg
+        runtime_state = SimpleNamespace(
+            t_now=0.0,
+            node_states={
+                "early": SimpleNamespace(
+                    node_id="early",
+                    node_type="station",
+                    position=SimpleNamespace(node_id="early"),
+                ),
+                "late": SimpleNamespace(
+                    node_id="late",
+                    node_type="station",
+                    position=SimpleNamespace(node_id="late"),
+                ),
+            },
+        )
+        coarse_plan = SimpleNamespace(
+            truck_eta_map={
+                "early": 500.0,
+                "late": 550.0,
+            },
+            get_recovery_candidates=lambda _order_id: ("early", "late"),
+        )
+
+        summary = builder._select_best_mode_c_recovery(
+            runtime_state=runtime_state,
+            coarse_plan=coarse_plan,
+            drone_view=SimpleNamespace(drone_id="DRN-1", battery_max=100.0),
+            order=SimpleNamespace(order_id="ORDER-1"),
+            deliver_pos=SimpleNamespace(),
+            t_deliver_finish=0.0,
+            energy_after_delivery=100.0,
+            trigger_type="test_idle",
+            trigger_station_id=None,
+            t_now=0.0,
+        )
+
+        self.assertIsNotNone(summary)
+        self.assertEqual(summary.candidate_count, 2)
+        self.assertAlmostEqual(summary.best_truck_eta_remaining, 500.0)
+        self.assertAlmostEqual(summary.best_uav_flight_time, 100.0)
+        self.assertAlmostEqual(summary.best_wait_time, 400.0)
 
     def test_public_candidate_output_entry_rebuilds_from_decision_context(self) -> None:
         env, drone_id = self._reset_controlled_env()

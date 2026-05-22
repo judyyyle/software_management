@@ -31,6 +31,7 @@ if str(BACKEND_DIR) not in sys.path:
 
 from core.entities.order import Order
 from config.loader import load_drone_params
+from environment.geo.osm_service import build_road_graph, find_nearest_node
 from environment.state.order_manager import OrderManager
 
 from .contracts import BenchmarkMeta, TrainingInputMeta
@@ -555,6 +556,7 @@ def _build_truck_only_dynamic_orders(
         raise ValueError("truck_only_dynamic_deadline_window_max_min 不能小于 min")
 
     rng = random.Random(int(seed) ^ 0xC0FFEE)
+    reachable_delivery_nodes = _truck_reachable_delivery_nodes(scene_ctx)
     entries: list[Mapping[str, Any]] = []
     for idx in range(count):
         if count == 1:
@@ -568,24 +570,73 @@ def _build_truck_only_dynamic_orders(
                 max(spawn_start, base_spawn_t + rng.uniform(-jitter_span, jitter_span)),
             )
         deadline_offset_s = rng.uniform(deadline_min_min, deadline_max_min) * 60.0
+        delivery_lng, delivery_lat = rng.choice(reachable_delivery_nodes)
         entries.append(
             {
                 "order_id": f"TRUCKONLY-{int(seed)}-{idx + 1:02d}",
                 "spawn_sim_s": float(round(spawn_t, 6)),
                 "deadline_offset_s": float(round(deadline_offset_s, 6)),
                 "payload_weight": float(round(rng.uniform(weight_min, weight_max), 6)),
-                "delivery_lng": float(
-                    rng.uniform(float(bounds["min_lng"]), float(bounds["max_lng"]))
-                ),
-                "delivery_lat": float(
-                    rng.uniform(float(bounds["min_lat"]), float(bounds["max_lat"]))
-                ),
+                "delivery_lng": float(delivery_lng),
+                "delivery_lat": float(delivery_lat),
                 "delivery_z": 0.0,
                 "pickup_source_id": None,
                 "source_type": None,
             }
         )
     return tuple(entries)
+
+
+def _truck_reachable_delivery_nodes(
+    scene_ctx: TrainingSceneContext,
+) -> tuple[tuple[float, float], ...]:
+    """返回 depot 所在强连通路网分量内的 WGS84 节点坐标，供 truck-only 订单采样。"""
+
+    xml_path = scene_ctx.road_network.xml_path
+    if not xml_path:
+        raise ValueError("truck-only 动态订单需要 scene_ctx.road_network.xml_path")
+
+    try:
+        import networkx as nx  # type: ignore[import]
+    except ImportError as exc:
+        raise ImportError("缺少 networkx，无法按路网生成 truck-only 动态订单") from exc
+
+    road_graph, road_nodes = build_road_graph(
+        Path(xml_path).read_text(encoding="utf-8"),
+        respect_osm_oneway=True,
+    )
+    if len(road_graph.nodes) == 0:
+        raise ValueError("truck-only 动态订单需要非空 OSM 路网")
+
+    depot_nodes: list[str] = []
+    for depot in scene_ctx.depots.values():
+        location = depot.get_location(0.0)
+        nearest = find_nearest_node(road_graph, road_nodes, location.x, location.y)
+        if nearest:
+            depot_nodes.append(str(nearest))
+    if not depot_nodes:
+        raise ValueError("无法将 depot 映射到 OSM 路网节点")
+
+    selected_component: set[str] | None = None
+    for component in nx.strongly_connected_components(road_graph):
+        component_ids = {str(node_id) for node_id in component}
+        if any(node_id in component_ids for node_id in depot_nodes):
+            selected_component = component_ids
+            break
+    if selected_component is None:
+        selected_component = {
+            str(node_id)
+            for node_id in max(nx.strongly_connected_components(road_graph), key=len)
+        }
+
+    delivery_nodes = tuple(
+        (float(road_nodes[node_id][0]), float(road_nodes[node_id][1]))
+        for node_id in sorted(selected_component)
+        if node_id in road_nodes
+    )
+    if not delivery_nodes:
+        raise ValueError("depot 所在 OSM 强连通分量没有可采样节点")
+    return delivery_nodes
 
 
 def _normalize_scheduled_dynamic_entry(

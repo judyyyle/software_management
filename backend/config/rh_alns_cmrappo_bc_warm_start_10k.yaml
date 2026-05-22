@@ -27,7 +27,7 @@ scene:
   scene_bundle_dir: backend/test_data/default_scene
   scene_config_file: scene_config.json
   entities_file: entities.json
-  orders_file: orders.json
+  orders_file: orders_ppo_training_intensity.json
   osm_network_file: osm_network.geojson
   osm_network_format: geojson
 
@@ -67,16 +67,15 @@ data:
   #   - 从 orders.json.dynamic_orders 中筛出“对满电 depot-home UAV 在 spawn 时刻
   #     存在合法 mode C 回收点”的动态单子集
   #   - 作为独立 eval split 输出，用于 postmortem 观察 mode C 能力
-  c_sensitive_eval_enabled: true
+  c_sensitive_eval_enabled: false
   c_sensitive_eval_seed: 20260426
   c_sensitive_eval_min_legal_mode_c_recovery_nodes: 1
 
   # 训练主输入：泊松流。
-  # Run10：保持下方 poisson_weight_bands 的 0.70/0.30 载重比例不变，
-  # 只提高动态订单到达频率：1.20/min 在 5400s episode 下期望约 108 单，
-  # 平均间隔约 50s，高于默认场景动态单的约 90s 间隔。
+  # 正式贪心预训练输入：保持下方 poisson_weight_bands 的 0.70/0.30 载重比例不变，
+  # 将动态订单到达频率固定为 1.50/min，在 5400s episode 下期望约 135 单。
   # 单位固定为 单/分钟，与 Phase 1 文档口径保持一致。
-  poisson_arrival_rate: 1.20
+  poisson_arrival_rate: 1.50
   poisson_weight_min_kg: 0.5
   poisson_weight_max_kg: 10.0
   # 分段载重采样：当前机队为 9 LightDrone(<=2kg) + 3 HeavyDrone(<=10kg)，
@@ -304,9 +303,9 @@ reward:
 
   # 正奖励仅保留送达奖励，避免 reward 结构过于混杂。
   R_delivery_bonus: 100
-  # Rendezvous 分段塑形：
-  # 1. 到达 recover 节点时先给一个确定性小奖励，缩短 credit assignment 路径；
-  # 2. 真正被卡车回收上车时再给更大的成功奖励。
+  # Rendezvous 塑形：
+  # 1. 到达 recover 节点不再给额外奖励，避免鼓励 UAV 只追求进入 C 回收流程；
+  # 2. 真正被卡车回收上车时给成功奖励。
   # Run11: 在 Run10 基础上回补 mode C 的探索与成功激励，
   # 但仍保持显著低于 Run09 的 reward scale。
   rendezvous_arrive_bonus: 8.0
@@ -326,14 +325,14 @@ reward:
 training:
   # 复现性：单环境、固定训练随机种子、强制 deterministic。
   training_seed: 20260424
-  device: auto
+  device: cpu
   num_envs: 1
   torch_deterministic: true
   cudnn_benchmark: false
   mixed_precision: false
 
   # PPO 核心超参数。
-  total_timesteps: 100000
+  total_timesteps: 50000
   # Run16: 小幅回升学习率，补偿更大 Huber delta 下 critic 梯度绝对值下降。
   ppo_learning_rate: 0.0001
   rollout_steps: 2048
@@ -351,6 +350,7 @@ training:
   clip_coef: 0.20
   reward_scale: 0.01
   # Mode C shaping bonus 使用训练尺度固定值，不再依赖原始 reward 经过 reward_scale 缩放。
+  # rendezvous_arrive_bonus_scaled 保留为旧配置兼容字段，当前训练逻辑不再使用。
   mode_c_attempt_bonus_scaled: 0.10
   rendezvous_arrive_bonus_scaled: 0.30
   rendezvous_bonus_scaled: 0.80
@@ -375,32 +375,31 @@ training:
 
   # BC warm start 默认关闭。开启后用同刻 batch teacher 生成监督标签，
   # 并通过 apply_decision_batch() 沿 teacher 轨迹采样后续 decision batch。
-  bc_warm_start_enabled: false
-  bc_warm_start_updates: 0
-  bc_warm_start_batches_per_update: 1
-  # 0 表示每条 teacher rollout 直到 episode done；正数表示每条 rollout 最多采样多少个 decision batch。
-  bc_warm_start_max_decision_batches_per_rollout: 0
-  # BC 专用监督损失权重；只影响 warm start，不影响 PPO rollout/update。
+  bc_warm_start_enabled: true
+  bc_warm_start_updates: 30
+  bc_warm_start_batches_per_update: 2
+  # 正式 10k 验证先限制每条 teacher rollout 的采样长度，避免 BC 成本远大于 PPO 本体。
+  bc_warm_start_max_decision_batches_per_rollout: 128
+  # BC 专用监督损失权重；降低 forced WAIT 稀释，适度放大 C 标签。
   bc_wait_no_dispatch_loss_weight: 0.05
   bc_wait_with_dispatch_loss_weight: 0.50
   bc_mode_b_dispatch_loss_weight: 1.00
-  bc_mode_c_dispatch_loss_weight: 2.00
+  bc_mode_c_dispatch_loss_weight: 1.00
 
-  # 训练订单强度 curriculum：前期使用提高后的 1.20/min 训练，
-  # 后续再逐步引入 high=1.50/min，增加高压 backlog 覆盖。
+  # 正式贪心预训练固定使用 high=1.50/min；不再保留短跑/冒烟阶段的 1.20->1.50 混合 curriculum。
   train_arrival_curriculum_enabled: true
-  train_arrival_base_rate_per_min: 1.20
-  train_arrival_high_start_update: 40
-  train_arrival_high_full_update: 120
-  train_arrival_high_max_probability: 0.25
+  train_arrival_base_rate_per_min: 1.50
+  train_arrival_high_start_update: 0
+  train_arrival_high_full_update: 0
+  train_arrival_high_max_probability: 1.00
 
   # 训练/评估过程控制。
   log_interval_updates: 1
   save_interval_updates: 25
   # 诊断短跑阶段降低评估频率；若 selection key 优于历史最优，则覆盖保存 policy_best.pt。
-  eval_interval_updates: 10
-  benchmark_eval_episodes: 3
-  stochastic_eval_seeds: 5
+  eval_interval_updates: 5
+  benchmark_eval_episodes: 1
+  stochastic_eval_seeds: 3
   checkpoint_keep_last: 5
 
   # Run05：checkpoint / early-stop 稳态版。
@@ -408,7 +407,7 @@ training:
   #   1. best checkpoint 以 stochastic_high / stochastic_medium 为主排序目标
   #   2. benchmark 仅作 guardrail：优先无 timeout 且 all_orders_cleared，不参与 patience
   #   3. 当 stochastic_high 长时间无提升，且 value_loss 未出现新低时提前停训
-  early_stop_enabled: true
+  early_stop_enabled: false
   early_stop_min_evals: 8
   early_stop_stochastic_high_patience: 15
   early_stop_value_loss_window: 5

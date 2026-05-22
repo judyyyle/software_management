@@ -12,13 +12,15 @@ from __future__ import annotations
 import random
 import tempfile
 import unittest
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
 import numpy as np
 
-from .contracts import CriticBatch, FactorizedActionMask, ObservationBatch
+from .actions import WAIT_ACTION
+from .contracts import CriticBatch, FactorizedActionMask, ObservationBatch, ResolvedActionIndices
 from .model import PolicyForwardOutput, SharedPPOActorCritic
 from .rollout_buffer import RolloutTransition, compute_gae
 from .train_cmrappo import (
@@ -40,6 +42,7 @@ from .train_cmrappo import (
     _ppo_update,
     _record_episode_step,
     _record_terminal_episode_rewards,
+    _run_bc_warm_start,
     _run_periodic_evaluation,
     _sample_training_arrival_band,
     _shape_pending_transition_reward_for_rendezvous,
@@ -206,6 +209,121 @@ class TestPhase7ModelRuntime(unittest.TestCase):
             early_stop_value_loss_min_delta=0.0,
             allowed_train_order_source_mode=("poisson",),
         )
+
+    def test_bc_warm_start_reads_batch_labels_without_env_step(self) -> None:
+        device = torch.device("cpu")
+
+        class DummyModel(torch.nn.Module):
+            def __init__(self) -> None:
+                super().__init__()
+                self.weight = torch.nn.Parameter(torch.as_tensor(1.0, dtype=torch.float32))
+
+            def forward(self, **_kwargs: object) -> tuple[SimpleNamespace, None]:
+                return SimpleNamespace(), None
+
+            def evaluate_actions(self, **_kwargs: object) -> tuple[torch.Tensor, torch.Tensor]:
+                return self.weight.reshape(1), torch.zeros(1, dtype=torch.float32)
+
+        model = DummyModel()
+        optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
+        train_cfg = replace(
+            self._build_training_config(),
+            bc_warm_start_enabled=True,
+            bc_warm_start_updates=1,
+            bc_warm_start_batches_per_update=1,
+        )
+        context_1 = SimpleNamespace(
+            deciding_drone_id="d1",
+            coarse_plan=SimpleNamespace(plan_version=3),
+        )
+        context_2 = SimpleNamespace(
+            deciding_drone_id="d2",
+            coarse_plan=SimpleNamespace(plan_version=4),
+        )
+        candidate_out_1 = SimpleNamespace(
+            resolved_action_lookup=SimpleNamespace(dispatch_actions={})
+        )
+        candidate_out_2 = SimpleNamespace(
+            resolved_action_lookup=SimpleNamespace(dispatch_actions={})
+        )
+        fake_env = mock.Mock()
+        fake_env.reset.return_value = SimpleNamespace(done=False)
+        fake_env.is_done.side_effect = [False, False]
+        fake_env.peek_current_decision_batch.side_effect = [(context_1,), (context_2,)]
+        fake_env.build_candidate_output.side_effect = [candidate_out_1, candidate_out_2]
+        fake_env.step.side_effect = AssertionError("BC warm start 不应执行 env.step")
+        fake_env.apply_decision_batch.side_effect = [
+            SimpleNamespace(done=False),
+            SimpleNamespace(done=True),
+        ]
+        teacher_result_1 = SimpleNamespace(
+            labels_by_drone={
+                "d1": ResolvedActionIndices(root_branch_idx=0),
+            },
+            assignments_by_drone={
+                "d1": SimpleNamespace(action=WAIT_ACTION),
+            },
+            actions_by_drone={
+                "d1": WAIT_ACTION,
+            },
+        )
+        teacher_result_2 = SimpleNamespace(
+            labels_by_drone={
+                "d2": ResolvedActionIndices(root_branch_idx=0),
+            },
+            assignments_by_drone={
+                "d2": SimpleNamespace(action=WAIT_ACTION),
+            },
+            actions_by_drone={
+                "d2": WAIT_ACTION,
+            },
+        )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            metrics_path = Path(tmpdir) / "train_metrics.jsonl"
+            with mock.patch(
+                "backend.training.train_cmrappo.TrainingEnvAdapter",
+                return_value=fake_env,
+            ):
+                with mock.patch(
+                    "backend.training.train_cmrappo.build_batch_matching_teacher_labels",
+                    side_effect=[teacher_result_1, teacher_result_2],
+                ) as teacher_mock:
+                    stats = _run_bc_warm_start(
+                        model=model,
+                        optimizer=optimizer,
+                        scene_ctx=SimpleNamespace(),
+                        order_source=SimpleNamespace(),
+                        config_path=Path("backend/config/rh_alns_cmrappo.yaml"),
+                        tensorizer=SimpleNamespace(
+                            build=mock.Mock(return_value=SimpleNamespace()),
+                            build_action_mask=mock.Mock(return_value=SimpleNamespace()),
+                        ),
+                        critic_builder=SimpleNamespace(
+                            build=mock.Mock(return_value=SimpleNamespace())
+                        ),
+                        critic_schema=SimpleNamespace(),
+                        train_cfg=train_cfg,
+                        device=device,
+                        metrics_path=metrics_path,
+                        event_hook=None,
+                    )
+
+            self.assertEqual(stats["samples"], 2)
+            self.assertEqual(stats["wait"], 2)
+            self.assertEqual(stats["wait_no_dispatch"], 2)
+            self.assertEqual(stats["wait_with_dispatch"], 0)
+            self.assertEqual(stats["decision_batches"], 2)
+            self.assertTrue(metrics_path.read_text(encoding="utf-8"))
+        fake_env.step.assert_not_called()
+        self.assertEqual(
+            fake_env.apply_decision_batch.call_args_list,
+            [
+                mock.call({"d1": WAIT_ACTION}),
+                mock.call({"d2": WAIT_ACTION}),
+            ],
+        )
+        self.assertEqual(teacher_mock.call_count, 2)
 
     def test_forward_accepts_single_and_batched_inputs_without_extra_unsqueeze(self) -> None:
         device = torch.device("cpu")
@@ -893,7 +1011,7 @@ class TestPhase7ModelRuntime(unittest.TestCase):
         self.assertAlmostEqual(post_action, -2.5, places=6)
         self.assertAlmostEqual(mode_c_attempt, 0.0, places=6)
 
-    def test_shape_post_action_reward_for_rendezvous_adds_arrive_and_success_bonus(self) -> None:
+    def test_shape_post_action_reward_for_rendezvous_adds_success_bonus_only(self) -> None:
         (
             shaped_reward,
             arrive_bonus_applied,
@@ -910,11 +1028,11 @@ class TestPhase7ModelRuntime(unittest.TestCase):
             rendezvous_bonus=0.2,
         )
 
-        self.assertTrue(arrive_bonus_applied)
+        self.assertFalse(arrive_bonus_applied)
         self.assertTrue(success_bonus_applied)
-        self.assertAlmostEqual(shaped_reward, 0.7, places=6)
+        self.assertAlmostEqual(shaped_reward, -1.3, places=6)
 
-    def test_shape_post_action_reward_for_rendezvous_adds_arrive_bonus_on_waiting_state(self) -> None:
+    def test_shape_post_action_reward_for_rendezvous_does_not_add_arrive_bonus_on_waiting_state(self) -> None:
         (
             shaped_reward,
             arrive_bonus_applied,
@@ -934,9 +1052,9 @@ class TestPhase7ModelRuntime(unittest.TestCase):
             rendezvous_bonus=5.0,
         )
 
-        self.assertTrue(arrive_bonus_applied)
+        self.assertFalse(arrive_bonus_applied)
         self.assertFalse(success_bonus_applied)
-        self.assertAlmostEqual(shaped_reward, 0.5, places=6)
+        self.assertAlmostEqual(shaped_reward, -1.5, places=6)
 
     def test_shape_post_action_reward_for_rendezvous_does_not_add_attempt_bonus_at_dispatch(self) -> None:
         (
@@ -1022,11 +1140,11 @@ class TestPhase7ModelRuntime(unittest.TestCase):
             rendezvous_bonus=0.2,
         )
 
-        self.assertTrue(arrive_bonus_applied)
+        self.assertFalse(arrive_bonus_applied)
         self.assertTrue(success_bonus_applied)
-        self.assertAlmostEqual(shaped_reward, 1.2, places=6)
+        self.assertAlmostEqual(shaped_reward, -0.8, places=6)
 
-    def test_shape_pending_transition_reward_for_rendezvous_adds_arrive_only_on_waiting_state(self) -> None:
+    def test_shape_pending_transition_reward_for_rendezvous_does_not_add_arrive_on_waiting_state(self) -> None:
         pending_transition = RolloutTransition(
             observation_batch=self._build_single_observation(),
             critic_batch=self._build_single_critic_batch(),
@@ -1060,9 +1178,9 @@ class TestPhase7ModelRuntime(unittest.TestCase):
             rendezvous_bonus=5.0,
         )
 
-        self.assertTrue(arrive_bonus_applied)
+        self.assertFalse(arrive_bonus_applied)
         self.assertFalse(success_bonus_applied)
-        self.assertAlmostEqual(shaped_reward, 1.0, places=6)
+        self.assertAlmostEqual(shaped_reward, -1.0, places=6)
 
     def test_finalize_pending_transition_records_successor_bootstrap(self) -> None:
         pending = {
@@ -1105,7 +1223,7 @@ class TestPhase7ModelRuntime(unittest.TestCase):
         self.assertFalse(bool(backlog[0].done))
         self.assertEqual(successor_bootstrap_values, {(3, "uav_1", 2): 1.75})
 
-    def test_finalize_pending_transition_applies_rendezvous_bonus_to_mode_c_pending(self) -> None:
+    def test_finalize_pending_transition_applies_success_bonus_to_mode_c_pending(self) -> None:
         pending = {
             "uav_1": RolloutTransition(
                 observation_batch=self._build_single_observation(),
@@ -1151,11 +1269,11 @@ class TestPhase7ModelRuntime(unittest.TestCase):
 
         self.assertFalse(pending)
         self.assertEqual(len(backlog), 1)
-        self.assertAlmostEqual(float(backlog[0].reward), 0.2, places=6)
-        self.assertTrue(bool(backlog[0].rendezvous_arrive_bonus_applied))
+        self.assertAlmostEqual(float(backlog[0].reward), -1.8, places=6)
+        self.assertFalse(bool(backlog[0].rendezvous_arrive_bonus_applied))
         self.assertTrue(bool(backlog[0].rendezvous_success_bonus_applied))
 
-    def test_finalize_pending_transition_scales_late_rendezvous_bonus(self) -> None:
+    def test_finalize_pending_transition_scales_late_success_bonus(self) -> None:
         pending = {
             "uav_1": RolloutTransition(
                 observation_batch=self._build_single_observation(),
@@ -1201,8 +1319,8 @@ class TestPhase7ModelRuntime(unittest.TestCase):
         )
 
         self.assertEqual(len(backlog), 1)
-        self.assertAlmostEqual(float(backlog[0].reward), 0.002, places=6)
-        self.assertTrue(bool(backlog[0].rendezvous_arrive_bonus_applied))
+        self.assertAlmostEqual(float(backlog[0].reward), -0.018, places=6)
+        self.assertFalse(bool(backlog[0].rendezvous_arrive_bonus_applied))
         self.assertTrue(bool(backlog[0].rendezvous_success_bonus_applied))
 
     def test_flush_terminal_pending_transitions_marks_done_and_preserves_order(self) -> None:
@@ -1282,7 +1400,7 @@ class TestPhase7ModelRuntime(unittest.TestCase):
         self.assertAlmostEqual(float(backlog[0].reward), 1.0, places=6)
         self.assertAlmostEqual(float(backlog[1].reward), 1.5, places=6)
 
-    def test_flush_terminal_pending_transitions_scales_late_rendezvous_bonus(self) -> None:
+    def test_flush_terminal_pending_transitions_scales_late_success_bonus(self) -> None:
         pending = {
             "uav_1": RolloutTransition(
                 observation_batch=self._build_single_observation(),
@@ -1323,9 +1441,9 @@ class TestPhase7ModelRuntime(unittest.TestCase):
 
         self.assertFalse(pending)
         self.assertEqual(len(backlog), 1)
-        self.assertAlmostEqual(float(backlog[0].reward), 0.002, places=6)
+        self.assertAlmostEqual(float(backlog[0].reward), -0.018, places=6)
         self.assertTrue(bool(backlog[0].done))
-        self.assertTrue(bool(backlog[0].rendezvous_arrive_bonus_applied))
+        self.assertFalse(bool(backlog[0].rendezvous_arrive_bonus_applied))
         self.assertTrue(bool(backlog[0].rendezvous_success_bonus_applied))
 
     def test_insert_finalized_transition_in_order_uses_global_decision_index(self) -> None:
