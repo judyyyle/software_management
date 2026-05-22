@@ -457,11 +457,16 @@ class TestPhase6Integration(unittest.TestCase):
         )
         recovery_nodes = coarse_plan.recovery_pool[order.order_id]
 
-        self.assertEqual(recovery_nodes, tuple(station_ids[:5]))
+        self.assertLessEqual(
+            len(recovery_nodes),
+            env._cfg.max_candidate_recovery_per_order,
+        )
+        self.assertTrue(set(recovery_nodes).issubset(set(station_ids[:5])))
+        self.assertEqual(recovery_nodes[0], preferred_station_id)
         self.assertIn(
             preferred_station_id,
             recovery_nodes,
-            "PlannerBridge 应与 env 内联 coarse plan 一致，暴露卡车未来会经过的固定节点",
+            "PlannerBridge 应与 env 内联 coarse plan 一致，优先保留靠近订单的未来固定节点",
         )
 
     def test_poisson_planner_bridge_rejects_empty_backbone(self) -> None:
@@ -622,7 +627,13 @@ class TestPhase6Integration(unittest.TestCase):
 
         runtime_state = env.build_runtime_state_view()
         env._drone_state[drone_id] = TrainingDroneState.FLYING_TO_DELIVER
-        self.assertEqual(env._build_truck_reservation_constraints(runtime_state), ())
+        constraints = env._build_truck_reservation_constraints(runtime_state)
+        self.assertEqual(len(constraints), 1)
+        self.assertEqual(
+            constraints[0].state,
+            ReservationConstraintState.HARD,
+        )
+        self.assertEqual(constraints[0].node_id, station_id)
 
         env._drone_state[drone_id] = TrainingDroneState.WAITING_FOR_TRUCK
         constraints = env._build_truck_reservation_constraints(runtime_state)
@@ -1109,6 +1120,27 @@ class TestPhase6Integration(unittest.TestCase):
         env._dispatch_commit.pop(drone_id, None)
         env._drone_state[drone_id] = TrainingDroneState.IDLE
         self.assertEqual(env._episode_done_reason(), "all_orders_cleared")
+
+    def test_all_orders_cleared_waits_for_future_scheduled_dynamic_orders(self) -> None:
+        env, _drone_id = self._reset_controlled_env()
+        order_mgr = env._require_order_manager()
+        order_mgr.pending_orders.clear()
+        order_mgr.assigned_orders.clear()
+        order_mgr._next_order_time = math.inf
+        order_mgr._scheduled_dynamic = [
+            {
+                "order_id": "ORDER-FUTURE-DYNAMIC",
+                "spawn_sim_s": env._t_now + 60.0,
+            }
+        ]
+        order_mgr._scheduled_dynamic_i = 0
+
+        self.assertIsNone(env._episode_done_reason())
+        self.assertFalse(env.is_done())
+
+        order_mgr._scheduled_dynamic_i = len(order_mgr._scheduled_dynamic)
+        self.assertEqual(env._episode_done_reason(), "all_orders_cleared")
+        self.assertTrue(env.is_done())
 
     def test_recovery_only_truck_plan_skips_patrol_station_coverage(self) -> None:
         env, drone_id = self._reset_controlled_env()
@@ -1614,7 +1646,7 @@ class TestPhase6Integration(unittest.TestCase):
         self.assertEqual(resolved_wait, WAIT_ACTION)
         self.assertEqual(resolved_mode_c.order_id, order.order_id)
         self.assertEqual(resolved_mode_c.mode, PolicyMode.C)
-        self.assertIsNone(resolved_mode_c.recover_node_id)
+        self.assertEqual(resolved_mode_c.recover_node_id, station_safe.station_id)
 
     def test_candidate_builder_mode_c_prefers_earliest_recovery_time(self) -> None:
         builder = CandidateBuilder.__new__(CandidateBuilder)

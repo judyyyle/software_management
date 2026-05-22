@@ -111,6 +111,20 @@ class TestTrainingEnvAdapterPhase5b(unittest.TestCase):
 
         order = self._inject_order(env, drone_id=drone_id, order_id="ORDER-P5B-01")
         t_deliver = env._estimate_delivery_arrival_time(drone, order)
+        t_deliver_finish = (
+            t_deliver + env._scene_solver_params().drone_service_time_order_s
+        )
+        recover_flight_time = env._estimate_flight_time(
+            drone=drone,
+            from_pos=order.delivery_loc,
+            to_pos=entity_mgr.stations[station_ids[1]].location,
+        )
+        feasible_truck_arrival = (
+            t_deliver_finish
+            + recover_flight_time
+            + env._cfg.rendezvous_execution_margin_sec
+            + 30.0
+        )
         env._full_backbone_cache = [
             BackboneVisit(
                 node_id=station_ids[0],
@@ -119,8 +133,8 @@ class TestTrainingEnvAdapterPhase5b(unittest.TestCase):
             ),
             BackboneVisit(
                 node_id=station_ids[1],
-                arrival_time=t_deliver + 350.0,
-                departure_time=t_deliver + 350.0 + 1e-6,
+                arrival_time=feasible_truck_arrival,
+                departure_time=feasible_truck_arrival + 1e-6,
             ),
         ]
 
@@ -149,7 +163,7 @@ class TestTrainingEnvAdapterPhase5b(unittest.TestCase):
         )
 
         self.assertEqual(len(mode_c_actions), 1)
-        self.assertIsNone(mode_c_actions[0].recover_node_id)
+        self.assertEqual(mode_c_actions[0].recover_node_id, station_ids[1])
         self.assertTrue(order_feature.has_mode_c_action)
         self.assertAlmostEqual(
             order_feature.best_mode_c_truck_eta_remaining,
@@ -329,11 +343,16 @@ class TestTrainingEnvAdapterPhase5b(unittest.TestCase):
         coarse_plan = env._build_coarse_plan_view(env._t_now)
         recovery_nodes = coarse_plan.recovery_pool[order.order_id]
 
-        self.assertEqual(recovery_nodes, tuple(station_ids[:5]))
+        self.assertLessEqual(
+            len(recovery_nodes),
+            env._cfg.max_candidate_recovery_per_order,
+        )
+        self.assertTrue(set(recovery_nodes).issubset(set(station_ids[:5])))
+        self.assertEqual(recovery_nodes[0], preferred_station_id)
         self.assertIn(
             preferred_station_id,
             recovery_nodes,
-            "coarse plan 应暴露卡车未来会经过的固定节点，具体可行性由 CandidateBuilder 过滤",
+            "coarse plan 应优先保留靠近订单的未来固定节点，具体可行性由 CandidateBuilder 过滤",
         )
 
     def test_post_delivery_revalidation_failure_enters_fallback(self) -> None:
@@ -421,6 +440,20 @@ class TestTrainingEnvAdapterPhase5b(unittest.TestCase):
 
         order = self._inject_order(env, drone_id=drone_id, order_id="ORDER-P5B-DIAG-01")
         t_deliver = env._estimate_delivery_arrival_time(drone, order)
+        t_deliver_finish = (
+            t_deliver + env._scene_solver_params().drone_service_time_order_s
+        )
+        recover_flight_time = env._estimate_flight_time(
+            drone=drone,
+            from_pos=order.delivery_loc,
+            to_pos=entity_mgr.stations[station_ids[1]].location,
+        )
+        feasible_truck_arrival = (
+            t_deliver_finish
+            + recover_flight_time
+            + env._cfg.rendezvous_execution_margin_sec
+            + 30.0
+        )
         env._full_backbone_cache = [
             BackboneVisit(
                 node_id=station_ids[0],
@@ -429,12 +462,14 @@ class TestTrainingEnvAdapterPhase5b(unittest.TestCase):
             ),
             BackboneVisit(
                 node_id=station_ids[1],
-                arrival_time=t_deliver + 350.0,
-                departure_time=t_deliver + 350.0 + 1e-6,
+                arrival_time=feasible_truck_arrival,
+                departure_time=feasible_truck_arrival + 1e-6,
             ),
         ]
         env._decision_queue.clear()
         env._enqueue_decision(drone_id, "test_idle", None)
+        env._planner_bridge = None
+        env._current_coarse_plan = None
         env._episode_dispatch_decision_count = 0
         env._episode_dispatch_decision_with_legal_mode_c_count = 0
         env._episode_feasible_mode_c_recover_node_count_total = 0

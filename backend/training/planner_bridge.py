@@ -33,6 +33,8 @@ from .scene_loader import DEFAULT_CONFIG_PATH
 
 _TIME_EPS = 1e-6
 _EXACT_ROUTE_SEARCH_MAX_NODES = 8
+_RECOVERY_OPPORTUNITY_BONUS_SEC = 90.0
+_RECOVERY_OPPORTUNITY_BONUS_CAP_SEC = 360.0
 
 
 @dataclass(frozen=True)
@@ -49,6 +51,8 @@ class _PlannerConfig:
     patrol_stations_per_loop: int
     max_candidate_recovery_per_order: int
     recovery_pool_future_scan_limit: int
+    rendezvous_execution_margin_sec: float
+    rendezvous_max_wait_sec: float
     allow_empty_backbone_route: bool
     beam_width: int
 
@@ -104,6 +108,7 @@ class PlannerBridge:
         self._truck_speed_provider = truck_speed_provider
         self._truck_travel_time_provider = truck_travel_time_provider
         self._truck_order_service_time_sec = _load_truck_order_service_time()
+        self._drone_service_time_order_sec = _load_drone_order_service_time()
         self._fixed_node_service_time_sec = _load_fixed_node_service_time()
         self._runtime_allow_empty_backbone_route = bool(
             self._cfg.allow_empty_backbone_route
@@ -366,6 +371,7 @@ class PlannerBridge:
                 selected_nodes={node.node_id for node in base_nodes},
             )
             nodes = self._append_station_coverage(
+                runtime_state=runtime_state,
                 base_nodes=base_nodes,
                 coverage_nodes=coverage_nodes,
                 depot_node=depot_node,
@@ -380,6 +386,7 @@ class PlannerBridge:
                 selected_nodes={node.node_id for node in base_nodes},
             )
             nodes = self._append_station_coverage(
+                runtime_state=runtime_state,
                 base_nodes=base_nodes,
                 coverage_nodes=coverage_nodes,
                 depot_node=depot_node,
@@ -700,6 +707,7 @@ class PlannerBridge:
     def _append_station_coverage(
         self,
         *,
+        runtime_state: Any,
         base_nodes: Sequence[_TruckPlanNode],
         coverage_nodes: Sequence[_TruckPlanNode],
         depot_node: _TruckPlanNode | None,
@@ -733,7 +741,14 @@ class PlannerBridge:
         ).key
         while _station_count(selected) < target_station_count:
             best_insert: (
-                tuple[float, tuple[str, ...], tuple[_TruckPlanNode, ...], tuple[float, ...]]
+                tuple[
+                    float,
+                    float,
+                    float,
+                    tuple[str, ...],
+                    tuple[_TruckPlanNode, ...],
+                    tuple[float, ...],
+                ]
                 | None
             ) = None
             selected_ids = {node.node_id for node in selected}
@@ -749,26 +764,42 @@ class PlannerBridge:
                     candidate_eval_nodes = candidate + (
                         (depot_node,) if depot_node is not None else ()
                     )
-                    candidate_key = self._evaluate_truck_route(
+                    candidate_eval = self._evaluate_truck_route(
                         nodes=candidate_eval_nodes,
                         start_pos=start_pos,
                         start_time=start_time,
                         reservation_constraints=reservation_constraints,
                         truck_speed=truck_speed,
-                    ).key
+                    )
+                    candidate_key = candidate_eval.key
                     if _worsens_primary_metrics(candidate_key, base_key, count=4):
                         continue
                     extra_route_time = candidate_key[4] - base_key[4]
+                    station_eta = candidate_eval.arrival_times[insert_idx]
+                    opportunity_bonus = self._station_recovery_opportunity_bonus(
+                        runtime_state=runtime_state,
+                        station=station,
+                        station_eta=float(station_eta),
+                    )
+                    adjusted_extra_time = float(extra_route_time) - float(
+                        opportunity_bonus
+                    )
                     candidate_order = tuple(node.node_id for node in candidate)
                     current_best = best_insert
                     if current_best is None or (
+                        adjusted_extra_time,
+                        -opportunity_bonus,
                         extra_route_time,
                         candidate_order,
                     ) < (
                         current_best[0],
                         current_best[1],
+                        current_best[2],
+                        current_best[3],
                     ):
                         best_insert = (
+                            float(adjusted_extra_time),
+                            float(-opportunity_bonus),
                             float(extra_route_time),
                             candidate_order,
                             candidate,
@@ -776,9 +807,102 @@ class PlannerBridge:
                         )
             if best_insert is None:
                 break
-            selected = best_insert[2]
-            base_key = best_insert[3]
+            selected = best_insert[4]
+            base_key = best_insert[5]
         return selected
+
+    def _station_recovery_opportunity_bonus(
+        self,
+        *,
+        runtime_state: Any,
+        station: _TruckPlanNode,
+        station_eta: float,
+    ) -> float:
+        """Estimate how useful a station visit is for pending UAV Mode C recovery.
+
+        This is a coarse truck-planning signal only. CandidateBuilder remains the
+        source of truth for per-drone energy and rendezvous legality.
+        """
+        if station.node_type != "station":
+            return 0.0
+
+        pending_orders = getattr(runtime_state, "pending_orders", {})
+        if not pending_orders:
+            return 0.0
+
+        support_radius_m = max(100.0, float(self._cfg.support_radius_km) * 1000.0)
+        bonus = 0.0
+        for order in pending_orders.values():
+            if float(order.payload_weight) > self._heavy_payload_capacity + _TIME_EPS:
+                continue
+
+            delivery_finish = self._estimate_earliest_uav_delivery_finish(
+                runtime_state=runtime_state,
+                order=order,
+            )
+            if delivery_finish is None:
+                continue
+            if float(delivery_finish) > float(order.deadline) + _TIME_EPS:
+                continue
+
+            distance_to_station = float(order.delivery_loc.distance_2d(station.position))
+            spatial_score = max(0.0, 1.0 - distance_to_station / support_radius_m)
+            if spatial_score <= _TIME_EPS:
+                continue
+
+            recovery_flight_time = distance_to_station / max(
+                _TIME_EPS,
+                float(self._recovery_pool_drone_cruise_speed),
+            )
+            uav_arrival = float(delivery_finish) + float(recovery_flight_time)
+            planned_wait = float(station_eta) - float(uav_arrival)
+            temporal_score = self._rendezvous_temporal_score(planned_wait)
+            if temporal_score <= _TIME_EPS:
+                continue
+
+            remaining = max(0.0, float(order.deadline) - float(runtime_state.t_now))
+            window = max(_TIME_EPS, float(order.time_window_seconds))
+            urgency = 1.0 - min(1.0, remaining / window)
+            bonus += (
+                _RECOVERY_OPPORTUNITY_BONUS_SEC
+                * spatial_score
+                * temporal_score
+                * (0.75 + 0.25 * urgency)
+            )
+
+        return min(_RECOVERY_OPPORTUNITY_BONUS_CAP_SEC, float(bonus))
+
+    def _estimate_earliest_uav_delivery_finish(
+        self,
+        *,
+        runtime_state: Any,
+        order: Any,
+    ) -> float | None:
+        best_flight_time: float | None = None
+        for drone in getattr(runtime_state, "drone_states", {}).values():
+            if float(order.payload_weight) > float(drone.payload_capacity) + _TIME_EPS:
+                continue
+            speed = max(_TIME_EPS, float(drone.cruise_speed))
+            flight_time = float(drone.current_loc.distance_2d(order.delivery_loc)) / speed
+            if best_flight_time is None or flight_time < best_flight_time:
+                best_flight_time = flight_time
+        if best_flight_time is None:
+            return None
+        return (
+            float(runtime_state.t_now)
+            + float(best_flight_time)
+            + float(self._drone_service_time_order_sec)
+        )
+
+    def _rendezvous_temporal_score(self, planned_wait: float) -> float:
+        lower = float(self._cfg.rendezvous_execution_margin_sec)
+        upper = float(self._cfg.rendezvous_max_wait_sec)
+        if lower <= planned_wait <= upper:
+            return 1.0
+        span = max(_TIME_EPS, upper - lower)
+        if planned_wait < lower:
+            return max(0.0, 1.0 - (lower - float(planned_wait)) / span)
+        return max(0.0, 1.0 - (float(planned_wait) - upper) / span)
 
     def _select_station_backbone_nodes(
         self,
@@ -999,6 +1123,13 @@ def _load_planner_config(config_path: Path) -> _PlannerConfig:
         patrol_stations_per_loop=int(planner.get("patrol_stations_per_loop", 0)),
         max_candidate_recovery_per_order=max_candidate_recovery_per_order,
         recovery_pool_future_scan_limit=recovery_pool_future_scan_limit,
+        rendezvous_execution_margin_sec=float(
+            candidate.get(
+                "rendezvous_execution_margin_sec",
+                candidate.get("rendezvous_filter_margin_sec", 0.0),
+            )
+        ),
+        rendezvous_max_wait_sec=float(candidate["rendezvous_max_wait_sec"]),
         allow_empty_backbone_route=bool(
             planner.get("allow_empty_backbone_route", False)
         ),
@@ -1022,6 +1153,12 @@ def _load_truck_order_service_time() -> float:
     from config.loader import load_solver_energy_params
 
     return float(load_solver_energy_params().truck_service_time_order_s)
+
+
+def _load_drone_order_service_time() -> float:
+    from config.loader import load_solver_energy_params
+
+    return float(load_solver_energy_params().drone_service_time_order_s)
 
 
 def _load_fixed_node_service_time() -> float:
