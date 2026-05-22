@@ -109,7 +109,7 @@ entities_config = {
         {
             "truck_id": "TRK-TEST-01",
             "name": "卡车-01",
-            "speed": 16.5,
+            "speed": 13.0,
             "max_inventory": 30,
             "swap_time": 120,
             "parking_slots": 3,
@@ -117,33 +117,41 @@ entities_config = {
         }
     ],
     "drones": [
-        # 1 架 LightDrone 搭载在卡车上
-        {
-            "drone_id": "UAV-TEST-01",
-            "drone_type": "LightDrone",
-            "home_id": "TRK-TEST-01",
-            "home_type": "TRUCK",
-        },
-        # 8 架 LightDrone 在仓库
+        # 8 架 LightDrone，其中 4 架初始搭载在卡车上
         *[
             {
                 "drone_id": f"UAV-TEST-{i:02d}",
                 "drone_type": "LightDrone",
-                "home_id": "DEP-TEST-01",
-                "home_type": "DEPOT",
+                "home_id": "TRK-TEST-01" if i <= 4 else "DEP-TEST-01",
+                "home_type": "TRUCK" if i <= 4 else "DEPOT",
             }
-            for i in range(2, 10)
+            for i in range(1, 9)
         ],
-        # 3 架 HeavyDrone 在仓库
-        *[
-            {
-                "drone_id": f"UAV-TEST-{i:02d}",
-                "drone_type": "HeavyDrone",
-                "home_id": "DEP-TEST-01",
-                "home_type": "DEPOT",
-            }
-            for i in range(10, 13)
-        ],
+        # 4 架 HeavyDrone，其中 2 架初始搭载在卡车上
+        {
+            "drone_id": "UAV-TEST-09",
+            "drone_type": "HeavyDrone",
+            "home_id": "DEP-TEST-01",
+            "home_type": "DEPOT",
+        },
+        {
+            "drone_id": "UAV-TEST-10",
+            "drone_type": "HeavyDrone",
+            "home_id": "TRK-TEST-01",
+            "home_type": "TRUCK",
+        },
+        {
+            "drone_id": "UAV-TEST-11",
+            "drone_type": "HeavyDrone",
+            "home_id": "TRK-TEST-01",
+            "home_type": "TRUCK",
+        },
+        {
+            "drone_id": "UAV-TEST-12",
+            "drone_type": "HeavyDrone",
+            "home_id": "DEP-TEST-01",
+            "home_type": "DEPOT",
+        },
     ],
 }
 

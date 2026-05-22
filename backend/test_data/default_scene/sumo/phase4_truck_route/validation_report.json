@@ -25,7 +25,7 @@
   "min_future_fixed_nodes_ok": true,
   "snap_within_warn_threshold": false,
   "sumo_edge_sequence_non_empty": true,
-  "sumo_export_dir": "/Users/myx/Documents/GitHub/HiveLogix/backend/test_data/default_scene/sumo/phase4_truck_route",
+  "sumo_export_dir": "/Users/myx/Documents/GitHub/HiveLogix_引入贪心预训练/backend/test_data/default_scene/sumo/phase4_truck_route",
   "truck_order_count": 4,
   "truck_order_ids": [
     "ORD-STATIC-08",
