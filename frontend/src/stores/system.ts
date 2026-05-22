@@ -447,7 +447,8 @@ export const useSystemStore = defineStore('system', () => {
    */
   async function dispatch(
     bbox: { minx: number; miny: number; maxx: number; maxy: number },
-    solver: 'greedy' | 'greedy_mmce' | 'greedy_mmce_bi' | 'market' = 'greedy',
+    solver: 'greedy' | 'greedy_mmce' | 'greedy_mmce_bi' | 'ga_mmce' | 'market' = 'greedy',
+    options: { reuseStaticGaPlan?: boolean } = {},
   ) {
     if (DEBUG_WEBSOCKET) {
       console.log('[system.dispatch] 被调用，bbox:', bbox)
@@ -460,6 +461,9 @@ export const useSystemStore = defineStore('system', () => {
     const payload: any = { solver, bbox }
     if (sceneId) {
       payload.scene_id = sceneId
+    }
+    if (solver === 'ga_mmce' && options.reuseStaticGaPlan) {
+      payload.reuse_static_ga_plan = true
     }
     
     if (DEBUG_WEBSOCKET) {

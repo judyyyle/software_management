@@ -24,7 +24,7 @@ from typing import TYPE_CHECKING
 
 from config.loader import load_solver_energy_params
 from solver.factory import create_solver, list_solvers
-from solver.greedy_mmce import AllocationResult, DispatchPlan
+from solver.greedy_mmce import AllocationResult, DispatchPlan, TruckRoute, TruckRouteNode
 from solver.market_based_solver import MarketBasedSolver
 from solver.interfaces import DispatchSolver
 from core.entities.primitives import RouteWaypoint, WaypointAction, SourceType, DroneStatus, Position3D
@@ -190,6 +190,7 @@ class DispatchDecisionEngine:
         self._activate_path_planner(scene_id)
         plan = self.solver.dispatch(pending, current_time, bbox, scene_id=scene_id)
         plan.summary["solver"] = self.solver_name
+        self._normalize_plan_for_runtime(plan)
 
         if self.solver_name != "market":
             bad = [a.order_id for a in plan.allocations if a.mode == "B_DYNAMIC"]
@@ -253,6 +254,7 @@ class DispatchDecisionEngine:
         plan.summary["solver"] = self.solver_name
         plan.summary["dispatch_type"] = "incremental"
         plan.summary["new_orders"] = len(new_orders)
+        self._normalize_plan_for_runtime(plan)
 
         if self.solver_name != "market":
             bad = [a.order_id for a in plan.allocations if a.mode == "B_DYNAMIC"]
@@ -290,6 +292,49 @@ class DispatchDecisionEngine:
                 self.order_mgr.pending_orders.pop(oid, None)
                 self.order_mgr.assigned_orders[oid] = order
 
+        if self.solver_name == "ga_mmce":
+            self._activate_path_planner(scene_id)
+            plan = self.solver.dispatch_incremental(
+                new_orders,
+                current_time,
+                bbox,
+                scene_id=scene_id,
+            )
+            plan.summary["solver"] = self.solver_name
+            plan.summary["dispatch_type"] = "dynamic_replan"
+            plan.summary["replanned_assigned_orders"] = 0
+            plan.summary["new_orders"] = len(new_orders)
+            self._normalize_plan_for_runtime(plan)
+
+            bad = [a.order_id for a in plan.allocations if a.mode == "B_DYNAMIC"]
+            if bad:
+                raise RuntimeError(
+                    f"当前求解器={self.solver_name}，但返回了 B_DYNAMIC 分配: {bad}"
+                )
+
+            self._accumulate_plan_metrics(plan)
+            replace_order_ids = self._ga_dynamic_replace_future_order_ids(plan)
+            logger.info(
+                "[DispatchDecisionEngine] GA 动态重优化使用增量后缀切换，替换未来订单停靠: %s",
+                sorted(replace_order_ids),
+            )
+            self._apply_plan(
+                plan,
+                current_time,
+                incremental=True,
+                replace_future_order_ids=replace_order_ids,
+            )
+            self._build_drone_routes(plan, current_time)
+
+            logger.info(
+                "[DispatchDecisionEngine] 动态重优化完成: new=%d 回收旧单=%d 总待分配=%d 可行=%d",
+                len(new_orders),
+                0,
+                plan.summary.get("total_orders", 0),
+                plan.summary.get("feasible", 0),
+            )
+            return plan
+
         # 不在求解前修改订单池：只构造“重优化视图”，避免异常时污染全局状态。
         replannable_assigned: dict[str, object] = {
             oid: order
@@ -322,6 +367,7 @@ class DispatchDecisionEngine:
         plan.summary["dispatch_type"] = "dynamic_replan"
         plan.summary["replanned_assigned_orders"] = len(replannable_assigned)
         plan.summary["new_orders"] = len(new_orders)
+        self._normalize_plan_for_runtime(plan)
 
         if self.solver_name != "market":
             bad = [a.order_id for a in plan.allocations if a.mode == "B_DYNAMIC"]
@@ -331,7 +377,20 @@ class DispatchDecisionEngine:
                 )
 
         self._accumulate_plan_metrics(plan)
-        self._apply_plan(plan, current_time, incremental=False)
+        if self.solver_name == "ga_mmce":
+            replace_order_ids = self._ga_dynamic_replace_future_order_ids(plan)
+            logger.info(
+                "[DispatchDecisionEngine] GA 动态重优化使用增量后缀切换，替换未来订单停靠: %s",
+                sorted(replace_order_ids),
+            )
+            self._apply_plan(
+                plan,
+                current_time,
+                incremental=True,
+                replace_future_order_ids=replace_order_ids,
+            )
+        else:
+            self._apply_plan(plan, current_time, incremental=False)
         self._build_drone_routes(plan, current_time)
 
         logger.info(
@@ -342,6 +401,38 @@ class DispatchDecisionEngine:
             plan.summary.get("feasible", 0),
         )
         return plan
+
+    def _normalize_plan_for_runtime(self, plan: DispatchPlan) -> None:
+        if self.solver_name != "ga_mmce":
+            return
+        from solver.ga_mmce.runtime_adapter import normalize_ga_allocation_modes
+
+        normalize_ga_allocation_modes(plan)
+
+    def _ga_dynamic_replace_future_order_ids(self, plan: DispatchPlan) -> set[str]:
+        """Return GA dynamic orders whose future truck stops may be replaced.
+
+        Locked and frozen-tail orders keep their existing runtime route entries;
+        only the reoptimized window is allowed to rewrite the not-yet-executed
+        truck suffix.
+        """
+        summary = plan.summary or {}
+        locked = {str(oid) for oid in (summary.get("locked_ids", []) or [])}
+        frozen = {str(oid) for oid in (summary.get("frozen_future_order_ids", []) or [])}
+        reoptimized = {
+            str(oid)
+            for oid in (summary.get("reoptimized_order_ids", []) or [])
+        }
+        if not reoptimized:
+            reoptimized = {
+                str(getattr(alloc, "order_id", "") or "")
+                for alloc in plan.allocations
+                if getattr(alloc, "feasible", False)
+            }
+        return {
+            oid for oid in reoptimized
+            if oid and oid not in locked and oid not in frozen
+        }
 
     def _accumulate_plan_metrics(self, plan: DispatchPlan) -> None:
         """累计调度成本，用于运行时 KPI 展示。"""
@@ -389,13 +480,21 @@ class DispatchDecisionEngine:
             if current_time >= contract.uav_arrival_time and not drone.status.is_flying():
                 self.solver.fulfill_contract(contract.contract_id)
 
-    def _apply_plan(self, plan: DispatchPlan, current_time: float, incremental: bool = False) -> None:
+    def _apply_plan(
+        self,
+        plan: DispatchPlan,
+        current_time: float,
+        incremental: bool = False,
+        replace_future_order_ids: set[str] | None = None,
+    ) -> None:
         """
         应用分配方案，更新订单和实体状态。
 
         Args:
             incremental: 增量模式。为 True 时保护正在执行中的卡车路由，
-                         仅将新停靠事件追加到已有的时刻表中，不覆盖卡车物理路线。
+                         仅合并未执行后缀，不覆盖已执行/正在执行路线。
+            replace_future_order_ids: 增量模式下，先从未执行后缀移除这些订单的旧停靠，
+                         再插入新计划中的对应停靠。
         """
         for alloc in plan.allocations:
             order = self.order_mgr.pending_orders.get(alloc.order_id)
@@ -464,8 +563,14 @@ class DispatchDecisionEngine:
             self._recalculate_truck_route_timing_for_b_wait(route, plan.allocations, current_time)
 
             if incremental:
-                # 增量模式：保护正在执行的卡车路由，只追加新的停靠事件
-                self._merge_incremental_truck_stops(truck, route, plan.allocations, current_time)
+                # 增量模式：保护正在执行的卡车路由，只合并未执行后缀
+                self._merge_incremental_truck_stops(
+                    truck,
+                    route,
+                    plan.allocations,
+                    current_time,
+                    replace_future_order_ids=replace_future_order_ids,
+                )
                 continue
 
             route_nodes = [node.node_id for node in route.nodes]
@@ -484,6 +589,7 @@ class DispatchDecisionEngine:
                     }
                     for node in route.nodes
                 ]
+                truck._planned_route_solver = self.solver_name
                 truck._planned_route_cursor = 0
                 logger.info(
                     "[DispatchDecisionEngine] 已将路由应用至卡车 %s（%d 个关键节点，几何路径 %d 点）",
@@ -543,16 +649,18 @@ class DispatchDecisionEngine:
         new_route: "TruckRoute",
         allocations: list,
         current_time: float,
+        replace_future_order_ids: set[str] | None = None,
     ) -> None:
-        """增量模式下将新的停靠事件追加到卡车已有时刻表中，不覆盖物理路线。
+        """增量模式下合并卡车未执行后缀，保护已经执行/正在执行的路线。
 
         原则：
           - 保留已执行和正在执行的停靠事件（cursor 之前）
           - 将新的 recovery / customer 停靠按时间顺序插入未执行区间
-          - 不调用 truck.set_route()，卡车继续沿原有几何路径行驶
+          - 后缀重建从卡车当前位置开始，避免把车辆拉回 GA snapshot 路线起点
         """
         existing_stops: list[dict] = getattr(truck, "_planned_route_stops", None) or []
         cursor = int(getattr(truck, "_planned_route_cursor", 0))
+        truck._planned_route_solver = self.solver_name
 
         if not existing_stops:
             # 卡车尚未有路线（首次被增量调度命中），按全量模式设置
@@ -568,6 +676,7 @@ class DispatchDecisionEngine:
                     }
                     for n in new_route.nodes
                 ]
+                truck._planned_route_solver = self.solver_name
                 truck._planned_route_cursor = 0
                 logger.info(
                     "[DispatchDecisionEngine] 增量模式首次为卡车 %s 设置路由 (%d 节点)",
@@ -580,18 +689,34 @@ class DispatchDecisionEngine:
 
         # 仅对未执行区间做去重：已执行过的同站点在新批次中应允许再次停靠。
         future_stops = existing_stops[cursor:]
+        replace_ids = {str(oid) for oid in (replace_future_order_ids or set())}
+        if replace_ids:
+            before = len(future_stops)
+            future_stops = [
+                stop for stop in future_stops
+                if str(stop.get("order_id", "") or "") not in replace_ids
+            ]
+            removed = before - len(future_stops)
+            if removed > 0:
+                logger.info(
+                    "[DispatchDecisionEngine] 增量后缀切换：卡车 %s 移除未来旧停靠 %d 个 orders=%s",
+                    truck.truck_id,
+                    removed,
+                    sorted(replace_ids),
+                )
 
         def _stop_key(stop_dict: dict) -> tuple:
-            node_type = stop_dict.get("node_type", "")
-            node_id = stop_dict.get("node_id", "")
-            return (node_type, node_id)
+            node_type = str(stop_dict.get("node_type", "") or "")
+            node_id = str(stop_dict.get("node_id", "") or "")
+            order_id = str(stop_dict.get("order_id", "") or "")
+            return (node_type, node_id, order_id)
 
         existing_future_keys = {_stop_key(s) for s in future_stops}
 
-        # 提取新路由中需要追加的事件性节点（customer / recovery / station）
+        # 提取新路由中需要追加的事件性节点（customer / recovery / station / depot）
         new_stops = []
         for node in new_route.nodes:
-            if node.node_type in ("customer", "recovery", "station"):
+            if node.node_type in ("customer", "recovery", "station", "depot"):
                 key = _stop_key(
                     {
                         "node_type": node.node_type,
@@ -615,16 +740,11 @@ class DispatchDecisionEngine:
             # 即便无新增停靠，也需要应用本批次后缀更新（例如 recovery 等待时长更新）。
             # 只更新已有 future_stops 的时间，切勿截断其他未来停靠点。
             refreshed_future = [dict(stop) for stop in future_stops]
-            for node in new_route.nodes:
-                if node.node_type in ("customer", "recovery", "station"):
-                    node_key = _stop_key({"node_type": node.node_type, "node_id": node.node_id})
-                    for stop in refreshed_future:
-                        if _stop_key(stop) == node_key:
-                            # 累加等待时间或取最大值，保持原有业务逻辑（至少确保 departure_time 合理）
-                            stop["departure_time"] = max(
-                                float(stop.get("departure_time", 0)),
-                                float(node.departure_time)
-                            )
+            refreshed_future = self._retime_incremental_future_stops(
+                truck,
+                refreshed_future,
+                current_time,
+            )
             
             truck._planned_route_stops = existing_stops[:cursor] + refreshed_future
             # 重新构建物理路由，保证旧停靠点不丢失
@@ -648,6 +768,13 @@ class DispatchDecisionEngine:
                     e,
                 )
             self._sync_waiting_drone_launch_times_for_truck(truck, current_time)
+            self._log_incremental_truck_suffix(
+                truck,
+                truck._planned_route_stops[cursor:],
+                current_time,
+                cursor,
+                reason="无新增停靠刷新",
+            )
             logger.info(
                 "[DispatchDecisionEngine] 增量模式卡车 %s 无新增停靠，已刷新后缀时序",
                 truck.truck_id,
@@ -664,7 +791,7 @@ class DispatchDecisionEngine:
                 "order_id": node.order_id,
             }
             for node in new_route.nodes
-            if node.node_type in ("customer", "recovery", "station")
+            if node.node_type in ("customer", "recovery", "station", "depot")
         ]
 
         # 稳定增量：保留旧 future 的相对顺序，只插入新停靠，避免前批动态单被后批重排。
@@ -706,7 +833,9 @@ class DispatchDecisionEngine:
                         insert_at = nxt_idx
                         break
 
-            merged.insert(insert_at, dict(stop))
+            inserted_stop = dict(stop)
+            inserted_stop["_incremental_new_stop"] = True
+            merged.insert(insert_at, inserted_stop)
             inserted_via_anchor += 1
 
         logger.info(
@@ -717,28 +846,13 @@ class DispatchDecisionEngine:
         )
 
         # 重新按卡车当前位置进行后缀时序推演，避免“时刻表触发快于物理到达”。
-        retimed_future: list[dict] = []
-        cur_pos = truck.get_location(current_time)
-        cur_time = current_time
-        speed = max(1e-6, float(getattr(truck, "speed", 0.0)))
-        for stop in merged:
-            stop_pos = stop.get("position")
-            if stop_pos is None:
-                continue
-            travel_time = cur_pos.distance_2d(stop_pos) / speed
-            arrival = cur_time + travel_time
-            prev_arrival = float(stop.get("arrival_time", arrival))
-            prev_departure = float(stop.get("departure_time", prev_arrival))
-            service_time = max(0.0, prev_departure - prev_arrival)
-            departure = arrival + service_time
-
-            updated = dict(stop)
-            updated["arrival_time"] = arrival
-            updated["departure_time"] = departure
-            retimed_future.append(updated)
-
-            cur_pos = stop_pos
-            cur_time = departure
+        # 旧 recovery 的等待时长必须按运行时无人机状态重算：无人机已落站时，
+        # 不再继承旧计划中为了预计返航而留下的长等待窗口。
+        retimed_future = self._retime_incremental_future_stops(
+            truck,
+            merged,
+            current_time,
+        )
 
         rebuilt_route = None
         try:
@@ -754,6 +868,20 @@ class DispatchDecisionEngine:
                 e,
             )
 
+        if rebuilt_route is None or len(rebuilt_route.nodes) < 2:
+            rebuilt_route = self._build_direct_incremental_route_from_stops(
+                truck,
+                retimed_future,
+                current_time,
+            )
+            if rebuilt_route is not None:
+                logger.warning(
+                    "[DispatchDecisionEngine] 增量模式卡车 %s OSM 后缀失败，"
+                    "使用直连兜底写入 %d 个未来停靠",
+                    truck.truck_id,
+                    max(0, len(rebuilt_route.nodes) - 1),
+                )
+
         if rebuilt_route is not None and len(rebuilt_route.nodes) >= 2:
             rebuilt_stops = [
                 {
@@ -765,7 +893,7 @@ class DispatchDecisionEngine:
                     "order_id": n.order_id,
                 }
                 for n in rebuilt_route.nodes
-                if n.node_type in ("customer", "recovery", "station")
+                if n.node_type in ("customer", "recovery", "station", "depot")
             ]
             truck._planned_route_stops = existing_stops[:cursor] + rebuilt_stops
             try:
@@ -782,7 +910,7 @@ class DispatchDecisionEngine:
                     e,
                 )
         else:
-            # 兜底：若 OSM 后缀重建失败，保留旧计划避免不可达停靠阻塞后续事件游标。
+            # 最终兜底：没有任何可执行路线时才保留旧计划，避免写入无法移动的停靠。
             logger.warning(
                 "[DispatchDecisionEngine] 增量模式卡车 %s 后缀重建失败，保留旧计划（不写入新停靠）",
                 truck.truck_id,
@@ -790,12 +918,353 @@ class DispatchDecisionEngine:
             truck._planned_route_stops = existing_stops
 
         self._sync_waiting_drone_launch_times_for_truck(truck, current_time)
+        self._log_incremental_truck_suffix(
+            truck,
+            truck._planned_route_stops[cursor:],
+            current_time,
+            cursor,
+            reason="新增停靠合并",
+        )
 
         logger.info(
             "[DispatchDecisionEngine] 增量模式追加 %d 个停靠到卡车 %s "
             "(cursor=%d, 总计 %d 停靠)",
             len(new_stops), truck.truck_id, cursor, len(truck._planned_route_stops),
         )
+
+    def _retime_incremental_future_stops(
+        self,
+        truck,
+        ordered_stops: list[dict],
+        current_time: float,
+    ) -> list[dict]:
+        """从卡车当前位置重算增量后缀时序，并收缩已过期的 recovery 等待。"""
+        runtime_recovery_eta = self._collect_runtime_recovery_eta_by_stop(
+            truck.truck_id,
+            current_time,
+        )
+        live_launch_stations = self._collect_live_truck_launch_stations(truck.truck_id)
+
+        retimed_future: list[dict] = []
+        cur_pos = truck.get_location(current_time)
+        cur_time = current_time
+        speed = max(1e-6, float(getattr(truck, "speed", 0.0)))
+        for stop in ordered_stops:
+            stop_pos = stop.get("position")
+            if stop_pos is None:
+                continue
+
+            travel_time = cur_pos.distance_2d(stop_pos) / speed
+            arrival = cur_time + travel_time
+            prev_arrival = float(stop.get("arrival_time", arrival))
+            prev_departure = float(stop.get("departure_time", prev_arrival))
+            original_service_time = max(0.0, prev_departure - prev_arrival)
+            preserve_new_wait = bool(stop.get("_incremental_new_stop", False))
+            service_time = self._resolve_incremental_stop_service_time(
+                stop=stop,
+                arrival=arrival,
+                original_service_time=original_service_time,
+                runtime_recovery_eta=runtime_recovery_eta,
+                live_launch_stations=live_launch_stations,
+                preserve_new_wait=preserve_new_wait,
+            )
+            departure = arrival + service_time
+
+            updated = {
+                key: value
+                for key, value in stop.items()
+                if not str(key).startswith("_incremental_")
+            }
+            updated["arrival_time"] = arrival
+            updated["departure_time"] = departure
+            retimed_future.append(updated)
+
+            cur_pos = stop_pos
+            cur_time = departure
+
+        return retimed_future
+
+    def _resolve_incremental_stop_service_time(
+        self,
+        *,
+        stop: dict,
+        arrival: float,
+        original_service_time: float,
+        runtime_recovery_eta: dict[tuple[str, str], float],
+        live_launch_stations: set[str],
+        preserve_new_wait: bool,
+    ) -> float:
+        """计算增量后缀停靠服务时长；旧 recovery 不继承陈旧长等待。"""
+        node_type = str(stop.get("node_type", "") or "")
+        node_id = str(stop.get("node_id", "") or "")
+        if preserve_new_wait:
+            return max(
+                original_service_time,
+                self._resolve_truck_route_base_service_time(
+                    node_type=node_type,
+                    original_service_time=0.0,
+                ),
+            )
+
+        service_time = self._resolve_truck_route_base_service_time(
+            node_type=node_type,
+            original_service_time=original_service_time,
+        )
+        if node_type in {"station", "depot"} and node_id in live_launch_stations:
+            service_time = max(service_time, self.TRUCK_DRONE_LAUNCH_TIME)
+
+        if node_type != "recovery":
+            return service_time
+
+        order_id = str(stop.get("order_id", "") or "")
+        runtime_eta = runtime_recovery_eta.get((node_id, order_id))
+        if runtime_eta is None and not order_id:
+            station_etas = [
+                eta
+                for (station_id, _order_id), eta in runtime_recovery_eta.items()
+                if station_id == node_id
+            ]
+            runtime_eta = max(station_etas) if station_etas else None
+        if runtime_eta is None:
+            return service_time
+
+        needed_departure = max(
+            arrival + service_time,
+            runtime_eta + self.TRUCK_DRONE_RECOVER_TIME + self.RECOVERY_EVENT_GUARD_S,
+        )
+        return max(service_time, needed_departure - arrival)
+
+    def _collect_live_truck_launch_stations(self, truck_id: str) -> set[str]:
+        """读取当前实体状态，找出仍随该卡车运输、未来需要放飞的无人机起飞站。"""
+        stations: set[str] = set()
+        for drone in self.entity_mgr.drones.values():
+            if getattr(drone, "transport_truck_id", "") != truck_id:
+                continue
+            launch_station_id = str(getattr(drone, "launch_station_id", "") or "")
+            if launch_station_id:
+                stations.add(launch_station_id)
+        return stations
+
+    def _collect_runtime_recovery_eta_by_stop(
+        self,
+        truck_id: str,
+        current_time: float,
+    ) -> dict[tuple[str, str], float]:
+        """根据实时无人机状态估算各订单回收停靠仍需等待到的最晚无人机到站时刻。"""
+        runtime_recovery_eta: dict[tuple[str, str], float] = {}
+
+        def remember(station_id: str, order_id: str, eta: float) -> None:
+            if not station_id or not order_id:
+                return
+            if station_id not in self.entity_mgr.stations and station_id not in self.entity_mgr.depots:
+                return
+            key = (station_id, order_id)
+            runtime_recovery_eta[key] = max(
+                runtime_recovery_eta.get(key, 0.0),
+                eta,
+            )
+
+        def resolve_owner_truck_id(drone) -> str:
+            carrier_id = getattr(drone, "transport_truck_id", "")
+            if carrier_id in self.entity_mgr.trucks:
+                return carrier_id
+            for tid, candidate_truck in self.entity_mgr.trucks.items():
+                if drone.drone_id in getattr(candidate_truck, "docked_drones", []):
+                    return tid
+            if (
+                getattr(drone, "home_type", None) == SourceType.TRUCK
+                and getattr(drone, "home_id", "") in self.entity_mgr.trucks
+            ):
+                return getattr(drone, "home_id", "")
+            if len(self.entity_mgr.trucks) == 1:
+                return next(iter(self.entity_mgr.trucks.keys()))
+            return ""
+
+        def estimate_route_recovery_eta(drone, start_time: float, start_loc: Position3D) -> tuple[str, str, float] | None:
+            route_plan = getattr(drone, "route_plan", None) or []
+            start_idx = int(getattr(drone, "current_waypoint_index", 0) or 0)
+            if start_idx >= len(route_plan):
+                return None
+
+            order_id = self._resolve_drone_runtime_order_id(drone)
+            if not order_id:
+                return None
+
+            cur = start_loc
+            remaining_dist = 0.0
+            extra_service = 0.0
+            dock_station_id = ""
+            for wp in route_plan[start_idx:]:
+                remaining_dist += cur.distance_3d(wp.loc)
+                cur = wp.loc
+                if wp.action == WaypointAction.DELIVER:
+                    extra_service += float(getattr(self.entity_mgr, "DRONE_SERVICE_TIME_ORDER", 0.0))
+                if wp.action in (WaypointAction.DOCK_DEPOT, WaypointAction.DOCK_TRUCK):
+                    target_id = wp.target_entity_id or ""
+                    if target_id in self.entity_mgr.stations or target_id in self.entity_mgr.depots:
+                        dock_station_id = target_id
+                    break
+
+            if not dock_station_id:
+                return None
+
+            cruise_speed = max(1e-6, float(getattr(drone, "cruise_speed", 0.0)))
+            eta = start_time + remaining_dist / cruise_speed + extra_service
+            return dock_station_id, order_id, eta
+
+        for drone in self.entity_mgr.drones.values():
+            if resolve_owner_truck_id(drone) != truck_id:
+                continue
+
+            waiting_station_id = str(getattr(drone, "waiting_recovery_station_id", "") or "")
+            if waiting_station_id:
+                order_id = self._resolve_drone_runtime_order_id(drone)
+                remember(waiting_station_id, order_id, current_time)
+                continue
+
+            transport_truck_id = getattr(drone, "transport_truck_id", "")
+            launch_station_id = str(getattr(drone, "launch_station_id", "") or "")
+            scheduled_launch_time = float(getattr(drone, "scheduled_launch_time", 0.0) or 0.0)
+            if (
+                transport_truck_id == truck_id
+                and launch_station_id
+                and math.isfinite(scheduled_launch_time)
+                and scheduled_launch_time >= current_time - 1e-6
+            ):
+                if launch_station_id in self.entity_mgr.stations:
+                    start_loc = self.entity_mgr.stations[launch_station_id].location
+                elif launch_station_id in self.entity_mgr.depots:
+                    start_loc = self.entity_mgr.depots[launch_station_id].location
+                else:
+                    start_loc = drone.current_loc
+                estimated = estimate_route_recovery_eta(
+                    drone,
+                    max(current_time, scheduled_launch_time),
+                    start_loc,
+                )
+                if estimated is not None:
+                    remember(*estimated)
+                continue
+
+            if not getattr(drone.status, "is_flying", False):
+                continue
+
+            estimated = estimate_route_recovery_eta(drone, current_time, drone.current_loc)
+            if estimated is not None:
+                remember(*estimated)
+
+        return runtime_recovery_eta
+
+    def _log_incremental_truck_suffix(
+        self,
+        truck,
+        future_stops: list[dict],
+        current_time: float,
+        cursor: int,
+        reason: str,
+    ) -> None:
+        """打印增量合并后的卡车未来后缀时序，用于定位异常长等待。"""
+        status = getattr(getattr(truck, "status", None), "value", getattr(truck, "status", ""))
+        loc = truck.get_location(current_time)
+        logger.info(
+            "[DispatchDecisionEngine] 增量模式卡车 %s 后缀时序：reason=%s current=%.1fs "
+            "cursor=%d total=%d status=%s loc=(%.2f, %.2f)",
+            truck.truck_id,
+            reason,
+            current_time,
+            cursor,
+            len(getattr(truck, "_planned_route_stops", []) or []),
+            status,
+            loc.x,
+            loc.y,
+        )
+
+        if not future_stops:
+            logger.info(
+                "[DispatchDecisionEngine] 增量模式卡车 %s 后缀时序为空",
+                truck.truck_id,
+            )
+            return
+
+        for idx, stop in enumerate(future_stops, start=cursor + 1):
+            arrival = float(stop.get("arrival_time", 0.0) or 0.0)
+            departure = float(stop.get("departure_time", arrival) or arrival)
+            node_id = stop.get("node_id", "")
+            node_type = stop.get("node_type", "")
+            order_id = stop.get("order_id", "") or "-"
+            logger.info(
+                "  [%d] %s (%s) - 到达: %.1fs, 离开: %.1fs, 停留: %.1fs | order=%s",
+                idx,
+                node_id,
+                node_type,
+                arrival,
+                departure,
+                max(0.0, departure - arrival),
+                order_id,
+            )
+
+    def _build_direct_incremental_route_from_stops(
+        self,
+        truck,
+        ordered_stops: list[dict],
+        current_time: float,
+    ) -> TruckRoute | None:
+        """Build a physically executable straight-line suffix if OSM rebuild fails."""
+        if not ordered_stops:
+            return None
+
+        start_pos = truck.get_location(current_time)
+        route = TruckRoute(truck_id=truck.truck_id)
+        route.nodes.append(
+            TruckRouteNode(
+                node_id=f"{truck.truck_id}_origin",
+                node_type="origin",
+                position=start_pos,
+                arrival_time=current_time,
+                departure_time=current_time,
+            )
+        )
+        route.geometry.append(start_pos)
+
+        cur_pos = start_pos
+        cur_time = current_time
+        total_dist = 0.0
+        speed = max(1e-6, float(getattr(truck, "speed", 0.0)))
+        for stop in ordered_stops:
+            stop_pos = stop.get("position")
+            node_id = str(stop.get("node_id", "") or "")
+            node_type = str(stop.get("node_type", "") or "")
+            if stop_pos is None or not node_id or not node_type:
+                continue
+
+            dist = cur_pos.distance_2d(stop_pos)
+            arrival = cur_time + dist / speed
+            prev_arrival = float(stop.get("arrival_time", arrival))
+            prev_departure = float(stop.get("departure_time", prev_arrival))
+            service_time = max(0.0, prev_departure - prev_arrival)
+            departure = arrival + service_time
+
+            route.nodes.append(
+                TruckRouteNode(
+                    node_id=node_id,
+                    node_type=node_type,
+                    position=stop_pos,
+                    arrival_time=arrival,
+                    departure_time=departure,
+                    order_id=str(stop.get("order_id", "") or ""),
+                )
+            )
+            if node_type == "station":
+                route.charging_stop_ids.append(node_id)
+            route.geometry.append(stop_pos)
+            total_dist += dist
+            cur_pos = stop_pos
+            cur_time = departure
+
+        route.total_distance = total_dist
+        if len(route.nodes) < 2:
+            return None
+        return route
 
     def _sync_waiting_drone_launch_times_for_truck(self, truck, current_time: float) -> None:
         """将车上等待起飞无人机的 launch_time 对齐到卡车当前时刻表。"""
@@ -804,6 +1273,7 @@ class DispatchDecisionEngine:
             return
 
         arrivals_by_node: dict[str, list[float]] = {}
+        arrivals_by_node_order: dict[tuple[str, str], list[float]] = {}
         for stop in planned_stops:
             node_id = stop.get("node_id")
             if not node_id:
@@ -811,21 +1281,32 @@ class DispatchDecisionEngine:
             arr = float(stop.get("arrival_time", float("inf")))
             if not math.isfinite(arr):
                 continue
-            arrivals_by_node.setdefault(node_id, []).append(arr)
+            node_key = str(node_id)
+            arrivals_by_node.setdefault(node_key, []).append(arr)
+            order_id = str(stop.get("order_id", "") or "")
+            if order_id:
+                arrivals_by_node_order.setdefault((node_key, order_id), []).append(arr)
 
         for node_id in arrivals_by_node:
             arrivals_by_node[node_id].sort()
+        for node_order_key in arrivals_by_node_order:
+            arrivals_by_node_order[node_order_key].sort()
 
         updated = 0
         for drone in self.entity_mgr.drones.values():
             if getattr(drone, "transport_truck_id", "") != truck.truck_id:
                 continue
 
-            launch_station_id = getattr(drone, "launch_station_id", "")
+            launch_station_id = str(getattr(drone, "launch_station_id", "") or "")
             if not launch_station_id:
                 continue
 
-            station_arrivals = arrivals_by_node.get(launch_station_id, [])
+            order_id = self._resolve_drone_runtime_order_id(drone)
+            station_arrivals = []
+            if order_id:
+                station_arrivals = arrivals_by_node_order.get((launch_station_id, order_id), [])
+            if not station_arrivals:
+                station_arrivals = arrivals_by_node.get(launch_station_id, [])
             future_arrivals = [
                 t for t in station_arrivals
                 if t >= current_time - 1e-6
@@ -840,10 +1321,11 @@ class DispatchDecisionEngine:
                     ]
                     logger.warning(
                         "[DispatchDecisionEngine] 卡车 %s 未找到等待无人机 %s 的起飞站 %s；"
-                        "未来停靠=%s",
+                        "order=%s 未来停靠=%s",
                         truck.truck_id,
                         drone.drone_id,
                         launch_station_id,
+                        order_id or "-",
                         future_node_ids[:12],
                     )
                     drone._last_missing_launch_station_log_time = current_time
@@ -867,6 +1349,27 @@ class DispatchDecisionEngine:
                 truck.truck_id,
                 updated,
             )
+
+    def _resolve_drone_runtime_order_id(self, drone) -> str:
+        """从运行时字段和航路实际动作中解析无人机当前/下一段订单。"""
+        for attr_name in ("carrying_order_id", "pending_release_order_id"):
+            order_id = str(getattr(drone, attr_name, "") or "")
+            if order_id:
+                return order_id
+
+        route_plan = getattr(drone, "route_plan", None) or []
+        start_idx = int(getattr(drone, "current_waypoint_index", 0) or 0)
+        for wp in route_plan[start_idx:]:
+            if wp.action in (WaypointAction.PICKUP, WaypointAction.DELIVER):
+                order_id = str(wp.target_entity_id or "")
+                if order_id:
+                    return order_id
+        for wp in reversed(route_plan[:start_idx]):
+            if wp.action in (WaypointAction.PICKUP, WaypointAction.DELIVER):
+                order_id = str(wp.target_entity_id or "")
+                if order_id:
+                    return order_id
+        return ""
 
     def _plan_drone_leg(
         self,
@@ -1045,7 +1548,10 @@ class DispatchDecisionEngine:
                 continue
 
             waiting_station_id = getattr(drone, "waiting_recovery_station_id", "")
-            if waiting_station_id and waiting_station_id in self.entity_mgr.stations:
+            if waiting_station_id and (
+                waiting_station_id in self.entity_mgr.stations
+                or waiting_station_id in self.entity_mgr.depots
+            ):
                 eta = current_time
                 runtime_recovery_eta[waiting_station_id] = max(
                     runtime_recovery_eta.get(waiting_station_id, 0.0),
@@ -1060,7 +1566,10 @@ class DispatchDecisionEngine:
             if (
                 transport_truck_id == route.truck_id
                 and launch_station_id
-                and launch_station_id in self.entity_mgr.stations
+                and (
+                    launch_station_id in self.entity_mgr.stations
+                    or launch_station_id in self.entity_mgr.depots
+                )
                 and math.isfinite(scheduled_launch_time)
                 and scheduled_launch_time >= current_time - 1e-6
             ):
@@ -1068,8 +1577,10 @@ class DispatchDecisionEngine:
                 start_idx = int(getattr(drone, "current_waypoint_index", 0) or 0)
                 if 0 <= start_idx < len(route_plan):
                     cur = route_plan[start_idx].loc
-                else:
+                elif launch_station_id in self.entity_mgr.stations:
                     cur = self.entity_mgr.stations[launch_station_id].location
+                else:
+                    cur = self.entity_mgr.depots[launch_station_id].location
 
                 remaining_dist = 0.0
                 extra_service = 0.0
@@ -1081,7 +1592,7 @@ class DispatchDecisionEngine:
                         extra_service += float(getattr(self.entity_mgr, "DRONE_SERVICE_TIME_ORDER", 0.0))
                     if wp.action in (WaypointAction.DOCK_DEPOT, WaypointAction.DOCK_TRUCK):
                         target_id = wp.target_entity_id or ""
-                        if target_id in self.entity_mgr.stations:
+                        if target_id in self.entity_mgr.stations or target_id in self.entity_mgr.depots:
                             dock_station_id = target_id
                         break
 
@@ -1113,7 +1624,7 @@ class DispatchDecisionEngine:
                     extra_service += float(getattr(self.entity_mgr, "DRONE_SERVICE_TIME_ORDER", 0.0))
                 if wp.action in (WaypointAction.DOCK_DEPOT, WaypointAction.DOCK_TRUCK):
                     target_id = wp.target_entity_id or ""
-                    if target_id in self.entity_mgr.stations:
+                    if target_id in self.entity_mgr.stations or target_id in self.entity_mgr.depots:
                         dock_station_id = target_id
                     break
 
@@ -1167,8 +1678,8 @@ class DispatchDecisionEngine:
 
             observed_arrivals.setdefault(node.node_id, []).append(arrival)
 
+            launch_ops = allocs_by_launch.get(node.node_id, [])
             if node.node_type == "recovery":
-                launch_ops = allocs_by_launch.get(node.node_id, [])
                 recovery_ops = allocs_by_recovery.get(node.node_id, [])
                 runtime_eta = runtime_recovery_eta.get(node.node_id)
                 service_time = base_services[i]
@@ -1196,6 +1707,8 @@ class DispatchDecisionEngine:
                     service_time = max(service_time, op_hold)
             else:
                 service_time = base_services[i]
+                if node.node_type in {"station", "depot"} and launch_ops:
+                    service_time = max(service_time, self.TRUCK_DRONE_LAUNCH_TIME)
 
             departure = arrival + service_time
             node.arrival_time = arrival
@@ -1210,8 +1723,10 @@ class DispatchDecisionEngine:
         base_service_time = max(0.0, float(original_service_time))
         if node_type == "customer":
             return max(base_service_time, self.TRUCK_SERVICE_TIME_ORDER)
-        if node_type in {"station", "recovery"}:
-            return max(base_service_time, self.TRUCK_STATION_HOLD_TIME)
+        if node_type == "recovery":
+            return max(self.TRUCK_STATION_HOLD_TIME, self.TRUCK_DRONE_RECOVER_TIME)
+        if node_type in {"station", "depot"}:
+            return self.TRUCK_STATION_HOLD_TIME
         return base_service_time
 
     def _log_detailed_route(self, route: "TruckRoute", allocations: list["AllocationResult"]) -> None:
@@ -1273,6 +1788,17 @@ class DispatchDecisionEngine:
 
         增量安全：跳过正在飞行中的无人机，避免覆盖其当前路径和位置。
         """
+        if self.solver_name == "ga_mmce":
+            from solver.ga_mmce.runtime_adapter import apply_ga_mmce_runtime_plan
+
+            apply_ga_mmce_runtime_plan(
+                entity_mgr=self.entity_mgr,
+                order_mgr=self.order_mgr,
+                plan=plan,
+                current_time=current_time,
+            )
+            return
+
         for alloc in plan.allocations:
             if not alloc.feasible or alloc.mode == "A" or not alloc.drone_id:
                 continue
@@ -1491,6 +2017,16 @@ class DispatchDecisionEngine:
 
         将分配中的无人机路由转换为DroneRoute对象，包含完整的飞行路径坐标序列。
         """
+        if self.solver_name == "ga_mmce":
+            from solver.ga_mmce.runtime_adapter import build_ga_mmce_drone_routes
+
+            build_ga_mmce_drone_routes(
+                entity_mgr=self.entity_mgr,
+                order_mgr=self.order_mgr,
+                plan=plan,
+            )
+            return
+
         from solver.greedy_mmce import DroneRoute
 
         for alloc in plan.allocations:
