@@ -618,7 +618,7 @@ class TestTrainingEnvAdapterPhase5c(unittest.TestCase):
         self.assertIsNotNone(reservation)
         self.assertFalse(hasattr(reservation, "expires_at"))
 
-    def test_rendezvous_wait_timeout_switches_to_fallback_after_arrival(self) -> None:
+    def test_revalidation_rejects_locked_node_beyond_max_wait(self) -> None:
         env, drone_id = self._reset_controlled_env()
         entity_mgr = env._require_entity_manager()
         drone = entity_mgr.drones[drone_id]
@@ -652,37 +652,14 @@ class TestTrainingEnvAdapterPhase5c(unittest.TestCase):
         deliver_leg = env._flight_legs[drone_id]
         env._advance_to_event(deliver_leg.arrival_time)
         service_finish_time = env._delivery_service_legs[drone_id].finish_time
-        env._advance_to_event(service_finish_time)
+        reward = env._advance_to_event(service_finish_time)
 
-        rendezvous_leg = env._flight_legs[drone_id]
-        env._advance_to_event(rendezvous_leg.arrival_time)
-
-        coarse_plan = env._build_coarse_plan_view(env._t_now)
-        t_arrive_truck = coarse_plan.truck_eta_map[recover_node_id]
-        self.assertGreater(
-            t_arrive_truck - rendezvous_leg.arrival_time,
-            env._cfg.rendezvous_max_wait_sec,
-        )
-        timeout_probe_t = (
-            rendezvous_leg.arrival_time
-            + env._cfg.rendezvous_max_wait_sec
-            + 1.0
-        )
-        reward = env._advance_to_event(timeout_probe_t)
-        expected_wait_penalty = -env._cfg.lambda_wait * (
-            timeout_probe_t - rendezvous_leg.arrival_time
-        )
-
-        self.assertAlmostEqual(
-            reward,
-            expected_wait_penalty - env._cfg.lambda_res_timeout * 1.0,
-            places=6,
-        )
+        self.assertEqual(reward, 0.0)
         self.assertEqual(env._drone_state[drone_id], TrainingDroneState.FALLBACK_RECOVERY)
         self.assertNotIn(drone_id, env._reservations)
         self.assertEqual(env._flight_legs[drone_id].kind, "fallback_recovery")
 
-    def test_return_to_rendezvous_does_not_timeout_until_arrival(self) -> None:
+    def test_revalidation_failure_reselects_available_post_delivery_node(self) -> None:
         env, drone_id = self._reset_controlled_env()
         entity_mgr = env._require_entity_manager()
         drone = entity_mgr.drones[drone_id]
@@ -716,29 +693,31 @@ class TestTrainingEnvAdapterPhase5c(unittest.TestCase):
         deliver_leg = env._flight_legs[drone_id]
         env._advance_to_event(deliver_leg.arrival_time)
         service_finish_time = env._delivery_service_legs[drone_id].finish_time
-        env._advance_to_event(service_finish_time)
-
-        rendezvous_leg = env._flight_legs[drone_id]
-        missed_truck_arrival = rendezvous_leg.arrival_time - 1.0
+        missed_truck_arrival = service_finish_time - 1.0
         env._full_backbone_cache = [
             BackboneVisit(
                 node_id=recover_node_id,
                 arrival_time=missed_truck_arrival,
                 departure_time=missed_truck_arrival + 1e-6,
             ),
+            BackboneVisit(
+                node_id=env._require_depot().depot_id,
+                arrival_time=service_finish_time + 100.0,
+                departure_time=service_finish_time + 100.0 + 1e-6,
+            ),
         ]
 
-        env._advance_to_event(missed_truck_arrival + 0.5)
+        env._advance_to_event(service_finish_time)
         self.assertEqual(
             env._drone_state[drone_id],
             TrainingDroneState.RETURN_TO_RENDEZVOUS,
         )
+        self.assertEqual(
+            env._dispatch_commit[drone_id].selected_recover_node,
+            env._require_depot().depot_id,
+        )
         self.assertIn(drone_id, env._reservations)
-
-        env._advance_to_event(rendezvous_leg.arrival_time)
-        self.assertEqual(env._drone_state[drone_id], TrainingDroneState.FALLBACK_RECOVERY)
-        self.assertNotIn(drone_id, env._reservations)
-        self.assertEqual(env._flight_legs[drone_id].kind, "fallback_recovery")
+        self.assertEqual(env._flight_legs[drone_id].kind, "return_to_rendezvous")
 
     def test_hard_overdue_penalty_removes_pending_order(self) -> None:
         env, drone_id = self._reset_controlled_env()

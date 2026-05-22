@@ -59,6 +59,9 @@ class _CandidateConfig:
 @dataclass(frozen=True)
 class _ModeCSummary:
     candidate_count: int
+    best_node_id: str
+    best_truck_arrival_time: float
+    best_uav_arrival_time: float
     best_rendezvous_margin: float
     best_wait_time: float
     best_uav_flight_time: float
@@ -302,6 +305,11 @@ class CandidateBuilder:
                     "order_feature": order_feature,
                     "has_mode_b": mode_b_summary is not None,
                     "has_mode_c": mode_c_summary is not None,
+                    "mode_c_recover_node_id": (
+                        mode_c_summary.best_node_id
+                        if mode_c_summary is not None
+                        else None
+                    ),
                 }
             )
 
@@ -346,9 +354,16 @@ class CandidateBuilder:
                     mode=PolicyMode.B,
                 )
             if has_mode_c:
+                recover_node_id = item["mode_c_recover_node_id"]
+                if recover_node_id is None:
+                    raise RuntimeError(
+                        "mode C 候选缺少已解析的 best recover node: "
+                        f"order_id={item['order_id']}"
+                    )
                 dispatch_actions[(order_slot, _MODE_C_IDX)] = DispatchAction(
                     order_id=item["order_id"],
                     mode=PolicyMode.C,
+                    recover_node_id=str(recover_node_id),
                 )
 
         while len(order_features) < self._cfg.max_candidate_orders:
@@ -593,6 +608,9 @@ class CandidateBuilder:
                 str(node_id),
                 {
                     "node_type": str(node_state.node_type),
+                    "node_id": str(node_id),
+                    "truck_arrival_time": float(t_arrive_truck),
+                    "uav_arrival_time": float(t_arrive_uav),
                     "truck_eta_remaining": max(
                         0.0,
                         float(t_arrive_truck) - float(t_now),
@@ -618,6 +636,9 @@ class CandidateBuilder:
         )
         return _ModeCSummary(
             candidate_count=int(feasible_count),
+            best_node_id=str(best["node_id"]),
+            best_truck_arrival_time=float(best["truck_arrival_time"]),
+            best_uav_arrival_time=float(best["uav_arrival_time"]),
             best_rendezvous_margin=best_margin,
             best_wait_time=float(best["wait_time"]),
             best_uav_flight_time=float(best["uav_flight_time"]),
