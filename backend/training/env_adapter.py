@@ -356,6 +356,7 @@ class DecisionTrigger:
     drone_id: str
     trigger_type: str
     trigger_station_id: str | None = None
+    t_enqueued: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -514,6 +515,8 @@ class TrainingEnvAdapter:
         self._episode_dispatch_decision_count = 0
         self._episode_dispatch_decision_with_legal_mode_c_count = 0
         self._episode_feasible_mode_c_recover_node_count_total = 0
+        self._episode_mode_c_candidate_order_filter_counts: dict[str, int] = {}
+        self._episode_mode_c_candidate_node_filter_counts: dict[str, int] = {}
         self._episode_mode_c_success_count = 0
         self._episode_mode_c_post_delivery_revalidation_fail_count = 0
         self._episode_mode_c_post_delivery_revalidation_fail_reasons = {
@@ -653,6 +656,8 @@ class TrainingEnvAdapter:
         self._episode_dispatch_decision_count = 0
         self._episode_dispatch_decision_with_legal_mode_c_count = 0
         self._episode_feasible_mode_c_recover_node_count_total = 0
+        self._episode_mode_c_candidate_order_filter_counts = {}
+        self._episode_mode_c_candidate_node_filter_counts = {}
         self._episode_mode_c_success_count = 0
         self._episode_mode_c_post_delivery_revalidation_fail_count = 0
         self._episode_mode_c_post_delivery_revalidation_fail_reasons = {
@@ -855,6 +860,115 @@ class TrainingEnvAdapter:
         info["event"] = "apply_decision"
         return self._build_step_result(reward=applied.carried_reward, info=info)
 
+    def apply_decision_batch(
+        self,
+        actions_by_drone: Mapping[str, EnvAction],
+    ) -> EnvStepResult:
+        """提交当前同刻 decision batch，并在 batch 全部提交后统一推进。
+
+        该入口用于 teacher rollout / 同刻匹配执行。batch 内所有动作先基于同一份
+        decision snapshot 做全量校验，提交阶段不允许任何单个动作推进时间。
+        """
+        if self.is_done():
+            raise RuntimeError("episode 已结束，不能继续提交 batch 决策")
+
+        decision_batch = self.peek_current_decision_batch()
+        if not decision_batch:
+            raise RuntimeError("当前没有可执行的 decision batch")
+
+        batch_drone_ids = [str(ctx.deciding_drone_id) for ctx in decision_batch]
+        expected_drone_ids = set(batch_drone_ids)
+        actual_drone_ids = {str(drone_id) for drone_id in actions_by_drone}
+        if actual_drone_ids != expected_drone_ids:
+            raise ValueError(
+                "actions_by_drone 与当前 decision batch 不一致: "
+                f"expected={sorted(expected_drone_ids)}, actual={sorted(actual_drone_ids)}"
+            )
+
+        selected_orders: list[str] = []
+        normalized_actions: dict[str, EnvAction] = {}
+        for ctx in decision_batch:
+            drone_id = str(ctx.deciding_drone_id)
+            action = actions_by_drone[drone_id]
+            if not self._is_action_allowed(action, ctx.action_lookup):
+                raise ValueError(f"非法 batch action: drone_id={drone_id}, action={action}")
+            normalized_actions[drone_id] = action
+            if isinstance(action, DispatchAction):
+                selected_orders.append(str(action.order_id))
+
+        if len(selected_orders) != len(set(selected_orders)):
+            raise ValueError("batch 内同一个订单被多个 UAV 选择")
+
+        t0 = float(self._t_now)
+        applied_items: list[AppliedDecision] = []
+        for ctx in decision_batch:
+            if abs(float(self._t_now) - t0) > _TIME_EPS:
+                raise RuntimeError("batch 内单个动作提交时发生了时间推进")
+            if not self._decision_queue:
+                raise RuntimeError("decision_queue 在 batch 提交期间被提前清空")
+            queue_head = self._decision_queue[0]
+            if int(queue_head.decision_id) != int(ctx.decision_id):
+                raise RuntimeError(
+                    "decision_queue 顺序与预校验 batch 不一致: "
+                    f"expected={ctx.decision_id}, actual={queue_head.decision_id}"
+                )
+            applied = self._apply_decision_core(
+                normalized_actions[str(ctx.deciding_drone_id)],
+                prevalidated_decision=ctx,
+            )
+            applied_items.append(applied)
+            if abs(float(self._t_now) - t0) > _TIME_EPS:
+                raise RuntimeError("batch 内单个动作提交后发生了时间推进")
+
+        advance_reward_breakdown: dict[str, float] = {}
+        if not self._decision_queue and not self.is_done():
+            advance_reward_breakdown = (
+                self._advance_until_decision_or_done_collect_reward_breakdown()
+            )
+
+        per_drone_rewards: dict[str, float] = {}
+        per_drone_reward_breakdown: dict[str, dict[str, float]] = {}
+        total_reward = 0.0
+        total_carry_in = 0.0
+        total_post_action = 0.0
+        total_wait_opportunity = 0.0
+        for applied in applied_items:
+            drone_id = str(applied.drone_id)
+            post_action_reward = self._agent_cost_accum.pop(drone_id, 0.0)
+            reward = float(applied.carried_reward) + float(post_action_reward)
+            per_drone_rewards[drone_id] = reward
+            per_drone_reward_breakdown[drone_id] = {
+                "attributed_carry_in": float(applied.carried_reward),
+                "attributed_post_action": float(post_action_reward),
+                "attributed_total": reward,
+            }
+            if "wait_opportunity_penalty" in applied.info:
+                wait_opportunity = float(applied.info["wait_opportunity_penalty"])
+                per_drone_reward_breakdown[drone_id]["wait_opportunity"] = wait_opportunity
+                total_wait_opportunity += wait_opportunity
+            total_reward += reward
+            total_carry_in += float(applied.carried_reward)
+            total_post_action += float(post_action_reward)
+
+        reward_breakdown = dict(advance_reward_breakdown)
+        reward_breakdown["attributed_carry_in"] = total_carry_in
+        reward_breakdown["attributed_post_action"] = total_post_action
+        reward_breakdown["attributed_total"] = total_reward
+        if total_wait_opportunity:
+            reward_breakdown["wait_opportunity"] = total_wait_opportunity
+        self._last_reward_breakdown = reward_breakdown
+
+        return self._build_step_result(
+            reward=total_reward,
+            info={
+                "event": "apply_decision_batch",
+                "batch_size": len(applied_items),
+                "applied": [dict(item.info) for item in applied_items],
+                "per_drone_rewards": per_drone_rewards,
+                "per_drone_reward_breakdown": per_drone_reward_breakdown,
+            },
+        )
+
     def build_runtime_snapshot(self) -> dict[str, Any]:
         """构建与当前 `t_now` 对齐的运行时可视化快照。"""
         return self.build_visualization_snapshot()
@@ -898,6 +1012,37 @@ class TrainingEnvAdapter:
         if not self._decision_queue or self.is_done():
             return None
         return self._build_decision_context(self._decision_queue[0])
+
+    def peek_current_decision_batch(self) -> tuple[DecisionContext, ...]:
+        """返回当前队首同刻决策 batch 的上下文快照。
+
+        batch 边界由 `DecisionTrigger.t_enqueued` 定义，只取队首开始的同刻连续
+        前缀；构造出的所有 `DecisionContext` 共享同一份 runtime/coarse snapshot。
+        """
+        if not self._decision_queue or self.is_done():
+            return ()
+
+        batch_t = float(self._decision_queue[0].t_enqueued)
+        batch_triggers: list[DecisionTrigger] = []
+        for trigger in self._decision_queue:
+            if abs(float(trigger.t_enqueued) - batch_t) > _TIME_EPS:
+                break
+            batch_triggers.append(trigger)
+
+        runtime_state = self.build_runtime_state_view()
+        coarse_plan = self._refresh_coarse_plan_if_needed(runtime_state)
+        planner_snapshot = self._build_decision_planner_snapshot(runtime_state)
+        execution_snapshot = self._build_decision_execution_snapshot(runtime_state)
+        return tuple(
+            self._build_decision_context_from_snapshot(
+                trigger=trigger,
+                runtime_state=runtime_state,
+                coarse_plan=coarse_plan,
+                planner_snapshot=planner_snapshot,
+                execution_snapshot=execution_snapshot,
+            )
+            for trigger in batch_triggers
+        )
 
     def build_candidate_output(
         self,
@@ -1078,6 +1223,32 @@ class TrainingEnvAdapter:
             and float(order.actual_deliver_time) <= float(order.deadline) + _TIME_EPS
         )
         overdue_delivery_count = len(delivered_primary_orders) - on_time_delivery_count
+        pending_primary_order_count = sum(
+            1
+            for order in order_mgr.pending_orders.values()
+            if self._is_uav_primary_order(order)
+        )
+        assigned_primary_order_count = sum(
+            1
+            for order in order_mgr.assigned_orders.values()
+            if self._is_uav_primary_order(order)
+        )
+        required_primary_order_count = (
+            len(delivered_primary_orders)
+            + len(timed_out_primary_orders)
+            + pending_primary_order_count
+            + assigned_primary_order_count
+        )
+        completion_rate = (
+            float(len(delivered_primary_orders)) / float(required_primary_order_count)
+            if required_primary_order_count > 0
+            else 0.0
+        )
+        required_on_time_rate = (
+            float(on_time_delivery_count) / float(required_primary_order_count)
+            if required_primary_order_count > 0
+            else 0.0
+        )
         on_time_rate = (
             float(on_time_delivery_count) / float(len(delivered_primary_orders))
             if delivered_primary_orders
@@ -1090,6 +1261,9 @@ class TrainingEnvAdapter:
             "on_time_delivery_count": int(on_time_delivery_count),
             "overdue_delivery_count": int(overdue_delivery_count),
             "on_time_rate": float(on_time_rate),
+            "required_primary_order_count": int(required_primary_order_count),
+            "completion_rate": float(completion_rate),
+            "required_on_time_rate": float(required_on_time_rate),
             "timeout_order_count": int(len(timed_out_primary_orders)),
             "fallback_count": int(self._episode_fallback_count),
             "hard_failure_count": int(self._episode_hard_failure_count),
@@ -1147,6 +1321,12 @@ class TrainingEnvAdapter:
             "feasible_mode_c_recover_node_count_total": int(
                 self._episode_feasible_mode_c_recover_node_count_total
             ),
+            "mode_c_candidate_order_filter_counts": dict(
+                self._episode_mode_c_candidate_order_filter_counts
+            ),
+            "mode_c_candidate_node_filter_counts": dict(
+                self._episode_mode_c_candidate_node_filter_counts
+            ),
             "avg_feasible_mode_c_nodes_per_dispatch_decision": (
                 float(self._episode_feasible_mode_c_recover_node_count_total)
                 / float(self._episode_dispatch_decision_count)
@@ -1167,20 +1347,8 @@ class TrainingEnvAdapter:
             "t_reservation_timeout_cost_sec": float(
                 self._episode_reservation_timeout_cost_sec
             ),
-            "pending_primary_order_count": int(
-                sum(
-                    1
-                    for order in order_mgr.pending_orders.values()
-                    if self._is_uav_primary_order(order)
-                )
-            ),
-            "assigned_primary_order_count": int(
-                sum(
-                    1
-                    for order in order_mgr.assigned_orders.values()
-                    if self._is_uav_primary_order(order)
-                )
-            ),
+            "pending_primary_order_count": int(pending_primary_order_count),
+            "assigned_primary_order_count": int(assigned_primary_order_count),
             "system_context_stats": self.build_system_context_stats(),
         }
         metrics.update(self.build_runtime_energy_metrics())
@@ -2785,18 +2953,37 @@ class TrainingEnvAdapter:
         # idle 路径在 step(WAIT) 入口一次性结算；riding_with_truck 路径后续按真实 dt 累计。
         self._drone_state[drone_id] = TrainingDroneState.ACTIVE_WAIT
 
-    def _apply_decision_core(self, action: EnvAction) -> AppliedDecision:
+    def _apply_decision_core(
+        self,
+        action: EnvAction,
+        *,
+        prevalidated_decision: DecisionContext | None = None,
+    ) -> AppliedDecision:
         """消费当前队首决策并提交动作，不负责自动推进到下一决策点。"""
         if self.is_done():
             raise RuntimeError("episode 已结束，不能继续提交决策")
         if not self._decision_queue:
             raise RuntimeError("当前没有可执行的 decision context")
 
-        trigger = self._decision_queue.pop(0)
+        trigger = self._decision_queue[0]
         deciding_drone_id = trigger.drone_id
-        decision = self._build_decision_context(trigger)
+        if prevalidated_decision is None:
+            decision = self._build_decision_context(trigger)
+        else:
+            decision = prevalidated_decision
+            if int(decision.decision_id) != int(trigger.decision_id):
+                raise RuntimeError(
+                    "预校验 decision 与队首 trigger 不一致: "
+                    f"decision_id={decision.decision_id}, trigger_id={trigger.decision_id}"
+                )
+            if str(decision.deciding_drone_id) != str(trigger.drone_id):
+                raise RuntimeError(
+                    "预校验 decision 与队首 trigger 的 UAV 不一致: "
+                    f"decision_drone={decision.deciding_drone_id}, trigger_drone={trigger.drone_id}"
+                )
         if not self._is_action_allowed(action, decision.action_lookup):
             raise ValueError(f"非法动作: {action}")
+        trigger = self._decision_queue.pop(0)
 
         # 与原 step() 语义一致：当前 drone 在别人动作窗口内累计的自身成本，
         # 在它自己的下一次决策被取走。
@@ -2963,6 +3150,24 @@ class TrainingEnvAdapter:
         coarse_plan = self._refresh_coarse_plan_if_needed(runtime_state)
         planner_snapshot = self._build_decision_planner_snapshot(runtime_state)
         execution_snapshot = self._build_decision_execution_snapshot(runtime_state)
+        return self._build_decision_context_from_snapshot(
+            trigger=trigger,
+            runtime_state=runtime_state,
+            coarse_plan=coarse_plan,
+            planner_snapshot=planner_snapshot,
+            execution_snapshot=execution_snapshot,
+        )
+
+    def _build_decision_context_from_snapshot(
+        self,
+        *,
+        trigger: DecisionTrigger,
+        runtime_state: RuntimeStateView,
+        coarse_plan: CoarsePlanView,
+        planner_snapshot: DecisionPlannerSnapshot,
+        execution_snapshot: DecisionExecutionSnapshot,
+    ) -> DecisionContext:
+        """基于共享 snapshot 构造单个 trigger 的决策上下文。"""
         action_lookup = self._build_action_lookup(
             drone_id=trigger.drone_id,
             coarse_plan=coarse_plan,
@@ -3022,9 +3227,28 @@ class TrainingEnvAdapter:
             return
         self._last_exposed_decision_id = trigger.decision_id
 
+        candidate_out = self._candidate_builder.build_from_decision_context(
+            decision_context,
+            last_seen_plan_version=int(decision_context.coarse_plan.plan_version),
+        )
+        rebuilt_action_lookup = candidate_out.resolved_action_lookup.as_action_lookup()
+        if rebuilt_action_lookup != decision_context.action_lookup:
+            raise RuntimeError(
+                "记录 decision diagnostics 时 CandidateOutput 与 DecisionContext 不一致"
+            )
+        diagnostics = dict(candidate_out.diagnostics)
+        _merge_int_counts(
+            self._episode_mode_c_candidate_order_filter_counts,
+            dict(diagnostics.get("mode_c_order_filter_counts", {})),
+        )
+        _merge_int_counts(
+            self._episode_mode_c_candidate_node_filter_counts,
+            dict(diagnostics.get("mode_c_node_filter_counts", {})),
+        )
+
         dispatch_actions = [
             action
-            for action in decision_context.action_lookup
+            for action in rebuilt_action_lookup
             if isinstance(action, DispatchAction)
         ]
         if not dispatch_actions:
@@ -3059,6 +3283,11 @@ class TrainingEnvAdapter:
 
     def _advance_until_decision_or_done(self) -> None:
         """持续推进事件，直到出现新的决策点或 episode 结束。"""
+        self._advance_until_decision_or_done_collect_reward_breakdown()
+
+    def _advance_until_decision_or_done_collect_reward_breakdown(self) -> dict[str, float]:
+        """持续推进到下一决策点，并返回推进期间聚合的 reward breakdown。"""
+        reward_breakdown: dict[str, float] = {}
         while not self.is_done() and not self._decision_queue:
             next_time = self._next_event_time()
             if math.isinf(next_time):
@@ -3066,6 +3295,8 @@ class TrainingEnvAdapter:
             if next_time <= self._t_now + _TIME_EPS:
                 next_time = min(self._cfg.upper_horizon_sec, self._t_now + 1.0)
             self._advance_to_event(next_time)
+            _merge_reward_breakdown(reward_breakdown, self._last_reward_breakdown)
+        return reward_breakdown
 
     def _advance_to_event(
         self,
@@ -5102,6 +5333,7 @@ class TrainingEnvAdapter:
                 drone_id=drone_id,
                 trigger_type=trigger_type,
                 trigger_station_id=trigger_station_id,
+                t_enqueued=float(self._t_now),
             )
         )
         self._next_decision_id += 1
@@ -6081,3 +6313,9 @@ def _merge_reward_breakdown(target: dict[str, float], source: Mapping[str, float
     """把一段 reward breakdown 累加合并到目标字典。"""
     for key, value in source.items():
         target[key] = target.get(key, 0.0) + float(value)
+
+
+def _merge_int_counts(target: dict[str, int], source: Mapping[str, Any]) -> None:
+    """把结构化诊断计数字典累加到 episode 级别。"""
+    for key, value in source.items():
+        target[str(key)] = int(target.get(str(key), 0)) + int(value)

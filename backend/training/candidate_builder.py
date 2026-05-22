@@ -118,15 +118,52 @@ class CandidateBuilder:
             trigger_type=trigger_type,
         )
 
+        mode_c_order_filter_counts = _new_counter(
+            (
+                "authorized_orders",
+                "pending_missing",
+                "policy_mode_missing",
+                "policy_c_allowed",
+                "payload_over_uav_capacity",
+                "delivery_energy_insufficient",
+                "delivery_feasible_orders",
+                "no_recovery_pool",
+                "no_feasible_recovery_node",
+                "feasible_mode_c_order_pre_trunc",
+                "feasible_mode_c_order_post_trunc",
+                "feasible_mode_c_order_truncated",
+                "actionable_order_pre_trunc",
+                "actionable_order_post_trunc",
+            )
+        )
+        mode_c_node_filter_counts = _new_counter(
+            (
+                "recovery_node_considered",
+                "node_missing",
+                "truck_eta_missing",
+                "truck_before_delivery_finish",
+                "truck_too_early",
+                "truck_too_late",
+                "energy_to_recover_insufficient",
+                "feasible",
+            )
+        )
+
         actionable_orders: list[dict[str, Any]] = []
         for order_id in coarse_plan.authorized_orders:
+            mode_c_order_filter_counts["authorized_orders"] += 1
             order = runtime_state.pending_orders.get(order_id)
             if order is None:
+                mode_c_order_filter_counts["pending_missing"] += 1
                 continue
             allowed_policy_modes = coarse_plan.get_policy_modes(order_id)
             if not allowed_policy_modes:
+                mode_c_order_filter_counts["policy_mode_missing"] += 1
                 continue
+            if PolicyMode.C in allowed_policy_modes:
+                mode_c_order_filter_counts["policy_c_allowed"] += 1
             if float(order.payload_weight) > float(drone_view.payload_capacity):
+                mode_c_order_filter_counts["payload_over_uav_capacity"] += 1
                 continue
 
             delivery_leg = self._estimate_uav_leg(
@@ -141,7 +178,9 @@ class CandidateBuilder:
             )
             energy_to_deliver = delivery_leg.energy_j
             if energy_to_deliver > float(drone_view.battery_current) + _TIME_EPS:
+                mode_c_order_filter_counts["delivery_energy_insufficient"] += 1
                 continue
+            mode_c_order_filter_counts["delivery_feasible_orders"] += 1
 
             energy_after_delivery = float(drone_view.battery_current) - energy_to_deliver
             mode_b_summary = None
@@ -167,10 +206,24 @@ class CandidateBuilder:
                     trigger_type=trigger_type,
                     trigger_station_id=trigger_station_id,
                     t_now=float(runtime_state.t_now),
+                    mode_c_node_filter_counts=mode_c_node_filter_counts,
                 )
+                if mode_c_summary is None:
+                    if _recovery_pool_for_context(
+                        coarse_plan=coarse_plan,
+                        order_id=order.order_id,
+                        trigger_type=trigger_type,
+                        trigger_station_id=trigger_station_id,
+                    ):
+                        mode_c_order_filter_counts["no_feasible_recovery_node"] += 1
+                    else:
+                        mode_c_order_filter_counts["no_recovery_pool"] += 1
 
             if mode_b_summary is None and mode_c_summary is None:
                 continue
+            mode_c_order_filter_counts["actionable_order_pre_trunc"] += 1
+            if mode_c_summary is not None:
+                mode_c_order_filter_counts["feasible_mode_c_order_pre_trunc"] += 1
 
             order_feature = OrderFeatures(
                 order_id=order_id,
@@ -186,6 +239,11 @@ class CandidateBuilder:
                 has_mode_b_action=mode_b_summary is not None,
                 best_mode_b_return_score=(
                     float(mode_b_summary["score"]) if mode_b_summary is not None else 0.0
+                ),
+                best_mode_b_recovery_flight_time=(
+                    float(mode_b_summary["recovery_flight_time"])
+                    if mode_b_summary is not None
+                    else 0.0
                 ),
                 best_mode_b_host_type=(
                     str(mode_b_summary["host_type"]) if mode_b_summary is not None else ""
@@ -247,6 +305,9 @@ class CandidateBuilder:
                 }
             )
 
+        pre_trunc_mode_c_order_count = sum(
+            1 for item in actionable_orders if bool(item["has_mode_c"])
+        )
         actionable_orders.sort(
             key=lambda item: (
                 item["order_feature"].order_pre_score,
@@ -255,6 +316,17 @@ class CandidateBuilder:
             )
         )
         actionable_orders = actionable_orders[: self._cfg.max_candidate_orders]
+        post_trunc_mode_c_order_count = sum(
+            1 for item in actionable_orders if bool(item["has_mode_c"])
+        )
+        mode_c_order_filter_counts["actionable_order_post_trunc"] += len(actionable_orders)
+        mode_c_order_filter_counts["feasible_mode_c_order_post_trunc"] += (
+            post_trunc_mode_c_order_count
+        )
+        mode_c_order_filter_counts["feasible_mode_c_order_truncated"] += max(
+            0,
+            int(pre_trunc_mode_c_order_count) - int(post_trunc_mode_c_order_count),
+        )
 
         order_features: list[OrderFeatures] = []
         order_mask: list[bool] = []
@@ -316,6 +388,10 @@ class CandidateBuilder:
                 wait_action=WAIT_ACTION,
                 dispatch_actions=dispatch_actions,
             ),
+            diagnostics={
+                "mode_c_order_filter_counts": dict(mode_c_order_filter_counts),
+                "mode_c_node_filter_counts": dict(mode_c_node_filter_counts),
+            },
         )
 
     def build_from_decision_context(
@@ -450,6 +526,7 @@ class CandidateBuilder:
         trigger_type: str,
         trigger_station_id: str | None,
         t_now: float,
+        mode_c_node_filter_counts: dict[str, int] | None = None,
     ) -> _ModeCSummary | None:
         if _is_riding_with_truck_trigger(trigger_type) and trigger_station_id:
             recovery_pool = self._runtime_recovery_pool(
@@ -462,11 +539,19 @@ class CandidateBuilder:
         safe_margin = self._safe_margin_j_by_drone[drone_view.drone_id]
         battery_max = max(float(getattr(drone_view, "battery_max", 0.0)), _TIME_EPS)
         feasible_count = 0
-        best_item: tuple[float, float, str, dict[str, Any]] | None = None
+        best_item: tuple[float, float, float, str, dict[str, Any]] | None = None
         for node_id in recovery_pool:
+            _increment_counter(mode_c_node_filter_counts, "recovery_node_considered")
             node_state = runtime_state.node_states.get(node_id)
             t_arrive_truck = coarse_plan.truck_eta_map.get(node_id)
-            if node_state is None or t_arrive_truck is None:
+            if node_state is None:
+                _increment_counter(mode_c_node_filter_counts, "node_missing")
+                continue
+            if t_arrive_truck is None:
+                _increment_counter(mode_c_node_filter_counts, "truck_eta_missing")
+                continue
+            if float(t_arrive_truck) <= float(t_deliver_finish) + _TIME_EPS:
+                _increment_counter(mode_c_node_filter_counts, "truck_before_delivery_finish")
                 continue
 
             recover_leg = self._estimate_uav_leg(
@@ -483,22 +568,27 @@ class CandidateBuilder:
                 - float(safe_margin)
             )
             if energy_margin_j < -_TIME_EPS:
+                _increment_counter(mode_c_node_filter_counts, "energy_to_recover_insufficient")
                 continue
 
             t_arrive_uav = t_deliver_finish + uav_flight_time
             planned_wait = float(t_arrive_truck) - float(t_arrive_uav)
             if planned_wait < self._cfg.rendezvous_execution_margin_sec - _TIME_EPS:
+                _increment_counter(mode_c_node_filter_counts, "truck_too_early")
                 continue
             if planned_wait > self._cfg.rendezvous_max_wait_sec + _TIME_EPS:
+                _increment_counter(mode_c_node_filter_counts, "truck_too_late")
                 continue
 
-            score = float(planned_wait) + 0.25 * float(uav_flight_time)
+            recovery_time = float(t_arrive_truck)
             rendezvous_margin = float(
                 planned_wait - self._cfg.rendezvous_execution_margin_sec
             )
             feasible_count += 1
+            _increment_counter(mode_c_node_filter_counts, "feasible")
             item = (
-                score,
+                recovery_time,
+                float(planned_wait),
                 float(uav_flight_time),
                 str(node_id),
                 {
@@ -513,13 +603,13 @@ class CandidateBuilder:
                     "energy_margin_ratio": max(0.0, energy_margin_j / battery_max),
                 },
             )
-            if best_item is None or item[:3] < best_item[:3]:
+            if best_item is None or item[:4] < best_item[:4]:
                 best_item = item
 
         if best_item is None:
             return None
 
-        best = best_item[3]
+        best = best_item[4]
         best_margin = float(best["rendezvous_margin"])
         timeout_risk = 1.0 - min(
             1.0,
@@ -585,6 +675,7 @@ class CandidateBuilder:
                 )
                 return {
                     "score": float(t_deliver_finish + fly_time),
+                    "recovery_flight_time": float(fly_time),
                     "queue_time_est": 0.0,
                     "host_type": "depot",
                 }
@@ -592,7 +683,7 @@ class CandidateBuilder:
         if not depot_nodes:
             return None
         depot_node = depot_nodes[0]
-        scored_hosts: list[tuple[float, float, float, str, str]] = []
+        scored_hosts: list[tuple[float, float, float, str, str, float]] = []
         for node_state in runtime_state.node_states.values():
             if str(node_state.node_type) != "station":
                 continue
@@ -634,6 +725,7 @@ class CandidateBuilder:
                 + service_time
                 + depot_fly_time
             )
+            recovery_flight_time = float(fly_time) + float(depot_fly_time)
             scored_hosts.append(
                 (
                     self._path_distance(
@@ -644,16 +736,18 @@ class CandidateBuilder:
                     queue_time_est,
                     str(node_state.node_id),
                     str(node_state.node_type),
+                    recovery_flight_time,
                 )
             )
 
         if not scored_hosts:
             return None
 
-        scored_hosts.sort(key=lambda item: item[:-1])
-        _distance, score, queue_time_est, _node_id, host_type = scored_hosts[0]
+        scored_hosts.sort(key=lambda item: (item[0], item[1], item[2], item[3]))
+        _distance, score, queue_time_est, _node_id, host_type, recovery_flight_time = scored_hosts[0]
         return {
             "score": float(score),
+            "recovery_flight_time": float(recovery_flight_time),
             "queue_time_est": float(queue_time_est),
             "host_type": host_type,
         }
@@ -741,6 +835,35 @@ def _predicted_queue_time_est(node_state: Any) -> float:
     return (int(node_state.queue_length) + 1) * float(node_state.swap_time)
 
 
+def _new_counter(keys: tuple[str, ...]) -> dict[str, int]:
+    return {key: 0 for key in keys}
+
+
+def _increment_counter(counter: dict[str, int] | None, key: str, amount: int = 1) -> None:
+    if counter is None:
+        return
+    counter[key] = int(counter.get(key, 0)) + int(amount)
+
+
+def _recovery_pool_for_context(
+    *,
+    coarse_plan: CoarsePlanView,
+    order_id: str,
+    trigger_type: str,
+    trigger_station_id: str | None,
+) -> tuple[str, ...]:
+    if _is_riding_with_truck_trigger(trigger_type) and trigger_station_id:
+        if trigger_station_id not in coarse_plan.route_drift_ref:
+            return coarse_plan.truck_backbone_route
+        trigger_idx = coarse_plan.get_route_position(trigger_station_id)
+        return tuple(
+            node_id
+            for node_id in coarse_plan.truck_backbone_route
+            if coarse_plan.get_route_position(node_id) >= trigger_idx
+        )
+    return coarse_plan.get_recovery_candidates(str(order_id))
+
+
 def _exact_mode_c_score(
     *,
     rendezvous_margin: float,
@@ -791,6 +914,7 @@ def _padding_order_feature() -> OrderFeatures:
         priority_band=0,
         has_mode_b_action=False,
         best_mode_b_return_score=0.0,
+        best_mode_b_recovery_flight_time=0.0,
         best_mode_b_host_type="",
         best_mode_b_queue_time_est=0.0,
         has_mode_c_action=False,

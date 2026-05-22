@@ -15,6 +15,8 @@ import unittest
 from core.entities.order import Order
 from core.entities.primitives import Position3D, TaskStatus
 
+from .batch_matching_teacher import build_batch_matching_teacher_labels
+from .actions import DispatchAction as SharedDispatchAction
 from .contracts import PolicyMode
 from .env_adapter import (
     BackboneVisit,
@@ -93,6 +95,237 @@ class TestTrainingEnvAdapterPhase5c(unittest.TestCase):
         )
         env._require_order_manager().pending_orders[order.order_id] = order
         return order
+
+    def test_enqueue_decision_records_trigger_enqueue_time(self) -> None:
+        env, drone_id = self._reset_controlled_env()
+        env._t_now = 123.456
+        self._inject_order(
+            env,
+            drone_id=drone_id,
+            order_id="ORDER-P5C-TRIGGER-TIME",
+            create_time=120.0,
+            deadline=3600.0,
+        )
+
+        env._enqueue_decision(drone_id, "test_idle", None)
+
+        self.assertEqual(len(env._decision_queue), 1)
+        trigger = env._decision_queue[0]
+        self.assertAlmostEqual(trigger.t_enqueued, 123.456)
+
+        env._t_now = 200.0
+        self.assertAlmostEqual(trigger.t_enqueued, 123.456)
+
+    def test_invalid_action_does_not_pop_decision_queue(self) -> None:
+        env, drone_id = self._reset_controlled_env()
+        self._inject_order(
+            env,
+            drone_id=drone_id,
+            order_id="ORDER-P5C-VALID-ACTION-SETUP",
+        )
+        env._enqueue_decision(drone_id, "test_idle", None)
+        self.assertEqual(len(env._decision_queue), 1)
+        original_trigger = env._decision_queue[0]
+
+        with self.assertRaises(ValueError):
+            env._apply_decision_core(
+                DispatchAction(order_id="ORDER-P5C-NOT-IN-LOOKUP", mode=PolicyMode.B)
+            )
+
+        self.assertEqual(len(env._decision_queue), 1)
+        self.assertEqual(env._decision_queue[0], original_trigger)
+
+    def test_peek_current_decision_batch_uses_same_enqueue_time_prefix(self) -> None:
+        env, drone_id = self._reset_controlled_env()
+        idle_drone_ids = [
+            item
+            for item, state in env._drone_state.items()
+            if state == TrainingDroneState.IDLE
+        ]
+        self.assertGreaterEqual(len(idle_drone_ids), 3)
+        env._t_now = 321.0
+        self._inject_order(
+            env,
+            drone_id=drone_id,
+            order_id="ORDER-P5C-BATCH-PEEK",
+            create_time=300.0,
+            deadline=3600.0,
+        )
+
+        first_id, second_id, later_id = idle_drone_ids[:3]
+        env._enqueue_decision(first_id, "test_idle", None)
+        env._enqueue_decision(second_id, "test_idle", None)
+        env._decision_queue.append(
+            DecisionTrigger(
+                decision_id=env._next_decision_id,
+                drone_id=later_id,
+                trigger_type="test_idle",
+                trigger_station_id=None,
+                t_enqueued=env._t_now + 1.0,
+            )
+        )
+        env._next_decision_id += 1
+
+        batch = env.peek_current_decision_batch()
+
+        self.assertEqual([ctx.deciding_drone_id for ctx in batch], [first_id, second_id])
+        self.assertIs(batch[0].runtime_state, batch[1].runtime_state)
+        self.assertIs(batch[0].coarse_plan, batch[1].coarse_plan)
+        self.assertEqual(len(env._decision_queue), 3)
+
+    def test_batch_teacher_assigns_conflicting_order_to_only_one_uav(self) -> None:
+        env, drone_id = self._reset_controlled_env()
+        idle_drone_ids = [
+            item
+            for item, state in env._drone_state.items()
+            if state == TrainingDroneState.IDLE
+        ]
+        self.assertGreaterEqual(len(idle_drone_ids), 2)
+        first_id, second_id = idle_drone_ids[:2]
+        order = self._inject_order(
+            env,
+            drone_id=drone_id,
+            order_id="ORDER-P5C-BATCH-CONFLICT",
+            payload_weight=1.0,
+        )
+        env._enqueue_decision(first_id, "test_idle", None)
+        env._enqueue_decision(second_id, "test_idle", None)
+
+        batch = env.peek_current_decision_batch()
+        self.assertEqual([ctx.deciding_drone_id for ctx in batch], [first_id, second_id])
+
+        candidate_outputs = {
+            ctx.deciding_drone_id: env.build_candidate_output(
+                ctx,
+                last_seen_plan_version=ctx.coarse_plan.plan_version,
+            )
+            for ctx in batch
+        }
+        for ctx in batch:
+            candidate_out = candidate_outputs[ctx.deciding_drone_id]
+            dispatch_order_ids = {
+                action.order_id
+                for action in candidate_out.resolved_action_lookup.dispatch_actions.values()
+            }
+            self.assertIn(order.order_id, dispatch_order_ids)
+
+        result = build_batch_matching_teacher_labels(
+            decision_contexts=batch,
+            candidate_outputs_by_drone=candidate_outputs,
+        )
+
+        selected = [
+            action
+            for action in result.actions_by_drone.values()
+            if isinstance(action, SharedDispatchAction)
+            and action.order_id == order.order_id
+        ]
+        self.assertEqual(len(selected), 1)
+        self.assertEqual(
+            sum(
+                1
+                for action in result.actions_by_drone.values()
+                if action == WAIT_ACTION
+            ),
+            1,
+        )
+
+    def test_apply_decision_batch_rejects_duplicate_dispatch_order_without_mutation(self) -> None:
+        env, drone_id = self._reset_controlled_env()
+        idle_drone_ids = [
+            item
+            for item, state in env._drone_state.items()
+            if state == TrainingDroneState.IDLE
+        ]
+        self.assertGreaterEqual(len(idle_drone_ids), 2)
+        first_id, second_id = idle_drone_ids[:2]
+        order = self._inject_order(
+            env,
+            drone_id=drone_id,
+            order_id="ORDER-P5C-BATCH-DUPLICATE",
+            payload_weight=1.0,
+        )
+        env._enqueue_decision(first_id, "test_idle", None)
+        env._enqueue_decision(second_id, "test_idle", None)
+        batch = env.peek_current_decision_batch()
+        self.assertEqual([ctx.deciding_drone_id for ctx in batch], [first_id, second_id])
+
+        actions_by_drone = {}
+        for ctx in batch:
+            actions_by_drone[ctx.deciding_drone_id] = next(
+                action
+                for action in ctx.action_lookup
+                if isinstance(action, DispatchAction)
+                and action.order_id == order.order_id
+                and action.mode == PolicyMode.B
+            )
+        original_queue = tuple(env._decision_queue)
+        original_t = env._t_now
+
+        with self.assertRaises(ValueError):
+            env.apply_decision_batch(actions_by_drone)
+
+        self.assertEqual(tuple(env._decision_queue), original_queue)
+        self.assertAlmostEqual(env._t_now, original_t)
+        self.assertIn(order.order_id, env._require_order_manager().pending_orders)
+        self.assertNotIn(order.order_id, env._require_order_manager().assigned_orders)
+
+    def test_apply_decision_batch_submits_wait_and_dispatch_before_advancing_time(self) -> None:
+        env, drone_id = self._reset_controlled_env()
+        idle_drone_ids = [
+            item
+            for item, state in env._drone_state.items()
+            if state == TrainingDroneState.IDLE
+        ]
+        self.assertGreaterEqual(len(idle_drone_ids), 2)
+        wait_drone_id, dispatch_drone_id = idle_drone_ids[:2]
+        order = self._inject_order(
+            env,
+            drone_id=dispatch_drone_id,
+            order_id="ORDER-P5C-BATCH-WAIT-DISPATCH",
+            payload_weight=1.0,
+        )
+        env._enqueue_decision(wait_drone_id, "test_idle", None)
+        env._enqueue_decision(dispatch_drone_id, "test_idle", None)
+        batch = env.peek_current_decision_batch()
+        self.assertEqual(
+            [ctx.deciding_drone_id for ctx in batch],
+            [wait_drone_id, dispatch_drone_id],
+        )
+        dispatch_context = batch[1]
+        dispatch_action = next(
+            action
+            for action in dispatch_context.action_lookup
+            if isinstance(action, DispatchAction)
+            and action.order_id == order.order_id
+            and action.mode == PolicyMode.B
+        )
+
+        result = env.apply_decision_batch(
+            {
+                wait_drone_id: WAIT_ACTION,
+                dispatch_drone_id: dispatch_action,
+            }
+        )
+
+        self.assertEqual(result.info["event"], "apply_decision_batch")
+        self.assertEqual(result.info["batch_size"], 2)
+        self.assertIn(wait_drone_id, result.info["per_drone_rewards"])
+        self.assertIn(dispatch_drone_id, result.info["per_drone_rewards"])
+        order_mgr = env._require_order_manager()
+        self.assertNotIn(order.order_id, order_mgr.pending_orders)
+        progressed_order = order_mgr.assigned_orders.get(
+            order.order_id
+        ) or next(
+            (
+                item
+                for item in order_mgr.completed_orders
+                if item.order_id == order.order_id
+            ),
+            None,
+        )
+        self.assertIsNotNone(progressed_order)
+        self.assertEqual(progressed_order.assigned_vehicle_id, dispatch_drone_id)
 
     def test_runtime_state_exposes_reservation_and_count(self) -> None:
         env, drone_id = self._reset_controlled_env()
@@ -328,6 +561,7 @@ class TestTrainingEnvAdapterPhase5c(unittest.TestCase):
             drone_id=drone_id,
             trigger_type="truck_station_arrival",
             trigger_station_id=recover_node_id,
+            t_enqueued=float(env._t_now),
         )
         env._apply_dispatch_action(
             trigger,
@@ -654,6 +888,7 @@ class TestTrainingEnvAdapterPhase5c(unittest.TestCase):
                 drone_id=drone_id,
                 trigger_type="test_idle",
                 trigger_station_id=None,
+                t_enqueued=float(env._t_now),
             )
         )
         env._next_decision_id += 1

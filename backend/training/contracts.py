@@ -526,6 +526,7 @@ class OrderFeatures:
     priority_band: int
     has_mode_b_action: bool
     best_mode_b_return_score: float
+    best_mode_b_recovery_flight_time: float
     best_mode_b_host_type: str
     best_mode_b_queue_time_est: float
     has_mode_c_action: bool
@@ -631,6 +632,7 @@ class CandidateOutput:
     mode_mask: tuple[tuple[bool, bool], ...]
     factorized_action_schema: FactorizedActionSchema
     resolved_action_lookup: ResolvedActionLookup
+    diagnostics: Mapping[str, Any] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)

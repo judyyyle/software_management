@@ -7,47 +7,46 @@
 #     k2: 废阻功率系数    [W / (m/s)^3] — 由风洞测试或文献确定
 #
 # 参数来源：
-#   - 轻型：对标 DJI Mini 3 级别，2kg 总重悬停约 80W，15m/s 巡航约 110W
-#   - 重型：按 18kg 空机 / 10kg 载重 / 15m/s 巡航的建模口径标定
-#   - k1 / k2 可通过场地实测或论文 [cf. Aurambout 2019, UAV energy models] 修正
+#   - 轻型：对标美团 FP400 V4，公开最大速度 83km/h≈23.1m/s，仿真取 18m/s。
+#   - 重型：对标丰翼方舟 40，官方巡航速度 14m/s。
+#   - 电池容量为按本文件功率模型反推的等效电池能量，不是官方电池参数。
 # =====================================================================
 
 light_drone:
-  # 对标实物：FIXAR 007 NG
+  # 对标实物：美团 FP400 V4
 
   # 气动/功耗参数
-  k1: 35.2          # W / kg^1.5
-                   # 基于 MTOW=7kg、巡航速度18m/s、电池25V*27Ah、航时约59min反推
-  k2: 0.0059        # W / (m/s)^3
-                   # 单一公开工况无法唯一反推出 k2，暂保留原经验阻力项
+  k1: 22.0          # W / kg^1.5
+                   # 功率模型参数
+  k2: 0.06          # W / (m/s)^3
+                   # 气动阻力相关参数
 
   # 飞行性能
-  cruise_speed: 18.0           # m/s，FIXAR 007 NG 官方巡航速度
-  payload_capacity: 2.0        # kg，最大有效载荷
-  empty_weight: 5.0            # kg，按 MTOW 7kg - payload 2kg 估算，含电池/机体
+  cruise_speed: 18.0           # m/s，美团公开最大速度约 23.1m/s，仿真中取保守巡航速度
+  payload_capacity: 2.5        # kg，最大任务载荷
+  empty_weight: 7.0            # kg，按最大起飞重量 - 最大载重近似，含机体、电池、货箱等
 
   # 电池参数
-  battery_capacity_j: 2430000  # J，25V * 27Ah = 675Wh ≈ 2,430,000J
+  battery_capacity_j: 1490400  # J，约 414Wh，按功率模型反推的等效电池能量
   safe_margin_ratio: 0.10      # 保留 10% 电量作为安全余量
 
 
 heavy_drone:
-  # 对标实物：Garuda Aerospace GA-IN-DD-10
+  # 对标实物：丰翼方舟 40
 
   # 气动/功耗参数
   k1: 22.0          # W / kg^1.5
-                   # 保留原重载多旋翼经验值；与约30kg总重、30min续航匹配
+                   # 功率模型参数
   k2: 0.06          # W / (m/s)^3
-                   # 保留原速度阻力项
+                   # 气动阻力相关参数
 
   # 飞行性能
-  cruise_speed: 10.0           # m/s，Garuda GA-IN-DD-10 官方 Rated Speed
-  payload_capacity: 10.0       # kg，额定载荷
-  empty_weight: 19.64          # kg，按 Gross Weight 29.64kg - Payload 10kg 估算
+  cruise_speed: 14.0           # m/s，丰翼方舟 40 官方巡航速度
+  payload_capacity: 10.0       # kg，最大任务载荷
+  empty_weight: 36.0           # kg，按最大起飞重量 - 最大载重近似，含机体、电池、货箱等
 
   # 电池参数
-  battery_capacity_j: 7220000  # J，约 2.01 kWh；
-                               # 按 k1/k2功耗模型 + 30min续航 + 10%安全余量反推
+  battery_capacity_j: 14230800 # J，约 3953Wh，按功率模型反推的等效电池能量
   safe_margin_ratio: 0.10
 
 # 求解器统一评分参数（所有算法共享）

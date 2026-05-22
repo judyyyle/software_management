@@ -27,6 +27,8 @@ import numpy as np
 
 from config.loader import load_drone_params
 
+from .actions import DispatchAction
+from .batch_matching_teacher import build_batch_matching_teacher_labels
 from .contracts import (
     ActionSpaceMeta,
     CandidateMeta,
@@ -113,6 +115,14 @@ class _TrainingConfig:
     early_stop_value_loss_window: int
     early_stop_value_loss_min_delta: float
     allowed_train_order_source_mode: tuple[str, ...]
+    bc_warm_start_enabled: bool = False
+    bc_warm_start_updates: int = 0
+    bc_warm_start_batches_per_update: int = 1
+    bc_warm_start_max_decision_batches_per_rollout: int = 0
+    bc_wait_no_dispatch_loss_weight: float = 0.05
+    bc_wait_with_dispatch_loss_weight: float = 0.5
+    bc_mode_b_dispatch_loss_weight: float = 1.0
+    bc_mode_c_dispatch_loss_weight: float = 2.0
 
 
 @dataclass(frozen=True)
@@ -194,14 +204,6 @@ def _is_rendezvous_success_state(training_state: str) -> bool:
     return str(training_state) in {"charging_on_truck", "riding_with_truck"}
 
 
-def _is_rendezvous_arrival_state(training_state: str) -> bool:
-    return str(training_state) in {
-        "waiting_for_truck",
-        "charging_on_truck",
-        "riding_with_truck",
-    }
-
-
 def _is_mode_c_action_indices(action_indices: Any) -> bool:
     return (
         int(getattr(action_indices, "root_branch_idx", 0)) == 1
@@ -224,17 +226,6 @@ def _shape_post_action_reward_for_rendezvous(
     arrive_applied = False
     success_applied = False
     rendezvous_success = bool(getattr(transition_summary, "rendezvous_success", False))
-    training_state_after = str(
-        getattr(transition_summary, "actor_training_state_after", "")
-    )
-    rendezvous_arrived = (
-        rendezvous_success or _is_rendezvous_arrival_state(training_state_after)
-    )
-
-    arrive_bonus = float(rendezvous_arrive_bonus)
-    if rendezvous_arrived and arrive_bonus > 0.0:
-        shaped_reward += arrive_bonus
-        arrive_applied = True
 
     success_bonus = float(rendezvous_bonus)
     if rendezvous_success and success_bonus > 0.0:
@@ -281,15 +272,6 @@ def _shape_pending_transition_reward_for_rendezvous(
     success_applied = bool(
         getattr(pending_transition, "rendezvous_success_bonus_applied", False)
     )
-
-    arrive_bonus = float(rendezvous_arrive_bonus)
-    if (
-        not arrive_applied
-        and arrive_bonus > 0.0
-        and _is_rendezvous_arrival_state(training_state)
-    ):
-        shaped_reward += arrive_bonus
-        arrive_applied = True
 
     success_bonus = float(rendezvous_bonus)
     if (
@@ -545,6 +527,31 @@ def _compute_transition_loss_weight(
     return float(train_cfg.mode_b_dispatch_loss_weight)
 
 
+def _candidate_output_has_legal_mode_c(candidate_out: Any) -> bool:
+    return any(
+        isinstance(action, DispatchAction) and str(action.mode) == "C"
+        for action in candidate_out.resolved_action_lookup.dispatch_actions.values()
+    )
+
+
+def _compute_bc_label_loss_weight(
+    *,
+    train_cfg: _TrainingConfig,
+    action: Any,
+    candidate_out: Any,
+) -> float:
+    has_dispatch = bool(candidate_out.resolved_action_lookup.dispatch_actions)
+    if not isinstance(action, DispatchAction):
+        return (
+            float(train_cfg.bc_wait_with_dispatch_loss_weight)
+            if has_dispatch
+            else float(train_cfg.bc_wait_no_dispatch_loss_weight)
+        )
+    if str(action.mode) == "C":
+        return float(train_cfg.bc_mode_c_dispatch_loss_weight)
+    return float(train_cfg.bc_mode_b_dispatch_loss_weight)
+
+
 def train_cmrappo(
     *,
     output_dir: str | Path,
@@ -656,6 +663,21 @@ def train_cmrappo(
     meta_path = out_dir / "meta.json"
     config_snapshot_path = out_dir / "training_config_snapshot.yaml"
     model_version = model_version or datetime.now(timezone.utc).strftime("cmrappo_%Y%m%dT%H%M%SZ")
+
+    bc_warm_start_stats = _run_bc_warm_start(
+        model=model,
+        optimizer=optimizer,
+        scene_ctx=scene_ctx,
+        order_source=current_train_order_source,
+        config_path=Path(config_path),
+        tensorizer=tensorizer,
+        critic_builder=critic_builder,
+        critic_schema=critic_schema,
+        train_cfg=train_cfg,
+        device=device,
+        metrics_path=metrics_path,
+        event_hook=event_hook,
+    )
 
     current_result = initial_result
     episode_acc = _EpisodeAccumulator(
@@ -1299,6 +1321,7 @@ def train_cmrappo(
         "stopped_early": bool(stop_training_early),
         "stop_reason": stop_reason,
         "selected_policy_source": str(selected_checkpoint),
+        "bc_warm_start": bc_warm_start_stats,
     }
 
 
@@ -1764,6 +1787,8 @@ def _summarize_episode_records(
     mode_c_revalidation_fail_reason_totals: dict[str, int] = {}
     mode_c_timeout_from_state_totals: dict[str, int] = {}
     mode_c_fallback_from_state_totals: dict[str, int] = {}
+    mode_c_candidate_order_filter_totals: dict[str, int] = {}
+    mode_c_candidate_node_filter_totals: dict[str, int] = {}
     fallback_cause_totals: dict[str, int] = {}
     reservation_release_cause_totals: dict[str, int] = {}
     for item in episodes:
@@ -1781,6 +1806,20 @@ def _summarize_episode_records(
         for state_key, count in dict(item.get("mode_c_fallback_from_state", {})).items():
             mode_c_fallback_from_state_totals[str(state_key)] = (
                 mode_c_fallback_from_state_totals.get(str(state_key), 0) + int(count)
+            )
+        for reason_key, count in dict(
+            item.get("mode_c_candidate_order_filter_counts", {})
+        ).items():
+            mode_c_candidate_order_filter_totals[str(reason_key)] = (
+                mode_c_candidate_order_filter_totals.get(str(reason_key), 0)
+                + int(count)
+            )
+        for reason_key, count in dict(
+            item.get("mode_c_candidate_node_filter_counts", {})
+        ).items():
+            mode_c_candidate_node_filter_totals[str(reason_key)] = (
+                mode_c_candidate_node_filter_totals.get(str(reason_key), 0)
+                + int(count)
             )
         for cause_key, count in dict(item.get("fallback_cause_counts", {})).items():
             fallback_cause_totals[str(cause_key)] = (
@@ -1809,6 +1848,15 @@ def _summarize_episode_records(
         "mean_delivery_count": float(np.mean([float(item["delivery_count"]) for item in episodes])),
         "sum_delivery_count": int(sum(int(item["delivery_count"]) for item in episodes)),
         "mean_on_time_rate": float(np.mean([float(item["on_time_rate"]) for item in episodes])),
+        "sum_required_primary_order_count": int(
+            sum(int(item.get("required_primary_order_count", 0)) for item in episodes)
+        ),
+        "mean_completion_rate": float(
+            np.mean([float(item.get("completion_rate", 0.0)) for item in episodes])
+        ),
+        "mean_required_on_time_rate": float(
+            np.mean([float(item.get("required_on_time_rate", 0.0)) for item in episodes])
+        ),
         "sum_timeout_order_count": int(sum(int(item["timeout_order_count"]) for item in episodes)),
         "sum_fallback_count": int(sum(int(item["fallback_count"]) for item in episodes)),
         "sum_hard_failure_count": int(sum(int(item["hard_failure_count"]) for item in episodes)),
@@ -1824,6 +1872,12 @@ def _summarize_episode_records(
         ),
         "sum_feasible_mode_c_recover_node_count_total": int(
             feasible_mode_c_recover_node_total
+        ),
+        "sum_mode_c_candidate_order_filter_counts": dict(
+            mode_c_candidate_order_filter_totals
+        ),
+        "sum_mode_c_candidate_node_filter_counts": dict(
+            mode_c_candidate_node_filter_totals
         ),
         "avg_feasible_mode_c_nodes_per_dispatch_decision": (
             float(feasible_mode_c_recover_node_total) / float(dispatch_decision_total)
@@ -2162,6 +2216,310 @@ def _is_failed_drone_in_runtime_state(*, runtime_state: Any, drone_id: str) -> b
     if drone_states is None or drone_id not in drone_states:
         return False
     return str(drone_states[drone_id].training_state) == "airborne_energy_failure"
+
+
+def _bc_label_to_action_indices_tensor(
+    label: ResolvedActionIndices,
+    *,
+    device: Any,
+) -> dict[str, Any]:
+    root_branch_idx = int(label.root_branch_idx)
+    order_idx = 0 if label.order_idx is None else int(label.order_idx)
+    mode_idx = 0 if label.mode_idx is None else int(label.mode_idx)
+    return {
+        "root_branch_idx": torch.as_tensor([root_branch_idx], dtype=torch.long, device=device),
+        "order_idx": torch.as_tensor([order_idx], dtype=torch.long, device=device),
+        "mode_idx": torch.as_tensor([mode_idx], dtype=torch.long, device=device),
+    }
+
+
+def _run_bc_warm_start(
+    *,
+    model: Any,
+    optimizer: Any,
+    scene_ctx: Any,
+    order_source: OrderSourceConfig,
+    config_path: Path,
+    tensorizer: ObservationTensorizer,
+    critic_builder: CriticBatchBuilder,
+    critic_schema: CriticTensorSchemaMeta,
+    train_cfg: _TrainingConfig,
+    device: Any,
+    metrics_path: Path,
+    event_hook: Callable[[str, Mapping[str, Any]], None] | None,
+) -> dict[str, Any]:
+    if not train_cfg.bc_warm_start_enabled:
+        return {
+            "enabled": False,
+            "updates": 0,
+            "samples": 0,
+            "wait_no_dispatch": 0,
+            "wait_with_dispatch": 0,
+            "dispatch_B": 0,
+            "dispatch_C": 0,
+            "legal_C_count": 0,
+            "selected_C_given_legal_C": 0.0,
+            "last_loss": None,
+        }
+
+    bc_env = TrainingEnvAdapter(
+        scene_ctx=scene_ctx,
+        order_source=order_source,
+        config_path=config_path,
+    )
+    total_samples = 0
+    total_wait = 0
+    total_wait_no_dispatch = 0
+    total_wait_with_dispatch = 0
+    total_dispatch = 0
+    total_mode_b = 0
+    total_mode_c = 0
+    total_legal_c = 0
+    total_selected_c_given_legal_c = 0
+    total_decision_batches = 0
+    total_rollout_episodes = 0
+    total_completed_rollouts = 0
+    last_loss: float | None = None
+    model.train()
+
+    for update_idx in range(1, train_cfg.bc_warm_start_updates + 1):
+        loss_terms: list[Any] = []
+        update_wait = 0
+        update_wait_no_dispatch = 0
+        update_wait_with_dispatch = 0
+        update_dispatch = 0
+        update_mode_b = 0
+        update_mode_c = 0
+        update_legal_c = 0
+        update_selected_c_given_legal_c = 0
+        update_decision_batches = 0
+        update_completed_rollouts = 0
+        update_samples = 0
+        update_loss_weight_sum = 0.0
+
+        for _rollout_idx in range(train_cfg.bc_warm_start_batches_per_update):
+            reset_result = bc_env.reset()
+            if reset_result.done:
+                update_completed_rollouts += 1
+                continue
+
+            rollout_decision_batches = 0
+            while not bc_env.is_done():
+                max_batches = int(train_cfg.bc_warm_start_max_decision_batches_per_rollout)
+                if max_batches > 0 and rollout_decision_batches >= max_batches:
+                    break
+
+                decision_batch = bc_env.peek_current_decision_batch()
+                if not decision_batch:
+                    if bc_env.is_done():
+                        break
+                    raise RuntimeError(
+                        "BC teacher rollout 遇到非终止且无 decision batch 的状态"
+                    )
+
+                candidate_outputs_by_drone = {
+                    str(context.deciding_drone_id): bc_env.build_candidate_output(
+                        context,
+                        last_seen_plan_version=int(context.coarse_plan.plan_version),
+                    )
+                    for context in decision_batch
+                }
+                teacher_result = build_batch_matching_teacher_labels(
+                    decision_contexts=tuple(decision_batch),
+                    candidate_outputs_by_drone=candidate_outputs_by_drone,
+                )
+
+                for context in decision_batch:
+                    drone_id = str(context.deciding_drone_id)
+                    candidate_out = candidate_outputs_by_drone[drone_id]
+                    label = teacher_result.labels_by_drone[drone_id]
+                    assignment = teacher_result.assignments_by_drone[drone_id]
+                    has_dispatch = bool(candidate_out.resolved_action_lookup.dispatch_actions)
+                    has_legal_c = _candidate_output_has_legal_mode_c(candidate_out)
+                    selected_c = (
+                        isinstance(assignment.action, DispatchAction)
+                        and str(assignment.action.mode) == "C"
+                    )
+                    if has_legal_c:
+                        update_legal_c += 1
+                        if selected_c:
+                            update_selected_c_given_legal_c += 1
+                    update_samples += 1
+
+                    observation_batch = tensorizer.build(
+                        decision_context=context,
+                        candidate_out=candidate_out,
+                        transition_history=(),
+                    )
+                    action_mask = tensorizer.build_action_mask(candidate_out)
+                    critic_batch = critic_builder.build(
+                        decision_context=context,
+                        critic_tensor_schema_meta=critic_schema,
+                    )
+                    policy_out, _ = model.forward(
+                        observation_batch=observation_batch,
+                        action_mask=action_mask,
+                        critic_batch=critic_batch,
+                        lstm_state=None,
+                    )
+                    log_prob, _entropy = model.evaluate_actions(
+                        policy_out=policy_out,
+                        action_mask=action_mask,
+                        action_indices=_bc_label_to_action_indices_tensor(
+                            label,
+                            device=device,
+                        ),
+                    )
+                    sample_weight = _compute_bc_label_loss_weight(
+                        train_cfg=train_cfg,
+                        action=assignment.action,
+                        candidate_out=candidate_out,
+                    )
+                    if sample_weight > 0.0:
+                        loss_terms.append(-log_prob.reshape(-1)[0] * float(sample_weight))
+                        update_loss_weight_sum += float(sample_weight)
+
+                    if isinstance(assignment.action, DispatchAction):
+                        update_dispatch += 1
+                        if selected_c:
+                            update_mode_c += 1
+                        else:
+                            update_mode_b += 1
+                    else:
+                        update_wait += 1
+                        if has_dispatch:
+                            update_wait_with_dispatch += 1
+                        else:
+                            update_wait_no_dispatch += 1
+
+                step_result = bc_env.apply_decision_batch(teacher_result.actions_by_drone)
+                rollout_decision_batches += 1
+                update_decision_batches += 1
+                if step_result.done:
+                    update_completed_rollouts += 1
+                    break
+
+        total_rollout_episodes += int(train_cfg.bc_warm_start_batches_per_update)
+
+        if not loss_terms:
+            total_samples += update_samples
+            total_wait += update_wait
+            total_wait_no_dispatch += update_wait_no_dispatch
+            total_wait_with_dispatch += update_wait_with_dispatch
+            total_dispatch += update_dispatch
+            total_mode_b += update_mode_b
+            total_mode_c += update_mode_c
+            total_legal_c += update_legal_c
+            total_selected_c_given_legal_c += update_selected_c_given_legal_c
+            total_decision_batches += update_decision_batches
+            total_completed_rollouts += update_completed_rollouts
+            _append_metrics(
+                metrics_path,
+                {
+                    "phase": "bc_warm_start",
+                    "bc_update": update_idx,
+                    "bc_loss": None,
+                    "bc_samples": update_samples,
+                    "bc_loss_weight_sum": update_loss_weight_sum,
+                    "bc_wait": update_wait,
+                    "bc_wait_no_dispatch": update_wait_no_dispatch,
+                    "bc_wait_with_dispatch": update_wait_with_dispatch,
+                    "bc_dispatch": update_dispatch,
+                    "bc_dispatch_B": update_mode_b,
+                    "bc_dispatch_C": update_mode_c,
+                    "bc_mode_b": update_mode_b,
+                    "bc_mode_c": update_mode_c,
+                    "bc_legal_C_count": update_legal_c,
+                    "bc_selected_C_given_legal_C_count": update_selected_c_given_legal_c,
+                    "bc_selected_C_given_legal_C": (
+                        float(update_selected_c_given_legal_c) / float(update_legal_c)
+                        if update_legal_c
+                        else 0.0
+                    ),
+                    "bc_rollout_episodes": int(train_cfg.bc_warm_start_batches_per_update),
+                    "bc_completed_rollouts": update_completed_rollouts,
+                    "bc_decision_batches": update_decision_batches,
+                },
+            )
+            continue
+
+        if update_loss_weight_sum <= 0.0:
+            raise RuntimeError("BC warm start 存在 loss_terms 但权重和为 0")
+        loss = torch.stack(loss_terms).sum() / float(update_loss_weight_sum)
+        optimizer.zero_grad()
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), train_cfg.max_grad_norm)
+        optimizer.step()
+
+        sample_count = update_samples
+        last_loss = float(loss.detach().cpu().item())
+        total_samples += sample_count
+        total_wait += update_wait
+        total_wait_no_dispatch += update_wait_no_dispatch
+        total_wait_with_dispatch += update_wait_with_dispatch
+        total_dispatch += update_dispatch
+        total_mode_b += update_mode_b
+        total_mode_c += update_mode_c
+        total_legal_c += update_legal_c
+        total_selected_c_given_legal_c += update_selected_c_given_legal_c
+        total_decision_batches += update_decision_batches
+        total_completed_rollouts += update_completed_rollouts
+        metrics_payload = {
+            "phase": "bc_warm_start",
+            "bc_update": update_idx,
+            "bc_loss": last_loss,
+            "bc_samples": sample_count,
+            "bc_loss_weight_sum": update_loss_weight_sum,
+            "bc_wait": update_wait,
+            "bc_wait_no_dispatch": update_wait_no_dispatch,
+            "bc_wait_with_dispatch": update_wait_with_dispatch,
+            "bc_dispatch": update_dispatch,
+            "bc_dispatch_B": update_mode_b,
+            "bc_dispatch_C": update_mode_c,
+            "bc_mode_b": update_mode_b,
+            "bc_mode_c": update_mode_c,
+            "bc_legal_C_count": update_legal_c,
+            "bc_selected_C_given_legal_C_count": update_selected_c_given_legal_c,
+            "bc_selected_C_given_legal_C": (
+                float(update_selected_c_given_legal_c) / float(update_legal_c)
+                if update_legal_c
+                else 0.0
+            ),
+            "bc_rollout_episodes": int(train_cfg.bc_warm_start_batches_per_update),
+            "bc_completed_rollouts": update_completed_rollouts,
+            "bc_decision_batches": update_decision_batches,
+        }
+        _append_metrics(metrics_path, metrics_payload)
+        _emit_event_hook(event_hook, "bc_warm_start_update", metrics_payload)
+
+    return {
+        "enabled": True,
+        "updates": int(train_cfg.bc_warm_start_updates),
+        "batches_per_update": int(train_cfg.bc_warm_start_batches_per_update),
+        "samples": int(total_samples),
+        "wait": int(total_wait),
+        "wait_no_dispatch": int(total_wait_no_dispatch),
+        "wait_with_dispatch": int(total_wait_with_dispatch),
+        "dispatch": int(total_dispatch),
+        "dispatch_B": int(total_mode_b),
+        "dispatch_C": int(total_mode_c),
+        "mode_b": int(total_mode_b),
+        "mode_c": int(total_mode_c),
+        "legal_C_count": int(total_legal_c),
+        "selected_C_given_legal_C_count": int(total_selected_c_given_legal_c),
+        "selected_C_given_legal_C": (
+            float(total_selected_c_given_legal_c) / float(total_legal_c)
+            if total_legal_c
+            else 0.0
+        ),
+        "rollout_episodes": int(total_rollout_episodes),
+        "completed_rollouts": int(total_completed_rollouts),
+        "decision_batches": int(total_decision_batches),
+        "max_decision_batches_per_rollout": int(
+            train_cfg.bc_warm_start_max_decision_batches_per_rollout
+        ),
+        "last_loss": last_loss,
+    }
 
 
 def _ppo_update(
@@ -3616,6 +3974,26 @@ def _load_training_config(config_path: Path) -> _TrainingConfig:
             training.get("early_stop_value_loss_min_delta", 0.0)
         ),
         allowed_train_order_source_mode=tuple(training["allowed_train_order_source_mode"]),
+        bc_warm_start_enabled=bool(training.get("bc_warm_start_enabled", False)),
+        bc_warm_start_updates=int(training.get("bc_warm_start_updates", 0)),
+        bc_warm_start_batches_per_update=int(
+            training.get("bc_warm_start_batches_per_update", 1)
+        ),
+        bc_warm_start_max_decision_batches_per_rollout=int(
+            training.get("bc_warm_start_max_decision_batches_per_rollout", 0)
+        ),
+        bc_wait_no_dispatch_loss_weight=float(
+            training.get("bc_wait_no_dispatch_loss_weight", 0.05)
+        ),
+        bc_wait_with_dispatch_loss_weight=float(
+            training.get("bc_wait_with_dispatch_loss_weight", 0.5)
+        ),
+        bc_mode_b_dispatch_loss_weight=float(
+            training.get("bc_mode_b_dispatch_loss_weight", 1.0)
+        ),
+        bc_mode_c_dispatch_loss_weight=float(
+            training.get("bc_mode_c_dispatch_loss_weight", 2.0)
+        ),
     )
     _validate_training_config(cfg)
     return cfg
@@ -3652,6 +4030,22 @@ def _validate_training_config(cfg: _TrainingConfig) -> None:
         raise ValueError("early_stop_value_loss_window 必须为正数")
     if cfg.early_stop_value_loss_min_delta < 0.0:
         raise ValueError("early_stop_value_loss_min_delta 不能为负数")
+    if cfg.bc_warm_start_updates < 0:
+        raise ValueError("bc_warm_start_updates 不能为负数")
+    if cfg.bc_warm_start_batches_per_update <= 0:
+        raise ValueError("bc_warm_start_batches_per_update 必须为正数")
+    if cfg.bc_warm_start_max_decision_batches_per_rollout < 0:
+        raise ValueError("bc_warm_start_max_decision_batches_per_rollout 不能为负数")
+    if cfg.bc_wait_no_dispatch_loss_weight < 0.0:
+        raise ValueError("bc_wait_no_dispatch_loss_weight 不能为负数")
+    if cfg.bc_wait_with_dispatch_loss_weight < 0.0:
+        raise ValueError("bc_wait_with_dispatch_loss_weight 不能为负数")
+    if cfg.bc_mode_b_dispatch_loss_weight < 0.0:
+        raise ValueError("bc_mode_b_dispatch_loss_weight 不能为负数")
+    if cfg.bc_mode_c_dispatch_loss_weight < 0.0:
+        raise ValueError("bc_mode_c_dispatch_loss_weight 不能为负数")
+    if cfg.bc_warm_start_enabled and cfg.bc_warm_start_updates <= 0:
+        raise ValueError("bc_warm_start_enabled=true 时 bc_warm_start_updates 必须为正数")
     if cfg.wait_without_dispatch_loss_weight < 0.0:
         raise ValueError("wait_without_dispatch_loss_weight 不能为负数")
     if cfg.wait_with_dispatch_loss_weight < 0.0:

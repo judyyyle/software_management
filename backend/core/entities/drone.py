@@ -5,8 +5,8 @@ HiveLogix — 无人机实体 (Section 2)
 
 本模块实现异构无人机的完整物理模型，包括：
   - Drone         : 基类，持有全部物理属性与通用方法
-  - LightDrone    : 轻型无人机（2kg 载重，15m/s 巡航）
-  - HeavyDrone    : 重型无人机（10kg 载重，10m/s 巡航）
+  - LightDrone    : 轻型无人机（2.5kg 载重，18m/s 巡航）
+  - HeavyDrone    : 重型无人机（10kg 载重，14m/s 巡航）
 
 功率模型（多旋翼 induced + parasitic drag 功耗方程）：
   P = k1 × (m_empty + payload)^1.5 + k2 × v^3
@@ -461,13 +461,16 @@ class Drone:
 
 class LightDrone(Drone):
     """
-    轻型无人机（对标 DJI Mini 级别）。
+    轻型无人机（对标美团 FP400 V4）。
 
-    性能规格：
-      - 巡航速度: 20 m/s
-      - 最大载重: 2 kg
-      - 机体自重: 1.5 kg
-      - 电池容量: 100 Wh（360,000 J）
+    当前运行参数从 config/drone_params.yaml 的 light_drone 读取：
+      - 巡航速度: 18 m/s
+      - 最大载重: 2.5 kg
+      - 机体自重: 7 kg
+      - 电池容量: 约 414 Wh（1,490,400 J）
+      - 安全余量: 电池容量的 10%
+      - k1: 22.0 W/kg^1.5
+      - k2: 0.06 W/(m/s)^3
 
     气动参数由 config/drone_params.yaml 载入，子类实例化时读取并固化。
     """
@@ -504,13 +507,16 @@ class LightDrone(Drone):
 
 class HeavyDrone(Drone):
     """
-    重型无人机（对标 DJI M30 级别）。
+    重型无人机（对标丰翼方舟 40）。
 
-    性能规格：
-      - 巡航速度: 15 m/s
+    当前运行参数从 config/drone_params.yaml 的 heavy_drone 读取：
+      - 巡航速度: 14 m/s
       - 最大载重: 10 kg
-      - 机体自重: 5 kg
-      - 电池容量: 800 Wh（2,880,000 J）
+      - 机体自重: 36 kg
+      - 电池容量: 约 3953 Wh（14,230,800 J）
+      - 安全余量: 电池容量的 10%
+      - k1: 22.0 W/kg^1.5
+      - k2: 0.06 W/(m/s)^3
 
     气动参数由 config/drone_params.yaml 载入，子类实例化时读取并固化。
     """
