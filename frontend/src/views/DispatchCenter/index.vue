@@ -229,6 +229,34 @@
                 🧩 贪心（增量）
               </button>
               <button class="sc-btn sc-btn--dispatch"
+                :class="{ 'sc-btn--dispatch-active': dispatchSolver === 'ga_mmce' }"
+                :disabled="!initDone || dispatchLoading"
+                @click="dispatchSolver = 'ga_mmce'">
+                🧬 遗传算法
+              </button>
+              <label v-if="dispatchSolver === 'ga_mmce'" class="dispatch-cache-toggle">
+                <input
+                  v-model="reuseGaStaticPlan"
+                  type="checkbox"
+                  :disabled="dispatchLoading"
+                >
+                <span>复用上次静态结果</span>
+              </label>
+              <button class="sc-btn sc-btn--dispatch"
+                :class="{ 'sc-btn--dispatch-active': dispatchSolver === 'ga_mmce' }"
+                :disabled="!initDone || dispatchLoading"
+                @click="dispatchSolver = 'ga_mmce'">
+                🧬 遗传算法
+              </button>
+              <label v-if="dispatchSolver === 'ga_mmce'" class="dispatch-cache-toggle">
+                <input
+                  v-model="reuseGaStaticPlan"
+                  type="checkbox"
+                  :disabled="dispatchLoading"
+                >
+                <span>复用上次静态结果</span>
+              </label>
+              <button class="sc-btn sc-btn--dispatch"
                 :class="{ 'sc-btn--dispatch-active': dispatchSolver === 'market' }"
                 :disabled="!initDone || dispatchLoading || systemStore.policyActive || systemStore.trainingRunning"
                 @click="dispatchSolver = 'market'">
@@ -438,14 +466,15 @@ const dispatchLoading = ref(false)
 const lastDispatchResult = ref<any>(null)
 const dispatchPlan = ref<DispatchPlan | null>(null)
 const totalEnergyCostWh = ref(0)
-type DispatchSolverName = 'greedy' | 'greedy_mmce' | 'greedy_mmce_bi' | 'market'
-const dispatchSolver = ref<DispatchSolverName>('greedy_mmce_bi')
-const lastRenderedDecisionEventSeq = ref(0)
+type DispatchSolverName = 'greedy' | 'greedy_mmce' | 'greedy_mmce_bi' | 'ga_mmce' | 'market'
+const dispatchSolver = ref<DispatchSolverName>('greedy')
+const reuseGaStaticPlan = ref(false)
 
 function dispatchSolverLabel(solver: DispatchSolverName): string {
   if (solver === 'greedy') return '贪心（baseline）'
   if (solver === 'greedy_mmce') return '贪心（多模式）'
   if (solver === 'greedy_mmce_bi') return '贪心（增量）'
+  if (solver === 'ga_mmce') return '遗传算法'
   return '市场拍卖'
 }
 
@@ -760,7 +789,11 @@ async function doDispatch() {
     if (DEBUG_VEHICLE_UPDATES) {
       console.log('[doDispatch] 将调用 dispatch，bbox:', bbox)
     }
-    const result = await systemStore.dispatch(bbox, dispatchSolver.value)
+    const result = await systemStore.dispatch(
+      bbox,
+      dispatchSolver.value,
+      { reuseStaticGaPlan: dispatchSolver.value === 'ga_mmce' && reuseGaStaticPlan.value },
+    )
     if (DEBUG_VEHICLE_UPDATES) {
       console.log('[doDispatch] dispatch 返回:', result)
     }
@@ -782,6 +815,9 @@ async function doDispatch() {
         `(${modeStr ? '模式分布: ' + modeStr : '暂无分配'}) · ` +
         `待派 ${result.pending_count} | 派送中 ${result.assigned_count}`
       )
+      if (plan.static_cache_reused) {
+        _log('info', '♻️ 已复用上一次 GA 静态调度结果')
+      }
 
       dispatchPlan.value = plan
 
@@ -1143,6 +1179,27 @@ onBeforeUnmount(() => {
   color: var(--hl-text-secondary);
   font-size: 12px;
   white-space: nowrap;
+}
+
+.dispatch-cache-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  height: 34px;
+  padding: 0 10px;
+  border: 1px solid var(--hl-border);
+  border-radius: var(--hl-border-radius);
+  background: var(--hl-content-bg);
+  color: var(--hl-text-secondary);
+  font-size: 12px;
+  white-space: nowrap;
+}
+
+.dispatch-cache-toggle input {
+  width: 14px;
+  height: 14px;
+  margin: 0;
+  accent-color: var(--hl-info);
 }
 
 /* 调度统计快览 */

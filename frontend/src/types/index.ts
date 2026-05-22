@@ -323,6 +323,8 @@ export interface DispatchPlan {
     energy: number
     penalty: number
   }
+  static_cache_reused?: boolean
+  static_cache_path?: string
   allocations: unknown[]
   truck_routes?: Record<string, DispatchTruckRoute>
   drone_routes?: DispatchDroneRoute[]
