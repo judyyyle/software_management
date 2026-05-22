@@ -3051,7 +3051,7 @@ def _build_meta_payload(
         policy=PolicyMeta(
             encoder_type=str(policy["encoder_type"]),
             d_model=int(policy["d_model"]),
-            nhead=int(policy["nhead"]),
+            nhead=int(policy["nhead"]) if policy.get("nhead") is not None else None,
             ff_dim=int(policy["ff_dim"]),
             dropout=float(policy["dropout"]),
             lstm_hidden=int(policy["lstm_hidden"]),

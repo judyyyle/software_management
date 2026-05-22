@@ -57,10 +57,15 @@ class _CandidateConfig:
 
 
 @dataclass(frozen=True)
-class _ModeCRecoveryCandidate:
-    recover_node_type: str
-    truck_eta: float
-    rendezvous_margin: float
+class _ModeCSummary:
+    candidate_count: int
+    best_rendezvous_margin: float
+    best_wait_time: float
+    best_uav_flight_time: float
+    best_energy_margin_ratio: float
+    best_node_type: str
+    best_truck_eta_remaining: float
+    timeout_risk: float
 
 
 class CandidateBuilder:
@@ -149,9 +154,9 @@ class CandidateBuilder:
                     battery_after_delivery=energy_after_delivery,
                 )
 
-            mode_c_candidate: _ModeCRecoveryCandidate | None = None
+            mode_c_summary: _ModeCSummary | None = None
             if PolicyMode.C in allowed_policy_modes:
-                mode_c_candidate = self._select_best_mode_c_recovery(
+                mode_c_summary = self._select_best_mode_c_recovery(
                     runtime_state=runtime_state,
                     coarse_plan=coarse_plan,
                     drone_view=drone_view,
@@ -161,11 +166,8 @@ class CandidateBuilder:
                     energy_after_delivery=energy_after_delivery,
                     trigger_type=trigger_type,
                     trigger_station_id=trigger_station_id,
+                    t_now=float(runtime_state.t_now),
                 )
-            mode_c_summary = self._summarize_best_mode_c(
-                recovery_candidate=mode_c_candidate,
-                t_now=float(runtime_state.t_now),
-            )
 
             if mode_b_summary is None and mode_c_summary is None:
                 continue
@@ -194,18 +196,43 @@ class CandidateBuilder:
                     else 0.0
                 ),
                 has_mode_c_action=mode_c_summary is not None,
+                mode_c_candidate_count=(
+                    int(mode_c_summary.candidate_count)
+                    if mode_c_summary is not None
+                    else 0
+                ),
                 best_mode_c_rendezvous_margin=(
-                    float(mode_c_summary["rendezvous_margin"])
+                    float(mode_c_summary.best_rendezvous_margin)
+                    if mode_c_summary is not None
+                    else 0.0
+                ),
+                best_mode_c_wait_time=(
+                    float(mode_c_summary.best_wait_time)
+                    if mode_c_summary is not None
+                    else 0.0
+                ),
+                best_mode_c_uav_flight_time=(
+                    float(mode_c_summary.best_uav_flight_time)
+                    if mode_c_summary is not None
+                    else 0.0
+                ),
+                best_mode_c_energy_margin_ratio=(
+                    float(mode_c_summary.best_energy_margin_ratio)
                     if mode_c_summary is not None
                     else 0.0
                 ),
                 best_mode_c_node_type=(
-                    str(mode_c_summary["node_type"])
+                    str(mode_c_summary.best_node_type)
                     if mode_c_summary is not None
                     else ""
                 ),
                 best_mode_c_truck_eta_remaining=(
-                    float(mode_c_summary["truck_eta_remaining"])
+                    float(mode_c_summary.best_truck_eta_remaining)
+                    if mode_c_summary is not None
+                    else 0.0
+                ),
+                best_mode_c_timeout_risk=(
+                    float(mode_c_summary.timeout_risk)
                     if mode_c_summary is not None
                     else 0.0
                 ),
@@ -422,7 +449,8 @@ class CandidateBuilder:
         energy_after_delivery: float,
         trigger_type: str,
         trigger_station_id: str | None,
-    ) -> _ModeCRecoveryCandidate | None:
+        t_now: float,
+    ) -> _ModeCSummary | None:
         if _is_riding_with_truck_trigger(trigger_type) and trigger_station_id:
             recovery_pool = self._runtime_recovery_pool(
                 coarse_plan=coarse_plan,
@@ -432,65 +460,82 @@ class CandidateBuilder:
             recovery_pool = coarse_plan.get_recovery_candidates(order.order_id)
 
         safe_margin = self._safe_margin_j_by_drone[drone_view.drone_id]
-        best_item: tuple[float, float, str, _ModeCRecoveryCandidate] | None = None
+        battery_max = max(float(getattr(drone_view, "battery_max", 0.0)), _TIME_EPS)
+        feasible_count = 0
+        best_item: tuple[float, float, str, dict[str, Any]] | None = None
         for node_id in recovery_pool:
             node_state = runtime_state.node_states.get(node_id)
             t_arrive_truck = coarse_plan.truck_eta_map.get(node_id)
             if node_state is None or t_arrive_truck is None:
                 continue
 
-            uav_flight_time = self._estimate_flight_time(
+            recover_leg = self._estimate_uav_leg(
                 drone_view=drone_view,
                 from_pos=deliver_pos,
                 to_pos=node_state.position,
+                payload=0.0,
             )
+            uav_flight_time = float(recover_leg.flight_time_sec)
+            energy_to_recover = float(recover_leg.energy_j)
+            energy_margin_j = (
+                float(energy_after_delivery)
+                - energy_to_recover
+                - float(safe_margin)
+            )
+            if energy_margin_j < -_TIME_EPS:
+                continue
+
             t_arrive_uav = t_deliver_finish + uav_flight_time
             planned_wait = float(t_arrive_truck) - float(t_arrive_uav)
             if planned_wait < self._cfg.rendezvous_execution_margin_sec - _TIME_EPS:
                 continue
             if planned_wait > self._cfg.rendezvous_max_wait_sec + _TIME_EPS:
                 continue
-            if not self._can_reach(
-                drone_view=drone_view,
-                from_pos=deliver_pos,
-                to_pos=node_state.position,
-                payload=0.0,
-                safe_margin=safe_margin,
-                battery_current=energy_after_delivery,
-            ):
-                continue
 
             score = float(planned_wait) + 0.25 * float(uav_flight_time)
-            candidate = _ModeCRecoveryCandidate(
-                recover_node_type=str(node_state.node_type),
-                truck_eta=float(t_arrive_truck),
-                rendezvous_margin=float(
-                    planned_wait - self._cfg.rendezvous_execution_margin_sec
-                ),
+            rendezvous_margin = float(
+                planned_wait - self._cfg.rendezvous_execution_margin_sec
             )
-            item = (score, float(uav_flight_time), str(node_id), candidate)
+            feasible_count += 1
+            item = (
+                score,
+                float(uav_flight_time),
+                str(node_id),
+                {
+                    "node_type": str(node_state.node_type),
+                    "truck_eta_remaining": max(
+                        0.0,
+                        float(t_arrive_truck) - float(t_now),
+                    ),
+                    "rendezvous_margin": rendezvous_margin,
+                    "wait_time": float(planned_wait),
+                    "uav_flight_time": float(uav_flight_time),
+                    "energy_margin_ratio": max(0.0, energy_margin_j / battery_max),
+                },
+            )
             if best_item is None or item[:3] < best_item[:3]:
                 best_item = item
 
-        return None if best_item is None else best_item[3]
-
-    def _summarize_best_mode_c(
-        self,
-        *,
-        recovery_candidate: _ModeCRecoveryCandidate | None,
-        t_now: float,
-    ) -> dict[str, Any] | None:
-        if recovery_candidate is None:
+        if best_item is None:
             return None
 
-        return {
-            "rendezvous_margin": float(recovery_candidate.rendezvous_margin),
-            "node_type": str(recovery_candidate.recover_node_type),
-            "truck_eta_remaining": max(
-                0.0,
-                float(recovery_candidate.truck_eta) - float(t_now),
-            ),
-        }
+        best = best_item[3]
+        best_margin = float(best["rendezvous_margin"])
+        timeout_risk = 1.0 - min(
+            1.0,
+            max(0.0, best_margin)
+            / max(float(self._cfg.rendezvous_max_wait_sec), _TIME_EPS),
+        )
+        return _ModeCSummary(
+            candidate_count=int(feasible_count),
+            best_rendezvous_margin=best_margin,
+            best_wait_time=float(best["wait_time"]),
+            best_uav_flight_time=float(best["uav_flight_time"]),
+            best_energy_margin_ratio=float(best["energy_margin_ratio"]),
+            best_node_type=str(best["node_type"]),
+            best_truck_eta_remaining=float(best["truck_eta_remaining"]),
+            timeout_risk=float(timeout_risk),
+        )
 
     def _runtime_recovery_pool(
         self,
@@ -749,9 +794,14 @@ def _padding_order_feature() -> OrderFeatures:
         best_mode_b_host_type="",
         best_mode_b_queue_time_est=0.0,
         has_mode_c_action=False,
+        mode_c_candidate_count=0,
         best_mode_c_rendezvous_margin=0.0,
+        best_mode_c_wait_time=0.0,
+        best_mode_c_uav_flight_time=0.0,
+        best_mode_c_energy_margin_ratio=0.0,
         best_mode_c_node_type="",
         best_mode_c_truck_eta_remaining=0.0,
+        best_mode_c_timeout_risk=0.0,
         is_valid=False,
     )
 

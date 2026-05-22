@@ -35,6 +35,7 @@ from .env_adapter import (
     WAIT_ACTION,
 )
 from .order_source_adapter import OrderSourceMode, build_order_source
+from .observation_tensorizer import ORDER_TOKEN_FIELDS, ObservationTensorizer
 from .scene_loader import load_default_scene
 
 
@@ -1514,10 +1515,20 @@ class TestPhase6Integration(unittest.TestCase):
         self.assertTrue(candidate_out.mode_mask[0][1], "mode C 应保留")
         order_feature = candidate_out.candidate_features.order_features[0]
         self.assertTrue(order_feature.has_mode_c_action)
+        self.assertEqual(order_feature.mode_c_candidate_count, 1)
         self.assertAlmostEqual(
             order_feature.best_mode_c_rendezvous_margin,
             30.0,
         )
+        self.assertAlmostEqual(
+            order_feature.best_mode_c_wait_time,
+            env._cfg.rendezvous_execution_margin_sec + 30.0,
+        )
+        self.assertAlmostEqual(
+            order_feature.best_mode_c_uav_flight_time,
+            safe_recover_fly,
+        )
+        self.assertGreater(order_feature.best_mode_c_energy_margin_ratio, 0.0)
         self.assertEqual(
             order_feature.best_mode_c_node_type,
             "station",
@@ -1525,6 +1536,45 @@ class TestPhase6Integration(unittest.TestCase):
         self.assertAlmostEqual(
             order_feature.best_mode_c_truck_eta_remaining,
             t_safe_truck - runtime_state.t_now,
+        )
+        self.assertAlmostEqual(
+            order_feature.best_mode_c_timeout_risk,
+            1.0 - 30.0 / env._cfg.rendezvous_max_wait_sec,
+        )
+        tensorizer = ObservationTensorizer()
+        order_tokens, order_padding_mask = tensorizer._build_order_tokens((order_feature,))
+        self.assertFalse(order_padding_mask[0])
+        self.assertEqual(order_tokens.shape[1], len(ORDER_TOKEN_FIELDS))
+        self.assertAlmostEqual(
+            order_tokens[
+                0,
+                ORDER_TOKEN_FIELDS.index("mode_c_candidate_count_norm"),
+            ],
+            1.0 / tensorizer._cfg.max_candidate_recovery_per_order,
+        )
+        self.assertAlmostEqual(
+            order_tokens[
+                0,
+                ORDER_TOKEN_FIELDS.index("best_mode_c_wait_time_norm"),
+            ],
+            (
+                env._cfg.rendezvous_execution_margin_sec + 30.0
+            )
+            / env._cfg.upper_horizon_sec,
+        )
+        self.assertAlmostEqual(
+            order_tokens[
+                0,
+                ORDER_TOKEN_FIELDS.index("best_mode_c_energy_margin_ratio"),
+            ],
+            min(1.0, order_feature.best_mode_c_energy_margin_ratio),
+        )
+        self.assertAlmostEqual(
+            order_tokens[
+                0,
+                ORDER_TOKEN_FIELDS.index("best_mode_c_timeout_risk_norm"),
+            ],
+            order_feature.best_mode_c_timeout_risk,
         )
 
         resolved_wait = candidate_out.resolved_action_lookup.resolve(root_branch_idx=0)

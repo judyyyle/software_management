@@ -1346,40 +1346,215 @@ A pooled-recurrent factorized PPO actor for order-mode dispatching.
 
 ## 16. 建议的修改顺序
 
-推荐按以下顺序修改，避免一次性改太多导致难以定位问题：
+结合当前代码状态，推荐按以下顺序修改。
+
+当前代码中已经完成的部分包括：
 
 ```text
-第一步：
+1. Actor observation 已经没有 recovery_tokens / recovery_padding_mask。
+2. FactorizedActionMask 已经是 root / order / mode。
+3. ResolvedActionLookup 已经只用 root / order / mode 解析动作。
+4. CandidateBuilder 生成的 mode C DispatchAction 当前不携带 recover_node_id。
+5. mode C 送达后的 recovery node 选择已经在 env_adapter 执行层后置完成。
+```
+
+因此，当前不应再把重点放在“删除 actor recovery token”上，而应重点补齐：
+
+```text
+1. mode C order-level summary 是否足够完整；
+2. order token schema 是否同步扩展；
+3. actor 的 order aggregation 是否从 mean-only 升级为 mean / max / logmeanexp；
+4. 配置命名是否与真实模型一致。
+```
+
+注意：
+
+```text
+recovery_pool 当前仍可以保留在 CoarsePlanView / CandidateBuilder 内部，
+作为 mode C 可行性粗边界和候选来源。
+
+它不应作为 actor observation 明细输入，
+也不应变成 PPO 动作空间中的 recovery index。
+```
+
+推荐落地顺序如下：
+
+```text
+第 0 步：先做现状核验，不改行为
+  目标：
+    确认当前代码确实没有 actor recovery token / recovery mask / recovery index。
+
+  需要核验：
+    contracts.py
+      ObservationBatch 不包含 recovery_tokens / recovery_padding_mask。
+      FactorizedActionMask 只包含 root_branch_mask / order_mask / mode_mask。
+      ResolvedActionLookup.resolve() 只解析 root_branch_idx / order_idx / mode_idx。
+
+    candidate_builder.py
+      mode C DispatchAction 不携带 recover_node_id。
+
+    env_adapter.py
+      mode C 送达后由执行层选择 recover node。
+
+  这一步只是防止误改，不需要重构。
+
+第一步：扩展 contracts.py 中的 OrderFeatures
   contracts.py
-  修改 OrderFeatures 和 ObservationBatch
+  只新增 mode C summary 字段，不需要修改 ObservationBatch。
 
-第二步：
+  新增字段：
+    mode_c_candidate_count
+    best_mode_c_wait_time
+    best_mode_c_uav_flight_time
+    best_mode_c_energy_margin_ratio
+    best_mode_c_timeout_risk
+
+  同步修改：
+    candidate_builder.py 里的 _padding_order_feature()
+
+  不建议在这一步删除或重命名 recovery_pool。
+  recovery_pool 仍是 planner / candidate 内部机制，不是 actor 输入。
+
+第二步：补齐 CandidateBuilder 的 mode C summary
   candidate_builder.py
-  生成 mode C order-level summary
+  将当前 _ModeCRecoveryCandidate 升级为 _ModeCSummary 或等价结构。
 
-第三步：
+  需要基于真实数据流计算：
+    当前无人机位置 / 触发点
+    delivery leg 的时间与能耗
+    energy_after_delivery
+    recovery_pool 中每个候选节点
+    delivery -> recovery node 的飞行时间与能耗
+    truck ETA
+    planned_wait
+    rendezvous_margin
+    energy_margin_ratio
+    timeout_risk
+
+  需要输出：
+    candidate_count
+    best_wait_time
+    best_uav_flight_time
+    best_energy_margin_ratio
+    best_rendezvous_margin
+    best_node_type
+    best_truck_eta_remaining
+    timeout_risk
+
+  注意：
+    recovery_pool 在这里仍然只是内部候选来源。
+    不要把 recovery node 列表写入 ObservationBatch。
+    不要让 DispatchAction(mode=C) 提前携带 recover_node_id。
+
+第三步：同步 ObservationTensorizer 的 order token schema
   observation_tensorizer.py
-  修改 ORDER_TOKEN_FIELDS 和 _build_order_tokens()
-  删除 actor recovery tokens
+  修改 ORDER_TOKEN_FIELDS 和 _build_order_tokens()。
 
-第四步：
+  加入新增 mode C summary 字段：
+    mode_c_candidate_count_norm
+    best_mode_c_wait_time_norm
+    best_mode_c_uav_flight_time_norm
+    best_mode_c_energy_margin_ratio
+    best_mode_c_timeout_risk_norm
+
+  同时确认：
+    ORDER_TOKEN_FIELDS 数量
+    _build_order_tokens() 写入数量
+    bootstrap observation 推导出的 order_feat_dim
+  三者一致。
+
+  当前代码已经没有 actor recovery token，
+  所以这里只需要核验没有新增回去。
+
+第四步：跑 candidate / tensorizer 层测试
+  先跑较窄的测试，避免模型结构变化掩盖 token schema 问题。
+
+  建议：
+    backend/training/test_phase6_integration.py 中与 CandidateBuilder 相关的用例
+    backend/training/test_phase7_snapshot_and_tensorizers.py
+
+  重点检查：
+    mode_mask 仍正确表达 B/C 可行性
+    has_mode_c_action 与 mode_c_candidate_count 一致
+    mode C action resolve 后 recover_node_id 仍为 None
+    order_tokens shape 与字段数一致
+
+第五步：检查训练/推理侧是否需要跟随调整
   train_cmrappo.py / policy_inference.py
-  删除 recovery 字段引用，保证数据流能跑通
+  当前没有 recovery_tokens 字段引用时，不需要做删除性修改。
 
-第五步：
+  需要确认：
+    model 初始化 order_feat_dim 是否来自 bootstrap observation
+    stack / zero / sequence minibatch 是否只依赖 ObservationBatch 当前字段
+    policy_inference.py 与 train_cmrappo.py 使用同一套 tensorizer 输出
+
+  如果这些逻辑已经按 ObservationBatch 自动 stack，
+  这一步只做 smoke test，不做结构性改动。
+
+第六步：修改 model.py 的 order aggregation
   model.py
-  加 order_mean / order_max / order_logmeanexp
+  新增：
+    _masked_max
+    _masked_logmeanexp
 
-第六步：
+  修改：
+    context_proj 输入维度：
+      d_model * 3 + lstm_hidden
+      ->
+      d_model * 5 + lstm_hidden
+
+    forward_sequence():
+      order_summary
+      ->
+      order_mean / order_max / order_lse
+
+  保持不变：
+    order_head
+    mode_head
+    recurrent_core
+    critic_head
+
+  不在这一步加入 attention / dropout / GNN。
+
+第七步：修改配置命名
   rh_alns_cmrappo.yaml
-  修改 encoder_type 为 pool_lstm_v2
+  将 encoder_type 从 attn_lstm_lite 改为 pool_lstm_v2。
 
-第七步：
-  跑一次 shape smoke test
-  确认 forward、sample_action、evaluate_actions 全部正常
+  dropout 第一阶段设为 0.0。
 
-第八步：
-  再开始 PPO 训练
+  如果 PolicyMeta / 配置解析仍要求 nhead：
+    短期保留 nhead: 8，并标注 legacy only。
+
+  如果同步清理 PolicyMeta：
+    再移除 nhead 强制校验。
+
+第八步：跑模型 shape smoke test
+  确认：
+    forward()
+    forward_sequence()
+    sample_action()
+    evaluate_actions()
+  全部正常。
+
+  重点检查：
+    root_branch_logits shape
+    order_logits shape
+    mode_logits shape
+    value shape
+    sequence batch 的 LSTM state shape
+    WAIT 样本下 evaluate_actions 不错误消费 mode 分支
+
+第九步：小步训练验证
+  先跑短 episode / 小 batch。
+
+  观察：
+    policy loss / value loss 是否出现 NaN
+    entropy 是否正常
+    dispatch / wait 比例是否异常塌缩
+    mode C action 数量是否与 candidate supply 大体一致
+    mode C 送达后 recovery selection / fallback 指标是否正常
+
+  通过后再开始正式 PPO 训练。
 ```
 
 ---

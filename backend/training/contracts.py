@@ -529,9 +529,14 @@ class OrderFeatures:
     best_mode_b_host_type: str
     best_mode_b_queue_time_est: float
     has_mode_c_action: bool
+    mode_c_candidate_count: int
     best_mode_c_rendezvous_margin: float
+    best_mode_c_wait_time: float
+    best_mode_c_uav_flight_time: float
+    best_mode_c_energy_margin_ratio: float
     best_mode_c_node_type: str
     best_mode_c_truck_eta_remaining: float
+    best_mode_c_timeout_risk: float
     is_valid: bool
 
 
@@ -824,7 +829,6 @@ class CriticTensorSchemaMeta:
 class PolicyMeta:
     encoder_type: str
     d_model: int
-    nhead: int
     ff_dim: int
     dropout: float
     lstm_hidden: int
@@ -836,8 +840,18 @@ class PolicyMeta:
     use_drone_source_type_flag: bool
     critic_mode: str
     inference_mode: str
+    nhead: int | None = None
 
     def __post_init__(self) -> None:
+        if self.d_model <= 0:
+            raise ValueError(f"d_model ({self.d_model}) 必须为正数")
+        attention_encoders = {"attn_lstm_lite", "transformer", "attention"}
+        if self.encoder_type not in attention_encoders:
+            return
+        if self.nhead is None:
+            raise ValueError(f"{self.encoder_type} 必须配置 nhead")
+        if self.nhead <= 0:
+            raise ValueError(f"nhead ({self.nhead}) 必须为正数")
         if self.d_model % self.nhead != 0:
             raise ValueError(
                 f"d_model ({self.d_model}) 必须能被 nhead ({self.nhead}) 整除"
@@ -852,6 +866,16 @@ class ActionSpaceMeta:
     planner_modes: tuple[str, ...]
     enable_wait_action: bool
     include_mode_a_in_policy: bool
+
+    def __post_init__(self) -> None:
+        if self.type != "factorized":
+            return
+        expected_head_order = ("root", "order", "mode")
+        if self.factorized_head_order != expected_head_order:
+            raise ValueError(
+                "factorized_head_order 必须与当前 actor head 一致: "
+                f"expected={expected_head_order}, actual={self.factorized_head_order}"
+            )
 
 
 @dataclass(frozen=True)

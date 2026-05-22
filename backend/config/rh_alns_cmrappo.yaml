@@ -214,9 +214,9 @@ action_space:
 
   # head 顺序固定，不允许在实验间变动。
   factorized_head_order:
+    - root
     - order
     - mode
-    - recovery
 
   enable_wait_action: true
   wait_action_name: WAIT
@@ -256,13 +256,13 @@ reservation:
 
 policy:
   shared_policy: true
-  encoder_type: attn_lstm_lite
+  encoder_type: pool_lstm_v2
 
-  # d_model=128, nhead=8 -> 每头 16 维，属于稳定的标准配置。
+  # pool_lstm_v2 当前不使用 attention；nhead 仅为 PolicyMeta / 在线锁兼容字段。
   d_model: 128
-  nhead: 8
+  nhead: 8  # legacy only
   ff_dim: 256
-  dropout: 0.10
+  dropout: 0.0
 
   # LSTM 建模最近 6 个局部决策事件步，而非固定时间步。
   lstm_hidden: 128
@@ -333,7 +333,7 @@ training:
   mixed_precision: false
 
   # PPO 核心超参数。
-  total_timesteps: 800000
+  total_timesteps: 100000
   # Run16: 小幅回升学习率，补偿更大 Huber delta 下 critic 梯度绝对值下降。
   ppo_learning_rate: 0.0001
   rollout_steps: 2048
@@ -384,8 +384,8 @@ training:
   # 训练/评估过程控制。
   log_interval_updates: 1
   save_interval_updates: 25
-  # 每 5 次 update 评估一次；若 selection key 优于历史最优，则覆盖保存 policy_best.pt。
-  eval_interval_updates: 5
+  # 诊断短跑阶段降低评估频率；若 selection key 优于历史最优，则覆盖保存 policy_best.pt。
+  eval_interval_updates: 10
   benchmark_eval_episodes: 3
   stochastic_eval_seeds: 5
   checkpoint_keep_last: 5

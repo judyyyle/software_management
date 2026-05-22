@@ -79,7 +79,7 @@ if torch is not None:  # pragma: no cover
                 batch_first=True,
             )
             self.context_proj = nn.Sequential(
-                nn.Linear(d_model * 3 + lstm_hidden, ff_dim),
+                nn.Linear(d_model * 5 + lstm_hidden, ff_dim),
                 nn.ReLU(),
                 nn.Linear(ff_dim, d_model),
                 nn.ReLU(),
@@ -193,10 +193,23 @@ if torch is not None:  # pragma: no cover
                 ~history_padding_mask_flat,
                 dim=1,
             ).reshape(batch_size, seq_len, -1)
-            order_summary = _masked_mean(order_embed, ~order_padding_mask, dim=2)
+            order_valid_mask = ~order_padding_mask
+            order_mean = _masked_mean(order_embed, order_valid_mask, dim=2)
+            order_max = _masked_max(order_embed, order_valid_mask, dim=2)
+            order_lse = _masked_logmeanexp(order_embed, order_valid_mask, dim=2)
             infra_summary = infra_embed.mean(dim=2)
             base_context = self.context_proj(
-                torch.cat([uav_embed, order_summary, infra_summary, history_summary], dim=-1)
+                torch.cat(
+                    [
+                        uav_embed,
+                        order_mean,
+                        order_max,
+                        order_lse,
+                        infra_summary,
+                        history_summary,
+                    ],
+                    dim=-1,
+                )
             )
             recurrent_out, next_lstm_state = self.recurrent_core(base_context, lstm_state)
             recurrent_context = self.recurrent_proj(recurrent_out)
@@ -513,6 +526,24 @@ if torch is not None:  # pragma: no cover
         weighted = values * weights
         denom = weights.sum(dim=dim).clamp(min=1.0)
         return weighted.sum(dim=dim) / denom
+
+
+    def _masked_max(values: Tensor, valid_mask: Tensor, *, dim: int) -> Tensor:
+        mask = valid_mask.unsqueeze(-1)
+        has_valid = valid_mask.any(dim=dim, keepdim=False).unsqueeze(-1)
+        masked_values = values.masked_fill(~mask, -1e9)
+        pooled = masked_values.max(dim=dim).values
+        return torch.where(has_valid, pooled, torch.zeros_like(pooled))
+
+
+    def _masked_logmeanexp(values: Tensor, valid_mask: Tensor, *, dim: int) -> Tensor:
+        mask = valid_mask.unsqueeze(-1)
+        has_valid = valid_mask.any(dim=dim, keepdim=False).unsqueeze(-1)
+        safe_values = values.masked_fill(~mask, -1e9)
+        pooled = torch.logsumexp(safe_values, dim=dim)
+        count = valid_mask.sum(dim=dim).clamp(min=1).to(dtype=values.dtype).unsqueeze(-1)
+        pooled = pooled - torch.log(count)
+        return torch.where(has_valid, pooled, torch.zeros_like(pooled))
 
 
 else:

@@ -886,9 +886,12 @@ class TestPhase7ModelRuntime(unittest.TestCase):
                 }
             },
         )
-        carry_in, post_action = _extract_attributed_step_reward_parts(step_result=step_result)
+        carry_in, post_action, mode_c_attempt = _extract_attributed_step_reward_parts(
+            step_result=step_result
+        )
         self.assertAlmostEqual(carry_in, -3.0, places=6)
         self.assertAlmostEqual(post_action, -2.5, places=6)
+        self.assertAlmostEqual(mode_c_attempt, 0.0, places=6)
 
     def test_shape_post_action_reward_for_rendezvous_adds_arrive_and_success_bonus(self) -> None:
         (
