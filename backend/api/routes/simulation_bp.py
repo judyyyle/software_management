@@ -63,6 +63,14 @@ logger = logging.getLogger(__name__)
 sim_bp = Blueprint("sim", __name__)
 sock   = Sock()  # app.py 调用 sock.init_app(app) 绑定 Flask 应用
 
+
+def _optional_bool(value):
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return value
+    return str(value).strip().lower() in {"1", "true", "yes", "y", "on"}
+
 # ── 模块级单例（由 /api/sim/init 初始化）─────────────────────────────────────
 _entity_mgr: EntityManager           = EntityManager()
 _order_mgr:  OrderManager            = OrderManager()
@@ -1029,6 +1037,7 @@ def sim_dispatch():
     solver = body.get("solver", "greedy")
     bbox = body.get("bbox")
     scene_id = body.get("scene_id")  # 可选：预设场景 ID
+    reuse_static_ga_plan = _optional_bool(body.get("reuse_static_ga_plan"))
 
     logger.debug(f"[sim_dispatch] 收到请求体: {body}")
 
@@ -1039,6 +1048,10 @@ def sim_dispatch():
             "error": str(exc),
             "available_solvers": _dispatch_engine.get_available_solvers(),
         }), 400
+
+    solver_impl = getattr(_dispatch_engine, "solver", None)
+    if hasattr(solver_impl, "set_static_plan_cache_reuse"):
+        solver_impl.set_static_plan_cache_reuse(reuse_static_ga_plan)
 
     if not bbox or not all(k in bbox for k in ["minx", "miny", "maxx", "maxy"]):
         logger.error(f"[sim_dispatch] bbox 缺失或格式错误: {bbox}")
@@ -1094,6 +1107,8 @@ def sim_dispatch():
                 "modes":         plan.summary.get("modes", {}),
                 "cost_total":    round(plan.cost_total, 2),
                 "cost_breakdown": plan.summary.get("cost_breakdown", {}),
+                "static_cache_reused": bool(plan.summary.get("static_cache_reused", False)),
+                "static_cache_path": plan.summary.get("static_cache_path", ""),
                 "allocations": [
                     {
                         "order_id": a.order_id,
