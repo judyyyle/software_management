@@ -1,18 +1,26 @@
 {
   "DEP-TEST-01": {
-    "eta_ref": 1153.8715683819553,
-    "route_index_ref": 3
+    "eta_ref": 1679.5444465479052,
+    "route_index_ref": 5
   },
-  "STA-TEST-02": {
-    "eta_ref": 409.76545271030636,
-    "route_index_ref": 0
-  },
-  "STA-TEST-08": {
-    "eta_ref": 774.035941640366,
+  "STA-TEST-01": {
+    "eta_ref": 523.5124146070491,
     "route_index_ref": 1
   },
-  "STA-TEST-09": {
-    "eta_ref": 947.0887683068944,
+  "STA-TEST-02": {
+    "eta_ref": 732.7089354723498,
     "route_index_ref": 2
+  },
+  "STA-TEST-04": {
+    "eta_ref": 1086.419092548487,
+    "route_index_ref": 3
+  },
+  "STA-TEST-09": {
+    "eta_ref": 1257.7278899644741,
+    "route_index_ref": 4
+  },
+  "STA-TEST-10": {
+    "eta_ref": 202.65604990815547,
+    "route_index_ref": 0
   }
 }

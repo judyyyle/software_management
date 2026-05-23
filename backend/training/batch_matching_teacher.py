@@ -14,6 +14,8 @@ import math
 from dataclasses import dataclass
 from typing import Any, Callable, Mapping
 
+from config.loader import load_solver_energy_params
+
 from .actions import DispatchAction, EnvAction, WAIT_ACTION
 from .contracts import CandidateOutput, ResolvedActionIndices
 
@@ -21,7 +23,12 @@ from .contracts import CandidateOutput, ResolvedActionIndices
 _INF = 1.0e18
 _TIME_EPS = 1.0e-6
 _DEFAULT_WAIT_DISPATCH_MARGIN = 1_000_000.0
-_MODE_C_WAIT_COST_WEIGHT = 0.50
+_MODE_C_WAIT_COST_WEIGHT = 1.0
+_DEADLINE_WARNING_WINDOW_SEC = 900.0
+_DEADLINE_CRITICAL_WINDOW_SEC = 300.0
+_DEADLINE_WARNING_WEIGHT = 1.0
+_DEADLINE_CRITICAL_WEIGHT = 4.0
+_DEADLINE_LATE_WEIGHT = 10.0
 
 
 DispatchCostFn = Callable[[Any, CandidateOutput, DispatchAction, int, int], float]
@@ -238,19 +245,86 @@ def _default_dispatch_cost(
     order_idx: int,
     mode_idx: int,
 ) -> float:
-    del context, mode_idx
+    del mode_idx
     order_feature = candidate_out.candidate_features.order_features[order_idx]
+    delivery_flight_time = _estimate_delivery_flight_time(candidate_out, order_idx)
+    service_time = float(load_solver_energy_params().drone_service_time_order_s)
+    delivery_eta = float(context.t_decision) + float(delivery_flight_time)
+    deadline_risk_penalty = _deadline_risk_penalty(
+        slack_sec=float(order_feature.deadline) - float(delivery_eta)
+    )
 
     mode = str(action.mode)
     if mode == "B":
-        return float(order_feature.best_mode_b_recovery_flight_time)
+        recovery_cost = float(order_feature.best_mode_b_recovery_flight_time)
+        return float(
+            delivery_flight_time
+            + service_time
+            + recovery_cost
+            + deadline_risk_penalty
+        )
     if mode == "C":
-        return (
+        recovery_cost = (
             float(order_feature.best_mode_c_uav_flight_time)
             + _MODE_C_WAIT_COST_WEIGHT
             * float(order_feature.best_mode_c_wait_time)
         )
+        return float(
+            delivery_flight_time
+            + service_time
+            + recovery_cost
+            + deadline_risk_penalty
+        )
     raise ValueError(f"未知 dispatch mode: {action.mode}")
+
+
+def _estimate_delivery_flight_time(
+    candidate_out: CandidateOutput,
+    order_idx: int,
+) -> float:
+    order_feature = candidate_out.candidate_features.order_features[order_idx]
+    cruise_speed = max(
+        float(candidate_out.candidate_features.uav_self.cruise_speed),
+        _TIME_EPS,
+    )
+    return float(order_feature.distance_to_order) / cruise_speed
+
+
+def _deadline_risk_penalty(*, slack_sec: float) -> float:
+    """Return a DDL-aware cost correction for minimizing teacher assignment.
+
+    Negative values intentionally prioritize saveable urgent orders.  Once the
+    delivery ETA has already crossed the deadline, lateness gradually removes
+    that urgency bonus so already-late orders do not crowd out still-saveable
+    critical orders.
+    """
+
+    slack = float(slack_sec)
+    if not math.isfinite(slack):
+        return 0.0
+    warning_window = _DEADLINE_WARNING_WINDOW_SEC
+    critical_window = _DEADLINE_CRITICAL_WINDOW_SEC
+    if critical_window <= 0.0 or warning_window <= critical_window:
+        raise ValueError("DDL 窗口配置非法")
+
+    if slack >= warning_window:
+        return 0.0
+
+    warning_bonus_cap = (
+        _DEADLINE_WARNING_WEIGHT * (warning_window - critical_window)
+    )
+    critical_bonus_cap = _DEADLINE_CRITICAL_WEIGHT * critical_window
+    if slack >= critical_window:
+        return -_DEADLINE_WARNING_WEIGHT * (warning_window - slack)
+    if slack >= 0.0:
+        return -warning_bonus_cap - _DEADLINE_CRITICAL_WEIGHT * (
+            critical_window - slack
+        )
+    return (
+        -warning_bonus_cap
+        - critical_bonus_cap
+        + _DEADLINE_LATE_WEIGHT * (-slack)
+    )
 
 
 def _default_wait_cost(

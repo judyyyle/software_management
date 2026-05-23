@@ -522,6 +522,7 @@ class TrainingEnvAdapter:
         self._episode_mode_c_post_delivery_revalidation_fail_reasons = {
             key: 0 for key in _MODE_C_REVALIDATION_REASON_KEYS
         }
+        self._episode_mode_c_selected_node_expired_count = 0
         self._episode_mode_c_selected_filter_margin_sum = 0.0
         self._episode_mode_c_selected_execution_slack_sum = 0.0
         self._episode_mode_c_selected_reservation_count_sum = 0.0
@@ -663,6 +664,7 @@ class TrainingEnvAdapter:
         self._episode_mode_c_post_delivery_revalidation_fail_reasons = {
             key: 0 for key in _MODE_C_REVALIDATION_REASON_KEYS
         }
+        self._episode_mode_c_selected_node_expired_count = 0
         self._episode_mode_c_selected_filter_margin_sum = 0.0
         self._episode_mode_c_selected_execution_slack_sum = 0.0
         self._episode_mode_c_selected_reservation_count_sum = 0.0
@@ -1285,6 +1287,9 @@ class TrainingEnvAdapter:
             ),
             "mode_c_post_delivery_revalidation_fail_reasons": dict(
                 self._episode_mode_c_post_delivery_revalidation_fail_reasons
+            ),
+            "mode_c_selected_node_expired_count": int(
+                self._episode_mode_c_selected_node_expired_count
             ),
             "mode_c_selected_filter_margin_sum": float(
                 self._episode_mode_c_selected_filter_margin_sum
@@ -2279,6 +2284,13 @@ class TrainingEnvAdapter:
                 )
             if eta_ref is None:
                 continue
+            window = self._build_reservation_constraint_window(
+                drone_id=drone_id,
+                node_id=reservation.recover_node,
+                state=reservation_state,
+                eta_ref=float(eta_ref),
+                t_now=float(runtime_state.t_now),
+            )
 
             constraints.append(
                 TruckReservationConstraint(
@@ -2297,9 +2309,52 @@ class TrainingEnvAdapter:
                     related_order_id=(
                         None if commit is None else commit.order_id
                     ),
+                    earliest_eta=window[0],
+                    latest_eta=window[1],
+                    preferred_eta=window[2],
                 )
             )
         return tuple(constraints)
+
+    def _build_reservation_constraint_window(
+        self,
+        *,
+        drone_id: str,
+        node_id: str,
+        state: ReservationConstraintState,
+        eta_ref: float,
+        t_now: float,
+    ) -> tuple[float, float, float]:
+        """构造 planner 侧使用的动态 rendezvous 时间窗。"""
+
+        max_wait = float(self._cfg.rendezvous_max_wait_sec)
+        execution_margin = float(self._cfg.rendezvous_execution_margin_sec)
+        if state == ReservationConstraintState.STRONG_HARD:
+            wait_started_at = self._rendezvous_wait_started_at.get(drone_id)
+            latest = (
+                float(wait_started_at) + max_wait
+                if wait_started_at is not None
+                else float(eta_ref) + float(self._cfg.reservation_drift_eta_abs_threshold_sec)
+            )
+            earliest = min(max(float(t_now), 0.0), latest)
+            preferred = earliest
+            return (float(earliest), float(latest), float(preferred))
+
+        uav_arrival = self._estimate_rendezvous_arrival_for_recheck(
+            drone_id=drone_id,
+            node_id=node_id,
+            t_now=float(t_now),
+        )
+        if uav_arrival is None:
+            earliest = float(eta_ref)
+            latest = float(eta_ref) + float(self._cfg.reservation_drift_eta_abs_threshold_sec)
+            preferred = earliest
+            return (float(earliest), float(latest), float(preferred))
+
+        earliest = float(uav_arrival) + execution_margin
+        latest = float(uav_arrival) + max_wait
+        preferred = earliest
+        return (float(earliest), float(latest), float(preferred))
 
     def _apply_planner_reservation_outcomes(
         self,
@@ -2526,6 +2581,29 @@ class TrainingEnvAdapter:
     ) -> float | None:
         """按当前状态估计 UAV 到达 reservation 节点的时刻。"""
         state = self._drone_state.get(drone_id)
+        if state == TrainingDroneState.FLYING_TO_DELIVER:
+            leg = self._flight_legs.get(drone_id)
+            commit = self._dispatch_commit.get(drone_id)
+            if (
+                leg is not None
+                and leg.kind == "deliver"
+                and commit is not None
+                and leg.order_id == commit.order_id
+            ):
+                service_finish = (
+                    float(leg.arrival_time)
+                    + float(self._scene_solver_params().drone_service_time_order_s)
+                )
+                drone = self._require_entity_manager().drones[drone_id]
+                host = self._resolve_fixed_node(node_id)
+                return service_finish + self._estimate_flight_time(
+                    drone=drone,
+                    from_pos=leg.target_pos,
+                    to_pos=host.get_location(service_finish),
+                )
+            if commit is not None and commit.planned_uav_arrival_time_lb is not None:
+                return max(float(t_now), float(commit.planned_uav_arrival_time_lb))
+
         if state == TrainingDroneState.RETURN_TO_RENDEZVOUS:
             leg = self._flight_legs.get(drone_id)
             if (
@@ -3773,6 +3851,7 @@ class TrainingEnvAdapter:
                 include_current=True,
             )
             if next_truck_arrival is None:
+                self._episode_mode_c_selected_node_expired_count += 1
                 self._release_reservation(
                     drone_id,
                     cause=FALLBACK_CAUSE_ENERGY_OR_NODE_INVALID,

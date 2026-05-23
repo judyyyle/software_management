@@ -112,7 +112,7 @@ class TestBatchMatchingTeacher(unittest.TestCase):
                 candidate_outputs_by_drone=candidates,
             )
 
-    def test_default_cost_uses_post_delivery_recovery_cost_for_mode_choice(self) -> None:
+    def test_default_cost_combines_delivery_service_and_recovery_cost(self) -> None:
         runtime_state = object()
         coarse_plan = object()
         contexts = (_context("DRN-1", runtime_state, coarse_plan),)
@@ -125,12 +125,14 @@ class TestBatchMatchingTeacher(unittest.TestCase):
                 "DRN-1",
                 order_feature_overrides_by_order={
                     "ORDER-B": {
-                        "distance_to_order": 1.0,
+                        "distance_to_order": 100.0,
+                        "deadline": 2000.0,
                         "best_mode_b_recovery_flight_time": 80.0,
                         "best_mode_b_queue_time_est": 10000.0,
                     },
                     "ORDER-C": {
                         "distance_to_order": 10000.0,
+                        "deadline": 20000.0,
                         "best_mode_c_wait_time": 20.0,
                         "best_mode_c_uav_flight_time": 30.0,
                         "best_mode_c_energy_margin_ratio": 0.0,
@@ -145,8 +147,42 @@ class TestBatchMatchingTeacher(unittest.TestCase):
             candidate_outputs_by_drone=candidates,
         )
 
-        self.assertEqual(result.actions_by_drone["DRN-1"], DispatchAction("ORDER-C", "C"))
-        self.assertAlmostEqual(result.assignments_by_drone["DRN-1"].cost, 40.0)
+        self.assertEqual(result.actions_by_drone["DRN-1"], DispatchAction("ORDER-B", "B"))
+        self.assertAlmostEqual(result.assignments_by_drone["DRN-1"].cost, 120.0)
+
+    def test_default_cost_prioritizes_saveable_urgent_deadline(self) -> None:
+        runtime_state = object()
+        coarse_plan = object()
+        contexts = (_context("DRN-1", runtime_state, coarse_plan),)
+        candidates = {
+            "DRN-1": _candidate_output(
+                [
+                    ("RELAXED", ("B",)),
+                    ("URGENT", ("B",)),
+                ],
+                "DRN-1",
+                order_feature_overrides_by_order={
+                    "RELAXED": {
+                        "distance_to_order": 100.0,
+                        "deadline": 2000.0,
+                        "best_mode_b_recovery_flight_time": 1.0,
+                    },
+                    "URGENT": {
+                        "distance_to_order": 2000.0,
+                        "deadline": 350.0,
+                        "best_mode_b_recovery_flight_time": 500.0,
+                    },
+                },
+            )
+        }
+
+        result = build_batch_matching_teacher_labels(
+            decision_contexts=contexts,
+            candidate_outputs_by_drone=candidates,
+        )
+
+        self.assertEqual(result.actions_by_drone["DRN-1"], DispatchAction("URGENT", "B"))
+        self.assertAlmostEqual(result.assignments_by_drone["DRN-1"].cost, -870.0)
 
 
 def _context(drone_id: str, runtime_state: object, coarse_plan: object) -> SimpleNamespace:
@@ -254,6 +290,7 @@ def _order_feature(
     **overrides: float,
 ) -> OrderFeatures:
     values = {
+        "deadline": 1000.0,
         "distance_to_order": 100.0,
         "remaining_time": 900.0,
         "best_mode_b_return_score": 200.0,
@@ -268,7 +305,7 @@ def _order_feature(
     return OrderFeatures(
         order_id=order_id,
         weight=1.0,
-        deadline=1000.0,
+        deadline=float(values["deadline"]),
         remaining_time=float(values["remaining_time"]),
         delivery_x=0.0,
         delivery_y=0.0,

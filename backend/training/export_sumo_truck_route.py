@@ -8,14 +8,14 @@ HiveLogix — Phase 4 卡车路线导出与 SUMO 验证产物生成。
   - 完整执行路线包含 `depot / customer / station`；
   - `truck_backbone_route` 仅保留未来固定节点（`station / depot`）；
   - 订单访问顺序：deadline 为主，OSM 路网最短路径距离为 tie-break；
-  - 充换电站插入：以路网绕路代价最小为准，沿路站点绕路代价自然接近 0；
+  - 充换电站插入：以额外行驶时间为底，叠加 Mode C 回收机会 bonus；
   - ETA 使用 OSM 实际可达路径长度 / `truck.speed` 计算，不使用曼哈顿距离。
 
 执行流程：
   1. 加载场景（depot / truck / orders / stations / OSM 路网）；
   2. 构建 OSM 路网图（DiGraph）与 SUMO net 中间产物——必须在规划前完成；
   3. 按 deadline + 路网距离贪心排序订单；
-  4. 插入充换电站，满足 min_future_fixed_nodes 约束；
+  4. 插入充换电站，满足 min_future_fixed_nodes 与巡站数量目标；
   5. 物化执行路线：对每段 stop-to-stop 跑 Dijkstra，映射到 SUMO edge 序列；
   6. 导出 net.xml / rou.xml / poi.add.xml / sumocfg 及各 JSON 产物。
 """
@@ -56,6 +56,9 @@ DEFAULT_OUTPUT_SUBDIR = Path("sumo") / "phase4_truck_route"
 SNAP_WARN_THRESHOLD_M = 60.0
 # 绕路代价低于此值视为"顺路"，无论数量多少都直接加入路线。
 STATION_ONROUTE_DETOUR_THRESHOLD_M = 100.0
+_TIME_EPS = 1e-6
+_RECOVERY_OPPORTUNITY_BONUS_SEC = 90.0
+_RECOVERY_OPPORTUNITY_BONUS_CAP_SEC = 360.0
 
 _DRONE_PARAMS = load_drone_params()
 _SOLVER_ENERGY_PARAMS = load_solver_energy_params()
@@ -76,6 +79,35 @@ class Phase4TruckOrder:
     raw: Mapping[str, Any]
     deadline: float
     fulfillment_mode: str
+
+
+@dataclass(frozen=True)
+class Phase4ModeCOrder:
+    order: Order
+    raw: Mapping[str, Any]
+    available_time_sec: float
+    deadline: float
+    source_bucket: str
+
+
+@dataclass(frozen=True)
+class Phase4RouteConfig:
+    min_future_fixed_nodes: int
+    station_target_count: int
+    support_radius_km: float
+    rendezvous_execution_margin_sec: float
+    rendezvous_max_wait_sec: float
+
+
+@dataclass(frozen=True)
+class StationInsertionCandidate:
+    station: Any
+    insert_index: int
+    detour_cost_road_m: float
+    extra_route_time_sec: float
+    station_eta_sec: float
+    opportunity_bonus_sec: float
+    adjusted_extra_time_sec: float
 
 
 @dataclass(frozen=True)
@@ -137,10 +169,11 @@ def export_phase4_truck_route_for_scene(
     min_future_fixed_nodes: int | None = None,
 ) -> Phase4ExportResult:
     config_path = Path(config_path)
-    resolved_min_future_fixed_nodes = _resolve_min_future_fixed_nodes(
+    phase4_route_cfg = _resolve_phase4_route_config(
         config_path=config_path,
         override=min_future_fixed_nodes,
     )
+    resolved_min_future_fixed_nodes = phase4_route_cfg.min_future_fixed_nodes
     export_dir = _resolve_output_dir(scene_ctx, output_dir)
     export_dir.mkdir(parents=True, exist_ok=True)
 
@@ -158,12 +191,20 @@ def export_phase4_truck_route_for_scene(
     )
 
     truck_orders = _select_truck_orders(scene_ctx)
+    mode_c_candidate_orders = _select_mode_c_candidate_orders(scene_ctx)
     ordered_orders = _order_truck_orders(truck_orders, depot.location, road_graph, road_nodes)
     initial_execution_plan = _build_initial_execution_plan(depot_id, depot.location, ordered_orders)
     execution_plan, inserted_fixed_nodes = _ensure_min_future_fixed_nodes(
         initial_execution_plan,
         stations=scene_ctx.stations,
         min_future_fixed_nodes=resolved_min_future_fixed_nodes,
+        station_target_count=phase4_route_cfg.station_target_count,
+        mode_c_candidate_orders=mode_c_candidate_orders,
+        drones=tuple(scene_ctx.drones.values()),
+        truck_speed=float(truck.speed),
+        support_radius_km=phase4_route_cfg.support_radius_km,
+        rendezvous_execution_margin_sec=phase4_route_cfg.rendezvous_execution_margin_sec,
+        rendezvous_max_wait_sec=phase4_route_cfg.rendezvous_max_wait_sec,
         road_graph=road_graph,
         road_nodes=road_nodes,
     )
@@ -219,6 +260,8 @@ def export_phase4_truck_route_for_scene(
             inserted_fixed_nodes=inserted_fixed_nodes,
             execution_route=execution_route,
             min_future_fixed_nodes=resolved_min_future_fixed_nodes,
+            station_target_count=phase4_route_cfg.station_target_count,
+            mode_c_candidate_orders=mode_c_candidate_orders,
         ),
     )
 
@@ -229,6 +272,7 @@ def export_phase4_truck_route_for_scene(
         truck_backbone_route=truck_backbone_route,
         truck_eta_map=truck_eta_map,
         min_future_fixed_nodes=resolved_min_future_fixed_nodes,
+        station_target_count=phase4_route_cfg.station_target_count,
         export_dir=export_dir,
     )
     _write_json(export_dir / "validation_report.json", validation_report)
@@ -262,14 +306,11 @@ def export_phase4_truck_route(
     )
 
 
-def _resolve_min_future_fixed_nodes(
+def _resolve_phase4_route_config(
     *,
     config_path: str | Path,
     override: int | None,
-) -> int:
-    if override is not None:
-        return int(override)
-
+) -> Phase4RouteConfig:
     try:
         import yaml  # type: ignore[import]
     except ImportError as exc:
@@ -286,10 +327,47 @@ def _resolve_min_future_fixed_nodes(
     if not isinstance(planner_cfg, Mapping):
         raise ValueError(f"配置缺少 planner 段: {config_path}")
 
-    value = int(planner_cfg.get("phase4_min_future_fixed_nodes", 2))
-    if value < 1:
+    candidate_cfg = raw_cfg.get("candidate")
+    if not isinstance(candidate_cfg, Mapping):
+        raise ValueError(f"配置缺少 candidate 段: {config_path}")
+
+    min_future_fixed_nodes = (
+        int(override)
+        if override is not None
+        else int(planner_cfg.get("phase4_min_future_fixed_nodes", 2))
+    )
+    if min_future_fixed_nodes < 1:
         raise ValueError("planner.phase4_min_future_fixed_nodes 必须 >= 1")
-    return value
+
+    patrol_stations_per_loop = int(
+        planner_cfg.get("patrol_stations_per_loop", min_future_fixed_nodes)
+    )
+    station_target_count = max(min_future_fixed_nodes, patrol_stations_per_loop)
+    if station_target_count < 1:
+        raise ValueError("Phase 4 station_target_count 必须 >= 1")
+
+    rendezvous_execution_margin_sec = float(
+        candidate_cfg.get(
+            "rendezvous_execution_margin_sec",
+            candidate_cfg.get("rendezvous_filter_margin_sec", 0.0),
+        )
+    )
+    rendezvous_max_wait_sec = float(candidate_cfg["rendezvous_max_wait_sec"])
+    if rendezvous_execution_margin_sec < 0.0:
+        raise ValueError("candidate.rendezvous_execution_margin_sec 不能为负数")
+    if rendezvous_max_wait_sec < rendezvous_execution_margin_sec:
+        raise ValueError(
+            "candidate.rendezvous_max_wait_sec 不能小于 "
+            "rendezvous_execution_margin_sec"
+        )
+
+    return Phase4RouteConfig(
+        min_future_fixed_nodes=min_future_fixed_nodes,
+        station_target_count=station_target_count,
+        support_radius_km=float(planner_cfg["support_radius_km"]),
+        rendezvous_execution_margin_sec=rendezvous_execution_margin_sec,
+        rendezvous_max_wait_sec=rendezvous_max_wait_sec,
+    )
 
 
 def _resolve_output_dir(
@@ -342,6 +420,54 @@ def _select_truck_orders(scene_ctx: TrainingSceneContext) -> tuple[Phase4TruckOr
             "无法生成 Phase 4 路线"
         )
     return tuple(truck_orders)
+
+
+def _select_mode_c_candidate_orders(
+    scene_ctx: TrainingSceneContext,
+) -> tuple[Phase4ModeCOrder, ...]:
+    """收集初始骨架插站时可作为 Mode C 机会先验的订单。"""
+    items: list[Phase4ModeCOrder] = []
+    static_raw_by_id = {
+        str(entry["order_id"]): dict(entry)
+        for entry in scene_ctx.orders_raw.get("static_orders", [])
+    }
+    for order in scene_ctx.static_orders:
+        if float(order.payload_weight) > HEAVY_DRONE_PAYLOAD_CAPACITY_KG + _TIME_EPS:
+            continue
+        items.append(
+            Phase4ModeCOrder(
+                order=order,
+                raw=static_raw_by_id.get(order.order_id, {}),
+                available_time_sec=float(order.create_time),
+                deadline=float(order.deadline),
+                source_bucket="static_orders",
+            )
+        )
+
+    for item in scene_ctx.dynamic_orders:
+        order = item.order
+        if float(order.payload_weight) > HEAVY_DRONE_PAYLOAD_CAPACITY_KG + _TIME_EPS:
+            continue
+        items.append(
+            Phase4ModeCOrder(
+                order=order,
+                raw=dict(item.raw),
+                available_time_sec=float(item.spawn_sim_s),
+                deadline=float(order.deadline),
+                source_bucket="dynamic_orders",
+            )
+        )
+
+    return tuple(
+        sorted(
+            items,
+            key=lambda item: (
+                float(item.available_time_sec),
+                float(item.deadline),
+                item.order.order_id,
+            ),
+        )
+    )
 
 
 def _order_truck_orders(
@@ -400,44 +526,95 @@ def _ensure_min_future_fixed_nodes(
     *,
     stations: Mapping[str, Any],
     min_future_fixed_nodes: int,
+    station_target_count: int,
+    mode_c_candidate_orders: Sequence[Phase4ModeCOrder],
+    drones: Sequence[Any],
+    truck_speed: float,
+    support_radius_km: float,
+    rendezvous_execution_margin_sec: float,
+    rendezvous_max_wait_sec: float,
     road_graph: Any,
     road_nodes: Mapping[str, tuple[float, float]],
 ) -> tuple[list[dict[str, Any]], tuple[dict[str, Any], ...]]:
     # 两阶段插入：
     #   Phase 1 — 把所有绕路代价 < STATION_ONROUTE_DETOUR_THRESHOLD_M 的站点全部加入，
     #             这些站点本来就顺路，不应跳过。每次插入后重新计算，因为计划结构已变。
-    #   Phase 2 — 若 Phase 1 结束后 station 数量仍不足 min_future_fixed_nodes，
-    #             按绕路代价从小到大继续补足，直到满足约束。
+    #   Phase 2 — 若 Phase 1 结束后 station 数量仍不足 station_target_count，
+    #             按"额外行驶时间 - Mode C 回收机会 bonus"补足，直到满足约束。
     if min_future_fixed_nodes < 1:
         raise ValueError("min_future_fixed_nodes 必须 >= 1")
+    if station_target_count < min_future_fixed_nodes:
+        raise ValueError("station_target_count 不能小于 min_future_fixed_nodes")
+    if truck_speed <= 0:
+        raise ValueError(f"truck.speed 必须为正数: {truck_speed}")
 
     plan = list(execution_plan)
     inserted: list[dict[str, Any]] = []
     used_station_ids = {stop["node_id"] for stop in plan if stop["node_type"] == "station"}
 
-    def _best_insertion(station_pos: Position3D) -> tuple[float, int] | tuple[None, None]:
-        best_cost: float | None = None
-        best_index: int | None = None
+    def _station_insertions(station: Any) -> list[StationInsertionCandidate]:
+        candidates: list[StationInsertionCandidate] = []
         for insert_at in range(1, len(plan)):
-            cost = (
-                _road_distance(road_graph, road_nodes, plan[insert_at - 1]["position"], station_pos)
-                + _road_distance(road_graph, road_nodes, station_pos, plan[insert_at]["position"])
-                - _road_distance(road_graph, road_nodes, plan[insert_at - 1]["position"], plan[insert_at]["position"])
+            prev_pos = plan[insert_at - 1]["position"]
+            next_pos = plan[insert_at]["position"]
+            detour_cost = (
+                _road_distance(road_graph, road_nodes, prev_pos, station.location)
+                + _road_distance(road_graph, road_nodes, station.location, next_pos)
+                - _road_distance(road_graph, road_nodes, prev_pos, next_pos)
             )
-            if best_cost is None or cost < best_cost:
-                best_cost = cost
-                best_index = insert_at
-        return best_cost, best_index
+            candidate_plan = (
+                plan[:insert_at]
+                + [_make_plan_stop("station", station.station_id, station.location)]
+                + plan[insert_at:]
+            )
+            station_eta = _estimate_plan_arrival_time_at_index(
+                execution_plan=candidate_plan,
+                target_index=insert_at,
+                truck_speed=truck_speed,
+                road_graph=road_graph,
+                road_nodes=road_nodes,
+            )
+            extra_route_time = float(detour_cost) / max(_TIME_EPS, truck_speed)
+            opportunity_bonus = _phase4_station_recovery_opportunity_bonus(
+                station_pos=station.location,
+                station_eta=float(station_eta),
+                mode_c_candidate_orders=mode_c_candidate_orders,
+                drones=drones,
+                support_radius_km=support_radius_km,
+                rendezvous_execution_margin_sec=rendezvous_execution_margin_sec,
+                rendezvous_max_wait_sec=rendezvous_max_wait_sec,
+            )
+            candidates.append(
+                StationInsertionCandidate(
+                    station=station,
+                    insert_index=insert_at,
+                    detour_cost_road_m=float(detour_cost),
+                    extra_route_time_sec=float(extra_route_time),
+                    station_eta_sec=float(station_eta),
+                    opportunity_bonus_sec=float(opportunity_bonus),
+                    adjusted_extra_time_sec=float(extra_route_time)
+                    - float(opportunity_bonus),
+                )
+            )
+        return candidates
 
-    def _do_insert(station: Any, insert_index: int, detour_cost: float, reason: str) -> None:
-        plan.insert(insert_index, _make_plan_stop("station", station.station_id, station.location))
+    def _do_insert(candidate: StationInsertionCandidate, reason: str) -> None:
+        station = candidate.station
+        plan.insert(
+            candidate.insert_index,
+            _make_plan_stop("station", station.station_id, station.location),
+        )
         inserted.append(
             {
                 "node_type": "station",
                 "node_id": station.station_id,
-                "insert_index": insert_index,
+                "insert_index": candidate.insert_index,
                 "reason": reason,
-                "detour_cost_road_m": float(detour_cost),
+                "detour_cost_road_m": float(candidate.detour_cost_road_m),
+                "extra_route_time_sec": float(candidate.extra_route_time_sec),
+                "station_eta_sec": float(candidate.station_eta_sec),
+                "mode_c_opportunity_bonus_sec": float(candidate.opportunity_bonus_sec),
+                "adjusted_extra_time_sec": float(candidate.adjusted_extra_time_sec),
             }
         )
         used_station_ids.add(station.station_id)
@@ -450,31 +627,170 @@ def _ensure_min_future_fixed_nodes(
         for station_id, station in stations.items():
             if station_id in used_station_ids:
                 continue
-            cost, idx = _best_insertion(station.location)
-            if cost is not None and cost < STATION_ONROUTE_DETOUR_THRESHOLD_M:
-                candidates.append((cost, station_id, station, idx))
+            for candidate in _station_insertions(station):
+                if candidate.detour_cost_road_m < STATION_ONROUTE_DETOUR_THRESHOLD_M:
+                    candidates.append(candidate)
         if candidates:
-            candidates.sort(key=lambda c: (c[0], c[1]))
-            cost, _, station, idx = candidates[0]
-            _do_insert(station, idx, cost, "on_route")
+            candidates.sort(key=_station_insertion_sort_key)
+            _do_insert(candidates[0], "on_route")
             changed = True
 
-    # Phase 2: 数量不足时按绕路代价从小到大补足
-    while _count_future_fixed_nodes(plan) < min_future_fixed_nodes:
+    # Phase 2: 数量不足时补到与重规划巡站数量一致的目标。
+    while _count_future_fixed_nodes(plan) < station_target_count:
         candidates = []
         for station_id, station in stations.items():
             if station_id in used_station_ids:
                 continue
-            cost, idx = _best_insertion(station.location)
-            if cost is not None:
-                candidates.append((cost, station_id, station, idx))
+            candidates.extend(_station_insertions(station))
         if not candidates:
             raise ValueError("没有可插入的 station，无法满足最少 recovery 节点约束")
-        candidates.sort(key=lambda c: (c[0], c[1]))
-        cost, _, station, idx = candidates[0]
-        _do_insert(station, idx, cost, "min_future_fixed_nodes")
+        candidates.sort(key=_station_insertion_sort_key)
+        _do_insert(candidates[0], "station_target_count")
 
     return plan, tuple(inserted)
+
+
+def _station_insertion_sort_key(
+    candidate: StationInsertionCandidate,
+) -> tuple[float, float, float, str, int]:
+    return (
+        float(candidate.adjusted_extra_time_sec),
+        -float(candidate.opportunity_bonus_sec),
+        float(candidate.extra_route_time_sec),
+        str(candidate.station.station_id),
+        int(candidate.insert_index),
+    )
+
+
+def _estimate_plan_arrival_time_at_index(
+    *,
+    execution_plan: Sequence[Mapping[str, Any]],
+    target_index: int,
+    truck_speed: float,
+    road_graph: Any,
+    road_nodes: Mapping[str, tuple[float, float]],
+) -> float:
+    if target_index < 0 or target_index >= len(execution_plan):
+        raise IndexError(f"target_index 越界: {target_index}")
+    if target_index == 0:
+        return 0.0
+
+    current_time = 0.0
+    for idx in range(1, target_index + 1):
+        prev_stop = execution_plan[idx - 1]
+        cur_stop = execution_plan[idx]
+        distance = _road_distance(
+            road_graph,
+            road_nodes,
+            prev_stop["position"],
+            cur_stop["position"],
+        )
+        current_time += float(distance) / max(_TIME_EPS, truck_speed)
+        if idx == target_index:
+            return float(current_time)
+        current_time += _stop_service_time_sec(str(cur_stop["node_type"]))
+
+    return float(current_time)
+
+
+def _phase4_station_recovery_opportunity_bonus(
+    *,
+    station_pos: Position3D,
+    station_eta: float,
+    mode_c_candidate_orders: Sequence[Phase4ModeCOrder],
+    drones: Sequence[Any],
+    support_radius_km: float,
+    rendezvous_execution_margin_sec: float,
+    rendezvous_max_wait_sec: float,
+) -> float:
+    """给初始骨架插站一个与重规划一致的 Mode C 粗粒度机会信号。"""
+    if not mode_c_candidate_orders or not drones:
+        return 0.0
+
+    support_radius_m = max(100.0, float(support_radius_km) * 1000.0)
+    bonus = 0.0
+    for item in mode_c_candidate_orders:
+        order = item.order
+        delivery_finish = _estimate_phase4_uav_delivery_finish(
+            item=item,
+            drones=drones,
+        )
+        if delivery_finish is None:
+            continue
+        if float(delivery_finish) > float(item.deadline) + _TIME_EPS:
+            continue
+
+        distance_to_station = float(order.delivery_loc.distance_2d(station_pos))
+        spatial_score = max(0.0, 1.0 - distance_to_station / support_radius_m)
+        if spatial_score <= _TIME_EPS:
+            continue
+
+        recovery_flight_time = distance_to_station / max(
+            _TIME_EPS,
+            float(_DRONE_PARAMS.light.cruise_speed),
+        )
+        uav_arrival = float(delivery_finish) + float(recovery_flight_time)
+        planned_wait = float(station_eta) - float(uav_arrival)
+        temporal_score = _phase4_rendezvous_temporal_score(
+            planned_wait=float(planned_wait),
+            lower=float(rendezvous_execution_margin_sec),
+            upper=float(rendezvous_max_wait_sec),
+        )
+        if temporal_score <= _TIME_EPS:
+            continue
+
+        reference_time = max(
+            float(item.available_time_sec),
+            min(float(station_eta), float(item.deadline)),
+        )
+        remaining = max(0.0, float(item.deadline) - reference_time)
+        window = max(_TIME_EPS, float(order.time_window_seconds))
+        urgency = 1.0 - min(1.0, remaining / window)
+        bonus += (
+            _RECOVERY_OPPORTUNITY_BONUS_SEC
+            * spatial_score
+            * temporal_score
+            * (0.75 + 0.25 * urgency)
+        )
+
+    return min(_RECOVERY_OPPORTUNITY_BONUS_CAP_SEC, float(bonus))
+
+
+def _estimate_phase4_uav_delivery_finish(
+    *,
+    item: Phase4ModeCOrder,
+    drones: Sequence[Any],
+) -> float | None:
+    best_flight_time: float | None = None
+    order = item.order
+    for drone in drones:
+        if float(order.payload_weight) > float(drone.payload_capacity) + _TIME_EPS:
+            continue
+        speed = max(_TIME_EPS, float(drone.cruise_speed))
+        flight_time = float(drone.current_loc.distance_2d(order.delivery_loc)) / speed
+        if best_flight_time is None or flight_time < best_flight_time:
+            best_flight_time = flight_time
+    if best_flight_time is None:
+        return None
+    return (
+        float(item.available_time_sec)
+        + float(best_flight_time)
+        + float(_SOLVER_ENERGY_PARAMS.drone_service_time_order_s)
+    )
+
+
+def _phase4_rendezvous_temporal_score(
+    *,
+    planned_wait: float,
+    lower: float,
+    upper: float,
+) -> float:
+    if lower <= planned_wait <= upper:
+        return 1.0
+    span = max(_TIME_EPS, upper - lower)
+    if planned_wait < lower:
+        return max(0.0, 1.0 - (lower - float(planned_wait)) / span)
+    return max(0.0, 1.0 - (float(planned_wait) - upper) / span)
 
 
 def _make_plan_stop(
@@ -1034,6 +1350,8 @@ def _build_phase4_debug_trace(
     inserted_fixed_nodes: Sequence[Mapping[str, Any]],
     execution_route: TruckExecutionRoute,
     min_future_fixed_nodes: int,
+    station_target_count: int,
+    mode_c_candidate_orders: Sequence[Phase4ModeCOrder],
 ) -> dict[str, Any]:
     visited_orders = [
         stop for stop in execution_route.stops if stop.node_type == "customer"
@@ -1047,6 +1365,11 @@ def _build_phase4_debug_trace(
     return {
         "truck_id": truck_id,
         "min_future_fixed_nodes": min_future_fixed_nodes,
+        "station_target_count": station_target_count,
+        "mode_c_candidate_order_count": len(mode_c_candidate_orders),
+        "mode_c_candidate_order_ids": [
+            item.order.order_id for item in mode_c_candidate_orders
+        ],
         "ordered_truck_orders": [
             {
                 "seq": idx,
@@ -1104,6 +1427,7 @@ def _build_validation_report(
     truck_backbone_route: Sequence[str],
     truck_eta_map: Mapping[str, float],
     min_future_fixed_nodes: int,
+    station_target_count: int,
     export_dir: Path,
 ) -> dict[str, Any]:
     visited_customer_ids = [
@@ -1143,6 +1467,11 @@ def _build_validation_report(
             1 for nid in truck_backbone_route
             if any(s.node_id == nid and s.node_type == "station" for s in execution_route.stops)
         ) >= min_future_fixed_nodes,
+        "station_target_count": station_target_count,
+        "station_target_count_ok": sum(
+            1 for nid in truck_backbone_route
+            if any(s.node_id == nid and s.node_type == "station" for s in execution_route.stops)
+        ) >= station_target_count,
         "sumo_edge_sequence_non_empty": bool(execution_route.sumo_edge_sequence),
         "sumo_export_dir": str(export_dir),
     }

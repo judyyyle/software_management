@@ -43,7 +43,7 @@ class TestTrainingEnvAdapterPhase5a(unittest.TestCase):
         self.assertFalse(result.done)
         self.assertIn("system_context_stats", result.info)
 
-        max_steps = 256
+        max_steps = 384
         for _ in range(max_steps):
             if result.done:
                 break

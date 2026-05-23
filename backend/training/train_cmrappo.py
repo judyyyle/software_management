@@ -1899,6 +1899,9 @@ def _summarize_episode_records(
         "sum_mode_c_post_delivery_revalidation_fail_reasons": dict(
             mode_c_revalidation_fail_reason_totals
         ),
+        "sum_mode_c_selected_node_expired_count": int(
+            sum(int(item.get("mode_c_selected_node_expired_count", 0)) for item in episodes)
+        ),
         "sum_mode_c_selected_filter_margin_sum": float(
             sum(float(item.get("mode_c_selected_filter_margin_sum", 0.0)) for item in episodes)
         ),

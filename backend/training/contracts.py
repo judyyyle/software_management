@@ -108,6 +108,9 @@ class TruckReservationConstraint:
     max_eta_drift_sec: float
     issued_at: SimTimeSec
     related_order_id: OrderId | None = None
+    earliest_eta: EtaSec | None = None
+    latest_eta: EtaSec | None = None
+    preferred_eta: EtaSec | None = None
 
     def __post_init__(self) -> None:
         if not self.reservation_id:
@@ -126,6 +129,21 @@ class TruckReservationConstraint:
             )
         if self.issued_at < 0:
             raise ValueError(f"issued_at 不能为负数: {self.issued_at}")
+        if self.earliest_eta is not None and self.earliest_eta < 0:
+            raise ValueError(f"earliest_eta 不能为负数: {self.earliest_eta}")
+        if self.latest_eta is not None and self.latest_eta < 0:
+            raise ValueError(f"latest_eta 不能为负数: {self.latest_eta}")
+        if self.preferred_eta is not None and self.preferred_eta < 0:
+            raise ValueError(f"preferred_eta 不能为负数: {self.preferred_eta}")
+        if (
+            self.earliest_eta is not None
+            and self.latest_eta is not None
+            and self.earliest_eta > self.latest_eta
+        ):
+            raise ValueError(
+                "reservation 时间窗非法: "
+                f"earliest_eta={self.earliest_eta}, latest_eta={self.latest_eta}"
+            )
 
 
 @dataclass(frozen=True)

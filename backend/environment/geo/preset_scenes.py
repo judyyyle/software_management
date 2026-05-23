@@ -12,7 +12,7 @@ from pathlib import Path
 
 
 CACHE_BASE_DIR = os.path.join(os.path.dirname(__file__), "..", "..", "test_data", "default_scene")
-DEFAULT_PRESET_ORDERS_FILE = "orders.json"
+DEFAULT_PRESET_ORDERS_FILE = "orders_ppo_training_intensity.json"
 
 # 预设场景列表
 PRESET_SCENES = {
