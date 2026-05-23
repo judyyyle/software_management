@@ -184,7 +184,7 @@
   "dynamic_orders": [
     {
       "order_id": "ORD-D08A32AB-1",
-      "spawn_sim_s": 0,
+      "spawn_sim_s": 0.0,
       "deadline_offset_s": 1540.438764,
       "delivery_lng": 121.197511,
       "delivery_lat": 31.030665,
@@ -198,7 +198,7 @@
     },
     {
       "order_id": "ORD-C3700E18-2",
-      "spawn_sim_s": 34.436345,
+      "spawn_sim_s": 19.247614,
       "deadline_offset_s": 1777.006537,
       "delivery_lng": 121.224498,
       "delivery_lat": 31.035518,
@@ -212,7 +212,7 @@
     },
     {
       "order_id": "ORD-115929A7-3",
-      "spawn_sim_s": 41.205274,
+      "spawn_sim_s": 23.030993,
       "deadline_offset_s": 1699.499859,
       "delivery_lng": 121.199083,
       "delivery_lat": 31.052671,
@@ -226,7 +226,7 @@
     },
     {
       "order_id": "ORD-43D9FCA0-4",
-      "spawn_sim_s": 130.747517,
+      "spawn_sim_s": 73.079119,
       "deadline_offset_s": 2093.14946,
       "delivery_lng": 121.201108,
       "delivery_lat": 31.027793,
@@ -240,7 +240,7 @@
     },
     {
       "order_id": "ORD-B030DF3D-5",
-      "spawn_sim_s": 360.156018,
+      "spawn_sim_s": 201.30313,
       "deadline_offset_s": 1938.28365,
       "delivery_lng": 121.207892,
       "delivery_lat": 31.034347,
@@ -254,7 +254,7 @@
     },
     {
       "order_id": "ORD-5AD8F1CB-6",
-      "spawn_sim_s": 387.648941,
+      "spawn_sim_s": 216.669836,
       "deadline_offset_s": 1713.183269,
       "delivery_lng": 121.223443,
       "delivery_lat": 31.054336,
@@ -268,7 +268,7 @@
     },
     {
       "order_id": "ORD-98C051FD-7",
-      "spawn_sim_s": 517.624052,
+      "spawn_sim_s": 289.317231,
       "deadline_offset_s": 1076.434718,
       "delivery_lng": 121.229369,
       "delivery_lat": 31.026792,
@@ -282,7 +282,7 @@
     },
     {
       "order_id": "ORD-CA4C84B1-8",
-      "spawn_sim_s": 537.414328,
+      "spawn_sim_s": 300.378672,
       "deadline_offset_s": 1396.525602,
       "delivery_lng": 121.197215,
       "delivery_lat": 31.035195,
@@ -296,7 +296,7 @@
     },
     {
       "order_id": "ORD-8B103C37-9",
-      "spawn_sim_s": 628.068334,
+      "spawn_sim_s": 351.0482,
       "deadline_offset_s": 2278.471261,
       "delivery_lng": 121.208198,
       "delivery_lat": 31.029069,
@@ -310,7 +310,7 @@
     },
     {
       "order_id": "ORD-2E93EB29-10",
-      "spawn_sim_s": 644.897909,
+      "spawn_sim_s": 360.454807,
       "deadline_offset_s": 2063.251735,
       "delivery_lng": 121.235346,
       "delivery_lat": 31.023777,
@@ -324,7 +324,7 @@
     },
     {
       "order_id": "TRUCKONLY-20260424-01",
-      "spawn_sim_s": 673.872327,
+      "spawn_sim_s": 376.649569,
       "deadline_offset_s": 6637.939521,
       "delivery_lng": 121.209019,
       "delivery_lat": 31.047652,
@@ -338,7 +338,7 @@
     },
     {
       "order_id": "ORD-60247FE4-11",
-      "spawn_sim_s": 696.263611,
+      "spawn_sim_s": 389.164799,
       "deadline_offset_s": 1309.398119,
       "delivery_lng": 121.224121,
       "delivery_lat": 31.036016,
@@ -352,7 +352,7 @@
     },
     {
       "order_id": "ORD-9BD1F880-12",
-      "spawn_sim_s": 704.377662,
+      "spawn_sim_s": 393.700011,
       "deadline_offset_s": 1455.05558,
       "delivery_lng": 121.196717,
       "delivery_lat": 31.039695,
@@ -366,7 +366,7 @@
     },
     {
       "order_id": "ORD-EA3CAACA-13",
-      "spawn_sim_s": 726.861809,
+      "spawn_sim_s": 406.267146,
       "deadline_offset_s": 1298.781224,
       "delivery_lng": 121.234085,
       "delivery_lat": 31.045245,
@@ -380,7 +380,7 @@
     },
     {
       "order_id": "ORD-F18196A7-14",
-      "spawn_sim_s": 828.80788,
+      "spawn_sim_s": 463.248182,
       "deadline_offset_s": 1790.606902,
       "delivery_lng": 121.201939,
       "delivery_lat": 31.056409,
@@ -394,7 +394,7 @@
     },
     {
       "order_id": "ORD-EA5DEA56-15",
-      "spawn_sim_s": 891.297856,
+      "spawn_sim_s": 498.1759,
       "deadline_offset_s": 1888.814379,
       "delivery_lng": 121.212109,
       "delivery_lat": 31.054667,
@@ -408,7 +408,7 @@
     },
     {
       "order_id": "ORD-1A933420-16",
-      "spawn_sim_s": 1057.445816,
+      "spawn_sim_s": 591.041499,
       "deadline_offset_s": 986.367282,
       "delivery_lng": 121.226404,
       "delivery_lat": 31.038358,
@@ -422,7 +422,7 @@
     },
     {
       "order_id": "TRUCKONLY-20260424-02",
-      "spawn_sim_s": 1071.697904,
+      "spawn_sim_s": 599.007464,
       "deadline_offset_s": 7113.517172,
       "delivery_lng": 121.21081,
       "delivery_lat": 31.040702,
@@ -436,7 +436,7 @@
     },
     {
       "order_id": "ORD-B52013F1-17",
-      "spawn_sim_s": 1177.78571,
+      "spawn_sim_s": 658.303453,
       "deadline_offset_s": 1573.761339,
       "delivery_lng": 121.197664,
       "delivery_lat": 31.042093,
@@ -450,7 +450,7 @@
     },
     {
       "order_id": "ORD-F923F8F8-18",
-      "spawn_sim_s": 1201.187265,
+      "spawn_sim_s": 671.383357,
       "deadline_offset_s": 1228.8186,
       "delivery_lng": 121.208595,
       "delivery_lat": 31.028046,
@@ -464,7 +464,7 @@
     },
     {
       "order_id": "ORD-5C566AAE-19",
-      "spawn_sim_s": 1243.796787,
+      "spawn_sim_s": 695.199231,
       "deadline_offset_s": 2076.856278,
       "delivery_lng": 121.214749,
       "delivery_lat": 31.043668,
@@ -478,7 +478,7 @@
     },
     {
       "order_id": "ORD-E484F83F-20",
-      "spawn_sim_s": 1541.698084,
+      "spawn_sim_s": 861.706135,
       "deadline_offset_s": 1805.368353,
       "delivery_lng": 121.224358,
       "delivery_lat": 31.059101,
@@ -492,7 +492,7 @@
     },
     {
       "order_id": "ORD-E8D43B98-21",
-      "spawn_sim_s": 1557.13423,
+      "spawn_sim_s": 870.333909,
       "deadline_offset_s": 2049.500338,
       "delivery_lng": 121.231125,
       "delivery_lat": 31.033601,
@@ -506,10 +506,10 @@
     },
     {
       "order_id": "TRUCKONLY-20260424-03",
-      "spawn_sim_s": 1575.343194,
+      "spawn_sim_s": 880.511502,
       "deadline_offset_s": 5727.950748,
-      "delivery_lng": 121.212321,
-      "delivery_lat": 31.047897,
+      "delivery_lng": 121.212345288,
+      "delivery_lat": 31.045474634,
       "delivery_z": 0.0,
       "payload_weight": 11.485476,
       "source_type": null,
@@ -520,7 +520,7 @@
     },
     {
       "order_id": "ORD-9ED3F9F6-22",
-      "spawn_sim_s": 1657.221303,
+      "spawn_sim_s": 926.27589,
       "deadline_offset_s": 2156.539562,
       "delivery_lng": 121.236064,
       "delivery_lat": 31.031209,
@@ -534,7 +534,7 @@
     },
     {
       "order_id": "ORD-3BDBE393-23",
-      "spawn_sim_s": 1705.553856,
+      "spawn_sim_s": 953.290555,
       "deadline_offset_s": 1727.292866,
       "delivery_lng": 121.234619,
       "delivery_lat": 31.051874,
@@ -548,7 +548,7 @@
     },
     {
       "order_id": "ORD-3F177CBE-24",
-      "spawn_sim_s": 1756.7223,
+      "spawn_sim_s": 981.890293,
       "deadline_offset_s": 2311.72509,
       "delivery_lng": 121.228741,
       "delivery_lat": 31.046546,
@@ -562,7 +562,7 @@
     },
     {
       "order_id": "ORD-14FE827A-25",
-      "spawn_sim_s": 1838.685418,
+      "spawn_sim_s": 1027.702195,
       "deadline_offset_s": 1704.946244,
       "delivery_lng": 121.198152,
       "delivery_lat": 31.04969,
@@ -576,7 +576,7 @@
     },
     {
       "order_id": "ORD-B0EE7E0B-26",
-      "spawn_sim_s": 1847.909175,
+      "spawn_sim_s": 1032.857659,
       "deadline_offset_s": 1792.097787,
       "delivery_lng": 121.217859,
       "delivery_lat": 31.055485,
@@ -590,7 +590,7 @@
     },
     {
       "order_id": "ORD-07E2D640-27",
-      "spawn_sim_s": 1855.363009,
+      "spawn_sim_s": 1037.023853,
       "deadline_offset_s": 1585.388881,
       "delivery_lng": 121.198574,
       "delivery_lat": 31.058573,
@@ -604,7 +604,7 @@
     },
     {
       "order_id": "ORD-D2DFC3C5-28",
-      "spawn_sim_s": 1898.640923,
+      "spawn_sim_s": 1061.213313,
       "deadline_offset_s": 977.991393,
       "delivery_lng": 121.22985,
       "delivery_lat": 31.034353,
@@ -618,7 +618,7 @@
     },
     {
       "order_id": "ORD-C1A8E993-29",
-      "spawn_sim_s": 1918.068538,
+      "spawn_sim_s": 1072.072051,
       "deadline_offset_s": 1606.503967,
       "delivery_lng": 121.206003,
       "delivery_lat": 31.025852,
@@ -632,7 +632,7 @@
     },
     {
       "order_id": "ORD-1D762F77-30",
-      "spawn_sim_s": 1942.056624,
+      "spawn_sim_s": 1085.479787,
       "deadline_offset_s": 1601.175185,
       "delivery_lng": 121.201655,
       "delivery_lat": 31.056065,
@@ -646,7 +646,7 @@
     },
     {
       "order_id": "ORD-7A3B887B-31",
-      "spawn_sim_s": 1956.37993,
+      "spawn_sim_s": 1093.485557,
       "deadline_offset_s": 1593.553326,
       "delivery_lng": 121.225586,
       "delivery_lat": 31.057409,
@@ -660,7 +660,7 @@
     },
     {
       "order_id": "ORD-DDB83F7C-32",
-      "spawn_sim_s": 1966.889385,
+      "spawn_sim_s": 1099.35964,
       "deadline_offset_s": 1975.483373,
       "delivery_lng": 121.221655,
       "delivery_lat": 31.026931,
@@ -674,7 +674,7 @@
     },
     {
       "order_id": "ORD-790A7ECB-33",
-      "spawn_sim_s": 1973.308708,
+      "spawn_sim_s": 1102.947612,
       "deadline_offset_s": 1277.544783,
       "delivery_lng": 121.23593,
       "delivery_lat": 31.051866,
@@ -688,10 +688,10 @@
     },
     {
       "order_id": "TRUCKONLY-20260424-04",
-      "spawn_sim_s": 1994.120552,
+      "spawn_sim_s": 1114.580041,
       "deadline_offset_s": 5538.986541,
-      "delivery_lng": 121.225596,
-      "delivery_lat": 31.050078,
+      "delivery_lng": 121.227260214,
+      "delivery_lat": 31.049931149,
       "delivery_z": 0.0,
       "payload_weight": 11.071543,
       "source_type": null,
@@ -702,7 +702,7 @@
     },
     {
       "order_id": "ORD-36FB12A6-34",
-      "spawn_sim_s": 1999.418906,
+      "spawn_sim_s": 1117.541467,
       "deadline_offset_s": 1478.903588,
       "delivery_lng": 121.223338,
       "delivery_lat": 31.050359,
@@ -716,7 +716,7 @@
     },
     {
       "order_id": "ORD-79A92ABE-35",
-      "spawn_sim_s": 2161.361724,
+      "spawn_sim_s": 1208.056673,
       "deadline_offset_s": 1803.364686,
       "delivery_lng": 121.220767,
       "delivery_lat": 31.058754,
@@ -730,7 +730,7 @@
     },
     {
       "order_id": "ORD-B72A7753-36",
-      "spawn_sim_s": 2261.039756,
+      "spawn_sim_s": 1263.770027,
       "deadline_offset_s": 1462.042133,
       "delivery_lng": 121.221909,
       "delivery_lat": 31.058981,
@@ -744,7 +744,7 @@
     },
     {
       "order_id": "ORD-13F57CCF-37",
-      "spawn_sim_s": 2272.963423,
+      "spawn_sim_s": 1270.43456,
       "deadline_offset_s": 2165.044902,
       "delivery_lng": 121.236712,
       "delivery_lat": 31.042336,
@@ -758,7 +758,7 @@
     },
     {
       "order_id": "ORD-8A92FC57-38",
-      "spawn_sim_s": 2316.800756,
+      "spawn_sim_s": 1294.936698,
       "deadline_offset_s": 1955.894059,
       "delivery_lng": 121.234849,
       "delivery_lat": 31.036217,
@@ -772,7 +772,7 @@
     },
     {
       "order_id": "ORD-A7E5B418-39",
-      "spawn_sim_s": 2322.284749,
+      "spawn_sim_s": 1298.001883,
       "deadline_offset_s": 2120.847487,
       "delivery_lng": 121.209565,
       "delivery_lat": 31.054758,
@@ -786,10 +786,10 @@
     },
     {
       "order_id": "TRUCKONLY-20260424-05",
-      "spawn_sim_s": 2396.29483,
+      "spawn_sim_s": 1339.368569,
       "deadline_offset_s": 5734.972949,
-      "delivery_lng": 121.218727,
-      "delivery_lat": 31.053479,
+      "delivery_lng": 121.2176316,
+      "delivery_lat": 31.0530595,
       "delivery_z": 0.0,
       "payload_weight": 11.719512,
       "source_type": null,
@@ -800,7 +800,7 @@
     },
     {
       "order_id": "ORD-B3161A10-40",
-      "spawn_sim_s": 2441.375877,
+      "spawn_sim_s": 1364.56586,
       "deadline_offset_s": 1384.86787,
       "delivery_lng": 121.222332,
       "delivery_lat": 31.058578,
@@ -814,7 +814,7 @@
     },
     {
       "order_id": "ORD-8EFC379A-41",
-      "spawn_sim_s": 2481.224087,
+      "spawn_sim_s": 1386.838345,
       "deadline_offset_s": 2297.113048,
       "delivery_lng": 121.231771,
       "delivery_lat": 31.041958,
@@ -828,7 +828,7 @@
     },
     {
       "order_id": "ORD-2F5B9D2B-42",
-      "spawn_sim_s": 2501.265837,
+      "spawn_sim_s": 1398.040343,
       "deadline_offset_s": 2006.30316,
       "delivery_lng": 121.227845,
       "delivery_lat": 31.031738,
@@ -842,7 +842,7 @@
     },
     {
       "order_id": "ORD-1B220D3F-43",
-      "spawn_sim_s": 2506.971631,
+      "spawn_sim_s": 1401.2295,
       "deadline_offset_s": 1097.360908,
       "delivery_lng": 121.196328,
       "delivery_lat": 31.035892,
@@ -856,7 +856,7 @@
     },
     {
       "order_id": "ORD-36FB4D99-44",
-      "spawn_sim_s": 2550.136018,
+      "spawn_sim_s": 1425.355506,
       "deadline_offset_s": 1572.226037,
       "delivery_lng": 121.200866,
       "delivery_lat": 31.04576,
@@ -870,7 +870,7 @@
     },
     {
       "order_id": "ORD-5BED2D7F-45",
-      "spawn_sim_s": 2666.920661,
+      "spawn_sim_s": 1490.630312,
       "deadline_offset_s": 2143.666002,
       "delivery_lng": 121.201421,
       "delivery_lat": 31.040088,
@@ -884,7 +884,7 @@
     },
     {
       "order_id": "ORD-8A924ADF-46",
-      "spawn_sim_s": 2699.237093,
+      "spawn_sim_s": 1508.693036,
       "deadline_offset_s": 1854.884359,
       "delivery_lng": 121.199389,
       "delivery_lat": 31.05853,
@@ -898,7 +898,7 @@
     },
     {
       "order_id": "ORD-4DB60B1F-47",
-      "spawn_sim_s": 2861.394006,
+      "spawn_sim_s": 1599.327907,
       "deadline_offset_s": 1124.078069,
       "delivery_lng": 121.235999,
       "delivery_lat": 31.053453,
@@ -912,7 +912,7 @@
     },
     {
       "order_id": "ORD-7B67E076-48",
-      "spawn_sim_s": 2923.127288,
+      "spawn_sim_s": 1633.832684,
       "deadline_offset_s": 1937.496149,
       "delivery_lng": 121.226753,
       "delivery_lat": 31.042066,
@@ -926,7 +926,7 @@
     },
     {
       "order_id": "ORD-A19867E4-49",
-      "spawn_sim_s": 2982.871894,
+      "spawn_sim_s": 1667.225923,
       "deadline_offset_s": 1861.967903,
       "delivery_lng": 121.231951,
       "delivery_lat": 31.052765,
@@ -940,7 +940,7 @@
     },
     {
       "order_id": "ORD-CA5EC94A-50",
-      "spawn_sim_s": 2987.601934,
+      "spawn_sim_s": 1669.869699,
       "deadline_offset_s": 1798.753828,
       "delivery_lng": 121.216475,
       "delivery_lat": 31.030717,
@@ -954,7 +954,7 @@
     },
     {
       "order_id": "ORD-FC3214C7-51",
-      "spawn_sim_s": 3035.247935,
+      "spawn_sim_s": 1696.500628,
       "deadline_offset_s": 1843.02666,
       "delivery_lng": 121.222988,
       "delivery_lat": 31.056499,
@@ -968,7 +968,7 @@
     },
     {
       "order_id": "ORD-9B572DE8-52",
-      "spawn_sim_s": 3121.79115,
+      "spawn_sim_s": 1744.872498,
       "deadline_offset_s": 1974.033296,
       "delivery_lng": 121.228954,
       "delivery_lat": 31.049954,
@@ -982,7 +982,7 @@
     },
     {
       "order_id": "ORD-C32697E1-53",
-      "spawn_sim_s": 3176.16752,
+      "spawn_sim_s": 1775.265253,
       "deadline_offset_s": 2044.152223,
       "delivery_lng": 121.217813,
       "delivery_lat": 31.044085,
@@ -996,7 +996,7 @@
     },
     {
       "order_id": "ORD-3384DF7E-54",
-      "spawn_sim_s": 3283.665849,
+      "spawn_sim_s": 1835.34963,
       "deadline_offset_s": 2356.891441,
       "delivery_lng": 121.208125,
       "delivery_lat": 31.032305,
@@ -1010,7 +1010,7 @@
     },
     {
       "order_id": "ORD-E8464E3C-55",
-      "spawn_sim_s": 3297.998257,
+      "spawn_sim_s": 1843.360488,
       "deadline_offset_s": 1803.721033,
       "delivery_lng": 121.197017,
       "delivery_lat": 31.029322,
@@ -1024,7 +1024,7 @@
     },
     {
       "order_id": "ORD-B1B2F6E9-56",
-      "spawn_sim_s": 3313.817985,
+      "spawn_sim_s": 1852.202658,
       "deadline_offset_s": 1491.303733,
       "delivery_lng": 121.204248,
       "delivery_lat": 31.037652,
@@ -1038,7 +1038,7 @@
     },
     {
       "order_id": "ORD-C0AC1E3E-57",
-      "spawn_sim_s": 3326.687567,
+      "spawn_sim_s": 1859.395894,
       "deadline_offset_s": 1773.961231,
       "delivery_lng": 121.221162,
       "delivery_lat": 31.058965,
@@ -1052,7 +1052,7 @@
     },
     {
       "order_id": "ORD-B8BFE48C-58",
-      "spawn_sim_s": 3457.112622,
+      "spawn_sim_s": 1932.294778,
       "deadline_offset_s": 1158.371842,
       "delivery_lng": 121.200371,
       "delivery_lat": 31.055664,
@@ -1066,7 +1066,7 @@
     },
     {
       "order_id": "ORD-97D7A2CC-59",
-      "spawn_sim_s": 3575.027197,
+      "spawn_sim_s": 1998.20114,
       "deadline_offset_s": 2156.974741,
       "delivery_lng": 121.211765,
       "delivery_lat": 31.027863,
@@ -1080,7 +1080,7 @@
     },
     {
       "order_id": "ORD-8C17F8F1-60",
-      "spawn_sim_s": 3603.537672,
+      "spawn_sim_s": 2014.136589,
       "deadline_offset_s": 972.860629,
       "delivery_lng": 121.199156,
       "delivery_lat": 31.041989,
@@ -1094,7 +1094,7 @@
     },
     {
       "order_id": "ORD-7CF88E02-61",
-      "spawn_sim_s": 3610.062865,
+      "spawn_sim_s": 2017.783736,
       "deadline_offset_s": 1413.010072,
       "delivery_lng": 121.21155,
       "delivery_lat": 31.035563,
@@ -1108,7 +1108,7 @@
     },
     {
       "order_id": "ORD-313355C4-62",
-      "spawn_sim_s": 3627.263826,
+      "spawn_sim_s": 2027.397923,
       "deadline_offset_s": 1406.097899,
       "delivery_lng": 121.232607,
       "delivery_lat": 31.031111,
@@ -1122,7 +1122,7 @@
     },
     {
       "order_id": "ORD-10F5EB5E-63",
-      "spawn_sim_s": 3682.731204,
+      "spawn_sim_s": 2058.400478,
       "deadline_offset_s": 1867.407821,
       "delivery_lng": 121.212826,
       "delivery_lat": 31.059396,
@@ -1136,7 +1136,7 @@
     },
     {
       "order_id": "ORD-277E89D1-64",
-      "spawn_sim_s": 3693.268824,
+      "spawn_sim_s": 2064.290303,
       "deadline_offset_s": 1807.758477,
       "delivery_lng": 121.205799,
       "delivery_lat": 31.051024,
@@ -1150,7 +1150,7 @@
     },
     {
       "order_id": "ORD-EBACC712-65",
-      "spawn_sim_s": 3714.38287,
+      "spawn_sim_s": 2076.091643,
       "deadline_offset_s": 2318.76934,
       "delivery_lng": 121.211249,
       "delivery_lat": 31.055283,
@@ -1164,7 +1164,7 @@
     },
     {
       "order_id": "ORD-51BCB219-66",
-      "spawn_sim_s": 3715.245033,
+      "spawn_sim_s": 2076.573534,
       "deadline_offset_s": 2397.545473,
       "delivery_lng": 121.22474,
       "delivery_lat": 31.058985,
@@ -1178,7 +1178,7 @@
     },
     {
       "order_id": "ORD-1B29A46A-67",
-      "spawn_sim_s": 3765.41148,
+      "spawn_sim_s": 2104.613223,
       "deadline_offset_s": 1370.456368,
       "delivery_lng": 121.227604,
       "delivery_lat": 31.054753,
@@ -1192,7 +1192,7 @@
     },
     {
       "order_id": "ORD-E79AD8A2-68",
-      "spawn_sim_s": 3789.372846,
+      "spawn_sim_s": 2118.006025,
       "deadline_offset_s": 1436.805528,
       "delivery_lng": 121.199044,
       "delivery_lat": 31.055375,
@@ -1206,7 +1206,7 @@
     },
     {
       "order_id": "ORD-49255881-69",
-      "spawn_sim_s": 3857.721814,
+      "spawn_sim_s": 2156.208527,
       "deadline_offset_s": 2011.453405,
       "delivery_lng": 121.220243,
       "delivery_lat": 31.037952,
@@ -1220,7 +1220,7 @@
     },
     {
       "order_id": "ORD-D40B1533-70",
-      "spawn_sim_s": 3912.032796,
+      "spawn_sim_s": 2186.564734,
       "deadline_offset_s": 1129.452115,
       "delivery_lng": 121.213782,
       "delivery_lat": 31.056552,
@@ -1234,7 +1234,7 @@
     },
     {
       "order_id": "ORD-ECE200D6-71",
-      "spawn_sim_s": 4010.838108,
+      "spawn_sim_s": 2241.790297,
       "deadline_offset_s": 1821.450863,
       "delivery_lng": 121.203621,
       "delivery_lat": 31.025519,
@@ -1248,7 +1248,7 @@
     },
     {
       "order_id": "ORD-94CC36DC-72",
-      "spawn_sim_s": 4111.396092,
+      "spawn_sim_s": 2297.995485,
       "deadline_offset_s": 1899.462247,
       "delivery_lng": 121.215818,
       "delivery_lat": 31.050506,
@@ -1262,7 +1262,7 @@
     },
     {
       "order_id": "ORD-2DA7FCED-73",
-      "spawn_sim_s": 4111.746661,
+      "spawn_sim_s": 2298.19143,
       "deadline_offset_s": 1944.07406,
       "delivery_lng": 121.212901,
       "delivery_lat": 31.057772,
@@ -1276,7 +1276,7 @@
     },
     {
       "order_id": "ORD-8734C3CC-74",
-      "spawn_sim_s": 4114.60223,
+      "spawn_sim_s": 2299.787502,
       "deadline_offset_s": 2359.336206,
       "delivery_lng": 121.211966,
       "delivery_lat": 31.040329,
@@ -1290,7 +1290,7 @@
     },
     {
       "order_id": "ORD-415C3EDE-75",
-      "spawn_sim_s": 4145.47218,
+      "spawn_sim_s": 2317.04174,
       "deadline_offset_s": 1937.450354,
       "delivery_lng": 121.228801,
       "delivery_lat": 31.031315,
@@ -1304,7 +1304,7 @@
     },
     {
       "order_id": "ORD-29EEEAE5-76",
-      "spawn_sim_s": 4158.769945,
+      "spawn_sim_s": 2324.474301,
       "deadline_offset_s": 1987.352543,
       "delivery_lng": 121.237007,
       "delivery_lat": 31.039404,
@@ -1318,7 +1318,7 @@
     },
     {
       "order_id": "ORD-DFE49FA4-77",
-      "spawn_sim_s": 4242.691357,
+      "spawn_sim_s": 2371.380759,
       "deadline_offset_s": 1588.794394,
       "delivery_lng": 121.207578,
       "delivery_lat": 31.055728,
@@ -1332,7 +1332,7 @@
     },
     {
       "order_id": "ORD-15E561F6-78",
-      "spawn_sim_s": 4302.430739,
+      "spawn_sim_s": 2404.771079,
       "deadline_offset_s": 1910.389725,
       "delivery_lng": 121.229292,
       "delivery_lat": 31.050039,
@@ -1346,7 +1346,7 @@
     },
     {
       "order_id": "ORD-95DEAB51-79",
-      "spawn_sim_s": 4402.204661,
+      "spawn_sim_s": 2460.538029,
       "deadline_offset_s": 1229.137358,
       "delivery_lng": 121.235202,
       "delivery_lat": 31.045485,
@@ -1360,7 +1360,7 @@
     },
     {
       "order_id": "ORD-27BD2B98-80",
-      "spawn_sim_s": 4455.009146,
+      "spawn_sim_s": 2490.052205,
       "deadline_offset_s": 1398.385268,
       "delivery_lng": 121.219416,
       "delivery_lat": 31.058974,
@@ -1374,7 +1374,7 @@
     },
     {
       "order_id": "ORD-9B6E1D1A-81",
-      "spawn_sim_s": 4462.447929,
+      "spawn_sim_s": 2494.209987,
       "deadline_offset_s": 1062.776214,
       "delivery_lng": 121.232971,
       "delivery_lat": 31.034301,
@@ -1388,7 +1388,7 @@
     },
     {
       "order_id": "ORD-8CD53D9A-82",
-      "spawn_sim_s": 4568.752829,
+      "spawn_sim_s": 2553.627318,
       "deadline_offset_s": 2079.166454,
       "delivery_lng": 121.221895,
       "delivery_lat": 31.036024,
@@ -1402,7 +1402,7 @@
     },
     {
       "order_id": "ORD-64DC276C-83",
-      "spawn_sim_s": 4588.873781,
+      "spawn_sim_s": 2564.873585,
       "deadline_offset_s": 1405.731255,
       "delivery_lng": 121.19741,
       "delivery_lat": 31.036796,
@@ -1416,7 +1416,7 @@
     },
     {
       "order_id": "ORD-605AF927-84",
-      "spawn_sim_s": 4592.336717,
+      "spawn_sim_s": 2566.809134,
       "deadline_offset_s": 2238.88592,
       "delivery_lng": 121.203831,
       "delivery_lat": 31.039055,
@@ -1430,7 +1430,7 @@
     },
     {
       "order_id": "ORD-EA8E4ECE-85",
-      "spawn_sim_s": 4620.070795,
+      "spawn_sim_s": 2582.310629,
       "deadline_offset_s": 1025.861334,
       "delivery_lng": 121.201843,
       "delivery_lat": 31.048762,
@@ -1444,7 +1444,7 @@
     },
     {
       "order_id": "ORD-84390B11-86",
-      "spawn_sim_s": 4627.272311,
+      "spawn_sim_s": 2586.335795,
       "deadline_offset_s": 1450.439306,
       "delivery_lng": 121.223014,
       "delivery_lat": 31.053652,
@@ -1458,7 +1458,7 @@
     },
     {
       "order_id": "ORD-4FABB706-87",
-      "spawn_sim_s": 4720.835673,
+      "spawn_sim_s": 2638.631458,
       "deadline_offset_s": 1677.960403,
       "delivery_lng": 121.221718,
       "delivery_lat": 31.054262,
@@ -1472,7 +1472,7 @@
     },
     {
       "order_id": "ORD-43957E0E-88",
-      "spawn_sim_s": 4737.948369,
+      "spawn_sim_s": 2648.196311,
       "deadline_offset_s": 1267.526576,
       "delivery_lng": 121.197251,
       "delivery_lat": 31.032793,
@@ -1486,7 +1486,7 @@
     },
     {
       "order_id": "ORD-DC14A15E-89",
-      "spawn_sim_s": 4743.823579,
+      "spawn_sim_s": 2651.48016,
       "deadline_offset_s": 1219.867481,
       "delivery_lng": 121.235836,
       "delivery_lat": 31.029526,
@@ -1500,7 +1500,7 @@
     },
     {
       "order_id": "ORD-2F138070-90",
-      "spawn_sim_s": 4754.521897,
+      "spawn_sim_s": 2657.459804,
       "deadline_offset_s": 2388.836762,
       "delivery_lng": 121.222861,
       "delivery_lat": 31.026321,
@@ -1514,7 +1514,7 @@
     },
     {
       "order_id": "ORD-FF8F34B6-91",
-      "spawn_sim_s": 4769.88924,
+      "spawn_sim_s": 2666.049122,
       "deadline_offset_s": 1239.681192,
       "delivery_lng": 121.225888,
       "delivery_lat": 31.036812,
@@ -1528,7 +1528,7 @@
     },
     {
       "order_id": "ORD-692AFB6B-92",
-      "spawn_sim_s": 4817.260871,
+      "spawn_sim_s": 2692.526696,
       "deadline_offset_s": 1606.521027,
       "delivery_lng": 121.199411,
       "delivery_lat": 31.058061,
@@ -1542,7 +1542,7 @@
     },
     {
       "order_id": "ORD-E217CF47-93",
-      "spawn_sim_s": 4869.987782,
+      "spawn_sim_s": 2721.997513,
       "deadline_offset_s": 1576.596467,
       "delivery_lng": 121.212995,
       "delivery_lat": 31.04285,
@@ -1556,7 +1556,7 @@
     },
     {
       "order_id": "ORD-9681325A-94",
-      "spawn_sim_s": 4874.582551,
+      "spawn_sim_s": 2724.565682,
       "deadline_offset_s": 1919.792722,
       "delivery_lng": 121.196299,
       "delivery_lat": 31.049869,
@@ -1570,7 +1570,7 @@
     },
     {
       "order_id": "ORD-D6CFCEF6-95",
-      "spawn_sim_s": 4922.022536,
+      "spawn_sim_s": 2751.081461,
       "deadline_offset_s": 2348.46665,
       "delivery_lng": 121.199854,
       "delivery_lat": 31.055401,
@@ -1584,7 +1584,7 @@
     },
     {
       "order_id": "ORD-AED4C739-96",
-      "spawn_sim_s": 4956.113557,
+      "spawn_sim_s": 2770.136062,
       "deadline_offset_s": 1642.233,
       "delivery_lng": 121.235848,
       "delivery_lat": 31.057146,
@@ -1598,7 +1598,7 @@
     },
     {
       "order_id": "ORD-B1778A6B-97",
-      "spawn_sim_s": 5057.522455,
+      "spawn_sim_s": 2826.816855,
       "deadline_offset_s": 1472.959078,
       "delivery_lng": 121.204727,
       "delivery_lat": 31.042024,
@@ -1612,7 +1612,7 @@
     },
     {
       "order_id": "ORD-02BB671B-98",
-      "spawn_sim_s": 5058.124157,
+      "spawn_sim_s": 2827.153166,
       "deadline_offset_s": 967.463807,
       "delivery_lng": 121.200953,
       "delivery_lat": 31.043991,
@@ -1626,7 +1626,7 @@
     },
     {
       "order_id": "ORD-0788798F-99",
-      "spawn_sim_s": 5072.426414,
+      "spawn_sim_s": 2835.147171,
       "deadline_offset_s": 1962.430387,
       "delivery_lng": 121.212652,
       "delivery_lat": 31.035556,
@@ -1640,7 +1640,7 @@
     },
     {
       "order_id": "ORD-E0F045BD-100",
-      "spawn_sim_s": 5077.485714,
+      "spawn_sim_s": 2837.974981,
       "deadline_offset_s": 2184.649873,
       "delivery_lng": 121.217098,
       "delivery_lat": 31.053491,
@@ -1654,7 +1654,7 @@
     },
     {
       "order_id": "ORD-9512B93A-101",
-      "spawn_sim_s": 5091.412834,
+      "spawn_sim_s": 2845.75931,
       "deadline_offset_s": 1978.159845,
       "delivery_lng": 121.222961,
       "delivery_lat": 31.054226,
@@ -1668,7 +1668,7 @@
     },
     {
       "order_id": "ORD-754BA874-102",
-      "spawn_sim_s": 5093.777341,
+      "spawn_sim_s": 2847.080912,
       "deadline_offset_s": 1088.692533,
       "delivery_lng": 121.198506,
       "delivery_lat": 31.036865,
@@ -1682,7 +1682,7 @@
     },
     {
       "order_id": "ORD-6EC81B0F-103",
-      "spawn_sim_s": 5176.638071,
+      "spawn_sim_s": 2893.394519,
       "deadline_offset_s": 1821.803095,
       "delivery_lng": 121.198023,
       "delivery_lat": 31.028676,
@@ -1696,7 +1696,7 @@
     },
     {
       "order_id": "ORD-AA2F1EEE-104",
-      "spawn_sim_s": 5190.150163,
+      "spawn_sim_s": 2900.946875,
       "deadline_offset_s": 1194.959235,
       "delivery_lng": 121.22014,
       "delivery_lat": 31.041131,
@@ -1710,7 +1710,7 @@
     },
     {
       "order_id": "ORD-F897CBEB-105",
-      "spawn_sim_s": 5228.486158,
+      "spawn_sim_s": 2922.374132,
       "deadline_offset_s": 1276.145101,
       "delivery_lng": 121.2214,
       "delivery_lat": 31.059706,
@@ -1724,7 +1724,7 @@
     },
     {
       "order_id": "ORD-0BFA3261-106",
-      "spawn_sim_s": 5300.297708,
+      "spawn_sim_s": 2962.511987,
       "deadline_offset_s": 1047.221575,
       "delivery_lng": 121.214187,
       "delivery_lat": 31.044568,
@@ -1738,7 +1738,7 @@
     },
     {
       "order_id": "ORD-0314B2E4-107",
-      "spawn_sim_s": 5310.903241,
+      "spawn_sim_s": 2968.43977,
       "deadline_offset_s": 1406.860889,
       "delivery_lng": 121.223009,
       "delivery_lat": 31.030591,
@@ -1752,7 +1752,7 @@
     },
     {
       "order_id": "ORD-C35493D2-108",
-      "spawn_sim_s": 5367.368367,
+      "spawn_sim_s": 3000.0,
       "deadline_offset_s": 1250.263103,
       "delivery_lng": 121.228056,
       "delivery_lat": 31.02564,

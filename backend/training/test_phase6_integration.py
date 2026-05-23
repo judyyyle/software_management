@@ -606,7 +606,7 @@ class TestPhase6Integration(unittest.TestCase):
         )
         self.assertEqual(
             outcomes["res-invalidated"].invalidate_cause,
-            "eta_late_exceeds_threshold",
+            "reservation_window_missed",
         )
 
     def test_env_adapter_builds_post_delivery_reservation_constraints(self) -> None:
@@ -773,6 +773,46 @@ class TestPhase6Integration(unittest.TestCase):
             new_eta,
             places=6,
         )
+
+    def test_planner_waits_for_reservation_window_instead_of_invalidating_early_arrival(self) -> None:
+        env, drone_id = self._reset_controlled_env()
+        station_id = sorted(env._require_entity_manager().stations)[0]
+        runtime_state = env.build_runtime_state_view()
+        node_state = runtime_state.node_states[station_id]
+        travel_time = env._estimate_truck_road_travel_time(
+            runtime_state.truck_current_loc,
+            node_state.position,
+        )
+        earliest_eta = travel_time + 120.0
+        constraint = TruckReservationConstraint(
+            reservation_id=f"{drone_id}:{station_id}:10.000000",
+            drone_id=drone_id,
+            node_id=station_id,
+            state=ReservationConstraintState.HARD,
+            eta_ref=earliest_eta + 60.0,
+            max_eta_drift_sec=60.0,
+            issued_at=10.0,
+            earliest_eta=earliest_eta,
+            latest_eta=earliest_eta + 240.0,
+            preferred_eta=earliest_eta,
+        )
+        env._planner_bridge.reset_episode(allow_empty_backbone_route=False)
+
+        coarse_plan = env._planner_bridge.maybe_replan(
+            runtime_state,
+            PlannerTriggerContext(
+                t_now=env._t_now,
+                backlog_new_orders=env._cfg.coarse_new_order_trigger,
+                fallback_count_in_window=0,
+                hard_failure_count_in_window=0,
+                route_drift_ratio=0.0,
+            ),
+            reservation_constraints=(constraint,),
+        )
+
+        outcome = coarse_plan.reservation_outcomes[constraint.reservation_id]
+        self.assertNotEqual(outcome.status, ReservationPlanStatus.INVALIDATED)
+        self.assertAlmostEqual(coarse_plan.truck_eta_map[station_id], earliest_eta)
 
     def test_eta_late_exceeds_threshold_uses_total_wait_limit_for_waiting_uav(self) -> None:
         env, drone_id = self._reset_controlled_env()
