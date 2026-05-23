@@ -77,6 +77,14 @@ class _TruckRouteCandidate:
 
 
 @dataclass(frozen=True)
+class _ReservationWindow:
+    constraint: TruckReservationConstraint
+    earliest_eta: float
+    latest_eta: float
+    preferred_eta: float
+
+
+@dataclass(frozen=True)
 class _PlanVisit:
     node_id: str
     arrival_time: float
@@ -409,6 +417,7 @@ class PlannerBridge:
             start_pos=start_pos,
             start_time=truck_route_ready_at,
             truck_speed=truck_speed,
+            reservation_constraints=reservation_constraints,
         )
 
     def _resolve_truck_mandatory_orders(self, runtime_state: Any) -> list[tuple[str, Any]]:
@@ -449,26 +458,29 @@ class PlannerBridge:
                 )
                 continue
 
-            late_sec = max(0.0, float(new_eta) - float(constraint.eta_ref))
-            if float(new_eta) < float(constraint.eta_ref) - _TIME_EPS:
+            window = self._reservation_window(constraint)
+            early_sec = max(0.0, window.earliest_eta - float(new_eta))
+            late_sec = max(0.0, float(new_eta) - window.latest_eta)
+            eta_drift_sec = max(0.0, float(new_eta) - float(constraint.eta_ref))
+            if early_sec > _TIME_EPS:
                 status = ReservationPlanStatus.INVALIDATED
-                invalidate_cause = "arrived_before_eta_ref"
-            elif late_sec <= _TIME_EPS:
+                invalidate_cause = "arrived_before_reservation_window"
+            elif late_sec > _TIME_EPS:
+                status = ReservationPlanStatus.INVALIDATED
+                invalidate_cause = "reservation_window_missed"
+            elif eta_drift_sec <= _TIME_EPS:
                 status = ReservationPlanStatus.KEPT
                 invalidate_cause = None
-            elif late_sec <= float(constraint.max_eta_drift_sec) + _TIME_EPS:
+            else:
                 status = ReservationPlanStatus.DRIFTED
                 invalidate_cause = None
-            else:
-                status = ReservationPlanStatus.INVALIDATED
-                invalidate_cause = "eta_late_exceeds_threshold"
 
             outcomes[constraint.reservation_id] = ReservationPlanOutcome(
                 reservation_id=constraint.reservation_id,
                 node_id=constraint.node_id,
                 old_eta=float(constraint.eta_ref),
                 new_eta=float(new_eta),
-                eta_drift_sec=float(late_sec),
+                eta_drift_sec=float(eta_drift_sec),
                 status=status,
                 invalidate_cause=invalidate_cause,
             )
@@ -602,6 +614,7 @@ class PlannerBridge:
             start_pos=start_pos,
             start_time=start_time,
             truck_speed=truck_speed,
+            reservation_constraints=reservation_constraints,
         )
         key = self._truck_route_key(
             nodes=nodes,
@@ -636,19 +649,32 @@ class PlannerBridge:
                 truck_timeout_count += 1
                 total_truck_lateness += lateness
 
-        reservation_invalid_count = 0
-        total_reservation_late = 0.0
+        strong_hard_invalid_count = 0
+        hard_invalid_count = 0
+        total_strong_hard_violation = 0.0
+        total_hard_violation = 0.0
+        total_reservation_wait = 0.0
         for constraint in reservation_constraints:
             arrival = arrival_by_node.get(constraint.node_id)
+            window = self._reservation_window(constraint)
             if arrival is None:
+                if constraint.state.value == "strong_hard":
+                    strong_hard_invalid_count += 1
+                else:
+                    hard_invalid_count += 1
                 continue
-            if float(arrival) < float(constraint.eta_ref) - _TIME_EPS:
-                reservation_invalid_count += 1
-                continue
-            late_sec = max(0.0, float(arrival) - float(constraint.eta_ref))
-            total_reservation_late += late_sec
-            if late_sec > float(constraint.max_eta_drift_sec) + _TIME_EPS:
-                reservation_invalid_count += 1
+            early_sec = max(0.0, window.earliest_eta - float(arrival))
+            late_sec = max(0.0, float(arrival) - window.latest_eta)
+            violation_sec = early_sec + late_sec
+            total_reservation_wait += max(0.0, float(arrival) - window.preferred_eta)
+            if constraint.state.value == "strong_hard":
+                total_strong_hard_violation += violation_sec
+                if violation_sec > _TIME_EPS:
+                    strong_hard_invalid_count += 1
+            else:
+                total_hard_violation += violation_sec
+                if violation_sec > _TIME_EPS:
+                    hard_invalid_count += 1
 
         last_departure = float(start_time)
         if nodes:
@@ -658,14 +684,18 @@ class PlannerBridge:
                 start_time=start_time,
                 truck_speed=1.0,
                 precomputed_arrivals=tuple(arrival_times),
+                reservation_constraints=reservation_constraints,
             )
             last_departure = departure_times[-1]
         total_route_time = max(0.0, last_departure - float(start_time))
         return (
             float(truck_timeout_count),
-            float(reservation_invalid_count),
             float(total_truck_lateness),
-            float(total_reservation_late),
+            float(strong_hard_invalid_count),
+            float(hard_invalid_count),
+            float(total_strong_hard_violation),
+            float(total_hard_violation),
+            float(total_reservation_wait),
             float(total_route_time),
         )
 
@@ -677,13 +707,21 @@ class PlannerBridge:
         start_time: float,
         truck_speed: float,
         precomputed_arrivals: Sequence[float] | None = None,
+        reservation_constraints: Sequence[TruckReservationConstraint] = (),
     ) -> tuple[tuple[float, ...], tuple[float, ...]]:
         arrivals: list[float] = []
         departures: list[float] = []
+        windows_by_node = self._reservation_windows_by_node(reservation_constraints)
         if precomputed_arrivals is not None:
             for node, arrival in zip(nodes, precomputed_arrivals, strict=True):
-                arrivals.append(float(arrival))
-                departures.append(float(arrival) + float(node.service_time_sec))
+                effective_arrival = max(
+                    float(arrival),
+                    self._reservation_wait_until(node.node_id, windows_by_node),
+                )
+                arrivals.append(float(effective_arrival))
+                departures.append(
+                    float(effective_arrival) + float(node.service_time_sec)
+                )
             return tuple(arrivals), tuple(departures)
 
         if start_pos is None:
@@ -696,13 +734,69 @@ class PlannerBridge:
                 node.position,
                 truck_speed=truck_speed,
             )
-            arrival = t_cursor + travel_time
+            arrival = max(
+                t_cursor + travel_time,
+                self._reservation_wait_until(node.node_id, windows_by_node),
+            )
             departure = arrival + float(node.service_time_sec)
             arrivals.append(float(arrival))
             departures.append(float(departure))
             current_pos = node.position
             t_cursor = departure
         return tuple(arrivals), tuple(departures)
+
+    def _reservation_window(
+        self,
+        constraint: TruckReservationConstraint,
+    ) -> _ReservationWindow:
+        earliest = (
+            float(constraint.earliest_eta)
+            if constraint.earliest_eta is not None
+            else float(constraint.eta_ref)
+        )
+        latest = (
+            float(constraint.latest_eta)
+            if constraint.latest_eta is not None
+            else float(constraint.eta_ref) + float(constraint.max_eta_drift_sec)
+        )
+        preferred = (
+            float(constraint.preferred_eta)
+            if constraint.preferred_eta is not None
+            else earliest
+        )
+        if latest < earliest:
+            latest = earliest
+        preferred = min(max(preferred, earliest), latest)
+        return _ReservationWindow(
+            constraint=constraint,
+            earliest_eta=float(earliest),
+            latest_eta=float(latest),
+            preferred_eta=float(preferred),
+        )
+
+    def _reservation_windows_by_node(
+        self,
+        reservation_constraints: Sequence[TruckReservationConstraint],
+    ) -> dict[str, tuple[_ReservationWindow, ...]]:
+        windows: dict[str, list[_ReservationWindow]] = {}
+        for constraint in reservation_constraints:
+            windows.setdefault(str(constraint.node_id), []).append(
+                self._reservation_window(constraint)
+            )
+        return {
+            node_id: tuple(sorted(items, key=lambda item: item.earliest_eta))
+            for node_id, items in windows.items()
+        }
+
+    @staticmethod
+    def _reservation_wait_until(
+        node_id: str,
+        windows_by_node: Mapping[str, tuple[_ReservationWindow, ...]],
+    ) -> float:
+        windows = windows_by_node.get(str(node_id), ())
+        if not windows:
+            return 0.0
+        return max(window.earliest_eta for window in windows)
 
     def _append_station_coverage(
         self,
@@ -772,9 +866,9 @@ class PlannerBridge:
                         truck_speed=truck_speed,
                     )
                     candidate_key = candidate_eval.key
-                    if _worsens_primary_metrics(candidate_key, base_key, count=4):
+                    if _worsens_primary_metrics(candidate_key, base_key, count=7):
                         continue
-                    extra_route_time = candidate_key[4] - base_key[4]
+                    extra_route_time = candidate_key[-1] - base_key[-1]
                     station_eta = candidate_eval.arrival_times[insert_idx]
                     opportunity_bonus = self._station_recovery_opportunity_bonus(
                         runtime_state=runtime_state,
@@ -983,12 +1077,14 @@ class PlannerBridge:
         start_pos: Any,
         start_time: float,
         truck_speed: float,
+        reservation_constraints: Sequence[TruckReservationConstraint] = (),
     ) -> tuple[TruckPlanStopView, ...]:
         arrivals, departures = self._simulate_truck_node_times(
             nodes=nodes,
             start_pos=start_pos,
             start_time=start_time,
             truck_speed=truck_speed,
+            reservation_constraints=reservation_constraints,
         )
         return tuple(
             TruckPlanStopView(
