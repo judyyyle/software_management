@@ -480,7 +480,7 @@ class TestTrainingEnvAdapterPhase5c(unittest.TestCase):
         self.assertEqual(env._flight_legs[drone_id].target_node_id, depot_id)
         self.assertAlmostEqual(
             env._agent_cost_accum.get(drone_id, 0.0) - reward_before_service,
-            env._cfg.mode_c_attempt_bonus,
+            env._cfg.R_delivery_bonus + env._cfg.mode_c_attempt_bonus,
             places=6,
         )
 
@@ -654,7 +654,7 @@ class TestTrainingEnvAdapterPhase5c(unittest.TestCase):
         service_finish_time = env._delivery_service_legs[drone_id].finish_time
         reward = env._advance_to_event(service_finish_time)
 
-        self.assertEqual(reward, 0.0)
+        self.assertEqual(reward, env._cfg.R_delivery_bonus)
         self.assertEqual(env._drone_state[drone_id], TrainingDroneState.FALLBACK_RECOVERY)
         self.assertNotIn(drone_id, env._reservations)
         self.assertEqual(env._flight_legs[drone_id].kind, "fallback_recovery")
@@ -719,7 +719,7 @@ class TestTrainingEnvAdapterPhase5c(unittest.TestCase):
         self.assertIn(drone_id, env._reservations)
         self.assertEqual(env._flight_legs[drone_id].kind, "return_to_rendezvous")
 
-    def test_hard_overdue_penalty_removes_pending_order(self) -> None:
+    def test_hard_overdue_records_metric_without_removing_pending_order(self) -> None:
         env, drone_id = self._reset_controlled_env()
         env._planned_route_stop_i = len(env._planned_route_stops)
 
@@ -733,14 +733,37 @@ class TestTrainingEnvAdapterPhase5c(unittest.TestCase):
 
         reward = env._advance_to_event(env._t_now + 1.0)
 
-        self.assertAlmostEqual(
-            reward,
-            -env._cfg.lambda_overdue * 1.0 - env._cfg.hard_overdue_penalty_sec,
-            places=6,
+        self.assertAlmostEqual(reward, 0.0, places=6)
+        self.assertIn(order.order_id, env._require_order_manager().pending_orders)
+        self.assertFalse(env._require_order_manager().completed_orders)
+        self.assertEqual(order.status, TaskStatus.PENDING)
+        snapshot = env.build_episode_metrics_snapshot()
+        self.assertEqual(snapshot["hard_overdue_count"], 1)
+        self.assertEqual(snapshot["timeout_order_count"], 0)
+
+    def test_late_delivery_discount_keeps_delivery_reward_positive(self) -> None:
+        env, drone_id = self._reset_controlled_env()
+        order = self._inject_order(
+            env,
+            drone_id=drone_id,
+            order_id="ORDER-P5C-LATE-REWARD",
+            create_time=0.0,
+            deadline=10.0,
         )
-        self.assertNotIn(order.order_id, env._require_order_manager().pending_orders)
-        removed = next(item for item in env._require_order_manager().completed_orders if item.order_id == order.order_id)
-        self.assertEqual(removed.status, TaskStatus.TIMEOUT)
+        order.actual_deliver_time = 10.0 + 10_000.0
+
+        delivery_bonus, lateness_discount = env._compute_delivery_reward(order)
+
+        self.assertAlmostEqual(delivery_bonus, env._cfg.R_delivery_bonus, places=6)
+        self.assertLess(lateness_discount, 0.0)
+        self.assertGreater(
+            delivery_bonus + lateness_discount,
+            0.0,
+        )
+        self.assertGreaterEqual(
+            delivery_bonus + lateness_discount,
+            env._cfg.min_late_delivery_reward,
+        )
 
     def test_episode_snapshot_reports_frontend_style_average_order_delay(self) -> None:
         env, drone_id = self._reset_controlled_env()
@@ -976,6 +999,33 @@ class TestTrainingEnvAdapterPhase5c(unittest.TestCase):
         self.assertNotIn("queue", breakdown)
         self.assertAlmostEqual(env._episode_wait_time_sec, 5.0, places=6)
         self.assertAlmostEqual(env._episode_queue_time_sec, 5.0, places=6)
+
+    def test_reservation_timeout_enters_fallback_without_reward_penalty(self) -> None:
+        env, drone_id = self._reset_controlled_env()
+        station_id = sorted(env._require_entity_manager().stations)[0]
+        t_now = float(env._cfg.rendezvous_max_wait_sec + 5.0)
+        env._full_backbone_cache = [
+            BackboneVisit(
+                node_id=station_id,
+                arrival_time=t_now + 100.0,
+                departure_time=t_now + 100.0 + 1e-6,
+            )
+        ]
+        env._drone_state[drone_id] = TrainingDroneState.WAITING_FOR_TRUCK
+        env._acquire_reservation(
+            drone_id=drone_id,
+            recover_node_id=station_id,
+        )
+        env._rendezvous_wait_started_at[drone_id] = 0.0
+
+        reward = env._process_reservation_timeouts(t_now)
+
+        self.assertAlmostEqual(reward, 0.0, places=6)
+        self.assertNotIn(drone_id, env._reservations)
+        self.assertAlmostEqual(env._agent_cost_accum.get(drone_id, 0.0), 0.0, places=6)
+        self.assertEqual(env._episode_reservation_timeout_count, 1)
+        self.assertAlmostEqual(env._episode_reservation_timeout_cost_sec, 5.0, places=6)
+        self.assertEqual(env._drone_state[drone_id], TrainingDroneState.FALLBACK_RECOVERY)
 
     def test_mode_a_background_completion_updates_stats_without_reward(self) -> None:
         env = self._make_env()

@@ -265,7 +265,7 @@
       "travel_time_sec": 202.65605
     },
     {
-      "distance_m": 1245.426199,
+      "distance_m": 1224.363243,
       "from_node_id": "STA-TEST-10",
       "from_node_type": "station",
       "geometry": [
@@ -383,11 +383,6 @@
           "x": 327917.689204,
           "y": 3436177.515057,
           "z": 0.0
-        },
-        {
-          "x": 327922.908444,
-          "y": 3436197.921126,
-          "z": 0.0
         }
       ],
       "osm_node_path": [
@@ -429,18 +424,13 @@
       ],
       "to_node_id": "ORD-STATIC-08",
       "to_node_type": "customer",
-      "travel_time_sec": 95.802015
+      "travel_time_sec": 94.181788
     },
     {
-      "distance_m": 2405.706543,
+      "distance_m": 2384.643587,
       "from_node_id": "ORD-STATIC-08",
       "from_node_type": "customer",
       "geometry": [
-        {
-          "x": 327922.908444,
-          "y": 3436197.921126,
-          "z": 0.0
-        },
         {
           "x": 327917.689204,
           "y": 3436177.515057,
@@ -646,7 +636,7 @@
       ],
       "to_node_id": "STA-TEST-01",
       "to_node_type": "station",
-      "travel_time_sec": 185.054349
+      "travel_time_sec": 183.434122
     },
     {
       "distance_m": 2589.554771,
@@ -864,7 +854,7 @@
       "travel_time_sec": 199.196521
     },
     {
-      "distance_m": 1023.139483,
+      "distance_m": 938.08131,
       "from_node_id": "STA-TEST-02",
       "from_node_type": "station",
       "geometry": [
@@ -932,11 +922,6 @@
           "x": 329972.866402,
           "y": 3434382.722264,
           "z": 0.0
-        },
-        {
-          "x": 329936.202353,
-          "y": 3434305.971757,
-          "z": 0.0
         }
       ],
       "osm_node_path": [
@@ -963,18 +948,13 @@
       ],
       "to_node_id": "ORD-STATIC-02",
       "to_node_type": "customer",
-      "travel_time_sec": 78.703037
+      "travel_time_sec": 72.160101
     },
     {
-      "distance_m": 2125.609024,
+      "distance_m": 1957.448655,
       "from_node_id": "ORD-STATIC-02",
       "from_node_type": "customer",
       "geometry": [
-        {
-          "x": 329936.202353,
-          "y": 3434305.971757,
-          "z": 0.0
-        },
         {
           "x": 329972.866402,
           "y": 3434382.722264,
@@ -1099,11 +1079,6 @@
           "x": 331145.989213,
           "y": 3434348.676887,
           "z": 0.0
-        },
-        {
-          "x": 331208.334522,
-          "y": 3434403.622656,
-          "z": 0.0
         }
       ],
       "osm_node_path": [
@@ -1148,18 +1123,13 @@
       ],
       "to_node_id": "ORD-STATIC-06",
       "to_node_type": "customer",
-      "travel_time_sec": 163.508386
+      "travel_time_sec": 150.572973
     },
     {
-      "distance_m": 539.483535,
+      "distance_m": 456.381338,
       "from_node_id": "ORD-STATIC-06",
       "from_node_type": "customer",
       "geometry": [
-        {
-          "x": 331208.334522,
-          "y": 3434403.622656,
-          "z": 0.0
-        },
         {
           "x": 331145.989213,
           "y": 3434348.676887,
@@ -1216,7 +1186,7 @@
       ],
       "to_node_id": "STA-TEST-04",
       "to_node_type": "station",
-      "travel_time_sec": 41.498733
+      "travel_time_sec": 35.106257
     },
     {
       "distance_m": 2097.014366,
@@ -1351,7 +1321,7 @@
       "travel_time_sec": 161.308797
     },
     {
-      "distance_m": 874.481406,
+      "distance_m": 846.717341,
       "from_node_id": "STA-TEST-09",
       "from_node_type": "station",
       "geometry": [
@@ -1409,11 +1379,6 @@
           "x": 328932.640943,
           "y": 3433947.826008,
           "z": 0.0
-        },
-        {
-          "x": 328904.916466,
-          "y": 3433946.343896,
-          "z": 0.0
         }
       ],
       "osm_node_path": [
@@ -1435,18 +1400,13 @@
       ],
       "to_node_id": "ORD-STATIC-07",
       "to_node_type": "customer",
-      "travel_time_sec": 67.2678
+      "travel_time_sec": 65.132103
     },
     {
-      "distance_m": 4089.133829,
+      "distance_m": 4061.369764,
       "from_node_id": "ORD-STATIC-07",
       "from_node_type": "customer",
       "geometry": [
-        {
-          "x": 328904.916466,
-          "y": 3433946.343896,
-          "z": 0.0
-        },
         {
           "x": 328932.640943,
           "y": 3433947.826008,
@@ -1768,7 +1728,7 @@
       ],
       "to_node_id": "DEP-TEST-01",
       "to_node_type": "depot",
-      "travel_time_sec": 314.548756
+      "travel_time_sec": 312.413059
     }
   ],
   "stops": [
@@ -1799,21 +1759,21 @@
       "z": 0.0
     },
     {
-      "arrival_time_sec": 308.458065,
-      "departure_time_sec": 338.458065,
+      "arrival_time_sec": 306.837838,
+      "departure_time_sec": 336.837838,
       "nearest_osm_node_id": "11770830110",
       "node_id": "ORD-STATIC-08",
       "node_type": "customer",
       "order_id": "ORD-STATIC-08",
       "seq": 2,
-      "snap_distance_m": 21.062956,
-      "x": 327922.908444,
-      "y": 3436197.921126,
+      "snap_distance_m": 0.0,
+      "x": 327917.689204,
+      "y": 3436177.515057,
       "z": 0.0
     },
     {
-      "arrival_time_sec": 523.512415,
-      "departure_time_sec": 533.512415,
+      "arrival_time_sec": 520.27196,
+      "departure_time_sec": 530.27196,
       "nearest_osm_node_id": "3506824986",
       "node_id": "STA-TEST-01",
       "node_type": "station",
@@ -1825,8 +1785,8 @@
       "z": 0.0
     },
     {
-      "arrival_time_sec": 732.708935,
-      "departure_time_sec": 742.708935,
+      "arrival_time_sec": 729.468481,
+      "departure_time_sec": 739.468481,
       "nearest_osm_node_id": "11393537553",
       "node_id": "STA-TEST-02",
       "node_type": "station",
@@ -1838,34 +1798,34 @@
       "z": 0.0
     },
     {
-      "arrival_time_sec": 821.411973,
-      "departure_time_sec": 851.411973,
+      "arrival_time_sec": 811.628582,
+      "departure_time_sec": 841.628582,
       "nearest_osm_node_id": "7113128125",
       "node_id": "ORD-STATIC-02",
       "node_type": "customer",
       "order_id": "ORD-STATIC-02",
       "seq": 5,
-      "snap_distance_m": 85.058173,
-      "x": 329936.202353,
-      "y": 3434305.971757,
+      "snap_distance_m": 0.0,
+      "x": 329972.866402,
+      "y": 3434382.722264,
       "z": 0.0
     },
     {
-      "arrival_time_sec": 1014.920359,
-      "departure_time_sec": 1044.920359,
+      "arrival_time_sec": 992.201555,
+      "departure_time_sec": 1022.201555,
       "nearest_osm_node_id": "11459214575",
       "node_id": "ORD-STATIC-06",
       "node_type": "customer",
       "order_id": "ORD-STATIC-06",
       "seq": 6,
-      "snap_distance_m": 83.102197,
-      "x": 331208.334522,
-      "y": 3434403.622656,
+      "snap_distance_m": 0.0,
+      "x": 331145.989213,
+      "y": 3434348.676887,
       "z": 0.0
     },
     {
-      "arrival_time_sec": 1086.419093,
-      "departure_time_sec": 1096.419093,
+      "arrival_time_sec": 1057.307812,
+      "departure_time_sec": 1067.307812,
       "nearest_osm_node_id": "3008440405",
       "node_id": "STA-TEST-04",
       "node_type": "station",
@@ -1877,8 +1837,8 @@
       "z": 0.0
     },
     {
-      "arrival_time_sec": 1257.72789,
-      "departure_time_sec": 1267.72789,
+      "arrival_time_sec": 1228.616609,
+      "departure_time_sec": 1238.616609,
       "nearest_osm_node_id": "1601488743",
       "node_id": "STA-TEST-09",
       "node_type": "station",
@@ -1890,21 +1850,21 @@
       "z": 0.0
     },
     {
-      "arrival_time_sec": 1334.99569,
-      "departure_time_sec": 1364.99569,
+      "arrival_time_sec": 1303.748712,
+      "departure_time_sec": 1333.748712,
       "nearest_osm_node_id": "7743084366",
       "node_id": "ORD-STATIC-07",
       "node_type": "customer",
       "order_id": "ORD-STATIC-07",
       "seq": 9,
-      "snap_distance_m": 27.764065,
-      "x": 328904.916466,
-      "y": 3433946.343896,
+      "snap_distance_m": 0.0,
+      "x": 328932.640943,
+      "y": 3433947.826008,
       "z": 0.0
     },
     {
-      "arrival_time_sec": 1679.544447,
-      "departure_time_sec": 1679.544447,
+      "arrival_time_sec": 1646.161771,
+      "departure_time_sec": 1646.161771,
       "nearest_osm_node_id": "13340772659",
       "node_id": "DEP-TEST-01",
       "node_type": "depot",
@@ -2036,7 +1996,7 @@
     "e1228573913s0",
     "e761346730s0"
   ],
-  "total_distance_m": 19624.077805,
-  "total_travel_time_sec": 1509.544447,
+  "total_distance_m": 19190.103025,
+  "total_travel_time_sec": 1476.161771,
   "truck_id": "TRK-TEST-01"
 }
