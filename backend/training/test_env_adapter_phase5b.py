@@ -12,14 +12,20 @@ from __future__ import annotations
 import math
 import unittest
 
+import networkx as nx
+
 from core.entities.order import Order
 from core.entities.primitives import Position3D
+from environment.geo.osm_service import find_nearest_node
+from utils.coord_utils import wgs84_to_utm
 
 from .contracts import PolicyMode
 from .env_adapter import (
+    ActiveTruckRouteContext,
     BackboneVisit,
     DispatchAction,
     FALLBACK_CAUSE_PLANNER_INVALIDATED_FOR_TRUCK_ORDER,
+    _build_route_from_active_truck_context,
     TrainingDroneState,
     TrainingEnvAdapter,
 )
@@ -30,6 +36,50 @@ from .actions import WAIT_ACTION
 class TestTrainingEnvAdapterPhase5b(unittest.TestCase):
     def _make_env(self) -> TrainingEnvAdapter:
         return TrainingEnvAdapter()
+
+    def test_active_truck_route_context_uses_downstream_osm_path_not_nearest_trap(self) -> None:
+        road_nodes = {
+            "route_a": (121.00000, 31.00000),
+            "route_b": (121.00010, 31.00000),
+            "target": (121.00020, 31.00000),
+            "trap": (121.000055, 31.000005),
+        }
+        graph = nx.DiGraph()
+        graph.add_edge("route_a", "route_b", weight=10.0)
+        graph.add_edge("route_b", "target", weight=10.0)
+        graph.add_edge("target", "route_b", weight=10.0)
+        graph.add_node("trap")
+
+        route_a_x, route_a_y = wgs84_to_utm(*road_nodes["route_a"])
+        route_b_x, route_b_y = wgs84_to_utm(*road_nodes["route_b"])
+        target_x, target_y = wgs84_to_utm(*road_nodes["target"])
+        from_pos = Position3D(
+            x=(route_a_x + route_b_x) / 2.0,
+            y=(route_a_y + route_b_y) / 2.0,
+            z=0.0,
+        )
+        to_pos = Position3D(x=target_x, y=target_y, z=0.0)
+        context = ActiveTruckRouteContext(
+            position=from_pos,
+            segment_id=0,
+            traveled_m=5.0,
+            remaining_osm_node_path=("route_b", "target"),
+        )
+        self.assertEqual(
+            find_nearest_node(graph, road_nodes, from_pos.x, from_pos.y),
+            "trap",
+        )
+
+        route = _build_route_from_active_truck_context(
+            context=context,
+            from_pos=from_pos,
+            to_pos=to_pos,
+            road_graph=graph,
+            road_nodes=road_nodes,
+        )
+
+        self.assertIsNotNone(route)
+        self.assertEqual(route.osm_node_path, ("route_b", "target"))
 
     def _first_idle_drone_id(self, env: TrainingEnvAdapter) -> str:
         for drone_id, state in env._drone_state.items():

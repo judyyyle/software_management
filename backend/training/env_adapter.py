@@ -182,6 +182,24 @@ class NodeStateView:
 
 
 @dataclass(frozen=True)
+class TruckRoadRoute:
+    """一次卡车 OSM 路网寻路结果。"""
+
+    geometry: tuple[Position3D, ...]
+    osm_node_path: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class ActiveTruckRouteContext:
+    """卡车正在既有 OSM 路径上行驶时的起点上下文。"""
+
+    position: Position3D
+    segment_id: int
+    traveled_m: float
+    remaining_osm_node_path: tuple[str, ...]
+
+
+@dataclass(frozen=True)
 class RuntimeStateView:
     """当前时刻暴露给训练侧的运行时状态快照。"""
     # Phase 5 已固定对外 schema；后续阶段只能填充实现，不能改字段形状。
@@ -281,6 +299,7 @@ class PlannedTruckSegment:
     distance_m: float
     geometry: tuple[Position3D, ...]
     cumulative_distances_m: tuple[float, ...]
+    osm_node_path: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -461,8 +480,13 @@ class TrainingEnvAdapter:
         self._road_nodes: Mapping[str, tuple[float, float]] | None = None
         self._truck_road_route_geometry_cache: dict[
             tuple[float, float, float, float],
-            tuple[Position3D, ...],
+            TruckRoadRoute,
         ] = {}
+        self._active_truck_route_context_cache: tuple[
+            int,
+            float,
+            ActiveTruckRouteContext | None,
+        ] | None = None
 
         self._drone_state: dict[DroneId, TrainingDroneState] = {}
         # 记录 active_wait 结束后应恢复到哪个基础状态。
@@ -646,6 +670,7 @@ class TrainingEnvAdapter:
         self._truck_route_version = 1
         self._drone_path_version.clear()
         self._truck_road_route_geometry_cache.clear()
+        self._active_truck_route_context_cache = None
         self._episode_delivery_count = 0
         self._episode_fallback_count = 0
         self._episode_hard_failure_count = 0
@@ -1588,6 +1613,7 @@ class TrainingEnvAdapter:
             "from_node_id": segment.from_node_id,
             "to_node_id": segment.to_node_id,
             "distance_m": float(max(0.0, segment.distance_m - traveled_m)),
+            "osm_node_path": list(segment.osm_node_path),
             "path_utm": [_position_to_payload(pos) for pos in remaining_points],
         }
 
@@ -2707,10 +2733,11 @@ class TrainingEnvAdapter:
                 arrival_time=float(stop_view.arrival_time),
                 departure_time=float(stop_view.departure_time),
             )
-            geometry = self._build_truck_road_route_geometry(
+            route = self._build_truck_road_route(
                 from_pos=prev_stop.position,
                 to_pos=position,
             )
+            geometry = route.geometry
             distance_m = _polyline_distance_2d(geometry)
             planned_segments.append(
                 PlannedTruckSegment(
@@ -2724,6 +2751,7 @@ class TrainingEnvAdapter:
                     distance_m=float(distance_m),
                     geometry=geometry,
                     cumulative_distances_m=_build_cumulative_distances(geometry),
+                    osm_node_path=route.osm_node_path,
                 )
             )
             planned_stops.append(planned_stop)
@@ -2786,6 +2814,30 @@ class TrainingEnvAdapter:
         from_pos: Position3D,
         to_pos: Position3D,
     ) -> tuple[Position3D, ...]:
+        return self._build_truck_road_route(
+            from_pos=from_pos,
+            to_pos=to_pos,
+        ).geometry
+
+    def _build_truck_road_route(
+        self,
+        *,
+        from_pos: Position3D,
+        to_pos: Position3D,
+    ) -> TruckRoadRoute:
+        road_graph, road_nodes = self._require_road_graph()
+        active_context = self._active_truck_route_context_for_position(from_pos)
+        if active_context is not None:
+            anchored_route = _build_route_from_active_truck_context(
+                context=active_context,
+                from_pos=from_pos,
+                to_pos=to_pos,
+                road_graph=road_graph,
+                road_nodes=road_nodes,
+            )
+            if anchored_route is not None:
+                return anchored_route
+
         key = (
             round(float(from_pos.x), 2),
             round(float(from_pos.y), 2),
@@ -2794,20 +2846,17 @@ class TrainingEnvAdapter:
         )
         cached = self._truck_road_route_geometry_cache.get(key)
         if cached is not None:
-            return tuple(_clone_position(pos) for pos in cached)
+            return _clone_truck_road_route(cached)
 
-        road_graph, road_nodes = self._require_road_graph()
-        geometry = _build_route_geometry_between_positions(
+        route = _build_route_between_positions(
             from_pos=from_pos,
             to_pos=to_pos,
             road_graph=road_graph,
             road_nodes=road_nodes,
             nearest_cache={},
         )
-        self._truck_road_route_geometry_cache[key] = tuple(
-            _clone_position(pos) for pos in geometry
-        )
-        return geometry
+        self._truck_road_route_geometry_cache[key] = _clone_truck_road_route(route)
+        return route
 
     def _build_planner_trigger_context(
         self,
@@ -5566,17 +5615,22 @@ class TrainingEnvAdapter:
                     raise ValueError("truck_execution_route.segments 元素必须为对象")
                 from_stop = planned_stops[idx - 1]
                 to_stop = planned_stops[idx]
+                osm_node_path_raw = raw_segment.get("osm_node_path")
+                osm_node_path = (
+                    tuple(str(item) for item in osm_node_path_raw)
+                    if isinstance(osm_node_path_raw, list)
+                    else ()
+                )
                 geometry = _parse_segment_geometry_payload(raw_segment)
                 if geometry is None:
-                    osm_node_path_raw = raw_segment.get("osm_node_path")
-                    if not isinstance(osm_node_path_raw, list):
+                    if not osm_node_path:
                         raise ValueError("缺少 segment.geometry，且 osm_node_path 非法")
                     if road_nodes is None:
                         _, road_nodes = self._require_road_graph()
                     geometry = _build_geometry_from_osm_node_path(
                         from_pos=from_stop.position,
                         to_pos=to_stop.position,
-                        osm_node_path=[str(item) for item in osm_node_path_raw],
+                        osm_node_path=list(osm_node_path),
                         road_nodes=road_nodes,
                     )
                 planned_segments.append(
@@ -5591,6 +5645,7 @@ class TrainingEnvAdapter:
                         distance_m=float(raw_segment.get("distance_m", _polyline_distance_2d(geometry))),
                         geometry=geometry,
                         cumulative_distances_m=_build_cumulative_distances(geometry),
+                        osm_node_path=osm_node_path,
                     )
                 )
 
@@ -5663,13 +5718,14 @@ class TrainingEnvAdapter:
             current_pos = _clone_position(depot.location)
             for station in chosen:
                 prev_stop = self._planned_route_stops[-1]
-                segment_geometry = _build_route_geometry_between_positions(
+                segment_route = _build_route_between_positions(
                     from_pos=current_pos,
                     to_pos=station.location,
                     road_graph=road_graph,
                     road_nodes=road_nodes,
                     nearest_cache=nearest_cache,
                 )
+                segment_geometry = segment_route.geometry
                 travel_distance = _polyline_distance_2d(segment_geometry)
                 segment_start_time = t_cursor
                 travel_time = travel_distance / max(_TIME_EPS, truck.speed)
@@ -5698,6 +5754,7 @@ class TrainingEnvAdapter:
                         distance_m=travel_distance,
                         geometry=segment_geometry,
                         cumulative_distances_m=_build_cumulative_distances(segment_geometry),
+                        osm_node_path=segment_route.osm_node_path,
                     )
                 )
                 self._full_backbone_cache.append(
@@ -5710,13 +5767,14 @@ class TrainingEnvAdapter:
                 current_pos = station.location
                 t_cursor = departure_time
 
-            segment_geometry = _build_route_geometry_between_positions(
+            segment_route = _build_route_between_positions(
                 from_pos=current_pos,
                 to_pos=depot.location,
                 road_graph=road_graph,
                 road_nodes=road_nodes,
                 nearest_cache=nearest_cache,
             )
+            segment_geometry = segment_route.geometry
             travel_distance_back = _polyline_distance_2d(segment_geometry)
             segment_start_time = t_cursor
             travel_time_back = travel_distance_back / max(_TIME_EPS, truck.speed)
@@ -5747,6 +5805,7 @@ class TrainingEnvAdapter:
                     distance_m=travel_distance_back,
                     geometry=segment_geometry,
                     cumulative_distances_m=_build_cumulative_distances(segment_geometry),
+                    osm_node_path=segment_route.osm_node_path,
                 )
             )
             self._full_backbone_cache.append(
@@ -6027,6 +6086,80 @@ class TrainingEnvAdapter:
 
         return _clone_position(self._planned_route_stops[-1].position)
 
+    def _active_truck_route_context_for_position(
+        self,
+        from_pos: Position3D,
+    ) -> ActiveTruckRouteContext | None:
+        """若 from_pos 是当前卡车行驶中位置，返回其下游 OSM 路径上下文。"""
+        cache_key = (int(self._truck_route_version), round(float(self._t_now), 6))
+        cached = self._active_truck_route_context_cache
+        if (
+            cached is not None
+            and cached[0] == cache_key[0]
+            and cached[1] == cache_key[1]
+        ):
+            context = cached[2]
+        else:
+            context = self._active_truck_route_context_at_time(self._t_now)
+            self._active_truck_route_context_cache = (
+                cache_key[0],
+                cache_key[1],
+                context,
+            )
+        if context is None:
+            return None
+        if context.position.distance_2d(from_pos) > 1.0:
+            return None
+        return context
+
+    def _active_truck_route_context_at_time(
+        self,
+        t_now: float,
+    ) -> ActiveTruckRouteContext | None:
+        if not self._planned_route_stops:
+            return None
+
+        first_stop = self._planned_route_stops[0]
+        if t_now <= first_stop.departure_time + _TIME_EPS:
+            return None
+
+        for idx, segment in enumerate(self._planned_route_segments):
+            if t_now < segment.start_time - _TIME_EPS:
+                return None
+            if t_now < segment.end_time - _TIME_EPS:
+                if not segment.osm_node_path:
+                    return None
+                segment_dt = max(_TIME_EPS, segment.end_time - segment.start_time)
+                ratio = max(
+                    0.0,
+                    min(1.0, (t_now - segment.start_time) / segment_dt),
+                )
+                traveled_m = float(segment.distance_m) * ratio
+                position = _interpolate_position_on_geometry(
+                    geometry=segment.geometry,
+                    cumulative_distances_m=segment.cumulative_distances_m,
+                    traveled_m=traveled_m,
+                )
+                _, road_nodes = self._require_road_graph()
+                remaining_path = _remaining_osm_node_path_from_distance(
+                    segment=segment,
+                    traveled_m=traveled_m,
+                    road_nodes=road_nodes,
+                )
+                if not remaining_path:
+                    return None
+                return ActiveTruckRouteContext(
+                    position=position,
+                    segment_id=int(segment.segment_id),
+                    traveled_m=float(traveled_m),
+                    remaining_osm_node_path=remaining_path,
+                )
+            next_stop = self._planned_route_stops[idx + 1]
+            if t_now <= next_stop.departure_time + _TIME_EPS:
+                return None
+
+        return None
+
     def _truck_traveled_distance_m(self, t_now: float) -> float:
         """按 planned route segments 统计当前时刻已真实行驶的路网距离。"""
         traveled = 0.0
@@ -6293,6 +6426,74 @@ def _remaining_geometry_from_distance(
     return tuple(remaining)
 
 
+def _remaining_osm_node_path_from_distance(
+    *,
+    segment: PlannedTruckSegment,
+    traveled_m: float,
+    road_nodes: Mapping[str, tuple[float, float]],
+) -> tuple[str, ...]:
+    if not segment.osm_node_path:
+        return ()
+
+    remaining: list[str] = []
+    threshold_m = max(0.0, float(traveled_m) - 0.5)
+    for osm_node_id in segment.osm_node_path:
+        node_pos = _road_node_position(road_nodes, str(osm_node_id))
+        node_progress_m = _project_position_progress_on_geometry(
+            geometry=segment.geometry,
+            cumulative_distances_m=segment.cumulative_distances_m,
+            position=node_pos,
+        )
+        if node_progress_m + 0.5 >= threshold_m:
+            remaining.append(str(osm_node_id))
+
+    if remaining:
+        return tuple(remaining)
+    return (str(segment.osm_node_path[-1]),)
+
+
+def _project_position_progress_on_geometry(
+    *,
+    geometry: tuple[Position3D, ...],
+    cumulative_distances_m: tuple[float, ...],
+    position: Position3D,
+) -> float:
+    if len(geometry) <= 1:
+        return 0.0
+    if len(cumulative_distances_m) != len(geometry):
+        cumulative_distances_m = _build_cumulative_distances(geometry)
+
+    best_progress = 0.0
+    best_distance_sq = float("inf")
+    for idx in range(1, len(geometry)):
+        start = geometry[idx - 1]
+        end = geometry[idx]
+        dx = float(end.x) - float(start.x)
+        dy = float(end.y) - float(start.y)
+        seg_len_sq = dx * dx + dy * dy
+        if seg_len_sq <= _TIME_EPS:
+            ratio = 0.0
+        else:
+            ratio = (
+                ((float(position.x) - float(start.x)) * dx)
+                + ((float(position.y) - float(start.y)) * dy)
+            ) / seg_len_sq
+            ratio = max(0.0, min(1.0, ratio))
+        proj_x = float(start.x) + dx * ratio
+        proj_y = float(start.y) + dy * ratio
+        dist_sq = (
+            (float(position.x) - proj_x) ** 2
+            + (float(position.y) - proj_y) ** 2
+        )
+        if dist_sq < best_distance_sq:
+            best_distance_sq = dist_sq
+            best_progress = float(cumulative_distances_m[idx - 1]) + (
+                float(cumulative_distances_m[idx])
+                - float(cumulative_distances_m[idx - 1])
+            ) * ratio
+    return best_progress
+
+
 def _parse_segment_geometry_payload(raw_segment: Mapping[str, Any]) -> tuple[Position3D, ...] | None:
     raw_geometry = raw_segment.get("geometry")
     if raw_geometry is None:
@@ -6332,14 +6533,21 @@ def _build_geometry_from_osm_node_path(
     return tuple(geometry)
 
 
-def _build_route_geometry_between_positions(
+def _clone_truck_road_route(route: TruckRoadRoute) -> TruckRoadRoute:
+    return TruckRoadRoute(
+        geometry=tuple(_clone_position(pos) for pos in route.geometry),
+        osm_node_path=tuple(route.osm_node_path),
+    )
+
+
+def _build_route_between_positions(
     *,
     from_pos: Position3D,
     to_pos: Position3D,
     road_graph: Any,
     road_nodes: Mapping[str, tuple[float, float]],
     nearest_cache: dict[tuple[float, float], tuple[str, float]],
-) -> tuple[Position3D, ...]:
+) -> TruckRoadRoute:
     from_node_id, _ = _find_nearest_node_cached(
         road_graph=road_graph,
         road_nodes=road_nodes,
@@ -6358,12 +6566,75 @@ def _build_route_geometry_between_positions(
         osm_path = shortest_path(road_graph, from_node_id, to_node_id)
         if not osm_path:
             raise ValueError(f"OSM 路网不可达: {from_node_id} -> {to_node_id}")
-    return _build_geometry_from_osm_node_path(
+    normalized_path = tuple(str(node_id) for node_id in osm_path)
+    return TruckRoadRoute(
+        geometry=_build_geometry_from_osm_node_path(
+            from_pos=from_pos,
+            to_pos=to_pos,
+            osm_node_path=list(normalized_path),
+            road_nodes=road_nodes,
+        ),
+        osm_node_path=normalized_path,
+    )
+
+
+def _build_route_geometry_between_positions(
+    *,
+    from_pos: Position3D,
+    to_pos: Position3D,
+    road_graph: Any,
+    road_nodes: Mapping[str, tuple[float, float]],
+    nearest_cache: dict[tuple[float, float], tuple[str, float]],
+) -> tuple[Position3D, ...]:
+    return _build_route_between_positions(
         from_pos=from_pos,
         to_pos=to_pos,
-        osm_node_path=[str(node_id) for node_id in osm_path],
+        road_graph=road_graph,
         road_nodes=road_nodes,
+        nearest_cache=nearest_cache,
+    ).geometry
+
+
+def _build_route_from_active_truck_context(
+    *,
+    context: ActiveTruckRouteContext,
+    from_pos: Position3D,
+    to_pos: Position3D,
+    road_graph: Any,
+    road_nodes: Mapping[str, tuple[float, float]],
+) -> TruckRoadRoute | None:
+    to_node_id, _ = _find_nearest_node_cached(
+        road_graph=road_graph,
+        road_nodes=road_nodes,
+        position=to_pos,
+        cache={},
     )
+    remaining_path = tuple(str(node_id) for node_id in context.remaining_osm_node_path)
+    if not remaining_path:
+        return None
+
+    for idx, start_node_id in enumerate(remaining_path):
+        if start_node_id == to_node_id:
+            suffix_path = [start_node_id]
+        else:
+            suffix_path = shortest_path(road_graph, start_node_id, to_node_id)
+        if not suffix_path:
+            continue
+        prefix_path = remaining_path[: idx + 1]
+        route_path = tuple(prefix_path) + tuple(
+            str(node_id) for node_id in suffix_path[1:]
+        )
+        return TruckRoadRoute(
+            geometry=_build_geometry_from_osm_node_path(
+                from_pos=from_pos,
+                to_pos=to_pos,
+                osm_node_path=list(route_path),
+                road_nodes=road_nodes,
+            ),
+            osm_node_path=route_path,
+        )
+
+    return None
 
 
 def _find_nearest_node_cached(
