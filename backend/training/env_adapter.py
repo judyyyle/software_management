@@ -14,7 +14,7 @@ HiveLogix — Phase 5c 训练环境适配器。
   - 完整 post_delivery_revalidation：送达后对 mode C 原选回收点做三条件复核
   - mode B 优先返仓；电量不足返仓时先到可达 station 补能再自动返仓
   - reservation 状态机与 timeout 触发 fallback
-  - 完整 per-dt reward：T_overdue / T_wait / T_queue / T_fallback
+  - 完整 per-dt reward：T_overdue / T_idle / T_fallback
   - WAIT 动作的 T_idle 一次性精确结算
   - hard overdue 强制移除
 """
@@ -396,10 +396,8 @@ class _YamlConfig:
     reservation_beta: float
     reservation_gamma: float
     reservation_drift_eta_abs_threshold_sec: float
-    lambda_wait: float
     wait_idle_penalty_coef: float
     wait_opportunity_penalty_coef: float
-    lambda_queue: float
     lambda_miss: float
     lambda_res_timeout: float
     lambda_overdue: float
@@ -1252,6 +1250,20 @@ class TrainingEnvAdapter:
             and float(order.actual_deliver_time) <= float(order.deadline) + _TIME_EPS
         )
         overdue_delivery_count = len(delivered_primary_orders) - on_time_delivery_count
+        delivered_primary_orders_with_timing = [
+            order
+            for order in delivered_primary_orders
+            if order.actual_deliver_time is not None
+        ]
+        order_delay_sum_min = sum(
+            max(0.0, float(order.actual_deliver_time) - float(order.deadline)) / 60.0
+            for order in delivered_primary_orders_with_timing
+        )
+        avg_order_delay_min = (
+            order_delay_sum_min / float(len(delivered_primary_orders_with_timing))
+            if delivered_primary_orders_with_timing
+            else 0.0
+        )
         pending_primary_order_count = sum(
             1
             for order in order_mgr.pending_orders.values()
@@ -1290,6 +1302,11 @@ class TrainingEnvAdapter:
             "on_time_delivery_count": int(on_time_delivery_count),
             "overdue_delivery_count": int(overdue_delivery_count),
             "on_time_rate": float(on_time_rate),
+            "completed_with_timing_order_count": int(
+                len(delivered_primary_orders_with_timing)
+            ),
+            "order_delay_sum_min": float(order_delay_sum_min),
+            "avg_order_delay_min": float(avg_order_delay_min),
             "required_primary_order_count": int(required_primary_order_count),
             "completion_rate": float(completion_rate),
             "required_on_time_rate": float(required_on_time_rate),
@@ -4630,7 +4647,8 @@ class TrainingEnvAdapter:
                     -self._cfg.lambda_overdue * unassigned_overdue_dt
                 )
 
-        # ── T_wait / T_idle / T_queue / T_fallback：按状态归因给对应无人机 ──
+        # ── T_idle / T_fallback：按状态归因给对应无人机 ──
+        # T_wait 与 T_queue 仍统计时长，但不再作为 reward 惩罚项。
         wait_dt_total = 0.0
         idle_wait_dt_total = 0.0
         queue_dt_total = 0.0
@@ -4640,11 +4658,6 @@ class TrainingEnvAdapter:
 
         for drone_id, state in self._drone_state.items():
             if state == TrainingDroneState.WAITING_FOR_TRUCK:
-                # T_wait：等待卡车的无人机自己承担
-                penalty = -self._cfg.lambda_wait * dt
-                self._agent_cost_accum[drone_id] = (
-                    self._agent_cost_accum.get(drone_id, 0.0) + penalty
-                )
                 wait_dt_total += dt
             elif (
                 state == TrainingDroneState.ACTIVE_WAIT
@@ -4658,11 +4671,6 @@ class TrainingEnvAdapter:
                 )
                 idle_wait_dt_total += dt
             elif state == TrainingDroneState.QUEUEING_AT_HOST:
-                # T_queue：排队的无人机自己承担
-                penalty = -self._cfg.lambda_queue * dt
-                self._agent_cost_accum[drone_id] = (
-                    self._agent_cost_accum.get(drone_id, 0.0) + penalty
-                )
                 queue_dt_total += dt
             elif state == TrainingDroneState.FALLBACK_RECOVERY:
                 fallback_cause = (
@@ -4687,18 +4695,10 @@ class TrainingEnvAdapter:
         self._episode_ppo_attributed_fallback_time_sec += ppo_fallback_dt_total
         self._episode_system_attributed_fallback_time_sec += system_fallback_dt_total
 
-        if wait_dt_total > _TIME_EPS:
-            penalty = -self._cfg.lambda_wait * wait_dt_total
-            global_reward += penalty
-            breakdown["wait"] = penalty
         if idle_wait_dt_total > _TIME_EPS:
             penalty = -self._cfg.wait_idle_penalty_coef * idle_wait_dt_total
             global_reward += penalty
             breakdown["idle"] = penalty
-        if queue_dt_total > _TIME_EPS:
-            penalty = -self._cfg.lambda_queue * queue_dt_total
-            global_reward += penalty
-            breakdown["queue"] = penalty
         if fallback_dt_total > _TIME_EPS:
             penalty = -self._cfg.lambda_miss * fallback_dt_total
             global_reward += penalty
@@ -6295,12 +6295,10 @@ def _load_env_yaml(config_path: Path) -> _YamlConfig:
         reservation_drift_eta_abs_threshold_sec=float(
             reservation["drift_eta_abs_threshold_sec"]
         ),
-        lambda_wait=float(reward["lambda_wait"]),
         wait_idle_penalty_coef=float(reward["wait_idle_penalty_coef"]),
         wait_opportunity_penalty_coef=float(
             reward.get("wait_opportunity_penalty_coef", 0.0)
         ),
-        lambda_queue=float(reward["lambda_queue"]),
         lambda_miss=float(reward["lambda_miss"]),
         lambda_res_timeout=float(reward["lambda_res_timeout"]),
         lambda_overdue=float(reward["lambda_overdue"]),

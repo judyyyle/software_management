@@ -1791,6 +1791,12 @@ def _summarize_episode_records(
     mode_c_candidate_node_filter_totals: dict[str, int] = {}
     fallback_cause_totals: dict[str, int] = {}
     reservation_release_cause_totals: dict[str, int] = {}
+    completed_with_timing_total = int(
+        sum(int(item.get("completed_with_timing_order_count", 0)) for item in episodes)
+    )
+    order_delay_sum_min_total = float(
+        sum(float(item.get("order_delay_sum_min", 0.0)) for item in episodes)
+    )
     for item in episodes:
         for reason_key, count in dict(
             item.get("mode_c_post_delivery_revalidation_fail_reasons", {})
@@ -1848,6 +1854,16 @@ def _summarize_episode_records(
         "mean_delivery_count": float(np.mean([float(item["delivery_count"]) for item in episodes])),
         "sum_delivery_count": int(sum(int(item["delivery_count"]) for item in episodes)),
         "mean_on_time_rate": float(np.mean([float(item["on_time_rate"]) for item in episodes])),
+        "mean_avg_order_delay_min": float(
+            np.mean([float(item.get("avg_order_delay_min", 0.0)) for item in episodes])
+        ),
+        "sum_completed_with_timing_order_count": int(completed_with_timing_total),
+        "sum_order_delay_min": float(order_delay_sum_min_total),
+        "weighted_avg_order_delay_min": (
+            float(order_delay_sum_min_total) / float(completed_with_timing_total)
+            if completed_with_timing_total > 0
+            else 0.0
+        ),
         "sum_required_primary_order_count": int(
             sum(int(item.get("required_primary_order_count", 0)) for item in episodes)
         ),
@@ -3473,9 +3489,7 @@ def _build_meta_payload(
             min_orders_to_trigger=int(planner["min_orders_to_trigger"]),
         ),
         reward=RewardMeta(
-            lambda_wait=float(reward["lambda_wait"]),
             wait_idle_penalty_coef=float(reward["wait_idle_penalty_coef"]),
-            lambda_queue=float(reward["lambda_queue"]),
             lambda_miss=float(reward["lambda_miss"]),
             lambda_res_timeout=float(reward["lambda_res_timeout"]),
             lambda_overdue=float(reward["lambda_overdue"]),
@@ -3548,8 +3562,6 @@ def _build_meta_payload(
                 "policy.max_global_stations",
             ),
             tunable_fields=(
-                "reward.lambda_wait",
-                "reward.lambda_queue",
                 "reward.lambda_miss",
                 "reward.lambda_overdue",
             ),

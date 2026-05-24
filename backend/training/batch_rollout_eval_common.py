@@ -309,6 +309,8 @@ def print_summary(summary: Mapping[str, Any]) -> None:
         "mean_total_reward",
         "mean_delivery_count",
         "mean_on_time_rate",
+        "mean_avg_order_delay_min",
+        "weighted_avg_order_delay_min",
         "mean_completion_rate",
         "mean_required_on_time_rate",
         "sum_required_primary_order_count",

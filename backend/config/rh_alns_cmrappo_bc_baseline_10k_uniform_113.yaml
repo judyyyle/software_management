@@ -27,7 +27,7 @@ scene:
   scene_bundle_dir: backend/test_data/scene-2
   scene_config_file: scene_config.json
   entities_file: entities.json
-  orders_file: orders_ppo_training_intensity.json
+  orders_file: orders_ppo_training_intensity_uniform_113.json
   osm_network_file: osm_network.geojson
   osm_network_format: geojson
 

@@ -2641,7 +2641,7 @@ class TestPhase7ModelRuntime(unittest.TestCase):
                 "action_space": {"type": "factorized"},
                 "candidate": {"max_candidate_orders": 32},
                 "planner": {"coarse_replan_interval_sec": 60.0},
-                "reward": {"lambda_wait": 1.0},
+                "reward": {"wait_idle_penalty_coef": 0.03},
                 "critic_schema": {
                     "name": "critic_tensor_v1",
                     "schema_version": "v1",
@@ -2772,7 +2772,7 @@ class TestPhase7ModelRuntime(unittest.TestCase):
                 "action_space": {"type": "factorized"},
                 "candidate": {"max_candidate_orders": 32},
                 "planner": {"coarse_replan_interval_sec": 60.0},
-                "reward": {"lambda_wait": 1.0},
+                "reward": {"wait_idle_penalty_coef": 0.03},
                 "critic_schema": {
                     "name": "critic_tensor_v1",
                     "schema_version": "v1",
@@ -2858,7 +2858,7 @@ class TestPhase7ModelRuntime(unittest.TestCase):
                 "action_space": {"type": "factorized"},
                 "candidate": {"max_candidate_orders": 32},
                 "planner": {"coarse_replan_interval_sec": 60.0},
-                "reward": {"lambda_wait": 1.0},
+                "reward": {"wait_idle_penalty_coef": 0.03},
                 "critic_schema": {
                     "name": "critic_tensor_v1",
                     "schema_version": "v1",

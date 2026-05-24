@@ -925,9 +925,7 @@ class PlannerMeta:
 
 @dataclass(frozen=True)
 class RewardMeta:
-    lambda_wait: float
     wait_idle_penalty_coef: float
-    lambda_queue: float
     lambda_miss: float
     lambda_res_timeout: float
     lambda_overdue: float
