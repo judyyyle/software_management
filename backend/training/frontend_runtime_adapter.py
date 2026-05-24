@@ -423,6 +423,8 @@ class TrainingTelemetryBridge:
     def _select_episode_stats(self, snapshot: Mapping[str, Any]) -> dict[str, Any]:
         keys = (
             "delivery_count",
+            "completed_with_timing_order_count",
+            "avg_order_delay_min",
             "fallback_count",
             "hard_failure_count",
             "reservation_timeout_count",

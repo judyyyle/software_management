@@ -742,6 +742,39 @@ class TestTrainingEnvAdapterPhase5c(unittest.TestCase):
         removed = next(item for item in env._require_order_manager().completed_orders if item.order_id == order.order_id)
         self.assertEqual(removed.status, TaskStatus.TIMEOUT)
 
+    def test_episode_snapshot_reports_frontend_style_average_order_delay(self) -> None:
+        env, drone_id = self._reset_controlled_env()
+        order_mgr = env._require_order_manager()
+
+        on_time = self._inject_order(
+            env,
+            drone_id=drone_id,
+            order_id="ORDER-P5C-AVG-DELAY-ON-TIME",
+            create_time=0.0,
+            deadline=100.0,
+        )
+        late = self._inject_order(
+            env,
+            drone_id=drone_id,
+            order_id="ORDER-P5C-AVG-DELAY-LATE",
+            create_time=0.0,
+            deadline=100.0,
+        )
+        for order, deliver_time in ((on_time, 90.0), (late, 190.0)):
+            order_mgr.pending_orders.pop(order.order_id)
+            order.actual_deliver_time = deliver_time
+            order.update_status(TaskStatus.ASSIGNED)
+            order.update_status(TaskStatus.PICKED_UP)
+            order.update_status(TaskStatus.DELIVERING)
+            order.update_status(TaskStatus.COMPLETED)
+            order_mgr.completed_orders.append(order)
+
+        snapshot = env.build_episode_metrics_snapshot()
+
+        self.assertEqual(snapshot["completed_with_timing_order_count"], 2)
+        self.assertAlmostEqual(snapshot["order_delay_sum_min"], 1.5, places=6)
+        self.assertAlmostEqual(snapshot["avg_order_delay_min"], 0.75, places=6)
+
     def test_wait_action_uses_exact_idle_penalty_and_gap_cap(self) -> None:
         env, drone_id = self._reset_controlled_env()
         env._planned_route_stop_i = len(env._planned_route_stops)
@@ -929,7 +962,7 @@ class TestTrainingEnvAdapterPhase5c(unittest.TestCase):
         self.assertEqual(queued_trigger_types, {"order_arrival_wake"})
         self.assertIsNotNone(env.current_decision_context)
 
-    def test_settle_per_dt_rewards_separates_wait_and_queue(self) -> None:
+    def test_settle_per_dt_rewards_tracks_wait_and_queue_without_penalty(self) -> None:
         env, drone_id = self._reset_controlled_env()
         other_drone_id = self._second_drone_id(env, drone_id)
 
@@ -938,13 +971,11 @@ class TestTrainingEnvAdapterPhase5c(unittest.TestCase):
 
         reward, breakdown = env._settle_per_dt_rewards(t_prev=0.0, t_next=5.0)
 
-        self.assertAlmostEqual(
-            reward,
-            -env._cfg.lambda_wait * 5.0 - env._cfg.lambda_queue * 5.0,
-            places=6,
-        )
-        self.assertAlmostEqual(breakdown["wait"], -env._cfg.lambda_wait * 5.0, places=6)
-        self.assertAlmostEqual(breakdown["queue"], -env._cfg.lambda_queue * 5.0, places=6)
+        self.assertAlmostEqual(reward, 0.0, places=6)
+        self.assertNotIn("wait", breakdown)
+        self.assertNotIn("queue", breakdown)
+        self.assertAlmostEqual(env._episode_wait_time_sec, 5.0, places=6)
+        self.assertAlmostEqual(env._episode_queue_time_sec, 5.0, places=6)
 
     def test_mode_a_background_completion_updates_stats_without_reward(self) -> None:
         env = self._make_env()

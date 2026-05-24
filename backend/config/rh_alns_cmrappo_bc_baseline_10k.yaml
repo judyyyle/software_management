@@ -203,11 +203,6 @@ candidate:
   rendezvous_max_wait_sec: 240
   energy_safe_margin_ratio: 0.10
 
-  # 候选集排序和裁剪的稳定化开关。
-  enable_order_pre_score_truncation: true
-  enable_recovery_quality_truncation: true
-  always_keep_wait_action: true
-
 action_space:
   type: factorized
 
@@ -289,14 +284,11 @@ policy:
 
 reward:
   # UAV-scope 主指标权重：仅评价无人机可配送订单。
-  # Run11: 显著降低等待惩罚权重，避免 mode C 因等待卡车被过度打压。
-  lambda_wait: 0.08
-  # Run12: 10m/s 机型下 0.25 会把低密度场景的安全等待几乎全部打成噪声。
-  wait_idle_penalty_coef: 0.10
+  # 仅保留 actor 主动 WAIT 的轻量时间成本；mode C 等卡车与充换电排队只统计时长，不扣 reward。
+  wait_idle_penalty_coef: 0.03
   # 当 IDLE UAV 在当前确有合法派单动作时仍选择 WAIT，立即施加小额机会成本。
   # 只惩罚“跳过可执行派单”的 WAIT，避免未接单 pending 超时完全缺少 credit。
   wait_opportunity_penalty_coef: 2.0
-  lambda_queue: 0.10
   lambda_miss: 0.15
   lambda_res_timeout: 0.10
   lambda_overdue: 0.15
