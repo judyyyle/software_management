@@ -1797,6 +1797,12 @@ def _summarize_episode_records(
     order_delay_sum_min_total = float(
         sum(float(item.get("order_delay_sum_min", 0.0)) for item in episodes)
     )
+    total_tardiness_sec = float(
+        sum(float(item.get("total_tardiness_sec", 0.0)) for item in episodes)
+    )
+    completed_with_tardiness_total = int(
+        sum(int(item.get("completed_with_timing_order_count", 0)) for item in episodes)
+    )
     for item in episodes:
         for reason_key, count in dict(
             item.get("mode_c_post_delivery_revalidation_fail_reasons", {})
@@ -1859,6 +1865,18 @@ def _summarize_episode_records(
         ),
         "sum_completed_with_timing_order_count": int(completed_with_timing_total),
         "sum_order_delay_min": float(order_delay_sum_min_total),
+        "sum_total_tardiness_sec": float(total_tardiness_sec),
+        "mean_tardiness_sec": (
+            float(total_tardiness_sec) / float(completed_with_tardiness_total)
+            if completed_with_tardiness_total > 0
+            else 0.0
+        ),
+        "max_tardiness_sec": float(
+            max(float(item.get("max_tardiness_sec", 0.0)) for item in episodes)
+        ),
+        "sum_late_delivery_count": int(
+            sum(int(item.get("late_delivery_count", 0)) for item in episodes)
+        ),
         "weighted_avg_order_delay_min": (
             float(order_delay_sum_min_total) / float(completed_with_timing_total)
             if completed_with_timing_total > 0
@@ -1874,6 +1892,9 @@ def _summarize_episode_records(
             np.mean([float(item.get("required_on_time_rate", 0.0)) for item in episodes])
         ),
         "sum_timeout_order_count": int(sum(int(item["timeout_order_count"]) for item in episodes)),
+        "sum_unserved_primary_order_count": int(
+            sum(int(item.get("unserved_primary_order_count", 0)) for item in episodes)
+        ),
         "sum_fallback_count": int(sum(int(item["fallback_count"]) for item in episodes)),
         "sum_hard_failure_count": int(sum(int(item["hard_failure_count"]) for item in episodes)),
         "sum_reservation_timeout_count": int(
@@ -1989,10 +2010,16 @@ def _count_done_reason(report: Mapping[str, Any], *, reason: str) -> int:
     return sum(1 for episode in episodes if str(episode.get("done_reason")) == str(reason))
 
 
+def _sum_undelivered_order_count(report: Mapping[str, Any]) -> int:
+    return int(report.get("sum_timeout_order_count", 0)) + int(
+        report.get("sum_unserved_primary_order_count", 0)
+    )
+
+
 def _build_benchmark_guardrail_key(eval_report: Mapping[str, Any]) -> tuple[Any, ...]:
     benchmark = dict(eval_report["benchmark"])
     return (
-        -int(benchmark["sum_timeout_order_count"]),
+        -_sum_undelivered_order_count(benchmark),
         int(_count_done_reason(benchmark, reason="all_orders_cleared")),
     )
 
@@ -2003,11 +2030,11 @@ def _build_eval_selection_key(eval_report: Mapping[str, Any]) -> tuple[Any, ...]
     stochastic_medium = dict(stochastic["medium"])
     return (
         *_build_benchmark_guardrail_key(eval_report),
-        -int(stochastic_high["sum_timeout_order_count"]),
+        -_sum_undelivered_order_count(stochastic_high),
         float(stochastic_high["mean_total_reward"]),
         -int(stochastic_high.get("sum_fallback_count", 0)),
         float(stochastic_medium["mean_total_reward"]),
-        -int(stochastic_medium.get("sum_timeout_order_count", 0)),
+        -_sum_undelivered_order_count(stochastic_medium),
         -int(stochastic_medium.get("sum_fallback_count", 0)),
     )
 
@@ -2015,7 +2042,7 @@ def _build_eval_selection_key(eval_report: Mapping[str, Any]) -> tuple[Any, ...]
 def _build_stochastic_high_improvement_key(eval_report: Mapping[str, Any]) -> tuple[Any, ...]:
     stochastic_high = dict(eval_report["stochastic"]["high"])
     return (
-        -int(stochastic_high["sum_timeout_order_count"]),
+        -_sum_undelivered_order_count(stochastic_high),
         float(stochastic_high["mean_total_reward"]),
         -int(stochastic_high.get("sum_fallback_count", 0)),
     )
@@ -3492,13 +3519,22 @@ def _build_meta_payload(
             wait_idle_penalty_coef=float(reward["wait_idle_penalty_coef"]),
             lambda_miss=float(reward["lambda_miss"]),
             lambda_res_timeout=float(reward["lambda_res_timeout"]),
-            lambda_overdue=float(reward["lambda_overdue"]),
+            lambda_overdue=float(reward.get("lambda_overdue", 0.0)),
             R_delivery_bonus=float(reward["R_delivery_bonus"]),
+            late_delivery_penalty_coef=float(
+                reward.get("late_delivery_penalty_coef", 0.0)
+            ),
+            late_delivery_penalty_cap=float(
+                reward.get("late_delivery_penalty_cap", 0.0)
+            ),
+            min_late_delivery_reward=float(
+                reward.get("min_late_delivery_reward", 1.0)
+            ),
             rendezvous_arrive_bonus=float(reward.get("rendezvous_arrive_bonus", 0.0)),
             rendezvous_bonus=float(reward.get("rendezvous_bonus", 0.0)),
             mode_c_attempt_bonus=float(reward.get("mode_c_attempt_bonus", 0.0)),
             max_overdue_sec=float(reward["max_overdue_sec"]),
-            hard_overdue_penalty_sec=float(reward["hard_overdue_penalty_sec"]),
+            hard_overdue_penalty_sec=float(reward.get("hard_overdue_penalty_sec", 0.0)),
             hard_failure_penalty_sec=float(reward["hard_failure_penalty_sec"]),
             primary_metrics_scope=str(reward["primary_metrics_scope"]),
             include_mode_a_in_primary_metrics=bool(reward["include_mode_a_in_primary_metrics"]),
@@ -3546,7 +3582,7 @@ def _build_meta_payload(
             reservation_alpha=float(reservation["alpha"]),
             reservation_beta=float(reservation["beta"]),
             reservation_gamma=float(reservation["gamma"]),
-            overdue_penalty_mode="per_dt",
+            overdue_penalty_mode="delivery_time_lateness_discount",
             fifo_queue_enabled=True,
             riding_with_truck_enabled=True,
             allow_empty_backbone_route=bool(planner["allow_empty_backbone_route"]),
@@ -3563,7 +3599,9 @@ def _build_meta_payload(
             ),
             tunable_fields=(
                 "reward.lambda_miss",
-                "reward.lambda_overdue",
+                "reward.late_delivery_penalty_coef",
+                "reward.late_delivery_penalty_cap",
+                "reward.min_late_delivery_reward",
             ),
         ),
     )
