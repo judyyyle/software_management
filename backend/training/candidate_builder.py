@@ -232,7 +232,7 @@ class CandidateBuilder:
                 order_id=order_id,
                 weight=float(order.payload_weight),
                 deadline=float(order.deadline),
-                remaining_time=max(0.0, float(order.deadline) - runtime_state.t_now),
+                remaining_time=float(order.deadline) - float(runtime_state.t_now),
                 delivery_x=float(order.delivery_loc.x),
                 delivery_y=float(order.delivery_loc.y),
                 delivery_z=float(order.delivery_loc.z),

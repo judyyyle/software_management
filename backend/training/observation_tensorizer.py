@@ -287,7 +287,6 @@ class ObservationTensorizer:
             drone_state=post_drone,
         )
         delivered = float(reward_breakdown.get("delivery_bonus", 0.0)) > 0.0
-        reservation_timeout = float(reward_breakdown.get("reservation_timeout", 0.0)) < 0.0
         hard_failure = (
             float(reward_breakdown.get("hard_failure", 0.0)) < 0.0
             or post_drone.training_state == "airborne_energy_failure"
@@ -300,6 +299,7 @@ class ObservationTensorizer:
         )
         if isinstance(active_fallback_causes, dict):
             fallback_cause = str(active_fallback_causes.get(actor_id, "none"))
+        reservation_timeout = fallback_cause == "rendezvous_wait_timeout"
         rendezvous_success = post_drone.training_state in {"charging_on_truck", "riding_with_truck"}
         queue_entered = post_drone.training_state == "queueing_at_host"
         service_completed = (
