@@ -21,9 +21,9 @@
     "truck_route.sumocfg",
     "validation_report.json"
   ],
-  "max_snap_distance_m": 85.058173,
+  "max_snap_distance_m": 38.853532,
   "min_future_fixed_nodes_ok": true,
-  "snap_within_warn_threshold": false,
+  "snap_within_warn_threshold": true,
   "station_target_count": 5,
   "station_target_count_ok": true,
   "sumo_edge_sequence_non_empty": true,
