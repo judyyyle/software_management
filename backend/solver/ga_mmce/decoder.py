@@ -3,12 +3,18 @@ from __future__ import annotations
 import math
 from collections import Counter
 from dataclasses import dataclass, field
+from types import SimpleNamespace
 from typing import Any
 
 from .adapters import GAAdapterContext, apply_initial_drone_layout_overlay, clone_state_for_decode
 from .chromosome import Individual
 from .config import GAConfig
 from .physical_evaluator import GACandidate, PhysicalEvaluator
+
+try:
+    from utils.coord_utils import wgs84_to_utm
+except Exception:  # pragma: no cover - isolated unit tests may not load app utils.
+    wgs84_to_utm = None
 
 try:
     from ..greedy_mmce import AllocationResult, DispatchPlan, DroneRoute, TruckRoute, TruckRouteNode
@@ -223,15 +229,32 @@ class GADecoder:
         )
         plan_completion_time = self._plan_completion_time(candidates, initial_time)
         objective += plan_completion_time * float(self.config.weight_completion)
+        future_terms = self._collect_static_future_friendliness(
+            original_state=state,
+            decoded_state=state_copy,
+            context=context,
+            truck_routes=truck_routes,
+        )
+        objective += float(future_terms.get("future_objective", 0.0) or 0.0)
+        metrics.update(
+            {
+                key: float(value)
+                for key, value in future_terms.items()
+                if key.startswith("future_") and isinstance(value, int | float)
+            }
+        )
 
         objective = self._finite_or(objective, self.config.big_m)
         diagnostics = self._collect_decode_diagnostics(gene_attempts, candidates, closure_info)
+        if future_terms.get("future_preview_count", 0):
+            diagnostics["future_friendliness"] = dict(future_terms)
         cost_breakdown = self._collect_cost_breakdown(
             candidates=candidates,
             metrics=metrics,
             penalties=penalties,
             fitness_total=objective + sum(float(value) for value in penalties.values()),
             plan_completion_time=plan_completion_time,
+            future_terms=future_terms,
         )
         plan = self._build_dispatch_plan(
             allocations=allocations,
@@ -336,6 +359,170 @@ class GADecoder:
             return 0.0, 0
         return repeated_count * factor, repeated_count
 
+    def _collect_static_future_friendliness(
+        self,
+        *,
+        original_state: Any,
+        decoded_state: Any,
+        context: GAAdapterContext,
+        truck_routes: dict[str, TruckRoute],
+    ) -> dict[str, float]:
+        """Score how well the static backbone prepares for scheduled dynamics."""
+        result = {
+            "future_objective": 0.0,
+            "future_preview_count": 0.0,
+            "future_terminal_penalty": 0.0,
+            "future_route_proximity_reward": 0.0,
+            "future_station_coverage_reward": 0.0,
+            "future_station_coverage_count": 0.0,
+        }
+        if str(getattr(context, "mode", "") or "").lower() != "static":
+            return result
+        if not bool(getattr(self.config, "future_preview_enabled", False)):
+            return result
+
+        future_positions = self._future_dynamic_positions(original_state)
+        if not future_positions:
+            return result
+        max_orders = int(getattr(self.config, "future_preview_max_orders", 0) or 0)
+        if max_orders > 0:
+            future_positions = future_positions[:max_orders]
+
+        route_positions = self._route_positions(truck_routes)
+        if not route_positions:
+            return result
+
+        center = self._centroid(future_positions)
+        terminal = self._terminal_route_position(truck_routes) or route_positions[-1]
+        terminal_penalty = (
+            self._distance_2d(terminal, center)
+            * float(getattr(self.config, "future_terminal_position_weight", 0.0) or 0.0)
+        )
+
+        route_radius = max(1.0, float(getattr(self.config, "future_route_proximity_radius_m", 1.0) or 1.0))
+        route_reward_unit = float(getattr(self.config, "future_route_proximity_reward", 0.0) or 0.0)
+        route_reward = 0.0
+        for pos in future_positions:
+            nearest = min(self._distance_2d(pos, route_pos) for route_pos in route_positions)
+            route_reward += route_reward_unit * max(0.0, 1.0 - nearest / route_radius)
+
+        station_radius = max(1.0, float(getattr(self.config, "future_station_coverage_radius_m", 1.0) or 1.0))
+        station_reward_unit = float(getattr(self.config, "future_station_coverage_reward", 0.0) or 0.0)
+        covered_stations = self._covered_future_station_ids(
+            decoded_state,
+            future_positions,
+            route_positions,
+            station_radius,
+        )
+        station_reward = station_reward_unit * len(covered_stations)
+
+        result.update(
+            {
+                "future_objective": terminal_penalty - route_reward - station_reward,
+                "future_preview_count": float(len(future_positions)),
+                "future_terminal_penalty": terminal_penalty,
+                "future_route_proximity_reward": route_reward,
+                "future_station_coverage_reward": station_reward,
+                "future_station_coverage_count": float(len(covered_stations)),
+            }
+        )
+        return result
+
+    def _future_dynamic_positions(self, state: Any) -> list[Any]:
+        order_mgr = self._read_field(state, "order_mgr")
+        entries = self._read_field(order_mgr, "_scheduled_dynamic", []) if order_mgr is not None else []
+        cursor = int(self._read_field(order_mgr, "_scheduled_dynamic_i", 0) or 0) if order_mgr is not None else 0
+        now = self._current_time(state)
+        positions: list[Any] = []
+        for entry in list(entries)[max(0, cursor):]:
+            if not isinstance(entry, dict):
+                continue
+            try:
+                if float(entry.get("spawn_sim_s", 0.0)) < now - 1e-6:
+                    continue
+            except (TypeError, ValueError):
+                pass
+            pos = self._delivery_position_from_entry(entry)
+            if pos is not None:
+                positions.append(pos)
+        return positions
+
+    def _delivery_position_from_entry(self, entry: dict[str, Any]) -> Any | None:
+        loc = entry.get("delivery_loc")
+        if loc is not None and hasattr(loc, "x") and hasattr(loc, "y"):
+            return loc
+        if wgs84_to_utm is None:
+            return None
+        try:
+            x, y = wgs84_to_utm(float(entry["delivery_lng"]), float(entry["delivery_lat"]))
+            return SimpleNamespace(x=float(x), y=float(y), z=float(entry.get("delivery_z", 0.0) or 0.0))
+        except Exception:
+            return None
+
+    def _route_positions(self, truck_routes: dict[str, TruckRoute]) -> list[Any]:
+        positions: list[Any] = []
+        for route in truck_routes.values():
+            for node in route.nodes:
+                pos = getattr(node, "position", None)
+                if pos is not None and hasattr(pos, "x") and hasattr(pos, "y"):
+                    positions.append(pos)
+        return positions
+
+    def _terminal_route_position(self, truck_routes: dict[str, TruckRoute]) -> Any | None:
+        latest_time = -math.inf
+        terminal = None
+        for route in truck_routes.values():
+            for node in route.nodes:
+                pos = getattr(node, "position", None)
+                if pos is None or not hasattr(pos, "x") or not hasattr(pos, "y"):
+                    continue
+                departure = float(getattr(node, "departure_time", getattr(node, "arrival_time", 0.0)) or 0.0)
+                if departure >= latest_time:
+                    latest_time = departure
+                    terminal = pos
+        return terminal
+
+    def _covered_future_station_ids(
+        self,
+        state: Any,
+        future_positions: list[Any],
+        route_positions: list[Any],
+        radius_m: float,
+    ) -> set[str]:
+        stations = self._mapping(state, "stations")
+        if not isinstance(stations, dict):
+            return set()
+        covered: set[str] = set()
+        for station_id, station in stations.items():
+            station_pos = self._read_field(station, "location")
+            if station_pos is None or not hasattr(station_pos, "x") or not hasattr(station_pos, "y"):
+                continue
+            near_future = any(self._distance_2d(station_pos, pos) <= radius_m for pos in future_positions)
+            if not near_future:
+                continue
+            near_route = any(self._distance_2d(station_pos, pos) <= radius_m for pos in route_positions)
+            if near_route:
+                covered.add(str(station_id))
+        return covered
+
+    def _centroid(self, positions: list[Any]) -> Any:
+        count = max(1, len(positions))
+        return SimpleNamespace(
+            x=sum(float(pos.x) for pos in positions) / count,
+            y=sum(float(pos.y) for pos in positions) / count,
+            z=sum(float(getattr(pos, "z", 0.0) or 0.0) for pos in positions) / count,
+        )
+
+    def _distance_2d(self, pos_a: Any, pos_b: Any) -> float:
+        if hasattr(pos_a, "distance_2d"):
+            try:
+                return float(pos_a.distance_2d(pos_b))
+            except Exception:
+                pass
+        dx = float(pos_a.x) - float(pos_b.x)
+        dy = float(pos_a.y) - float(pos_b.y)
+        return math.hypot(dx, dy)
+
     def _collect_cost_breakdown(
         self,
         candidates: list[GACandidate],
@@ -343,7 +530,9 @@ class GADecoder:
         penalties: dict[str, float],
         fitness_total: float,
         plan_completion_time: float,
+        future_terms: dict[str, float] | None = None,
     ) -> dict[str, float]:
+        future_terms = future_terms or {}
         raw_truck_distance = sum(float(c.truck_distance or 0.0) for c in candidates)
         raw_uav_distance = sum(float(c.uav_distance or 0.0) for c in candidates)
         truck_distance_cost = 0.0
@@ -360,6 +549,9 @@ class GADecoder:
         infeasible_penalty = float(penalties.get("infeasible_penalty", 0.0) or 0.0)
         final_return_penalty = float(penalties.get("final_return_penalty", 0.0) or 0.0)
         drone_reuse_penalty = float(penalties.get("drone_reuse_penalty", 0.0) or 0.0)
+        future_terminal_penalty = float(future_terms.get("future_terminal_penalty", 0.0) or 0.0)
+        future_route_proximity_reward = float(future_terms.get("future_route_proximity_reward", 0.0) or 0.0)
+        future_station_coverage_reward = float(future_terms.get("future_station_coverage_reward", 0.0) or 0.0)
         total = (
             truck_distance_cost
             + uav_distance_cost
@@ -374,7 +566,10 @@ class GADecoder:
             + infeasible_penalty
             + final_return_penalty
             + drone_reuse_penalty
+            + future_terminal_penalty
             - mode_reward
+            - future_route_proximity_reward
+            - future_station_coverage_reward
         )
         residual = float(fitness_total) - total
         return {
@@ -395,6 +590,10 @@ class GADecoder:
             "infeasible_penalty": infeasible_penalty,
             "final_return_penalty": final_return_penalty,
             "drone_reuse_penalty": drone_reuse_penalty,
+            "future_terminal_penalty": future_terminal_penalty,
+            "future_route_proximity_reward": future_route_proximity_reward,
+            "future_station_coverage_reward": future_station_coverage_reward,
+            "future_objective": float(future_terms.get("future_objective", 0.0) or 0.0),
             "residual_cost": residual,
             "total_fitness": float(fitness_total),
         }

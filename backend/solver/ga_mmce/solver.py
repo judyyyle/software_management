@@ -32,7 +32,7 @@ from .population import enforce_fixed_tail, initialize_population
 logger = logging.getLogger(__name__)
 DEBUG_LOG_PATH = Path(__file__).resolve().parents[1] / "ga_mmce_debug_log"
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
-STATIC_PLAN_CACHE_SCHEMA = 1
+STATIC_PLAN_CACHE_SCHEMA = 2
 STATIC_PLAN_CACHE_ENV = "GA_MMCE_REUSE_STATIC_PLAN"
 STATIC_PLAN_CACHE_PATH_ENV = "GA_MMCE_STATIC_PLAN_CACHE_PATH"
 
@@ -44,6 +44,7 @@ class GAStateView:
     current_time: float
     bbox: dict | None = None
     scene_id: str | None = None
+    order_mgr: Any | None = None
 
 
 class GAMMCESolver:
@@ -71,9 +72,14 @@ class GAMMCESolver:
         self._reuse_static_plan_cache_override: bool | None = None
         self._last_route_bbox: dict | None = None
         self._last_route_scene_id: str | None = None
+        self._order_mgr: Any | None = None
 
         if self.config.random_seed is not None:
             random.seed(self.config.random_seed)
+
+    def bind_order_manager(self, order_mgr: Any) -> None:
+        """Expose scheduled future orders to the static GA objective."""
+        self._order_mgr = order_mgr
 
     def set_static_plan_cache_reuse(self, enabled: bool | None) -> None:
         """Enable/disable static plan cache reuse for the next GA static dispatch.
@@ -97,6 +103,7 @@ class GAMMCESolver:
             current_time=current_time,
             bbox=bbox,
             scene_id=scene_id,
+            order_mgr=self._order_mgr,
         )
         return self.solve(state, dispatch_type="full")
 
@@ -114,6 +121,7 @@ class GAMMCESolver:
             current_time=current_time,
             bbox=bbox,
             scene_id=scene_id,
+            order_mgr=self._order_mgr,
         )
         setattr(state, "_ga_solver", self)
         return self.reschedule_on_event(state, new_orders, current_time)
@@ -132,6 +140,7 @@ class GAMMCESolver:
             current_time=current_time,
             bbox=bbox,
             scene_id=scene_id,
+            order_mgr=self._order_mgr,
         )
         setattr(state, "_ga_solver", self)
         return self.reschedule_on_event(state, {}, current_time)
@@ -899,7 +908,27 @@ class GAMMCESolver:
             "depot_drone_ids": tuple(str(v) for v in context.depot_drone_ids),
             "all_drone_ids": tuple(str(v) for v in context.all_drone_ids),
             "support_node_ids": tuple(str(v) for v in context.support_node_ids),
+            "future_dynamic_orders": self._future_dynamic_cache_signature(state),
         }
+
+    def _future_dynamic_cache_signature(self, state: Any) -> tuple[tuple[str, float, float, float, float], ...]:
+        order_mgr = getattr(state, "order_mgr", None) or self._order_mgr
+        entries = getattr(order_mgr, "_scheduled_dynamic", []) if order_mgr is not None else []
+        cursor = int(getattr(order_mgr, "_scheduled_dynamic_i", 0) or 0) if order_mgr is not None else 0
+        rows = []
+        for entry in list(entries)[max(0, cursor):]:
+            if not isinstance(entry, dict):
+                continue
+            rows.append(
+                (
+                    str(entry.get("order_id", "")),
+                    self._rounded_number(entry.get("spawn_sim_s", 0.0)),
+                    self._rounded_number(entry.get("deadline_offset_s", entry.get("deadline_sim_s", 0.0))),
+                    self._rounded_number(entry.get("delivery_lng", 0.0)),
+                    self._rounded_number(entry.get("delivery_lat", 0.0)),
+                )
+            )
+        return tuple(rows)
 
     def _normalized_static_plan_cache_signature(self, signature: Any) -> Any:
         if not isinstance(signature, dict):

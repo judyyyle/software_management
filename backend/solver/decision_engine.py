@@ -74,7 +74,7 @@ class DispatchDecisionEngine:
             self.solver_name = solver_name.strip().lower()
             self.solver = create_solver(self.solver_name, self.entity_mgr)
 
-        if isinstance(self.solver, MarketBasedSolver):
+        if hasattr(self.solver, "bind_order_manager"):
             self.solver.bind_order_manager(self.order_mgr)
 
         runtime_cfg = load_solver_energy_params()
@@ -102,7 +102,7 @@ class DispatchDecisionEngine:
             return
         self.solver = create_solver(target, self.entity_mgr)
         self.solver_name = target
-        if isinstance(self.solver, MarketBasedSolver):
+        if hasattr(self.solver, "bind_order_manager"):
             self.solver.bind_order_manager(self.order_mgr)
         logger.info("[DispatchDecisionEngine] 已切换求解器为 %s", target)
 
