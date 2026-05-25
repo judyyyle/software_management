@@ -242,8 +242,8 @@ reservation:
   drift_eta_abs_threshold_sec: 60
   drift_eta_rel_threshold_ratio: 0.15
 
-  # timeout 后的局部损失通过 reward.lambda_res_timeout 统一结算；
-  # 下面三项保留为后续课程学习或 warmup 调参预留，当前默认不启用动态衰减。
+  # reservation timeout 仅触发 fallback 与指标记录，不再产生 reward penalty；
+  # 下面三项仅为旧配置兼容保留，当前不生效。
   timeout_penalty_init: 0.10
   timeout_penalty_final: 0.10
   timeout_penalty_decay: 1.0
@@ -290,11 +290,14 @@ reward:
   # 只惩罚“跳过可执行派单”的 WAIT，避免未接单 pending 超时完全缺少 credit。
   wait_opportunity_penalty_coef: 2.0
   lambda_miss: 0.15
-  lambda_res_timeout: 0.10
-  lambda_overdue: 0.15
+  lambda_res_timeout: 0.0  # deprecated: reservation timeout no longer creates reward penalty
+  lambda_overdue: 0.0  # deprecated: overdue no longer creates per-dt reward penalty
 
   # 正奖励仅保留送达奖励，避免 reward 结构过于混杂。
   R_delivery_bonus: 100
+  late_delivery_penalty_coef: 0.05
+  late_delivery_penalty_cap: 40.0
+  min_late_delivery_reward: 50.0
   # Rendezvous 塑形：
   # 1. 到达 recover 节点不再给额外奖励，避免鼓励 UAV 只追求进入 C 回收流程；
   # 2. 真正被卡车回收上车时给成功奖励。
@@ -304,9 +307,9 @@ reward:
   rendezvous_bonus: 20.0
   mode_c_attempt_bonus: 5.0
 
-  # 超时强制移除与硬失败惩罚。
+  # severe overdue 只作为指标阈值；不移除订单、不标记 TIMEOUT、不扣 reward。
   max_overdue_sec: 600
-  hard_overdue_penalty_sec: 600
+  hard_overdue_penalty_sec: 0.0  # deprecated
   hard_failure_penalty_sec: 1200
 
   # 指标口径开关：显式固定，避免后续实现偏离 Phase 1 文档约束。
