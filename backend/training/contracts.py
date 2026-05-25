@@ -930,6 +930,9 @@ class RewardMeta:
     lambda_res_timeout: float
     lambda_overdue: float
     R_delivery_bonus: float
+    late_delivery_penalty_coef: float
+    late_delivery_penalty_cap: float
+    min_late_delivery_reward: float
     rendezvous_arrive_bonus: float
     rendezvous_bonus: float
     mode_c_attempt_bonus: float

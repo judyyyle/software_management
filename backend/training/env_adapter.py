@@ -14,9 +14,9 @@ HiveLogix — Phase 5c 训练环境适配器。
   - 完整 post_delivery_revalidation：送达后对 mode C 原选回收点做三条件复核
   - mode B 优先返仓；电量不足返仓时先到可达 station 补能再自动返仓
   - reservation 状态机与 timeout 触发 fallback
-  - 完整 per-dt reward：T_overdue / T_idle / T_fallback
+  - 完整 per-dt reward：T_idle / T_fallback；overdue 仅作为统计与特征
   - WAIT 动作的 T_idle 一次性精确结算
-  - hard overdue 强制移除
+  - hard overdue 作为 severe late 指标，不强制移除订单
 """
 
 from __future__ import annotations
@@ -402,6 +402,9 @@ class _YamlConfig:
     lambda_res_timeout: float
     lambda_overdue: float
     R_delivery_bonus: float
+    late_delivery_penalty_coef: float
+    late_delivery_penalty_cap: float
+    min_late_delivery_reward: float
     mode_c_attempt_bonus: float
     max_overdue_sec: float
     hard_overdue_penalty_sec: float
@@ -575,6 +578,9 @@ class TrainingEnvAdapter:
         self._episode_ppo_attributed_fallback_time_sec = 0.0
         self._episode_system_attributed_fallback_time_sec = 0.0
         self._episode_overdue_time_sec = 0.0
+        self._episode_hard_overdue_time_sec = 0.0
+        self._episode_hard_overdue_order_ids: set[str] = set()
+        self._episode_lateness_discount_total = 0.0
         self._episode_reservation_timeout_cost_sec = 0.0
         self._runtime_uav_completed_distance_m = 0.0
         self._runtime_uav_completed_energy_j = 0.0
@@ -718,6 +724,9 @@ class TrainingEnvAdapter:
         self._episode_ppo_attributed_fallback_time_sec = 0.0
         self._episode_system_attributed_fallback_time_sec = 0.0
         self._episode_overdue_time_sec = 0.0
+        self._episode_hard_overdue_time_sec = 0.0
+        self._episode_hard_overdue_order_ids = set()
+        self._episode_lateness_discount_total = 0.0
         self._episode_reservation_timeout_cost_sec = 0.0
         self._runtime_uav_completed_distance_m = 0.0
         self._runtime_uav_completed_energy_j = 0.0
@@ -1255,6 +1264,17 @@ class TrainingEnvAdapter:
             for order in delivered_primary_orders
             if order.actual_deliver_time is not None
         ]
+        tardiness_values_sec = [
+            max(0.0, float(order.actual_deliver_time) - float(order.deadline))
+            for order in delivered_primary_orders_with_timing
+        ]
+        total_tardiness_sec = sum(tardiness_values_sec)
+        mean_tardiness_sec = (
+            total_tardiness_sec / float(len(tardiness_values_sec))
+            if tardiness_values_sec
+            else 0.0
+        )
+        max_tardiness_sec = max(tardiness_values_sec) if tardiness_values_sec else 0.0
         order_delay_sum_min = sum(
             max(0.0, float(order.actual_deliver_time) - float(order.deadline)) / 60.0
             for order in delivered_primary_orders_with_timing
@@ -1301,20 +1321,28 @@ class TrainingEnvAdapter:
             "delivery_count": int(self._episode_delivery_count),
             "on_time_delivery_count": int(on_time_delivery_count),
             "overdue_delivery_count": int(overdue_delivery_count),
+            "late_delivery_count": int(overdue_delivery_count),
             "on_time_rate": float(on_time_rate),
             "completed_with_timing_order_count": int(
                 len(delivered_primary_orders_with_timing)
             ),
             "order_delay_sum_min": float(order_delay_sum_min),
             "avg_order_delay_min": float(avg_order_delay_min),
+            "total_tardiness_sec": float(total_tardiness_sec),
+            "mean_tardiness_sec": float(mean_tardiness_sec),
+            "max_tardiness_sec": float(max_tardiness_sec),
             "required_primary_order_count": int(required_primary_order_count),
             "completion_rate": float(completion_rate),
             "required_on_time_rate": float(required_on_time_rate),
             "timeout_order_count": int(len(timed_out_primary_orders)),
+            "unserved_primary_order_count": int(
+                pending_primary_order_count + assigned_primary_order_count
+            ),
             "fallback_count": int(self._episode_fallback_count),
             "hard_failure_count": int(self._episode_hard_failure_count),
             "reservation_timeout_count": int(self._episode_reservation_timeout_count),
             "hard_overdue_count": int(self._episode_hard_overdue_count),
+            "severe_overdue_order_count": int(self._episode_hard_overdue_count),
             "wait_action_count": int(self._episode_wait_action_count),
             "dispatch_decision_count": int(self._episode_dispatch_decision_count),
             "dispatch_decision_with_legal_mode_c_count": int(
@@ -1393,6 +1421,8 @@ class TrainingEnvAdapter:
                 self._episode_system_attributed_fallback_time_sec
             ),
             "t_overdue_sec": float(self._episode_overdue_time_sec),
+            "t_hard_overdue_sec": float(self._episode_hard_overdue_time_sec),
+            "lateness_discount_total": float(self._episode_lateness_discount_total),
             "t_reservation_timeout_cost_sec": float(
                 self._episode_reservation_timeout_cost_sec
             ),
@@ -3507,10 +3537,10 @@ class TrainingEnvAdapter:
 
         event_reward = 0.0
         delivery_reward = 0.0
+        lateness_discount = 0.0
         mode_c_selection_reward = 0.0
         hard_failure_reward = 0.0
-        hard_overdue_reward = 0.0
-        reservation_timeout_reward = 0.0
+        reservation_timeout_hard_failure_reward = 0.0
 
         # 1. 硬失败事件：半空停电会在到达事件之前截断当前飞行段。
         for drone_id, leg, failure_time in hard_failure_ready:
@@ -3527,17 +3557,32 @@ class TrainingEnvAdapter:
 
         # 2. UAV 订单送达 / mode A 背景完成（只记系统上下文统计，不进 PPO reward）
         for drone_id, leg in delivery_ready:
-            delivery_bonus, service_bonus = self._process_delivery_event(drone_id, leg)
+            delivery_bonus, delivery_lateness_discount, service_bonus = (
+                self._process_delivery_event(drone_id, leg)
+            )
             delivery_reward += delivery_bonus
+            lateness_discount += delivery_lateness_discount
             mode_c_selection_reward += service_bonus
             # 送达奖励归因给完成送达的无人机
             self._agent_cost_accum[drone_id] = (
-                self._agent_cost_accum.get(drone_id, 0.0) + delivery_bonus
+                self._agent_cost_accum.get(drone_id, 0.0)
+                + delivery_bonus
+                + delivery_lateness_discount
             )
         for drone_id, service_leg in delivery_service_ready:
-            mode_c_selection_reward += self._process_delivery_service_event(
-                drone_id,
-                service_leg,
+            delivery_bonus, delivery_lateness_discount, service_bonus = (
+                self._process_delivery_service_event(
+                    drone_id,
+                    service_leg,
+                )
+            )
+            delivery_reward += delivery_bonus
+            lateness_discount += delivery_lateness_discount
+            mode_c_selection_reward += service_bonus
+            self._agent_cost_accum[drone_id] = (
+                self._agent_cost_accum.get(drone_id, 0.0)
+                + delivery_bonus
+                + delivery_lateness_discount
             )
         for stop in truck_stops:
             if stop.node_type == "customer" and stop.order_id:
@@ -3559,9 +3604,16 @@ class TrainingEnvAdapter:
                 else:
                     self._complete_truck_only_order_at_stop(stop)
 
-        event_reward += delivery_reward + hard_failure_reward + mode_c_selection_reward
+        event_reward += (
+            delivery_reward
+            + lateness_discount
+            + hard_failure_reward
+            + mode_c_selection_reward
+        )
         if delivery_reward:
             reward_breakdown["delivery_bonus"] = delivery_reward
+        if lateness_discount:
+            reward_breakdown["lateness_discount"] = lateness_discount
         if mode_c_selection_reward:
             reward_breakdown["mode_c_attempt_bonus"] = mode_c_selection_reward
         if hard_failure_reward:
@@ -3624,14 +3676,15 @@ class TrainingEnvAdapter:
             for stop in truck_stops:
                 self._process_rendezvous_recovery(stop.node_id, t_next)
 
-        # 4. hard overdue + reservation timeout（已在各自函数内写入 _agent_cost_accum）
-        hard_overdue_reward += self._apply_hard_overdue_penalty(t_next)
-        reservation_timeout_reward += self._process_reservation_timeouts(t_next)
-        event_reward += hard_overdue_reward + reservation_timeout_reward
-        if hard_overdue_reward:
-            reward_breakdown["hard_overdue"] = hard_overdue_reward
-        if reservation_timeout_reward:
-            reward_breakdown["reservation_timeout"] = reservation_timeout_reward
+        # 4. severe overdue metrics + reservation timeout（timeout 本身只转移状态和记录指标）
+        self._record_hard_overdue_metrics(t_next)
+        reservation_timeout_hard_failure_reward += self._process_reservation_timeouts(t_next)
+        event_reward += reservation_timeout_hard_failure_reward
+        if reservation_timeout_hard_failure_reward:
+            reward_breakdown["hard_failure"] = (
+                reward_breakdown.get("hard_failure", 0.0)
+                + reservation_timeout_hard_failure_reward
+            )
 
         # 5. poisson / benchmark 动态订单注入
         order_mgr.tick(t_next, entity_mgr)
@@ -3728,8 +3781,8 @@ class TrainingEnvAdapter:
             }
         )
 
-    def _process_delivery_event(self, drone_id: str, leg: FlightLeg) -> tuple[float, float]:
-        """处理一次送达事件，并立即衔接送达后的执行层转移。"""
+    def _process_delivery_event(self, drone_id: str, leg: FlightLeg) -> tuple[float, float, float]:
+        """处理一次到达客户点事件；真实完成与奖励在 delivery service 结束时结算。"""
         entity_mgr = self._require_entity_manager()
         order_mgr = self._require_order_manager()
         drone = entity_mgr.drones[drone_id]
@@ -3742,17 +3795,14 @@ class TrainingEnvAdapter:
         if released_order_id != commit.order_id:
             raise RuntimeError("delivery_event 订单绑定不一致")
 
-        order = order_mgr.assigned_orders.pop(commit.order_id)
-        order.actual_deliver_time = float(leg.arrival_time)
-        order.update_status(TaskStatus.COMPLETED)
-        order_mgr.completed_orders.append(order)
-        self._episode_delivery_count += 1
+        if commit.order_id not in order_mgr.assigned_orders:
+            raise RuntimeError(f"delivery_event 找不到已指派订单: {commit.order_id}")
         self._flight_legs.pop(drone_id, None)
         self._drone_state[drone_id] = TrainingDroneState.DELIVERY_SERVICE
 
         service_duration = float(self._scene_solver_params().drone_service_time_order_s)
         if service_duration <= _TIME_EPS:
-            service_bonus = self._process_delivery_service_event(
+            delivery_bonus, lateness_discount, service_bonus = self._process_delivery_service_event(
                 drone_id,
                 DeliveryServiceLeg(
                     order_id=commit.order_id,
@@ -3761,7 +3811,7 @@ class TrainingEnvAdapter:
                     service_pos=_clone_position(leg.target_pos),
                 ),
             )
-            return self._cfg.R_delivery_bonus, service_bonus
+            return delivery_bonus, lateness_discount, service_bonus
 
         self._delivery_service_legs[drone_id] = DeliveryServiceLeg(
             order_id=commit.order_id,
@@ -3770,17 +3820,24 @@ class TrainingEnvAdapter:
             service_pos=_clone_position(leg.target_pos),
         )
 
-        return self._cfg.R_delivery_bonus, 0.0
+        return 0.0, 0.0, 0.0
 
     def _process_delivery_service_event(
         self,
         drone_id: str,
         service_leg: DeliveryServiceLeg,
-    ) -> float:
-        """处理客户点 delivery service 结束后的后续转移。"""
+    ) -> tuple[float, float, float]:
+        """处理客户点 delivery service 结束后的完成结算与后续转移。"""
         self._delivery_service_legs.pop(drone_id, None)
+        order_mgr = self._require_order_manager()
         drone = self._require_entity_manager().drones[drone_id]
         commit = self._dispatch_commit[drone_id]
+        order = order_mgr.assigned_orders.pop(service_leg.order_id)
+        order.actual_deliver_time = float(service_leg.finish_time)
+        order.update_status(TaskStatus.COMPLETED)
+        order_mgr.completed_orders.append(order)
+        self._episode_delivery_count += 1
+        delivery_bonus, lateness_discount = self._compute_delivery_reward(order)
         drone.current_loc = _clone_position(service_leg.service_pos)
         self._drone_state[drone_id] = TrainingDroneState.DELIVERED
 
@@ -3791,7 +3848,7 @@ class TrainingEnvAdapter:
             )
             if target is None:
                 self._mark_hard_failure(drone_id)
-                return 0.0
+                return delivery_bonus, lateness_discount, 0.0
             if isinstance(target, Depot):
                 self._schedule_mode_b_return_to_depot(
                     drone_id,
@@ -3806,7 +3863,7 @@ class TrainingEnvAdapter:
                 )
             else:
                 raise TypeError(f"不支持的 mode B 返程宿主类型: {type(target)!r}")
-            return 0.0
+            return delivery_bonus, lateness_discount, 0.0
 
         had_revalidation_failure = False
         selected_node = commit.selected_recover_node
@@ -3827,7 +3884,7 @@ class TrainingEnvAdapter:
                     self._agent_cost_accum[drone_id] = (
                         self._agent_cost_accum.get(drone_id, 0.0) + bonus
                     )
-                return bonus
+                return delivery_bonus, lateness_discount, bonus
 
             had_revalidation_failure = True
             self._episode_mode_c_post_delivery_revalidation_fail_count += 1
@@ -3880,7 +3937,7 @@ class TrainingEnvAdapter:
                 self._agent_cost_accum[drone_id] = (
                     self._agent_cost_accum.get(drone_id, 0.0) + bonus
                 )
-            return bonus
+            return delivery_bonus, lateness_discount, bonus
 
         if not had_revalidation_failure:
             self._episode_mode_c_post_delivery_revalidation_fail_count += 1
@@ -3899,7 +3956,27 @@ class TrainingEnvAdapter:
             cause=FALLBACK_CAUSE_NO_POST_DELIVERY_C_NODE,
         ):
             self._mark_hard_failure(drone_id)
-        return 0.0
+        return delivery_bonus, lateness_discount, 0.0
+
+    def _compute_delivery_reward(self, order: Order) -> tuple[float, float]:
+        """返回送达基础奖励和一次性 lateness discount（负值）。"""
+        gross_reward = float(self._cfg.R_delivery_bonus)
+        delivered_time = float(
+            order.actual_deliver_time
+            if order.actual_deliver_time is not None
+            else self._t_now
+        )
+        tardiness = max(0.0, delivered_time - float(order.deadline))
+        if tardiness <= _TIME_EPS:
+            return gross_reward, 0.0
+
+        raw_discount = max(0.0, float(self._cfg.late_delivery_penalty_coef) * tardiness)
+        cap = max(0.0, float(self._cfg.late_delivery_penalty_cap))
+        min_reward = max(0.0, float(self._cfg.min_late_delivery_reward))
+        max_discount_for_positive_delivery = max(0.0, gross_reward - min_reward)
+        discount = min(raw_discount, cap, max_discount_for_positive_delivery)
+        self._episode_lateness_discount_total += discount
+        return gross_reward, -discount
 
     def _process_non_delivery_arrival(self, drone_id: str, leg: FlightLeg) -> None:
         """处理除送达以外的飞行到达事件。"""
@@ -4407,7 +4484,8 @@ class TrainingEnvAdapter:
     def _process_reservation_timeouts(self, t_now: float) -> float:
         """扫描所有 rendezvous 等待 timeout，并执行 5c 兜底转移。
 
-        reservation timeout 是 fallback 路径的一部分，归因给持有该 reservation 的无人机。
+        reservation timeout 是 fallback 路径的一部分；timeout 本身不再产生 reward
+        penalty。返回值仅包含 timeout 后无法进入 fallback 时的 hard failure 惩罚。
         """
         reward = 0.0
         for drone_id, reservation in list(self._reservations.items()):
@@ -4432,14 +4510,8 @@ class TrainingEnvAdapter:
                     planned_execution_slack_sec=commit.planned_execution_slack_sec,
                 )
 
-            timeout_penalty = -self._cfg.lambda_res_timeout * timeout_cost
             self._episode_reservation_timeout_count += 1
             self._episode_reservation_timeout_cost_sec += float(timeout_cost)
-            reward += timeout_penalty
-            # 归因给持有该 reservation 的无人机
-            self._agent_cost_accum[drone_id] = (
-                self._agent_cost_accum.get(drone_id, 0.0) + timeout_penalty
-            )
             if self._drone_state.get(drone_id) == TrainingDroneState.WAITING_FOR_TRUCK:
                 if not self._enter_fallback_recovery(
                     drone_id,
@@ -4487,44 +4559,24 @@ class TrainingEnvAdapter:
             return wait_overrun
         return None
 
-    def _apply_hard_overdue_penalty(self, t_now: float) -> float:
-        """强制移除超时过久仍未送达的订单，并将惩罚归因到对应无人机的累积器。"""
-        reward = 0.0
+    def _record_hard_overdue_metrics(self, t_now: float) -> None:
+        """记录 severe overdue 订单；不移除订单、不标记 TIMEOUT、不产生奖励惩罚。"""
         order_mgr = self._require_order_manager()
-
-        pending_remove = [
-            order_id
-            for order_id, order in list(order_mgr.pending_orders.items())
-            if self._is_hard_overdue_candidate(order, t_now)
-        ]
-        for order_id in pending_remove:
-            order = order_mgr.pending_orders.pop(order_id)
-            order.update_status(TaskStatus.TIMEOUT)
-            order_mgr.completed_orders.append(order)
-            self._episode_hard_overdue_count += 1
-            # 未接单订单无 owner，惩罚仅进系统指标（不归因任何 drone）
-            reward -= self._cfg.hard_overdue_penalty_sec
-
-        assigned_remove = [
-            order_id
-            for order_id, order in list(order_mgr.assigned_orders.items())
-            if self._is_hard_overdue_candidate(order, t_now)
-        ]
-        for order_id in assigned_remove:
-            self._episode_hard_overdue_count += 1
-            # 在移除前先记录 owner，以便归因
-            owner = order_mgr.assigned_orders[order_id].assigned_vehicle_id
-            penalty = self._force_remove_assigned_order(order_id, t_now)
-            reward += penalty
-            if owner and owner in self._drone_state:
-                self._agent_cost_accum[owner] = (
-                    self._agent_cost_accum.get(owner, 0.0) + penalty
-                )
-
-        return reward
+        active_orders = (
+            list(order_mgr.pending_orders.values())
+            + list(order_mgr.assigned_orders.values())
+        )
+        for order in active_orders:
+            if not self._is_hard_overdue_candidate(order, t_now):
+                continue
+            order_id = str(order.order_id)
+            if order_id in self._episode_hard_overdue_order_ids:
+                continue
+            self._episode_hard_overdue_order_ids.add(order_id)
+            self._episode_hard_overdue_count = len(self._episode_hard_overdue_order_ids)
 
     def _is_hard_overdue_candidate(self, order: Order, t_now: float) -> bool:
-        """检查订单是否达到 hard overdue 强制移除阈值。"""
+        """检查订单是否达到 severe overdue 统计阈值。"""
         if not self._is_uav_primary_order(order):
             return False
         return (t_now - float(order.deadline)) > self._cfg.max_overdue_sec + _TIME_EPS
@@ -4570,34 +4622,6 @@ class TrainingEnvAdapter:
             return 0.0
         return -coef * pressure
 
-    def _force_remove_assigned_order(self, order_id: str, t_now: float) -> float:
-        """强制移除已指派但已 hard overdue 的订单。"""
-        order_mgr = self._require_order_manager()
-        order = order_mgr.assigned_orders.pop(order_id)
-        order.update_status(TaskStatus.TIMEOUT)
-        order_mgr.completed_orders.append(order)
-
-        drone_id = order.assigned_vehicle_id
-        if drone_id and drone_id in self._require_entity_manager().drones:
-            drone = self._require_entity_manager().drones[drone_id]
-            if drone.carrying_order_id == order_id:
-                drone.release_order()
-            self._flight_legs.pop(drone_id, None)
-            self._delivery_service_legs.pop(drone_id, None)
-            self._release_reservation(drone_id, cause="hard_overdue")
-            self._dispatch_commit.pop(drone_id, None)
-            self._mode_b_pending_depot_return.pop(drone_id, None)
-            if self._drone_state.get(drone_id) != TrainingDroneState.AIRBORNE_ENERGY_FAILURE:
-                self._drone_state[drone_id] = TrainingDroneState.DELIVERED
-                if not self._enter_fallback_recovery(
-                    drone_id,
-                    start_time=t_now,
-                    cause=FALLBACK_CAUSE_HARD_FAILURE_FALLBACK,
-                ):
-                    return -self._cfg.hard_overdue_penalty_sec + self._mark_hard_failure(drone_id)
-
-        return -self._cfg.hard_overdue_penalty_sec
-
     def _settle_per_dt_rewards(
         self,
         *,
@@ -4616,36 +4640,20 @@ class TrainingEnvAdapter:
         breakdown: dict[str, float] = {}
         dt = t_next - t_prev
 
-        # ── T_overdue：已接单订单归因给 owner drone；未接单订单仅进系统指标 ──
-        assigned_overdue_dt = 0.0
-        unassigned_overdue_dt = 0.0
+        # ── overdue / severe overdue：只统计时长，不进入 PPO reward ──
+        overdue_dt_total = 0.0
+        hard_overdue_dt_total = 0.0
         for order in self._active_uav_orders():
             overdue_dt = max(0.0, t_next - max(t_prev, float(order.deadline)))
-            if overdue_dt <= _TIME_EPS:
-                continue
-            owner = order.assigned_vehicle_id
-            if owner and owner in self._drone_state:
-                # 已接单：归因给 owner drone
-                penalty = -self._cfg.lambda_overdue * overdue_dt
-                self._agent_cost_accum[owner] = (
-                    self._agent_cost_accum.get(owner, 0.0) + penalty
-                )
-                assigned_overdue_dt += overdue_dt
-            else:
-                # 未接单：仅进系统指标，不污染任何 drone 的 PPO reward
-                unassigned_overdue_dt += overdue_dt
+            if overdue_dt > _TIME_EPS:
+                overdue_dt_total += overdue_dt
+            hard_threshold = float(order.deadline) + float(self._cfg.max_overdue_sec)
+            hard_overdue_dt = max(0.0, t_next - max(t_prev, hard_threshold))
+            if hard_overdue_dt > _TIME_EPS:
+                hard_overdue_dt_total += hard_overdue_dt
 
-        total_overdue_dt = assigned_overdue_dt + unassigned_overdue_dt
-        self._episode_overdue_time_sec += total_overdue_dt
-        if total_overdue_dt > _TIME_EPS:
-            # breakdown 仍记录全局值，供 tensorboard 观察
-            global_penalty = -self._cfg.lambda_overdue * total_overdue_dt
-            global_reward += global_penalty
-            breakdown["overdue"] = global_penalty
-            if unassigned_overdue_dt > _TIME_EPS:
-                breakdown["overdue_unassigned"] = (
-                    -self._cfg.lambda_overdue * unassigned_overdue_dt
-                )
+        self._episode_overdue_time_sec += overdue_dt_total
+        self._episode_hard_overdue_time_sec += hard_overdue_dt_total
 
         # ── T_idle / T_fallback：按状态归因给对应无人机 ──
         # T_wait 与 T_queue 仍统计时长，但不再作为 reward 惩罚项。
@@ -6301,11 +6309,16 @@ def _load_env_yaml(config_path: Path) -> _YamlConfig:
         ),
         lambda_miss=float(reward["lambda_miss"]),
         lambda_res_timeout=float(reward["lambda_res_timeout"]),
-        lambda_overdue=float(reward["lambda_overdue"]),
+        lambda_overdue=float(reward.get("lambda_overdue", 0.0)),
         R_delivery_bonus=float(reward["R_delivery_bonus"]),
+        late_delivery_penalty_coef=float(reward.get("late_delivery_penalty_coef", 0.0)),
+        late_delivery_penalty_cap=float(reward.get("late_delivery_penalty_cap", 0.0)),
+        min_late_delivery_reward=float(
+            reward.get("min_late_delivery_reward", 1.0)
+        ),
         mode_c_attempt_bonus=float(reward.get("mode_c_attempt_bonus", 0.0)),
         max_overdue_sec=float(reward["max_overdue_sec"]),
-        hard_overdue_penalty_sec=float(reward["hard_overdue_penalty_sec"]),
+        hard_overdue_penalty_sec=float(reward.get("hard_overdue_penalty_sec", 0.0)),
         hard_failure_penalty_sec=float(reward["hard_failure_penalty_sec"]),
     )
     if cfg.rendezvous_execution_margin_sec < 0.0:
@@ -6315,6 +6328,14 @@ def _load_env_yaml(config_path: Path) -> _YamlConfig:
             "candidate.rendezvous_max_wait_sec 不能小于 "
             "rendezvous_execution_margin_sec"
         )
+    if cfg.late_delivery_penalty_coef < 0.0:
+        raise ValueError("reward.late_delivery_penalty_coef 不能为负数")
+    if cfg.late_delivery_penalty_cap < 0.0:
+        raise ValueError("reward.late_delivery_penalty_cap 不能为负数")
+    if cfg.min_late_delivery_reward < 0.0:
+        raise ValueError("reward.min_late_delivery_reward 不能为负数")
+    if cfg.min_late_delivery_reward > cfg.R_delivery_bonus:
+        raise ValueError("reward.min_late_delivery_reward 不能大于 R_delivery_bonus")
     return cfg
 
 
