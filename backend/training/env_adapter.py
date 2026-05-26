@@ -874,7 +874,7 @@ class TrainingEnvAdapter:
                 info={"event": "advance_to_time", "target_time": target},
             )
 
-        if stop_on_training_done:
+        if stop_on_training_done and self._enforces_upper_horizon():
             target = min(target, float(self._cfg.upper_horizon_sec))
         reward_breakdown: dict[str, float] = {}
         while (
@@ -1027,7 +1027,10 @@ class TrainingEnvAdapter:
 
     def is_done(self) -> bool:
         """检查 episode 是否满足当前实现中的任一终止条件。"""
-        if self._t_now >= self._cfg.upper_horizon_sec - _TIME_EPS:
+        if (
+            self._enforces_upper_horizon()
+            and self._t_now >= self._cfg.upper_horizon_sec - _TIME_EPS
+        ):
             return True
         if (
             self._order_manager is not None
@@ -1044,6 +1047,10 @@ class TrainingEnvAdapter:
         ):
             return True
         return False
+
+    def _enforces_upper_horizon(self) -> bool:
+        """benchmark 回放用于清空固定订单流，不使用 t_now 上限终止。"""
+        return self._order_source.mode != OrderSourceMode.BENCHMARK
 
     def current_episode_order_source_seed(self) -> int:
         """返回当前 episode 实际使用的订单源随机种子。"""
@@ -3560,9 +3567,18 @@ class TrainingEnvAdapter:
         while not self.is_done() and not self._decision_queue:
             next_time = self._next_event_time()
             if math.isinf(next_time):
-                next_time = self._cfg.upper_horizon_sec
+                if self._enforces_upper_horizon():
+                    next_time = self._cfg.upper_horizon_sec
+                else:
+                    raise RuntimeError(
+                        "benchmark episode 存在未完成状态，但没有可推进的未来事件"
+                    )
             if next_time <= self._t_now + _TIME_EPS:
-                next_time = min(self._cfg.upper_horizon_sec, self._t_now + 1.0)
+                next_time = (
+                    min(self._cfg.upper_horizon_sec, self._t_now + 1.0)
+                    if self._enforces_upper_horizon()
+                    else self._t_now + 1.0
+                )
             self._advance_to_event(next_time)
             _merge_reward_breakdown(reward_breakdown, self._last_reward_breakdown)
         return reward_breakdown
@@ -3579,7 +3595,7 @@ class TrainingEnvAdapter:
         per-dt 成本和事件奖励均已写入 _agent_cost_accum，step() 从中按 drone 取值。
         """
         t_next = float(t_next)
-        if clamp_to_horizon:
+        if clamp_to_horizon and self._enforces_upper_horizon():
             t_next = min(t_next, float(self._cfg.upper_horizon_sec))
         if t_next < self._t_now - _TIME_EPS:
             raise ValueError(f"不能回退时间: t_next={t_next}, t_now={self._t_now}")
@@ -5442,7 +5458,11 @@ class TrainingEnvAdapter:
 
     def _next_event_time(self) -> float:
         """从当前所有已知事件源里取下一个未来事件时刻。"""
-        candidates = [self._cfg.upper_horizon_sec]
+        candidates = (
+            [self._cfg.upper_horizon_sec]
+            if self._enforces_upper_horizon()
+            else []
+        )
 
         if self._planned_route_stop_i < len(self._planned_route_stops):
             candidates.append(self._planned_route_stops[self._planned_route_stop_i].arrival_time)
@@ -6181,7 +6201,10 @@ class TrainingEnvAdapter:
         return -self._cfg.hard_failure_penalty_sec
 
     def _episode_done_reason(self) -> str | None:
-        if self._t_now >= self._cfg.upper_horizon_sec - _TIME_EPS:
+        if (
+            self._enforces_upper_horizon()
+            and self._t_now >= self._cfg.upper_horizon_sec - _TIME_EPS
+        ):
             return "upper_horizon_reached"
         if (
             self._order_manager is not None
