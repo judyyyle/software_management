@@ -6,10 +6,10 @@ from typing import Any
 
 @dataclass
 class GAConfig:
-    population_size: int = 80
-    generations: int = 120
+    population_size: int = 120
+    generations: int = 200
     min_generations: int = 80
-    early_stopping_patience: int = 40
+    early_stopping_patience: int = 60
     improvement_tolerance: float = 1e-3
     elite_ratio: float = 0.08
     tournament_k: int = 3
@@ -30,8 +30,8 @@ class GAConfig:
     reopt_horizon_seconds: float | None = None
 
     mutation_mode_prob_a: float = 0.40
-    mutation_mode_prob_b: float = 0.25
-    mutation_mode_prob_c: float = 0.35
+    mutation_mode_prob_b: float = 0.35
+    mutation_mode_prob_c: float = 0.25
 
     enable_repair: bool = True
     repair_penalty_factor: float = 1000.0
@@ -39,8 +39,8 @@ class GAConfig:
     big_m: float = 1e9
 
     # 计划级完成时间权重：使用本轮所有订单的最大完成时间，而不是逐单累加。
-    weight_completion: float = 1.0
-    weight_delay: float = 10.0
+    weight_completion: float = 0.5
+    weight_delay: float = 80.0
     # 距离已经通过能耗模型间接体现，目标函数中不再重复计入距离成本。
     weight_energy: float = 0.02
     weight_waiting: float = 0.5
@@ -49,7 +49,18 @@ class GAConfig:
     weight_uav_distance: float = 0.0
 
     # 鼓励空地协同：每接受一个 B 模式订单，从目标函数中扣减该奖励值。
-    air_ground_mode_reward: float = 1000.0
+    air_ground_mode_reward: float = 400.0
+
+    # Static GA future-friendliness terms. These only affect the initial full
+    # GA plan, nudging the truck backbone toward later dynamic work that will be
+    # inserted by the greedy incremental solver.
+    future_preview_enabled: bool = True
+    future_preview_max_orders: int = 40
+    future_terminal_position_weight: float = 0.02
+    future_route_proximity_reward: float = 30.0
+    future_route_proximity_radius_m: float = 900.0
+    future_station_coverage_reward: float = 90.0
+    future_station_coverage_radius_m: float = 1200.0
 
     # 初始静态 GA 中同一架无人机重复承接多单的软惩罚；
     # 只改变初始全局计划的分布偏好，不禁止后续回收后继续复用无人机。
@@ -97,10 +108,10 @@ class GAConfig:
 
 
 STATIC_GA_CONFIG: dict[str, Any] = {
-    "population_size": 80,
-    "max_generations": 120,
+    "population_size": 120,
+    "max_generations": 200,
     "min_generations": 80,
-    "early_stopping_patience": 40,
+    "early_stopping_patience": 60,
     "improvement_tolerance": 1e-3,
     "log_interval": 10,
     "enable_csv": True,

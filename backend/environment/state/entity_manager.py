@@ -613,16 +613,22 @@ class EntityManager:
                                 self.TRUCK_DRONE_LAUNCH_TIME,
                             )
                             if departure_time > service_departure + 1e-6:
+                                old_departure = departure_time
                                 logger.info(
                                     "[EntityManager] 卡车 %s recovery %s 已完成且无其它待回收无人机，"
                                     "收缩离开时刻 %.1fs -> %.1fs",
                                     truck.truck_id,
                                     station_id,
-                                    departure_time,
+                                    old_departure,
                                     service_departure,
                                 )
                                 stop["departure_time"] = service_departure
                                 departure_time = service_departure
+                                self._shift_future_truck_stops(
+                                    planned_stops,
+                                    cursor + 1,
+                                    old_departure - service_departure,
+                                )
                     if departure_time > current_time + 1e-6:
                         break
 
@@ -674,6 +680,20 @@ class EntityManager:
             cursor += 1
 
         truck._planned_route_cursor = cursor
+
+    @staticmethod
+    def _shift_future_truck_stops(
+        planned_stops: list[dict],
+        start_idx: int,
+        delta_s: float,
+    ) -> None:
+        """Shift later stop event times earlier after a recovery wait is shortened."""
+        if delta_s <= 1e-6:
+            return
+        for future_stop in planned_stops[start_idx:]:
+            for key in ("arrival_time", "departure_time"):
+                if key in future_stop:
+                    future_stop[key] = max(0.0, float(future_stop[key]) - delta_s)
 
     def _get_truck_wait_stop(self, truck: Truck, current_time: float) -> Optional[dict]:
         """返回当前时刻卡车应等待的节点；GA-MMCE 额外支持 station/depot 服务停留。"""
