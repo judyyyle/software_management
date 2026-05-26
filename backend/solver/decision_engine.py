@@ -755,6 +755,21 @@ class DispatchDecisionEngine:
                     current_time,
                 )
                 if rebuilt_route and len(rebuilt_route.nodes) >= 2:
+                    if self.solver_name == "ga_mmce":
+                        rebuilt_stops = [
+                            {
+                                "node_id": n.node_id,
+                                "node_type": n.node_type,
+                                "position": n.position,
+                                "arrival_time": n.arrival_time,
+                                "departure_time": n.departure_time,
+                                "order_id": n.order_id,
+                            }
+                            for n in rebuilt_route.nodes
+                            if n.node_type in ("customer", "recovery", "station", "depot")
+                        ]
+                        if rebuilt_stops:
+                            truck._planned_route_stops = existing_stops[:cursor] + rebuilt_stops
                     truck.set_route(
                         [n.node_id for n in rebuilt_route.nodes],
                         [n.position for n in rebuilt_route.nodes],
