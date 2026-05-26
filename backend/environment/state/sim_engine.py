@@ -63,6 +63,7 @@ class SimulationEngine:
         self._pending_snapshot: set[str] = set()
         self._pending_incremental_ids: set[str] = set()
         self._last_incremental_dispatch_sim_time: float = -1e9
+        self._last_ga_urgent_rescue_check_sim_time: float = -1e9
         self._last_new_order_sim_time: float = -1e9
         self._first_pending_incremental_sim_time: float = -1e9
         # 动态调度节流参数：最短间隔 + 防抖 + 最长等待，减少高频重规划抖动。
@@ -266,6 +267,7 @@ class SimulationEngine:
                 self._first_pending_incremental_sim_time = self.current_time
 
         if not self._pending_incremental_ids:
+            self._try_ga_urgent_rescue_dispatch(current_ids)
             return
 
         # 防抖：若新订单仍在连续到达，先短暂合批；但不超过最长等待上限。
@@ -314,6 +316,48 @@ class SimulationEngine:
         except Exception:
             logger.exception("[SimEngine] 动态订单增量调度失败")
             # 失败后同样设置最小重试间隔，避免每帧抛错导致卡顿。
+            self._last_incremental_dispatch_sim_time = self.current_time
+
+    def _try_ga_urgent_rescue_dispatch(self, current_pending_ids: set[str]) -> None:
+        """GA-MMCE 专用：无新 pending 单时周期性触发临期订单救援检查。"""
+        if (
+            self._dispatch_engine is None
+            or self._order_mgr is None
+            or self._dispatch_bbox is None
+        ):
+            return
+        if str(getattr(self._dispatch_engine, "solver_name", "") or "").lower() != "ga_mmce":
+            return
+        if current_pending_ids or not self._order_mgr.assigned_orders:
+            return
+
+        solver = getattr(self._dispatch_engine, "solver", None)
+        config = getattr(solver, "config", None)
+        if not bool(getattr(config, "urgent_rescue_enabled", True)):
+            return
+        interval_s = max(1.0, float(getattr(config, "urgent_rescue_check_interval_s", 30.0) or 30.0))
+        if self.current_time - self._last_ga_urgent_rescue_check_sim_time < interval_s:
+            return
+        if self.current_time - self._last_incremental_dispatch_sim_time < interval_s:
+            return
+
+        self._last_ga_urgent_rescue_check_sim_time = self.current_time
+        try:
+            logger.info(
+                "[SimEngine] GA-MMCE 周期临期救援检查：assigned=%d t=%.1fs",
+                len(self._order_mgr.assigned_orders),
+                self.current_time,
+            )
+            self._dispatch_engine.execute_incremental(
+                {},
+                self.current_time,
+                self._dispatch_bbox,
+                scene_id=self._dispatch_scene_id,
+            )
+            self._last_incremental_dispatch_sim_time = self.current_time
+            self._pending_snapshot = set(self._order_mgr.pending_orders.keys())
+        except Exception:
+            logger.exception("[SimEngine] GA-MMCE 临期救援调度失败")
             self._last_incremental_dispatch_sim_time = self.current_time
 
     def _build_tick_payload(self) -> dict:

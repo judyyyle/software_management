@@ -51,6 +51,8 @@ DYNAMIC_REPLAN_FIELDS = [
     "final_A_count",
     "final_B_count",
     "final_C_count",
+    "urgent_rescue_order_ids",
+    "urgent_rescue_count",
     "unserved_order_ids",
 ]
 
@@ -70,7 +72,19 @@ def reschedule_on_event(state: Any, new_orders: Any, event_time: float) -> Dispa
     buckets = _classify_orders(advanced_state, incoming_new, event_time)
     dynamic_config = make_ga_config(DYNAMIC_GA_CONFIG, base=getattr(solver, "config", None))
 
+    urgent_rescue_orders = _select_urgent_rescue_orders(
+        advanced_state,
+        buckets,
+        dynamic_config,
+        event_time,
+    )
     planning_orders = _select_greedy_dynamic_orders(advanced_state, buckets)
+    if urgent_rescue_orders:
+        planning_orders = _merge_order_mappings(planning_orders, urgent_rescue_orders)
+    force_depot_direct_ids = {
+        order_id for order_id in urgent_rescue_orders
+        if order_id in planning_orders
+    }
     reoptimized_ids = list(planning_orders)
     frozen_future_ids = [
         oid for oid in buckets.pending
@@ -110,6 +124,8 @@ def reschedule_on_event(state: Any, new_orders: Any, event_time: float) -> Dispa
         )
         plan.summary["dynamic_solver"] = "greedy_mmce_bi"
         plan.summary["ga_dynamic_skipped"] = True
+        plan.summary["urgent_rescue_order_ids"] = list(force_depot_direct_ids)
+        plan.summary["urgent_rescue_count"] = len(force_depot_direct_ids)
         _write_dynamic_replan_csv(plan.summary)
         _store_last_stats(plan.summary)
         return plan
@@ -122,8 +138,12 @@ def reschedule_on_event(state: Any, new_orders: Any, event_time: float) -> Dispa
         helper = _resolve_dynamic_greedy_helper(solver)
         prev_delegate = getattr(helper, "_ga_mmce_dynamic_delegate", None)
         prev_order_ids = getattr(helper, "_ga_mmce_dynamic_order_ids", None)
+        prev_config = getattr(helper, "_ga_mmce_config", None)
+        prev_force_direct_ids = getattr(helper, "_ga_mmce_force_depot_direct_order_ids", None)
         setattr(helper, "_ga_mmce_dynamic_delegate", True)
         setattr(helper, "_ga_mmce_dynamic_order_ids", set(planning_orders))
+        setattr(helper, "_ga_mmce_config", dynamic_config)
+        setattr(helper, "_ga_mmce_force_depot_direct_order_ids", set(force_depot_direct_ids))
         try:
             final_plan = helper.dispatch_replan_current_state(
                 planning_orders,
@@ -151,6 +171,20 @@ def reschedule_on_event(state: Any, new_orders: Any, event_time: float) -> Dispa
                     pass
             else:
                 setattr(helper, "_ga_mmce_dynamic_order_ids", prev_order_ids)
+            if prev_config is None:
+                try:
+                    delattr(helper, "_ga_mmce_config")
+                except AttributeError:
+                    pass
+            else:
+                setattr(helper, "_ga_mmce_config", prev_config)
+            if prev_force_direct_ids is None:
+                try:
+                    delattr(helper, "_ga_mmce_force_depot_direct_order_ids")
+                except AttributeError:
+                    pass
+            else:
+                setattr(helper, "_ga_mmce_force_depot_direct_order_ids", prev_force_direct_ids)
 
     unserved_order_ids = list(_unserved_order_ids(final_plan, planning_orders))
     _annotate_dynamic_summary(
@@ -172,6 +206,8 @@ def reschedule_on_event(state: Any, new_orders: Any, event_time: float) -> Dispa
     )
     final_plan.summary["dynamic_solver"] = "greedy_mmce_bi"
     final_plan.summary["ga_dynamic_skipped"] = True
+    final_plan.summary["urgent_rescue_order_ids"] = list(force_depot_direct_ids)
+    final_plan.summary["urgent_rescue_count"] = len(force_depot_direct_ids)
     _write_dynamic_replan_csv(final_plan.summary)
     _store_last_stats(final_plan.summary)
     return final_plan
@@ -193,6 +229,14 @@ def _resolve_dynamic_greedy_helper(solver: Any) -> Any:
     return GreedyMMCEBackboneInsertion(getattr(solver, "entity_mgr", None))
 
 
+def _merge_order_mappings(*mappings: dict[str, Any]) -> dict[str, Any]:
+    merged: dict[str, Any] = {}
+    for mapping in mappings:
+        for order_id, order in mapping.items():
+            merged[str(order_id)] = order
+    return merged
+
+
 def _select_greedy_dynamic_orders(state: Any, buckets: OrderBuckets) -> dict[str, Any]:
     if buckets.new:
         return dict(buckets.new)
@@ -212,6 +256,83 @@ def _select_greedy_dynamic_orders(state: Any, buckets: OrderBuckets) -> dict[str
         for oid, order in buckets.pending.items()
         if oid not in planned_future
     }
+
+
+def _select_urgent_rescue_orders(
+    state: Any,
+    buckets: OrderBuckets,
+    config: GAConfig,
+    event_time: float,
+) -> dict[str, Any]:
+    """Pick GA-only rescue candidates that are near deadline but not yet running."""
+    if not bool(getattr(config, "urgent_rescue_enabled", True)):
+        return {}
+
+    window_s = _safe_float(
+        getattr(config, "urgent_rescue_deadline_window_s", 0.0),
+        0.0,
+    )
+    if window_s <= 0.0:
+        return {}
+
+    max_orders = int(getattr(config, "urgent_rescue_max_orders_per_check", 0) or 0)
+    order_mgr = _order_mgr(state)
+    assigned_pool = _read_field(order_mgr, "assigned_orders", {}) if order_mgr is not None else {}
+    if not isinstance(assigned_pool, dict):
+        assigned_pool = {}
+
+    future_planned = _future_planned_order_ids(state)
+    already_running = _running_order_ids(state)
+    candidates: list[tuple[float, str, Any]] = []
+    rescue_pool = dict(buckets.pending)
+    for order_id, order in buckets.locked.items():
+        if _status_name(_read_field(order, "status")) == "ASSIGNED":
+            rescue_pool.setdefault(order_id, order)
+
+    for order_id, order in rescue_pool.items():
+        oid = str(order_id)
+        status = _status_name(_read_field(order, "status"))
+        if oid in buckets.new:
+            continue
+        if oid in already_running and status != "ASSIGNED":
+            continue
+        if oid not in assigned_pool and oid not in future_planned:
+            continue
+        if _read_field(order, "actual_deliver_time") is not None:
+            continue
+
+        if status in {"PICKED_UP", "DELIVERING", "COMPLETED", "REJECTED", "CANCELLED", "CANCELED"}:
+            continue
+        if str(_read_field(order, "assigned_mode", "") or "").upper() == "C":
+            continue
+        if _order_has_flying_drone_route(state, oid):
+            continue
+
+        deadline = _safe_float(_read_field(order, "deadline", math.inf), math.inf)
+        remaining_s = deadline - float(event_time)
+        if remaining_s > window_s:
+            continue
+        candidates.append((remaining_s, oid, order))
+
+    candidates.sort(key=lambda item: (item[0], item[1]))
+    if max_orders > 0:
+        candidates = candidates[:max_orders]
+    return {oid: order for _, oid, order in candidates}
+
+
+def _order_has_flying_drone_route(state: Any, order_id: str) -> bool:
+    mgr = _entity_mgr(state)
+    for drone in (_mapping(mgr, "drones") or {}).values():
+        if not _drone_is_flying(drone):
+            continue
+        route_plan = _read_field(drone, "route_plan", []) or []
+        start_idx = int(_read_field(drone, "current_waypoint_index", 0) or 0)
+        for wp in route_plan[max(0, start_idx):]:
+            if _waypoint_action_name(_read_field(wp, "action")) not in {"PICKUP", "DELIVER"}:
+                continue
+            if str(_read_field(wp, "target_entity_id", "") or "") == str(order_id):
+                return True
+    return False
 
 
 def _future_planned_order_ids(state: Any) -> set[str]:

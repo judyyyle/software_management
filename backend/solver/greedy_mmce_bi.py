@@ -132,6 +132,9 @@ class GreedyMMCEBackboneInsertion(GreedyMMCE):
         truck_id = next(iter(self.entity_mgr.trucks.keys()))
         depot_id = next(iter(self.entity_mgr.depots.keys()))
 
+        if self._is_ga_mmce_dynamic_delegate():
+            return self._resolve_ga_dynamic_drone_pools(truck_id, depot_id)
+
         truck_pool: set[str] = set()
         depot_pool: set[str] = set()
         for drone_id in self.entity_mgr.drones:
@@ -146,6 +149,37 @@ class GreedyMMCEBackboneInsertion(GreedyMMCE):
         if len(truck_pool) < len(self.FIXED_TRUCK_DRONE_INDEXES):
             return None
         if len(depot_pool) < len(self.FIXED_DEPOT_DRONE_INDEXES):
+            return None
+        return truck_id, depot_id, truck_pool, depot_pool
+
+    def _resolve_ga_dynamic_drone_pools(
+        self,
+        truck_id: str,
+        depot_id: str,
+    ) -> tuple[str, str, set[str], set[str]] | None:
+        """GA 动态委托时使用 GAConfig 的初始装载名单，不覆盖普通贪心基线。"""
+        config = getattr(self, "_ga_mmce_config", None)
+        if config is None:
+            try:
+                from solver.ga_mmce.config import GAConfig
+            except Exception:
+                try:
+                    from .ga_mmce.config import GAConfig
+                except Exception:
+                    GAConfig = None
+            config = GAConfig() if GAConfig is not None else None
+
+        truck_pool = {
+            str(drone_id).strip()
+            for drone_id in (getattr(config, "initial_truck_drone_ids", ()) or ())
+            if str(drone_id).strip() in self.entity_mgr.drones
+        }
+        depot_pool = {
+            str(drone_id).strip()
+            for drone_id in (getattr(config, "initial_depot_drone_ids", ()) or ())
+            if str(drone_id).strip() in self.entity_mgr.drones
+        }
+        if not truck_pool and not depot_pool:
             return None
         return truck_id, depot_id, truck_pool, depot_pool
 
@@ -324,6 +358,18 @@ class GreedyMMCEBackboneInsertion(GreedyMMCE):
             if str(order_id)
         }
 
+    def _forced_ga_mmce_depot_direct_order_ids(self) -> set[str]:
+        if not self._is_ga_mmce_dynamic_delegate():
+            return set()
+        return {
+            str(order_id)
+            for order_id in (
+                getattr(self, "_ga_mmce_force_depot_direct_order_ids", set())
+                or set()
+            )
+            if str(order_id)
+        }
+
     def _drone_reserved_outside_ga_dynamic_scope(self, drone: "Drone") -> bool:
         """GA 动态委托时，排除仍被未重写未来任务预约的无人机。"""
         if not self._is_ga_mmce_dynamic_delegate():
@@ -496,6 +542,7 @@ class GreedyMMCEBackboneInsertion(GreedyMMCE):
         changed_trucks: set[str] = set()
         allocated_drones: set[str] = set()
         recovery_wait_times: dict[tuple[str, str], float] = {}
+        force_depot_direct_ids = self._forced_ga_mmce_depot_direct_order_ids()
 
         if incremental:
             heavy_orders = [o for o in sorted_orders if self._is_truck_only_order(o)]
@@ -581,6 +628,39 @@ class GreedyMMCEBackboneInsertion(GreedyMMCE):
 
         # 阶段 2：其余订单按 A/B/C 候选增量插入。
         for order in flex_orders:
+            if order.order_id in force_depot_direct_ids:
+                c_alloc = self._try_mode_c(order, current_time, allocated_drones, {})
+                if c_alloc.feasible:
+                    c_score, c_dist, c_energy, c_penalty = self._score_allocation(
+                        c_alloc,
+                        order,
+                        current_time,
+                        {},
+                    )
+                    c_alloc.score_total = c_score
+                    c_alloc.cost_dist = c_dist
+                    c_alloc.cost_energy = c_energy
+                    c_alloc.cost_penalty = c_penalty
+                    allocations.append(c_alloc)
+                    allocated_drones.add(c_alloc.drone_id)
+                    mode_counter["C"] = mode_counter.get("C", 0) + 1
+                    logger.info(
+                        "[MMCE-BI] GA临期救援订单 %s 强制仓空直递: drone=%s score=%.2f "
+                        "(dist=%.2f, energy=%.2f, penalty=%.2f)",
+                        order.order_id,
+                        c_alloc.drone_id,
+                        c_score,
+                        c_dist,
+                        c_energy,
+                        c_penalty,
+                    )
+                    continue
+                logger.info(
+                    "[MMCE-BI] GA临期救援订单 %s 仓空直递不可行: %s，回退常规 A/B/C 候选",
+                    order.order_id,
+                    c_alloc.reason,
+                )
+
             a_choice = self._best_truck_only_insertion(
                 order,
                 current_time,
@@ -994,9 +1074,13 @@ class GreedyMMCEBackboneInsertion(GreedyMMCE):
                     self._is_ga_mmce_dynamic_delegate()
                     and planned_solver == "ga_mmce"
                 )
+                force_depot_direct_ids = self._forced_ga_mmce_depot_direct_order_ids()
                 for stop in planned[cursor:]:
                     node_type = stop.get("node_type", "")
                     if node_type not in ("customer", "recovery", "station"):
+                        continue
+                    order_id = str(stop.get("order_id", "") or "")
+                    if force_depot_direct_ids and order_id in force_depot_direct_ids:
                         continue
                     position = stop.get("position")
                     if position is None:
@@ -1017,7 +1101,7 @@ class GreedyMMCEBackboneInsertion(GreedyMMCE):
                         "node_id": stop.get("node_id", ""),
                         "node_type": node_type,
                         "position": position,
-                        "order_id": stop.get("order_id", ""),
+                        "order_id": order_id,
                         "service_time": max(0.0, dep - arr),
                     }
                     if protect_ga_static_stops and node_type in ("station", "recovery"):
