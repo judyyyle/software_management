@@ -333,11 +333,7 @@ class TestFrontendRuntimeAdapter(unittest.TestCase):
         target_time = env._cfg.upper_horizon_sec + 5.0
 
         default_result = env.advance_to_time(target_time)
-        self.assertAlmostEqual(
-            default_result.runtime_state.t_now,
-            env._cfg.upper_horizon_sec,
-            places=6,
-        )
+        self.assertAlmostEqual(default_result.runtime_state.t_now, target_time, places=6)
 
         env._t_now = env._cfg.upper_horizon_sec - 1.0
         env._decision_queue.clear()

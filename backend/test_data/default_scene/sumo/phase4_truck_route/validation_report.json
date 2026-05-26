@@ -5,8 +5,8 @@
   "backbone_node_count": 6,
   "bounds_ok": true,
   "eta_monotonic": true,
-  "execution_customer_count": 4,
-  "execution_stop_count": 11,
+  "execution_customer_count": 6,
+  "execution_stop_count": 13,
   "future_recovery_node_count": 6,
   "generated_files": [
     "phase4_debug_trace.json",
@@ -28,11 +28,13 @@
   "station_target_count_ok": true,
   "sumo_edge_sequence_non_empty": true,
   "sumo_export_dir": "/Users/myx/Documents/GitHub/HiveLogix/backend/test_data/default_scene/sumo/phase4_truck_route",
-  "truck_order_count": 4,
+  "truck_order_count": 6,
   "truck_order_ids": [
     "ORD-STATIC-08",
     "ORD-STATIC-02",
     "ORD-STATIC-06",
-    "ORD-STATIC-07"
+    "ORD-STATIC-07",
+    "TRUCKONLY-20260424-01",
+    "TRUCKONLY-20260424-02"
   ]
 }
