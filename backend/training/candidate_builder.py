@@ -43,6 +43,9 @@ from .uav_path_service import TrainingUavPathService
 _TIME_EPS = 1e-6
 _MODE_B_IDX = 0
 _MODE_C_IDX = 1
+_DEADLINE_LEAD_TIME_SEC = 480.0
+_OVERDUE_SCORE_CAP_SEC = 600.0
+_OLD_OVERDUE_RESERVE_SLOTS = 2
 
 
 @dataclass(frozen=True)
@@ -298,6 +301,7 @@ class CandidateBuilder:
                     else 0.0
                 ),
                 is_valid=True,
+                estimated_delivery_finish_slack_sec=float(order.deadline) - t_deliver_finish,
             )
             actionable_orders.append(
                 {
@@ -316,14 +320,10 @@ class CandidateBuilder:
         pre_trunc_mode_c_order_count = sum(
             1 for item in actionable_orders if bool(item["has_mode_c"])
         )
-        actionable_orders.sort(
-            key=lambda item: (
-                item["order_feature"].order_pre_score,
-                item["order_feature"].priority_band,
-                item["order_id"],
-            )
+        actionable_orders = _select_candidate_orders(
+            actionable_orders,
+            max_candidate_orders=self._cfg.max_candidate_orders,
         )
-        actionable_orders = actionable_orders[: self._cfg.max_candidate_orders]
         post_trunc_mode_c_order_count = sum(
             1 for item in actionable_orders if bool(item["has_mode_c"])
         )
@@ -902,6 +902,74 @@ def _is_riding_with_truck_trigger(trigger_type: str) -> bool:
     return trigger_type in {"riding_with_truck", "truck_station_arrival"}
 
 
+def _candidate_deadline_sort_key(
+    item: Mapping[str, Any],
+) -> tuple[float, int, int, float, str]:
+    order_feature = item["order_feature"]
+    slack = float(order_feature.remaining_time)
+    lead = _DEADLINE_LEAD_TIME_SEC
+    if slack >= 0.0:
+        deadline_score = abs(slack - lead)
+        overdue_rank = 1
+        tail_score = max(0.0, slack - lead)
+    else:
+        lateness = -slack
+        deadline_score = lead + min(lateness, _OVERDUE_SCORE_CAP_SEC)
+        overdue_rank = 0
+        tail_score = lateness
+    return (
+        deadline_score,
+        overdue_rank,
+        int(order_feature.priority_band),
+        tail_score,
+        str(item["order_id"]),
+    )
+
+
+def _select_candidate_orders(
+    actionable_orders: list[dict[str, Any]],
+    *,
+    max_candidate_orders: int,
+) -> list[dict[str, Any]]:
+    sorted_actionable_orders = sorted(
+        actionable_orders,
+        key=_candidate_deadline_sort_key,
+    )
+    if len(sorted_actionable_orders) <= max_candidate_orders:
+        return sorted_actionable_orders
+    if max_candidate_orders <= 0:
+        return []
+
+    reserve_slots = min(_OLD_OVERDUE_RESERVE_SLOTS, max_candidate_orders)
+    main_slots = max_candidate_orders - reserve_slots
+    main_selected = sorted_actionable_orders[:main_slots]
+    selected_order_ids = {str(item["order_id"]) for item in main_selected}
+
+    overdue_candidates = [
+        item
+        for item in sorted_actionable_orders[main_slots:]
+        if float(item["order_feature"].remaining_time) < 0.0
+        and str(item["order_id"]) not in selected_order_ids
+    ]
+    reserve_selected = overdue_candidates[:reserve_slots]
+
+    selected = list(main_selected)
+    for item in reserve_selected:
+        selected.append(item)
+        selected_order_ids.add(str(item["order_id"]))
+
+    for item in sorted_actionable_orders[main_slots:]:
+        if len(selected) >= max_candidate_orders:
+            break
+        order_id = str(item["order_id"])
+        if order_id in selected_order_ids:
+            continue
+        selected.append(item)
+        selected_order_ids.add(order_id)
+
+    return selected[:max_candidate_orders]
+
+
 def _validate_trigger_context(
     *,
     runtime_state: Any,
@@ -948,6 +1016,7 @@ def _padding_order_feature() -> OrderFeatures:
         best_mode_c_truck_eta_remaining=0.0,
         best_mode_c_timeout_risk=0.0,
         is_valid=False,
+        estimated_delivery_finish_slack_sec=0.0,
     )
 
 
