@@ -231,6 +231,16 @@ class DispatchDecisionEngine:
     ) -> DispatchPlan:
         """增量调度：由 solver 策略决定走“纯增量”或“滚动重优化”。"""
         if not new_orders:
+            if self.solver_name == "ga_mmce":
+                if replan_unfinished is None:
+                    replan_unfinished = self.solver.should_replan_unfinished()
+                if replan_unfinished:
+                    return self._execute_replan_unfinished(
+                        {},
+                        current_time,
+                        bbox,
+                        scene_id=scene_id,
+                    )
             logger.debug("[DispatchDecisionEngine] 无新增订单")
             return DispatchPlan(
                 allocations=[],

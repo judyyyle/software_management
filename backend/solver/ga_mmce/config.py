@@ -7,7 +7,7 @@ from typing import Any
 @dataclass
 class GAConfig:
     population_size: int = 120
-    generations: int = 200
+    generations: int = 100
     min_generations: int = 80
     early_stopping_patience: int = 60
     improvement_tolerance: float = 1e-3
@@ -28,6 +28,12 @@ class GAConfig:
     warm_start_mutations: int = 0
     reopt_window_size: int | None = None
     reopt_horizon_seconds: float | None = None
+
+    # GA 动态委托专用：周期性把临期且尚未开始配送的订单改为仓库无人机直递。
+    urgent_rescue_enabled: bool = True
+    urgent_rescue_check_interval_s: float = 30.0
+    urgent_rescue_deadline_window_s: float = 240.0
+    urgent_rescue_max_orders_per_check: int = 6
 
     mutation_mode_prob_a: float = 0.40
     mutation_mode_prob_b: float = 0.35
@@ -93,23 +99,23 @@ class GAConfig:
         "UAV-TEST-01",
         "UAV-TEST-02",
         "UAV-TEST-03",
-        "UAV-TEST-04",
-        "UAV-TEST-05",
-        "UAV-TEST-06",
-        "UAV-TEST-07",
         "UAV-TEST-08",
+        "UAV-TEST-10",
         "UAV-TEST-11",
     )
     initial_depot_drone_ids: tuple[str, ...] = (
         "UAV-TEST-09",
-        "UAV-TEST-10",
+        "UAV-TEST-04",
+        "UAV-TEST-05",
+        "UAV-TEST-06",
+        "UAV-TEST-07",
         "UAV-TEST-12",
     )
 
 
 STATIC_GA_CONFIG: dict[str, Any] = {
     "population_size": 120,
-    "max_generations": 200,
+    "max_generations": 100,
     "min_generations": 80,
     "early_stopping_patience": 60,
     "improvement_tolerance": 1e-3,
