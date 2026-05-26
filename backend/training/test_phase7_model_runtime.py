@@ -38,6 +38,7 @@ from .train_cmrappo import (
     _flush_terminal_pending_transitions,
     _insert_finalized_transition_in_order,
     _latest_value_loss_shows_meaningful_decline,
+    _load_bc_warm_start_checkpoint,
     _materialize_recurrent_sequences,
     _ppo_update,
     _record_episode_step,
@@ -52,6 +53,7 @@ from .train_cmrappo import (
     _TrainingConfig,
     _resolve_device,
     _resolve_rollout_prefix_bootstrap_values,
+    _save_policy_checkpoint,
     _set_training_seed,
     _strip_episode_details,
     _summarize_episode_records,
@@ -324,6 +326,52 @@ class TestPhase7ModelRuntime(unittest.TestCase):
             ],
         )
         self.assertEqual(teacher_mock.call_count, 2)
+
+    def test_bc_warm_start_checkpoint_round_trips_model_optimizer_and_stats(self) -> None:
+        device = torch.device("cpu")
+        model = torch.nn.Linear(1, 1)
+        optimizer = torch.optim.Adam(model.parameters(), lr=0.01)
+
+        with torch.no_grad():
+            model.weight.fill_(2.0)
+            model.bias.fill_(0.5)
+        loss = model(torch.as_tensor([[1.0]])).sum()
+        loss.backward()
+        optimizer.step()
+        optimizer.zero_grad()
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "bc_warm_start_policy.pt"
+            _save_policy_checkpoint(
+                path=path,
+                model=model,
+                optimizer=optimizer,
+                critic_schema_hash="schema-1",
+                model_version="test-version",
+                global_step=0,
+                update_idx=0,
+                extra_payload={
+                    "phase": "bc_warm_start",
+                    "bc_warm_start": {"enabled": True, "samples": 7},
+                },
+            )
+
+            restored = torch.nn.Linear(1, 1)
+            restored_optimizer = torch.optim.Adam(restored.parameters(), lr=0.01)
+            stats = _load_bc_warm_start_checkpoint(
+                path=path,
+                model=restored,
+                optimizer=restored_optimizer,
+                device=device,
+                critic_schema_hash="schema-1",
+            )
+
+        self.assertTrue(stats["loaded_from_checkpoint"])
+        self.assertEqual(stats["samples"], 7)
+        self.assertEqual(stats["checkpoint_model_version"], "test-version")
+        self.assertTrue(torch.allclose(restored.weight, model.weight))
+        self.assertTrue(torch.allclose(restored.bias, model.bias))
+        self.assertTrue(restored_optimizer.state_dict()["state"])
 
     def test_forward_accepts_single_and_batched_inputs_without_extra_unsqueeze(self) -> None:
         device = torch.device("cpu")

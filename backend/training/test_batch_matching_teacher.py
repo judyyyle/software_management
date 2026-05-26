@@ -182,7 +182,57 @@ class TestBatchMatchingTeacher(unittest.TestCase):
         )
 
         self.assertEqual(result.actions_by_drone["DRN-1"], DispatchAction("URGENT", "B"))
-        self.assertAlmostEqual(result.assignments_by_drone["DRN-1"].cost, -870.0)
+        self.assertAlmostEqual(result.assignments_by_drone["DRN-1"].cost, -990.0)
+
+    def test_deadline_risk_uses_service_finish_slack_not_arrival_slack(self) -> None:
+        """Regression: deadline slack must be based on delivery *finish* time
+        (arrival + service_time), not bare customer arrival time.
+
+        Scenario (t_decision=100, cruise_speed=10, service_time=30):
+            distance      = 800  → flight_time = 80
+            arrival       = 100 + 80 = 180
+            finish        = 180 + 30 = 210
+            deadline      = 190
+
+            old slack (arrival-based) = 190 - 180 = +10  (appears on-time)
+            new slack (finish-based)  = 190 - 210 = -20  (correctly late)
+
+        With finish-based slack=-20:
+            penalty = -1800 + 10*20 = -1600
+            total   = flight(80) + service(30) + recovery(0) + (-1600) = -1490
+
+        With old arrival-based slack=+10 the total would have been -1650.
+        The exact value -1490 proves the stored finish-slack field is used.
+        """
+        runtime_state = object()
+        coarse_plan = object()
+        contexts = (_context("DRN-1", runtime_state, coarse_plan),)
+        candidates = {
+            "DRN-1": _candidate_output(
+                [("ORDER-B", ("B",))],
+                "DRN-1",
+                order_feature_overrides_by_order={
+                    "ORDER-B": {
+                        "distance_to_order": 800.0,
+                        "deadline": 190.0,
+                        "best_mode_b_recovery_flight_time": 0.0,
+                        # finish-based slack: deadline(190) - finish(210) = -20
+                        "estimated_delivery_finish_slack_sec": -20.0,
+                    },
+                },
+            )
+        }
+
+        result = build_batch_matching_teacher_labels(
+            decision_contexts=contexts,
+            candidate_outputs_by_drone=candidates,
+        )
+
+        self.assertAlmostEqual(
+            result.assignments_by_drone["DRN-1"].cost,
+            -1490.0,
+            msg="Cost must use delivery finish slack (-20), not arrival slack (+10)",
+        )
 
 
 def _context(drone_id: str, runtime_state: object, coarse_plan: object) -> SimpleNamespace:
@@ -302,6 +352,17 @@ def _order_feature(
         "best_mode_c_timeout_risk": 0.0,
     }
     values.update(overrides)
+    # Compute estimated_delivery_finish_slack_sec from the other values unless
+    # explicitly overridden.  Constants match _context (t_decision=100),
+    # _uav_self (cruise_speed=10), and drone_params.yaml (service_time=30).
+    _T_DECISION = 100.0
+    _CRUISE_SPEED = 10.0
+    _SERVICE_TIME = 30.0
+    flight_time = float(values["distance_to_order"]) / _CRUISE_SPEED
+    values.setdefault(
+        "estimated_delivery_finish_slack_sec",
+        float(values["deadline"]) - (_T_DECISION + flight_time + _SERVICE_TIME),
+    )
     return OrderFeatures(
         order_id=order_id,
         weight=1.0,
@@ -330,6 +391,9 @@ def _order_feature(
         best_mode_c_truck_eta_remaining=100.0,
         best_mode_c_timeout_risk=float(values["best_mode_c_timeout_risk"]),
         is_valid=True,
+        estimated_delivery_finish_slack_sec=float(
+            values["estimated_delivery_finish_slack_sec"]
+        ),
     )
 
 

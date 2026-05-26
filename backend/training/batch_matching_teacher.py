@@ -246,12 +246,15 @@ def _default_dispatch_cost(
     mode_idx: int,
 ) -> float:
     del mode_idx
+    del context
     order_feature = candidate_out.candidate_features.order_features[order_idx]
     delivery_flight_time = _estimate_delivery_flight_time(candidate_out, order_idx)
     service_time = float(load_solver_energy_params().drone_service_time_order_s)
-    delivery_eta = float(context.t_decision) + float(delivery_flight_time)
+    # Use precomputed delivery-finish slack from CandidateBuilder, which accounts for
+    # effective_launch_time + flight_time + drone_service_time.  This matches the
+    # env_adapter reward criterion: actual_deliver_time = service_leg.finish_time.
     deadline_risk_penalty = _deadline_risk_penalty(
-        slack_sec=float(order_feature.deadline) - float(delivery_eta)
+        slack_sec=float(order_feature.estimated_delivery_finish_slack_sec)
     )
 
     mode = str(action.mode)

@@ -353,6 +353,20 @@ class ModeCPostDeliverySelection:
     planned_execution_slack_sec: float
     uav_flight_time_sec: float
     wait_time_sec: float
+    eta_source: str = "unknown"
+
+
+@dataclass(frozen=True)
+class _ModeCRevalidationEtaResolution:
+    truck_eta: float | None
+    eta_source: str
+    commit_eta: float | None
+    current_coarse_plan_eta: float | None
+    current_coarse_plan_version: int | None
+    execution_backbone_eta: float | None
+    future_backbone_count: int
+    truck_replan_pending: bool
+    truck_replan_pending_reasons: tuple[str, ...]
 
 
 @dataclass(frozen=True)
@@ -525,6 +539,8 @@ class TrainingEnvAdapter:
         self._truck_replan_pending = False
         self._truck_replan_pending_reasons: set[str] = set()
         self._planner_replan_events: list[dict[str, Any]] = []
+        self._mode_c_revalidation_events: list[dict[str, Any]] = []
+        self._mode_c_post_delivery_selection_events: list[dict[str, Any]] = []
         self._active_launch_stations: set[str] = set()
         self._fallback_event_times: list[float] = []
         self._hard_failure_event_times: list[float] = []
@@ -667,6 +683,8 @@ class TrainingEnvAdapter:
         self._truck_replan_pending = False
         self._truck_replan_pending_reasons.clear()
         self._planner_replan_events.clear()
+        self._mode_c_revalidation_events.clear()
+        self._mode_c_post_delivery_selection_events.clear()
         self._active_launch_stations.clear()
         self._fallback_event_times.clear()
         self._hard_failure_event_times.clear()
@@ -1360,6 +1378,16 @@ class TrainingEnvAdapter:
             ),
             "mode_c_selected_node_expired_count": int(
                 self._episode_mode_c_selected_node_expired_count
+            ),
+            "mode_c_revalidation_debug_last": (
+                copy.deepcopy(self._mode_c_revalidation_events[-1])
+                if self._mode_c_revalidation_events
+                else None
+            ),
+            "mode_c_post_delivery_selection_debug_last": (
+                copy.deepcopy(self._mode_c_post_delivery_selection_events[-1])
+                if self._mode_c_post_delivery_selection_events
+                else None
             ),
             "mode_c_selected_filter_margin_sum": float(
                 self._episode_mode_c_selected_filter_margin_sum
@@ -2443,7 +2471,12 @@ class TrainingEnvAdapter:
         env_decisions: dict[str, str] = {}
         for reservation_id, outcome in coarse_plan.reservation_outcomes.items():
             if outcome.status != ReservationPlanStatus.INVALIDATED:
-                env_decisions[reservation_id] = "planner_status_no_env_action"
+                env_decisions[reservation_id] = self._sync_active_reservation_eta_from_outcome(
+                    reservation_id=reservation_id,
+                    outcome=outcome,
+                    constraints_by_id=constraints_by_id,
+                    t_now=float(t_now),
+                )
                 continue
             constraint = constraints_by_id.get(reservation_id)
             if constraint is None:
@@ -2494,6 +2527,45 @@ class TrainingEnvAdapter:
                 env_decisions[reservation_id] = "released_only"
         return env_decisions
 
+    def _sync_active_reservation_eta_from_outcome(
+        self,
+        *,
+        reservation_id: str,
+        outcome: ReservationPlanOutcome,
+        constraints_by_id: Mapping[str, TruckReservationConstraint],
+        t_now: float,
+    ) -> str:
+        """把 kept/drifted reservation 的 planner ETA 同步到 dispatch commit。"""
+        if outcome.new_eta is None:
+            return "planner_status_no_env_action"
+        constraint = constraints_by_id.get(reservation_id)
+        if constraint is None:
+            return "ignored_missing_constraint"
+        drone_id = constraint.drone_id
+        reservation = self._reservations.get(drone_id)
+        if reservation is None:
+            return "ignored_no_active_reservation"
+        if (
+            reservation.recover_node != constraint.node_id
+            or str(outcome.node_id) != str(constraint.node_id)
+        ):
+            return "ignored_reservation_node_mismatch"
+        commit = self._dispatch_commit.get(drone_id)
+        if commit is None:
+            return "ignored_missing_commit"
+        if (
+            commit.selected_recover_node is not None
+            and str(commit.selected_recover_node) != str(constraint.node_id)
+        ):
+            return "ignored_commit_node_mismatch"
+        self._update_reservation_commit_for_new_truck_eta(
+            drone_id=drone_id,
+            node_id=constraint.node_id,
+            new_truck_eta=float(outcome.new_eta),
+            t_now=float(t_now),
+        )
+        return f"{outcome.status.value}_commit_eta_synced"
+
     def _record_planner_replan_event(
         self,
         *,
@@ -2512,6 +2584,11 @@ class TrainingEnvAdapter:
         reservation_outcomes: list[dict[str, Any]] = []
         for reservation_id, outcome in sorted(coarse_plan.reservation_outcomes.items()):
             constraint = constraints_by_id.get(reservation_id)
+            commit = (
+                None
+                if constraint is None
+                else self._dispatch_commit.get(constraint.drone_id)
+            )
             reservation_outcomes.append(
                 {
                     "reservation_id": str(reservation_id),
@@ -2547,6 +2624,9 @@ class TrainingEnvAdapter:
                         None
                         if constraint is None or constraint.related_order_id is None
                         else str(constraint.related_order_id)
+                    ),
+                    "commit_planned_truck_arrival_time": (
+                        None if commit is None else commit.planned_truck_arrival_time
                     ),
                 }
             )
@@ -4280,19 +4360,36 @@ class TrainingEnvAdapter:
         drone_id: str,
         t_now: float,
     ) -> ModeCPostDeliverySelection | None:
-        """送达并完成 service 后，基于当前 future backbone 规则选择 C 回收点。"""
+        """送达 service 后，优先基于当前 coarse plan ETA 选择 C 回收点。"""
         entity_mgr = self._require_entity_manager()
         drone = entity_mgr.drones[drone_id]
         t_select = float(t_now)
-        candidates: list[tuple[float, float, float, str, float]] = []
-        future_visits = self._dedup_backbone_visits(
-            self._future_backbone_visits(t_select)
-        )
-        for visit in future_visits:
-            node_id = str(visit.node_id)
+        candidates: list[tuple[float, float, float, str, float, str]] = []
+        candidate_eta_by_node: dict[str, tuple[float, str]] = {}
+        if self._current_coarse_plan is not None:
+            for node_id in self._current_coarse_plan.truck_backbone_route:
+                if node_id not in self._current_coarse_plan.truck_eta_map:
+                    continue
+                truck_eta = float(self._current_coarse_plan.truck_eta_map[node_id])
+                if truck_eta >= t_select - _TIME_EPS:
+                    candidate_eta_by_node[str(node_id)] = (
+                        truck_eta,
+                        "current_coarse_plan",
+                    )
+
+        if not candidate_eta_by_node:
+            future_visits = self._dedup_backbone_visits(
+                self._future_backbone_visits(t_select)
+            )
+            for visit in future_visits:
+                candidate_eta_by_node[str(visit.node_id)] = (
+                    float(visit.arrival_time),
+                    "execution_backbone",
+                )
+
+        for node_id, (truck_eta, eta_source) in candidate_eta_by_node.items():
             if node_id not in entity_mgr.stations and node_id not in entity_mgr.depots:
                 continue
-            truck_eta = float(visit.arrival_time)
             host = self._resolve_fixed_node(node_id)
             host_pos = host.get_location(t_select)
             if not self._can_reach_from(
@@ -4327,14 +4424,33 @@ class TrainingEnvAdapter:
                     float(uav_flight_time),
                     node_id,
                     uav_arrival,
+                    eta_source,
                 )
             )
 
         if not candidates:
+            self._record_mode_c_post_delivery_selection_debug(
+                drone_id=drone_id,
+                t_now=t_select,
+                eta_source="missing",
+                selected_node=None,
+                resolved_truck_eta=None,
+                candidate_count=0,
+            )
             return None
 
         candidates.sort(key=lambda item: (item[0], item[1], item[2], item[3]))
-        truck_eta, wait_time, uav_flight_time, node_id, uav_arrival = candidates[0]
+        truck_eta, wait_time, uav_flight_time, node_id, uav_arrival, eta_source = (
+            candidates[0]
+        )
+        self._record_mode_c_post_delivery_selection_debug(
+            drone_id=drone_id,
+            t_now=t_select,
+            eta_source=str(eta_source),
+            selected_node=node_id,
+            resolved_truck_eta=float(truck_eta),
+            candidate_count=len(candidates),
+        )
         return ModeCPostDeliverySelection(
             recover_node_id=node_id,
             planned_truck_arrival_time=float(truck_eta),
@@ -4342,7 +4458,46 @@ class TrainingEnvAdapter:
             planned_execution_slack_sec=float(wait_time),
             uav_flight_time_sec=float(uav_flight_time),
             wait_time_sec=float(wait_time),
+            eta_source=str(eta_source),
         )
+
+    def _record_mode_c_post_delivery_selection_debug(
+        self,
+        *,
+        drone_id: str,
+        t_now: float,
+        eta_source: str,
+        selected_node: str | None,
+        resolved_truck_eta: float | None,
+        candidate_count: int,
+    ) -> None:
+        event = {
+            "drone_id": str(drone_id),
+            "t_now": float(t_now),
+            "eta_source": str(eta_source),
+            "selected_recover_node": (
+                None if selected_node is None else str(selected_node)
+            ),
+            "resolved_truck_eta": (
+                None if resolved_truck_eta is None else float(resolved_truck_eta)
+            ),
+            "candidate_count": int(candidate_count),
+            "current_coarse_plan_version": (
+                None
+                if self._current_coarse_plan is None
+                else int(self._current_coarse_plan.plan_version)
+            ),
+            "future_backbone_count": int(
+                len(self._future_backbone_visits(float(t_now)))
+            ),
+            "truck_replan_pending": bool(self._truck_replan_pending),
+            "truck_replan_pending_reasons": tuple(
+                sorted(self._truck_replan_pending_reasons)
+            ),
+        }
+        self._mode_c_post_delivery_selection_events.append(event)
+        if len(self._mode_c_post_delivery_selection_events) > 100:
+            del self._mode_c_post_delivery_selection_events[:-100]
 
     def _record_mode_c_selection_metrics(
         self,
@@ -4913,18 +5068,29 @@ class TrainingEnvAdapter:
     ) -> tuple[bool, dict[str, bool]]:
         """对 mode C 原选回收点执行 5b 的送达后复核。"""
         drone = self._require_entity_manager().drones[drone_id]
-        coarse_plan = self._build_coarse_plan_view(t_now)
-
-        node_still_valid = (
-            node_id in coarse_plan.truck_backbone_route
-            and node_id in coarse_plan.truck_eta_map
+        eta_resolution = self._resolve_mode_c_revalidation_truck_eta(
+            drone_id=drone_id,
+            node_id=node_id,
+            t_now=t_now,
         )
+        truck_eta = eta_resolution.truck_eta
+
+        node_still_valid = truck_eta is not None
         if not node_still_valid:
             checks = {
                 "energy_feasible": False,
                 "rendezvous_time_feasible": False,
                 "node_still_valid": False,
             }
+            self._record_mode_c_revalidation_debug(
+                drone_id=drone_id,
+                node_id=node_id,
+                t_now=t_now,
+                eta_resolution=eta_resolution,
+                checks=checks,
+                t_arrive_uav=None,
+                wait_time=None,
+            )
             return False, checks
 
         host = self._resolve_fixed_node(node_id)
@@ -4942,10 +5108,10 @@ class TrainingEnvAdapter:
             from_pos=drone.current_loc,
             to_pos=host_pos,
         )
-        wait_time = float(coarse_plan.truck_eta_map[node_id]) - float(t_arrive_uav)
+        wait_time = float(truck_eta) - float(t_arrive_uav)
         rendezvous_time_feasible = (
             t_arrive_uav + self._cfg.rendezvous_execution_margin_sec
-            <= coarse_plan.truck_eta_map[node_id] + _TIME_EPS
+            <= float(truck_eta) + _TIME_EPS
             and wait_time <= self._cfg.rendezvous_max_wait_sec + _TIME_EPS
         )
         checks = {
@@ -4953,7 +5119,115 @@ class TrainingEnvAdapter:
             "rendezvous_time_feasible": rendezvous_time_feasible,
             "node_still_valid": node_still_valid,
         }
+        self._record_mode_c_revalidation_debug(
+            drone_id=drone_id,
+            node_id=node_id,
+            t_now=t_now,
+            eta_resolution=eta_resolution,
+            checks=checks,
+            t_arrive_uav=t_arrive_uav,
+            wait_time=wait_time,
+        )
         return all(checks.values()), checks
+
+    def _resolve_mode_c_revalidation_truck_eta(
+        self,
+        *,
+        drone_id: str,
+        node_id: str,
+        t_now: float,
+    ) -> _ModeCRevalidationEtaResolution:
+        """解析 Mode C 送达后复核使用的计划承诺 ETA。"""
+        t_ref = float(t_now)
+        commit = self._dispatch_commit.get(drone_id)
+        commit_eta = None
+        if (
+            commit is not None
+            and commit.selected_recover_node == node_id
+            and commit.planned_truck_arrival_time is not None
+        ):
+            raw_commit_eta = float(commit.planned_truck_arrival_time)
+            if raw_commit_eta >= t_ref - _TIME_EPS:
+                commit_eta = raw_commit_eta
+
+        current_coarse_plan_eta = None
+        current_coarse_plan_version = None
+        if self._current_coarse_plan is not None:
+            current_coarse_plan_version = int(self._current_coarse_plan.plan_version)
+            raw_plan_eta = self._current_coarse_plan.truck_eta_map.get(node_id)
+            if raw_plan_eta is not None and float(raw_plan_eta) >= t_ref - _TIME_EPS:
+                current_coarse_plan_eta = float(raw_plan_eta)
+
+        execution_backbone_eta = self._next_backbone_arrival_time_for_node(
+            node_id,
+            t_ref,
+            include_current=True,
+        )
+        future_backbone_count = len(self._future_backbone_visits(t_ref))
+
+        if commit_eta is not None:
+            truck_eta = commit_eta
+            eta_source = "dispatch_commit"
+        elif current_coarse_plan_eta is not None:
+            truck_eta = current_coarse_plan_eta
+            eta_source = "current_coarse_plan"
+        elif execution_backbone_eta is not None:
+            truck_eta = float(execution_backbone_eta)
+            eta_source = "execution_backbone"
+        else:
+            truck_eta = None
+            eta_source = "missing"
+
+        return _ModeCRevalidationEtaResolution(
+            truck_eta=truck_eta,
+            eta_source=eta_source,
+            commit_eta=commit_eta,
+            current_coarse_plan_eta=current_coarse_plan_eta,
+            current_coarse_plan_version=current_coarse_plan_version,
+            execution_backbone_eta=execution_backbone_eta,
+            future_backbone_count=int(future_backbone_count),
+            truck_replan_pending=bool(self._truck_replan_pending),
+            truck_replan_pending_reasons=tuple(
+                sorted(self._truck_replan_pending_reasons)
+            ),
+        )
+
+    def _record_mode_c_revalidation_debug(
+        self,
+        *,
+        drone_id: str,
+        node_id: str,
+        t_now: float,
+        eta_resolution: _ModeCRevalidationEtaResolution,
+        checks: Mapping[str, bool],
+        t_arrive_uav: float | None,
+        wait_time: float | None,
+    ) -> None:
+        commit = self._dispatch_commit.get(drone_id)
+        event = {
+            "drone_id": str(drone_id),
+            "recover_node": str(node_id),
+            "t_now": float(t_now),
+            "eta_source": str(eta_resolution.eta_source),
+            "resolved_truck_eta": eta_resolution.truck_eta,
+            "commit_planned_truck_arrival_time": (
+                None if commit is None else commit.planned_truck_arrival_time
+            ),
+            "current_coarse_plan_version": eta_resolution.current_coarse_plan_version,
+            "current_coarse_plan_eta": eta_resolution.current_coarse_plan_eta,
+            "execution_backbone_eta": eta_resolution.execution_backbone_eta,
+            "future_backbone_count": int(eta_resolution.future_backbone_count),
+            "truck_replan_pending": bool(eta_resolution.truck_replan_pending),
+            "truck_replan_pending_reasons": tuple(
+                eta_resolution.truck_replan_pending_reasons
+            ),
+            "t_arrive_uav": None if t_arrive_uav is None else float(t_arrive_uav),
+            "wait_time": None if wait_time is None else float(wait_time),
+            "checks": {str(key): bool(value) for key, value in checks.items()},
+        }
+        self._mode_c_revalidation_events.append(event)
+        if len(self._mode_c_revalidation_events) > 100:
+            del self._mode_c_revalidation_events[:-100]
 
     def _select_deterministic_fallback_host(self, drone_id: str) -> ChargingHost | None:
         """按当前实现的 deterministic fallback 规则选宿主。"""

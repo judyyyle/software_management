@@ -320,25 +320,25 @@ reward:
 training:
   # 复现性：单环境、固定训练随机种子、强制 deterministic。
   training_seed: 20260424
-  device: cpu
+  device: mps
   num_envs: 1
   torch_deterministic: true
   cudnn_benchmark: false
   mixed_precision: false
 
   # PPO 核心超参数。
-  total_timesteps: 50000
+  total_timesteps: 20000
   # Run16: 小幅回升学习率，补偿更大 Huber delta 下 critic 梯度绝对值下降。
   ppo_learning_rate: 0.0001
-  rollout_steps: 2048
+  rollout_steps: 512
   recurrent_ppo: true
   sequence_len: 16
   burn_in_len: 0
   train_len: 16
-  sequence_minibatch_size: 64
-  target_minibatch_timesteps: 1024
+  sequence_minibatch_size: 32
+  target_minibatch_timesteps: 512
   # 兼容旧字段；在 recurrent PPO 下只允许作为 target_minibatch_timesteps 的过渡别名。
-  batch_size: 1024
+  batch_size: 512
   ppo_epochs: 2
   gamma: 0.99
   gae_lambda: 0.95
@@ -392,9 +392,9 @@ training:
   log_interval_updates: 1
   save_interval_updates: 25
   # 诊断短跑阶段降低评估频率；若 selection key 优于历史最优，则覆盖保存 policy_best.pt。
-  eval_interval_updates: 5
+  eval_interval_updates: 10
   benchmark_eval_episodes: 1
-  stochastic_eval_seeds: 3
+  stochastic_eval_seeds: 1
   checkpoint_keep_last: 5
 
   # Run05：checkpoint / early-stop 稳态版。

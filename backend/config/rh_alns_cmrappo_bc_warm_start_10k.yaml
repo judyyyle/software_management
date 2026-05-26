@@ -329,18 +329,18 @@ training:
   mixed_precision: false
 
   # PPO 核心超参数。
-  total_timesteps: 50000
+  total_timesteps: 20000
   # Run16: 小幅回升学习率，补偿更大 Huber delta 下 critic 梯度绝对值下降。
   ppo_learning_rate: 0.0001
-  rollout_steps: 2048
+  rollout_steps: 512
   recurrent_ppo: true
   sequence_len: 16
   burn_in_len: 0
   train_len: 16
-  sequence_minibatch_size: 64
-  target_minibatch_timesteps: 1024
+  sequence_minibatch_size: 32
+  target_minibatch_timesteps: 512
   # 兼容旧字段；在 recurrent PPO 下只允许作为 target_minibatch_timesteps 的过渡别名。
-  batch_size: 1024
+  batch_size: 512
   ppo_epochs: 2
   gamma: 0.99
   gae_lambda: 0.95
@@ -377,6 +377,10 @@ training:
   bc_warm_start_batches_per_update: 2
   # 正式 10k 验证先限制每条 teacher rollout 的采样长度，避免 BC 成本远大于 PPO 本体。
   bc_warm_start_max_decision_batches_per_rollout: 128
+  # warmup 完成后保存 bc_warm_start_policy.pt；后续重跑同一 output_dir 时优先复用，
+  # 或通过 bc_warm_start_checkpoint_path 显式指定已有 warmup 产物。
+  bc_warm_start_reuse_existing: true
+  bc_warm_start_checkpoint_path: ""
   # BC 专用监督损失权重；降低 forced WAIT 稀释，适度放大 C 标签。
   bc_wait_no_dispatch_loss_weight: 0.05
   bc_wait_with_dispatch_loss_weight: 0.50
@@ -394,9 +398,9 @@ training:
   log_interval_updates: 1
   save_interval_updates: 25
   # 诊断短跑阶段降低评估频率；若 selection key 优于历史最优，则覆盖保存 policy_best.pt。
-  eval_interval_updates: 5
+  eval_interval_updates: 10
   benchmark_eval_episodes: 1
-  stochastic_eval_seeds: 3
+  stochastic_eval_seeds: 1
   checkpoint_keep_last: 5
 
   # Run05：checkpoint / early-stop 稳态版。
