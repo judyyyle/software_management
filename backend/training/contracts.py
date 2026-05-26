@@ -557,6 +557,7 @@ class OrderFeatures:
     best_mode_c_truck_eta_remaining: float
     best_mode_c_timeout_risk: float
     is_valid: bool
+    estimated_delivery_finish_slack_sec: float = 0.0
 
 
 @dataclass(frozen=True)

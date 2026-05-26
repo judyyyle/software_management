@@ -20,7 +20,11 @@ from core.entities.primitives import Position3D
 from environment.geo.osm_service import build_road_graph, find_nearest_node, shortest_path
 from utils.coord_utils import wgs84_to_utm
 
-from .candidate_builder import CandidateBuilder
+from .candidate_builder import (
+    CandidateBuilder,
+    _candidate_deadline_sort_key,
+    _select_candidate_orders,
+)
 from .contracts import (
     PlannerTriggerContext,
     PolicyMode,
@@ -95,6 +99,21 @@ class TestPhase6Integration(unittest.TestCase):
         )
         env._require_order_manager().pending_orders[order.order_id] = order
         return order
+
+    def _candidate_sort_item(
+        self,
+        order_id: str,
+        remaining_time: float,
+        *,
+        priority_band: int = 1,
+    ) -> dict[str, object]:
+        return {
+            "order_id": order_id,
+            "order_feature": SimpleNamespace(
+                remaining_time=remaining_time,
+                priority_band=priority_band,
+            ),
+        }
 
     def test_background_mode_a_pending_is_seeded_from_static_truck_only_orders(self) -> None:
         env = self._make_env()
@@ -650,6 +669,150 @@ class TestPhase6Integration(unittest.TestCase):
             "ORDER-C-RES-CONSTRAINT",
         )
 
+    def test_mode_c_revalidation_uses_commit_eta_when_execution_backbone_empty(self) -> None:
+        env, drone_id = self._reset_controlled_env()
+        station_id = sorted(env._require_entity_manager().stations)[0]
+        station = env._require_entity_manager().stations[station_id]
+        drone = env._require_entity_manager().drones[drone_id]
+        t_now = 120.0
+        flight_time = env._estimate_flight_time(
+            drone=drone,
+            from_pos=drone.current_loc,
+            to_pos=station.location,
+        )
+        truck_eta = (
+            t_now
+            + flight_time
+            + env._cfg.rendezvous_execution_margin_sec
+            + 30.0
+        )
+        env._full_backbone_cache = []
+        env._current_coarse_plan = None
+        env._dispatch_commit[drone_id] = DispatchCommit(
+            order_id="ORDER-C-REVALIDATE-COMMIT-ETA",
+            mode=PolicyMode.C,
+            selected_recover_node=station_id,
+            trigger_station_id=None,
+            planned_truck_arrival_time=truck_eta,
+        )
+
+        is_valid, checks = env._revalidate_mode_c_recover_node(
+            drone_id=drone_id,
+            node_id=station_id,
+            t_now=t_now,
+        )
+
+        self.assertTrue(is_valid)
+        self.assertTrue(all(checks.values()))
+        debug = env.build_episode_metrics_snapshot()["mode_c_revalidation_debug_last"]
+        self.assertEqual(debug["eta_source"], "dispatch_commit")
+        self.assertEqual(debug["future_backbone_count"], 0)
+        self.assertAlmostEqual(debug["resolved_truck_eta"], truck_eta)
+
+    def test_mode_c_revalidation_falls_back_to_current_coarse_plan_eta(self) -> None:
+        env, drone_id = self._reset_controlled_env()
+        station_id = sorted(env._require_entity_manager().stations)[0]
+        station = env._require_entity_manager().stations[station_id]
+        drone = env._require_entity_manager().drones[drone_id]
+        t_now = 120.0
+        flight_time = env._estimate_flight_time(
+            drone=drone,
+            from_pos=drone.current_loc,
+            to_pos=station.location,
+        )
+        truck_eta = (
+            t_now
+            + flight_time
+            + env._cfg.rendezvous_execution_margin_sec
+            + 30.0
+        )
+        env._dispatch_commit[drone_id] = DispatchCommit(
+            order_id="ORDER-C-REVALIDATE-PLAN-ETA",
+            mode=PolicyMode.C,
+            selected_recover_node=station_id,
+            trigger_station_id=None,
+            planned_truck_arrival_time=t_now - 10.0,
+        )
+        coarse_plan = env._build_coarse_plan_view(0.0)
+        env._full_backbone_cache = []
+        env._current_coarse_plan = replace(
+            coarse_plan,
+            truck_backbone_route=(station_id,),
+            truck_eta_map={station_id: truck_eta},
+            route_drift_ref={
+                station_id: RouteDriftRef(
+                    eta_ref=truck_eta,
+                    route_index_ref=0,
+                )
+            },
+            launch_candidate_stations=(station_id,),
+        )
+
+        is_valid, checks = env._revalidate_mode_c_recover_node(
+            drone_id=drone_id,
+            node_id=station_id,
+            t_now=t_now,
+        )
+
+        self.assertTrue(is_valid)
+        self.assertTrue(all(checks.values()))
+        debug = env.build_episode_metrics_snapshot()["mode_c_revalidation_debug_last"]
+        self.assertEqual(debug["eta_source"], "current_coarse_plan")
+        self.assertAlmostEqual(debug["current_coarse_plan_eta"], truck_eta)
+
+    def test_planner_kept_outcome_syncs_reservation_commit_eta(self) -> None:
+        env, drone_id = self._reset_controlled_env()
+        station_id = sorted(env._require_entity_manager().stations)[0]
+        reservation_id = f"{drone_id}:{station_id}:10.000000"
+        old_eta = 180.0
+        new_eta = 220.0
+        env._reservations[drone_id] = ReservationState(
+            recover_node=station_id,
+            issued_at=10.0,
+        )
+        env._reservation_count[station_id] = 1
+        env._dispatch_commit[drone_id] = DispatchCommit(
+            order_id="ORDER-C-KEPT-SYNC",
+            mode=PolicyMode.C,
+            selected_recover_node=station_id,
+            trigger_station_id=None,
+            planned_truck_arrival_time=old_eta,
+        )
+        constraint = TruckReservationConstraint(
+            reservation_id=reservation_id,
+            drone_id=drone_id,
+            node_id=station_id,
+            state=ReservationConstraintState.HARD,
+            eta_ref=old_eta,
+            max_eta_drift_sec=60.0,
+            issued_at=10.0,
+        )
+        coarse_plan = replace(
+            env._build_coarse_plan_view(0.0),
+            reservation_outcomes={
+                reservation_id: ReservationPlanOutcome(
+                    reservation_id=reservation_id,
+                    node_id=station_id,
+                    old_eta=old_eta,
+                    new_eta=new_eta,
+                    eta_drift_sec=new_eta - old_eta,
+                    status=ReservationPlanStatus.KEPT,
+                )
+            },
+        )
+
+        env_decisions = env._apply_planner_reservation_outcomes(
+            coarse_plan=coarse_plan,
+            reservation_constraints=(constraint,),
+            t_now=0.0,
+        )
+
+        self.assertEqual(env_decisions[reservation_id], "kept_commit_eta_synced")
+        self.assertAlmostEqual(
+            env._dispatch_commit[drone_id].planned_truck_arrival_time,
+            new_eta,
+        )
+
     def test_planner_invalidated_node_not_in_plan_releases_reservation(self) -> None:
         env, drone_id = self._reset_controlled_env()
         station_id = sorted(env._require_entity_manager().stations)[0]
@@ -974,9 +1137,13 @@ class TestPhase6Integration(unittest.TestCase):
         self.assertEqual(event["trigger"]["backlog_new_orders"], 3)
         self.assertEqual(
             event["reservation_outcomes"][0]["env_decision"],
-            "planner_status_no_env_action",
+            "drifted_commit_eta_synced",
         )
         self.assertEqual(event["reservation_outcomes"][0]["drone_id"], drone_id)
+        self.assertAlmostEqual(
+            event["reservation_outcomes"][0]["commit_planned_truck_arrival_time"],
+            220.0,
+        )
 
     def test_future_backbone_visits_exclude_after_upper_horizon(self) -> None:
         env, _drone_id = self._reset_controlled_env()
@@ -1687,6 +1854,61 @@ class TestPhase6Integration(unittest.TestCase):
         self.assertEqual(resolved_mode_c.order_id, order.order_id)
         self.assertEqual(resolved_mode_c.mode, PolicyMode.C)
         self.assertEqual(resolved_mode_c.recover_node_id, station_safe.station_id)
+
+    def test_candidate_builder_deadline_sort_centers_lead_time(self) -> None:
+        items = [
+            self._candidate_sort_item("A", 480.0),
+            self._candidate_sort_item("B", 300.0),
+            self._candidate_sort_item("C", 600.0),
+            self._candidate_sort_item("D", 60.0),
+            self._candidate_sort_item("E", -60.0),
+            self._candidate_sort_item("F", -600.0),
+            self._candidate_sort_item("G", -1800.0),
+            self._candidate_sort_item("H", 1800.0),
+        ]
+
+        sorted_ids = [
+            item["order_id"] for item in sorted(items, key=_candidate_deadline_sort_key)
+        ]
+
+        self.assertEqual(sorted_ids[0], "A")
+        self.assertLess(sorted_ids.index("B"), 4)
+        self.assertLess(sorted_ids.index("C"), 4)
+        self.assertLess(sorted_ids.index("E"), sorted_ids.index("F"))
+        self.assertLess(sorted_ids.index("E"), sorted_ids.index("G"))
+        self.assertLess(sorted_ids.index("D"), sorted_ids.index("G"))
+        self.assertEqual(sorted_ids[-1], "H")
+
+    def test_candidate_builder_overdue_reserve_keeps_limited_visibility(self) -> None:
+        items = [
+            self._candidate_sort_item("A", 480.0),
+            self._candidate_sort_item("B", 500.0),
+            self._candidate_sort_item("C", 460.0),
+            self._candidate_sort_item("D", 450.0),
+            self._candidate_sort_item("E", -60.0),
+            self._candidate_sort_item("F", -600.0),
+            self._candidate_sort_item("G", -1800.0),
+            self._candidate_sort_item("H", 1800.0),
+        ]
+
+        selected = _select_candidate_orders(items, max_candidate_orders=5)
+        selected_ids = [item["order_id"] for item in selected]
+
+        self.assertEqual(len(selected_ids), 5)
+        self.assertEqual(len(selected_ids), len(set(selected_ids)))
+        self.assertEqual(set(selected_ids[:3]), {"A", "B", "C"})
+        self.assertIn("E", selected_ids)
+        self.assertIn("F", selected_ids)
+        self.assertNotIn("G", selected_ids)
+
+        all_selected = _select_candidate_orders(
+            items,
+            max_candidate_orders=len(items),
+        )
+        self.assertEqual(
+            {item["order_id"] for item in all_selected},
+            {item["order_id"] for item in items},
+        )
 
     def test_candidate_builder_mode_c_prefers_earliest_recovery_time(self) -> None:
         builder = CandidateBuilder.__new__(CandidateBuilder)

@@ -119,6 +119,8 @@ class _TrainingConfig:
     bc_warm_start_updates: int = 0
     bc_warm_start_batches_per_update: int = 1
     bc_warm_start_max_decision_batches_per_rollout: int = 0
+    bc_warm_start_checkpoint_path: str | None = None
+    bc_warm_start_reuse_existing: bool = True
     bc_wait_no_dispatch_loss_weight: float = 0.05
     bc_wait_with_dispatch_loss_weight: float = 0.5
     bc_mode_b_dispatch_loss_weight: float = 1.0
@@ -660,11 +662,13 @@ def train_cmrappo(
     policy_path = out_dir / "policy.pt"
     policy_last_path = out_dir / "policy_last.pt"
     policy_best_path = out_dir / "policy_best.pt"
+    bc_warm_start_policy_path = out_dir / "bc_warm_start_policy.pt"
+    bc_warm_start_meta_path = out_dir / "bc_warm_start_meta.json"
     meta_path = out_dir / "meta.json"
     config_snapshot_path = out_dir / "training_config_snapshot.yaml"
     model_version = model_version or datetime.now(timezone.utc).strftime("cmrappo_%Y%m%dT%H%M%SZ")
 
-    bc_warm_start_stats = _run_bc_warm_start(
+    bc_warm_start_stats = _load_or_run_bc_warm_start(
         model=model,
         optimizer=optimizer,
         scene_ctx=scene_ctx,
@@ -676,6 +680,9 @@ def train_cmrappo(
         train_cfg=train_cfg,
         device=device,
         metrics_path=metrics_path,
+        checkpoint_path=bc_warm_start_policy_path,
+        checkpoint_meta_path=bc_warm_start_meta_path,
+        model_version=model_version,
         event_hook=event_hook,
     )
 
@@ -1310,6 +1317,8 @@ def train_cmrappo(
         "policy_path": str(policy_path),
         "policy_last_path": str(policy_last_path),
         "policy_best_path": str(policy_best_path) if best_checkpoint is not None else None,
+        "bc_warm_start_policy_path": str(bc_warm_start_policy_path),
+        "bc_warm_start_meta_path": str(bc_warm_start_meta_path),
         "meta_path": str(meta_path),
         "metrics_path": str(metrics_path),
         "episode_metrics_path": str(episode_metrics_path),
@@ -2277,6 +2286,199 @@ def _bc_label_to_action_indices_tensor(
         "order_idx": torch.as_tensor([order_idx], dtype=torch.long, device=device),
         "mode_idx": torch.as_tensor([mode_idx], dtype=torch.long, device=device),
     }
+
+
+def _load_or_run_bc_warm_start(
+    *,
+    model: Any,
+    optimizer: Any,
+    scene_ctx: Any,
+    order_source: OrderSourceConfig,
+    config_path: Path,
+    tensorizer: ObservationTensorizer,
+    critic_builder: CriticBatchBuilder,
+    critic_schema: CriticTensorSchemaMeta,
+    train_cfg: _TrainingConfig,
+    device: Any,
+    metrics_path: Path,
+    checkpoint_path: Path,
+    checkpoint_meta_path: Path,
+    model_version: str,
+    event_hook: Callable[[str, Mapping[str, Any]], None] | None,
+) -> dict[str, Any]:
+    if not train_cfg.bc_warm_start_enabled:
+        return _run_bc_warm_start(
+            model=model,
+            optimizer=optimizer,
+            scene_ctx=scene_ctx,
+            order_source=order_source,
+            config_path=config_path,
+            tensorizer=tensorizer,
+            critic_builder=critic_builder,
+            critic_schema=critic_schema,
+            train_cfg=train_cfg,
+            device=device,
+            metrics_path=metrics_path,
+            event_hook=event_hook,
+        )
+
+    load_path = _resolve_bc_warm_start_load_path(
+        train_cfg=train_cfg,
+        default_checkpoint_path=checkpoint_path,
+    )
+    if load_path is not None:
+        stats = _load_bc_warm_start_checkpoint(
+            path=load_path,
+            model=model,
+            optimizer=optimizer,
+            device=device,
+            critic_schema_hash=critic_schema.schema_hash,
+        )
+        _emit_event_hook(
+            event_hook,
+            "bc_warm_start_checkpoint_loaded",
+            {
+                "phase": "bc_warm_start",
+                "path": str(load_path),
+                "target_checkpoint_path": str(checkpoint_path),
+                "samples": int(stats.get("samples", 0)),
+            },
+        )
+        if load_path.resolve() != checkpoint_path.resolve():
+            shutil.copy2(load_path, checkpoint_path)
+        _write_json(
+            path=checkpoint_meta_path,
+            payload={
+                "phase": "bc_warm_start",
+                "loaded_from_checkpoint": True,
+                "source_checkpoint_path": str(load_path),
+                "checkpoint_path": str(checkpoint_path),
+                "model_version": str(model_version),
+                "critic_schema_hash": str(critic_schema.schema_hash),
+                "config_path": str(config_path),
+                "stats": dict(stats),
+            },
+        )
+        stats = {
+            **dict(stats),
+            "checkpoint_path": str(checkpoint_path),
+            "source_checkpoint_path": str(load_path),
+            "checkpoint_meta_path": str(checkpoint_meta_path),
+        }
+        return stats
+
+    stats = _run_bc_warm_start(
+        model=model,
+        optimizer=optimizer,
+        scene_ctx=scene_ctx,
+        order_source=order_source,
+        config_path=config_path,
+        tensorizer=tensorizer,
+        critic_builder=critic_builder,
+        critic_schema=critic_schema,
+        train_cfg=train_cfg,
+        device=device,
+        metrics_path=metrics_path,
+        event_hook=event_hook,
+    )
+    if int(stats.get("updates", 0)) > 0:
+        _save_policy_checkpoint(
+            path=checkpoint_path,
+            model=model,
+            optimizer=optimizer,
+            critic_schema_hash=critic_schema.schema_hash,
+            model_version=model_version,
+            global_step=0,
+            update_idx=0,
+            extra_payload={
+                "phase": "bc_warm_start",
+                "bc_warm_start": dict(stats),
+            },
+        )
+        _write_json(
+            path=checkpoint_meta_path,
+            payload={
+                "phase": "bc_warm_start",
+                "checkpoint_path": str(checkpoint_path),
+                "model_version": str(model_version),
+                "critic_schema_hash": str(critic_schema.schema_hash),
+                "config_path": str(config_path),
+                "stats": dict(stats),
+            },
+        )
+        stats = {
+            **dict(stats),
+            "loaded_from_checkpoint": False,
+            "checkpoint_path": str(checkpoint_path),
+            "checkpoint_meta_path": str(checkpoint_meta_path),
+        }
+        _emit_event_hook(
+            event_hook,
+            "bc_warm_start_checkpoint_saved",
+            {
+                "phase": "bc_warm_start",
+                "path": str(checkpoint_path),
+                "meta_path": str(checkpoint_meta_path),
+                "samples": int(stats.get("samples", 0)),
+            },
+        )
+    return stats
+
+
+def _resolve_bc_warm_start_load_path(
+    *,
+    train_cfg: _TrainingConfig,
+    default_checkpoint_path: Path,
+) -> Path | None:
+    explicit_path = train_cfg.bc_warm_start_checkpoint_path
+    if explicit_path:
+        path = Path(explicit_path).expanduser()
+        if not path.is_file():
+            raise FileNotFoundError(f"BC warm start checkpoint 不存在: {path}")
+        return path
+    if train_cfg.bc_warm_start_reuse_existing and default_checkpoint_path.is_file():
+        return default_checkpoint_path
+    return None
+
+
+def _load_bc_warm_start_checkpoint(
+    *,
+    path: Path,
+    model: Any,
+    optimizer: Any,
+    device: Any,
+    critic_schema_hash: str,
+) -> dict[str, Any]:
+    checkpoint = torch.load(path, map_location=device)
+    state_dict = checkpoint.get("model_state_dict")
+    if state_dict is None:
+        raise ValueError(f"BC warm start checkpoint 缺少 model_state_dict: {path}")
+    checkpoint_schema_hash = checkpoint.get("critic_schema_hash")
+    if (
+        checkpoint_schema_hash is not None
+        and str(checkpoint_schema_hash) != str(critic_schema_hash)
+    ):
+        raise ValueError(
+            "BC warm start checkpoint critic schema 不匹配: "
+            f"{checkpoint_schema_hash} != {critic_schema_hash}"
+        )
+    model.load_state_dict(state_dict)
+    optimizer_state = checkpoint.get("optimizer_state_dict")
+    if optimizer_state is not None:
+        optimizer.load_state_dict(optimizer_state)
+    raw_stats = checkpoint.get("bc_warm_start")
+    stats = dict(raw_stats) if isinstance(raw_stats, Mapping) else {}
+    stats.update(
+        {
+            "enabled": True,
+            "loaded_from_checkpoint": True,
+            "checkpoint_path": str(path),
+            "checkpoint_model_version": checkpoint.get("model_version"),
+            "checkpoint_global_step": int(checkpoint.get("global_step", 0)),
+            "checkpoint_update": int(checkpoint.get("update", 0)),
+        }
+    )
+    return stats
 
 
 def _run_bc_warm_start(
@@ -3670,18 +3872,19 @@ def _save_policy_checkpoint(
     model_version: str,
     global_step: int,
     update_idx: int,
+    extra_payload: Mapping[str, Any] | None = None,
 ) -> None:
-    torch.save(
-        {
-            "model_state_dict": model.state_dict(),
-            "optimizer_state_dict": optimizer.state_dict(),
-            "critic_schema_hash": critic_schema_hash,
-            "model_version": model_version,
-            "global_step": int(global_step),
-            "update": int(update_idx),
-        },
-        path,
-    )
+    payload = {
+        "model_state_dict": model.state_dict(),
+        "optimizer_state_dict": optimizer.state_dict(),
+        "critic_schema_hash": critic_schema_hash,
+        "model_version": model_version,
+        "global_step": int(global_step),
+        "update": int(update_idx),
+    }
+    if extra_payload:
+        payload.update(dict(extra_payload))
+    torch.save(payload, path)
 
 
 def _set_training_seed(seed: int) -> None:
@@ -4034,6 +4237,12 @@ def _load_training_config(config_path: Path) -> _TrainingConfig:
         ),
         bc_warm_start_max_decision_batches_per_rollout=int(
             training.get("bc_warm_start_max_decision_batches_per_rollout", 0)
+        ),
+        bc_warm_start_checkpoint_path=(
+            str(training.get("bc_warm_start_checkpoint_path", "")).strip() or None
+        ),
+        bc_warm_start_reuse_existing=bool(
+            training.get("bc_warm_start_reuse_existing", True)
         ),
         bc_wait_no_dispatch_loss_weight=float(
             training.get("bc_wait_no_dispatch_loss_weight", 0.05)
