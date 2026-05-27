@@ -390,6 +390,24 @@ class PhysicalEvaluator:
             return False, need, "energy_not_enough"
         return True, need, ""
 
+    def _uav_path_distance(self, from_pos: Any, to_pos: Any) -> float:
+        altitude = float(self._read_field(self.greedy, "UAV_CRUISE_ALTITUDE_M", 80.0) or 80.0)
+        return float(self.greedy._uav_path_distance(from_pos, to_pos, altitude=altitude))
+
+    def _uav_route_path(self, launch_pos: Any, delivery_pos: Any, recover_pos: Any) -> list[Any]:
+        planner = self._read_field(self.greedy, "_path_planner")
+        if planner is None:
+            return [launch_pos, delivery_pos, recover_pos]
+
+        altitude = float(self._read_field(self.greedy, "UAV_CRUISE_ALTITUDE_M", 80.0) or 80.0)
+        outbound = list(planner.plan(launch_pos, delivery_pos, altitude) or [])
+        inbound = list(planner.plan(delivery_pos, recover_pos, altitude) or [])
+        if not outbound:
+            outbound = [launch_pos, delivery_pos]
+        if not inbound:
+            inbound = [delivery_pos, recover_pos]
+        return outbound + inbound[1:]
+
     def evaluate_fixed_mode_a(self, state, order_id: str, truck_id: str) -> GACandidate:
         orders = self._mapping(state, "orders")
         trucks = self._mapping(state, "trucks")
@@ -471,8 +489,8 @@ class PhysicalEvaluator:
         if not ok:
             return GACandidate(order_id, "B", False, drone_id=drone_id, reason=reason)
 
-        uav_dist_out = self.greedy._dist(launch_pos, order.delivery_loc)
-        uav_dist_back = self.greedy._dist(order.delivery_loc, recover_pos)
+        uav_dist_out = self._uav_path_distance(launch_pos, order.delivery_loc)
+        uav_dist_back = self._uav_path_distance(order.delivery_loc, recover_pos)
         uav_distance = uav_dist_out + uav_dist_back
         uav_energy = (
             self.greedy._uav_energy_wh(drone, launch_pos, order.delivery_loc, payload)
@@ -545,7 +563,10 @@ class PhysicalEvaluator:
                 "mode": "B",
                 "launch_node_id": launch_node_id,
                 "recover_node_id": recover_node_id,
-                "path": [launch_pos, order.delivery_loc, recover_pos],
+                "launch_loc": launch_pos,
+                "delivery_loc": order.delivery_loc,
+                "recovery_loc": recover_pos,
+                "path": self._uav_route_path(launch_pos, order.delivery_loc, recover_pos),
             },
             truck_final_node_id=recover_node_id,
             truck_final_time=truck_final_time,
@@ -587,8 +608,8 @@ class PhysicalEvaluator:
         if not ok:
             return GACandidate(order_id, "C", False, drone_id=drone_id, reason=reason)
 
-        uav_dist_out = self.greedy._dist(launch_pos, order.delivery_loc)
-        uav_dist_back = self.greedy._dist(order.delivery_loc, recover_pos)
+        uav_dist_out = self._uav_path_distance(launch_pos, order.delivery_loc)
+        uav_dist_back = self._uav_path_distance(order.delivery_loc, recover_pos)
         drone_speed = max(1e-6, float(self._read_field(drone, "cruise_speed", 0.0) or 0.0))
         start_time = self._drone_time(drone, state)
         delivery_arrival = start_time + uav_dist_out / drone_speed
@@ -616,7 +637,10 @@ class PhysicalEvaluator:
                 "mode": "C",
                 "launch_node_id": launch_node_id,
                 "recover_node_id": recover_node_id,
-                "path": [launch_pos, order.delivery_loc, recover_pos],
+                "launch_loc": launch_pos,
+                "delivery_loc": order.delivery_loc,
+                "recovery_loc": recover_pos,
+                "path": self._uav_route_path(launch_pos, order.delivery_loc, recover_pos),
             },
             drone_final_node_id=recover_node_id,
             drone_final_time=recover_arrival,
