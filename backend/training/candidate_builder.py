@@ -16,6 +16,7 @@ HiveLogix — Phase 6 候选动作生成器。
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping
@@ -27,6 +28,7 @@ from .actions import DispatchAction, WAIT_ACTION
 from .contracts import (
     CandidateFeatures,
     CandidateOutput,
+    CandidateTeacherEnergy,
     CoarsePlanView,
     FactorizedActionSchema,
     InfraFeatures,
@@ -68,6 +70,9 @@ class _ModeCSummary:
     best_rendezvous_margin: float
     best_wait_time: float
     best_uav_flight_time: float
+    best_recovery_energy_j: float
+    best_recovery_energy_ratio: float
+    best_total_energy_ratio: float
     best_energy_margin_ratio: float
     best_node_type: str
     best_truck_eta_remaining: float
@@ -154,6 +159,7 @@ class CandidateBuilder:
                 "feasible",
             )
         )
+        teacher_energy_debug: list[str] = []
 
         actionable_orders: list[dict[str, Any]] = []
         for order_id in coarse_plan.authorized_orders:
@@ -189,6 +195,13 @@ class CandidateBuilder:
             mode_c_order_filter_counts["delivery_feasible_orders"] += 1
 
             energy_after_delivery = float(drone_view.battery_current) - energy_to_deliver
+            battery_max = float(getattr(drone_view, "battery_max", 0.0))
+            delivery_energy_ratio = _teacher_energy_ratio(
+                energy_to_deliver,
+                battery_max,
+                debug_messages=teacher_energy_debug,
+                label=f"order={order_id}:delivery",
+            )
             mode_b_summary = None
             if PolicyMode.B in allowed_policy_modes:
                 mode_b_summary = self._select_best_mode_b_host(
@@ -209,6 +222,7 @@ class CandidateBuilder:
                     deliver_pos=order.delivery_loc,
                     t_deliver_finish=t_deliver_finish,
                     energy_after_delivery=energy_after_delivery,
+                    delivery_energy_ratio=delivery_energy_ratio,
                     trigger_type=trigger_type,
                     trigger_station_id=trigger_station_id,
                     t_now=float(runtime_state.t_now),
@@ -230,6 +244,65 @@ class CandidateBuilder:
             mode_c_order_filter_counts["actionable_order_pre_trunc"] += 1
             if mode_c_summary is not None:
                 mode_c_order_filter_counts["feasible_mode_c_order_pre_trunc"] += 1
+            mode_b_recovery_energy_ratio = (
+                _teacher_energy_ratio(
+                    float(mode_b_summary["recovery_energy_j"]),
+                    battery_max,
+                    debug_messages=teacher_energy_debug,
+                    label=f"order={order_id}:mode_b_recovery",
+                )
+                if mode_b_summary is not None
+                else 0.0
+            )
+            mode_c_recovery_energy_ratio = (
+                _teacher_energy_ratio(
+                    float(mode_c_summary.best_recovery_energy_j),
+                    battery_max,
+                    debug_messages=teacher_energy_debug,
+                    label=f"order={order_id}:mode_c_recovery",
+                )
+                if mode_c_summary is not None
+                else 0.0
+            )
+            teacher_energy = CandidateTeacherEnergy(
+                delivery_energy_ratio=float(delivery_energy_ratio),
+                best_mode_b_recovery_energy_ratio=float(mode_b_recovery_energy_ratio),
+                best_mode_c_recovery_energy_ratio=float(mode_c_recovery_energy_ratio),
+                best_mode_b_total_energy_ratio=_sum_teacher_energy_ratios(
+                    delivery_energy_ratio,
+                    mode_b_recovery_energy_ratio,
+                    debug_messages=teacher_energy_debug,
+                    label=f"order={order_id}:mode_b_total",
+                )
+                if mode_b_summary is not None
+                else 0.0,
+                best_mode_c_total_energy_ratio=_sum_teacher_energy_ratios(
+                    delivery_energy_ratio,
+                    mode_c_recovery_energy_ratio,
+                    debug_messages=teacher_energy_debug,
+                    label=f"order={order_id}:mode_c_total",
+                )
+                if mode_c_summary is not None
+                else 0.0,
+                mode_c_energy_saving_ratio=_teacher_energy_saving_ratio(
+                    mode_b_summary is not None,
+                    mode_c_summary is not None,
+                    _sum_teacher_energy_ratios(
+                        delivery_energy_ratio,
+                        mode_b_recovery_energy_ratio,
+                        debug_messages=teacher_energy_debug,
+                        label=f"order={order_id}:mode_b_total_for_saving",
+                    ),
+                    _sum_teacher_energy_ratios(
+                        delivery_energy_ratio,
+                        mode_c_recovery_energy_ratio,
+                        debug_messages=teacher_energy_debug,
+                        label=f"order={order_id}:mode_c_total_for_saving",
+                    ),
+                    debug_messages=teacher_energy_debug,
+                    label=f"order={order_id}:mode_c_saving",
+                ),
+            )
 
             order_feature = OrderFeatures(
                 order_id=order_id,
@@ -301,6 +374,22 @@ class CandidateBuilder:
                     else 0.0
                 ),
                 is_valid=True,
+                delivery_energy_ratio=float(teacher_energy.delivery_energy_ratio),
+                best_mode_b_recovery_energy_ratio=float(
+                    teacher_energy.best_mode_b_recovery_energy_ratio
+                ),
+                best_mode_c_recovery_energy_ratio=float(
+                    teacher_energy.best_mode_c_recovery_energy_ratio
+                ),
+                best_mode_b_total_energy_ratio=float(
+                    teacher_energy.best_mode_b_total_energy_ratio
+                ),
+                best_mode_c_total_energy_ratio=float(
+                    teacher_energy.best_mode_c_total_energy_ratio
+                ),
+                mode_c_energy_saving_ratio=float(
+                    teacher_energy.mode_c_energy_saving_ratio
+                ),
                 estimated_delivery_finish_slack_sec=float(order.deadline) - t_deliver_finish,
             )
             actionable_orders.append(
@@ -314,6 +403,7 @@ class CandidateBuilder:
                         if mode_c_summary is not None
                         else None
                     ),
+                    "teacher_energy": teacher_energy,
                 }
             )
 
@@ -340,10 +430,12 @@ class CandidateBuilder:
         order_mask: list[bool] = []
         mode_mask: list[tuple[bool, bool]] = []
         dispatch_actions: dict[tuple[int, int], DispatchAction] = {}
+        teacher_energy_by_order_idx: dict[int, CandidateTeacherEnergy] = {}
 
         for order_slot, item in enumerate(actionable_orders):
             order_features.append(item["order_feature"])
             order_mask.append(True)
+            teacher_energy_by_order_idx[int(order_slot)] = item["teacher_energy"]
             has_mode_b = bool(item["has_mode_b"])
             has_mode_c = bool(item["has_mode_c"])
             mode_mask.append((has_mode_b, has_mode_c))
@@ -403,9 +495,11 @@ class CandidateBuilder:
                 wait_action=WAIT_ACTION,
                 dispatch_actions=dispatch_actions,
             ),
+            teacher_energy_by_order_idx=teacher_energy_by_order_idx,
             diagnostics={
                 "mode_c_order_filter_counts": dict(mode_c_order_filter_counts),
                 "mode_c_node_filter_counts": dict(mode_c_node_filter_counts),
+                "teacher_energy_debug": tuple(teacher_energy_debug),
             },
         )
 
@@ -538,6 +632,7 @@ class CandidateBuilder:
         deliver_pos: Position3D,
         t_deliver_finish: float,
         energy_after_delivery: float,
+        delivery_energy_ratio: float,
         trigger_type: str,
         trigger_station_id: str | None,
         t_now: float,
@@ -577,6 +672,16 @@ class CandidateBuilder:
             )
             uav_flight_time = float(recover_leg.flight_time_sec)
             energy_to_recover = float(recover_leg.energy_j)
+            recovery_energy_ratio = (
+                float(energy_to_recover) / battery_max
+                if battery_max > _TIME_EPS
+                else 0.0
+            )
+            if not math.isfinite(recovery_energy_ratio) or recovery_energy_ratio < 0.0:
+                recovery_energy_ratio = 0.0
+            total_energy_ratio = float(delivery_energy_ratio) + float(recovery_energy_ratio)
+            if not math.isfinite(total_energy_ratio) or total_energy_ratio < 0.0:
+                total_energy_ratio = 0.0
             energy_margin_j = (
                 float(energy_after_delivery)
                 - energy_to_recover
@@ -618,6 +723,9 @@ class CandidateBuilder:
                     "rendezvous_margin": rendezvous_margin,
                     "wait_time": float(planned_wait),
                     "uav_flight_time": float(uav_flight_time),
+                    "recovery_energy_j": float(energy_to_recover),
+                    "recovery_energy_ratio": max(0.0, float(recovery_energy_ratio)),
+                    "total_energy_ratio": max(0.0, float(total_energy_ratio)),
                     "energy_margin_ratio": max(0.0, energy_margin_j / battery_max),
                 },
             )
@@ -642,6 +750,9 @@ class CandidateBuilder:
             best_rendezvous_margin=best_margin,
             best_wait_time=float(best["wait_time"]),
             best_uav_flight_time=float(best["uav_flight_time"]),
+            best_recovery_energy_j=float(best["recovery_energy_j"]),
+            best_recovery_energy_ratio=float(best["recovery_energy_ratio"]),
+            best_total_energy_ratio=float(best["total_energy_ratio"]),
             best_energy_margin_ratio=float(best["energy_margin_ratio"]),
             best_node_type=str(best["node_type"]),
             best_truck_eta_remaining=float(best["truck_eta_remaining"]),
@@ -681,22 +792,21 @@ class CandidateBuilder:
         depot_nodes.sort(key=lambda item: str(item.node_id))
         if depot_nodes:
             depot_node = depot_nodes[0]
-            if self._can_reach(
+            recover_leg = self._estimate_uav_leg(
                 drone_view=drone_view,
                 from_pos=deliver_pos,
                 to_pos=depot_node.position,
                 payload=0.0,
-                safe_margin=safe_margin,
-                battery_current=battery_after_delivery,
+            )
+            if (
+                float(battery_after_delivery) + _TIME_EPS
+                >= float(recover_leg.energy_j) + float(safe_margin)
             ):
-                fly_time = self._estimate_flight_time(
-                    drone_view=drone_view,
-                    from_pos=deliver_pos,
-                    to_pos=depot_node.position,
-                )
+                fly_time = float(recover_leg.flight_time_sec)
                 return {
                     "score": float(t_deliver_finish + fly_time),
                     "recovery_flight_time": float(fly_time),
+                    "recovery_energy_j": float(recover_leg.energy_j),
                     "queue_time_est": 0.0,
                     "host_type": "depot",
                 }
@@ -704,39 +814,35 @@ class CandidateBuilder:
         if not depot_nodes:
             return None
         depot_node = depot_nodes[0]
-        scored_hosts: list[tuple[float, float, float, str, str, float]] = []
+        scored_hosts: list[tuple[float, float, float, str, str, float, float]] = []
         for node_state in runtime_state.node_states.values():
             if str(node_state.node_type) != "station":
                 continue
-            if not self._can_reach(
+            station_leg = self._estimate_uav_leg(
                 drone_view=drone_view,
                 from_pos=deliver_pos,
                 to_pos=node_state.position,
                 payload=0.0,
-                safe_margin=safe_margin,
-                battery_current=battery_after_delivery,
+            )
+            if (
+                float(battery_after_delivery) + _TIME_EPS
+                < float(station_leg.energy_j) + float(safe_margin)
             ):
                 continue
-            if not self._can_reach(
+            depot_leg = self._estimate_uav_leg(
                 drone_view=drone_view,
                 from_pos=node_state.position,
                 to_pos=depot_node.position,
                 payload=0.0,
-                safe_margin=safe_margin,
-                battery_current=float(drone_view.battery_max),
+            )
+            if (
+                float(drone_view.battery_max) + _TIME_EPS
+                < float(depot_leg.energy_j) + float(safe_margin)
             ):
                 continue
 
-            fly_time = self._estimate_flight_time(
-                drone_view=drone_view,
-                from_pos=deliver_pos,
-                to_pos=node_state.position,
-            )
-            depot_fly_time = self._estimate_flight_time(
-                drone_view=drone_view,
-                from_pos=node_state.position,
-                to_pos=depot_node.position,
-            )
+            fly_time = float(station_leg.flight_time_sec)
+            depot_fly_time = float(depot_leg.flight_time_sec)
             queue_time_est = _predicted_queue_time_est(node_state)
             service_time = float(node_state.swap_time)
             score = (
@@ -747,6 +853,7 @@ class CandidateBuilder:
                 + depot_fly_time
             )
             recovery_flight_time = float(fly_time) + float(depot_fly_time)
+            recovery_energy_j = float(station_leg.energy_j) + float(depot_leg.energy_j)
             scored_hosts.append(
                 (
                     self._path_distance(
@@ -758,6 +865,7 @@ class CandidateBuilder:
                     str(node_state.node_id),
                     str(node_state.node_type),
                     recovery_flight_time,
+                    recovery_energy_j,
                 )
             )
 
@@ -765,10 +873,19 @@ class CandidateBuilder:
             return None
 
         scored_hosts.sort(key=lambda item: (item[0], item[1], item[2], item[3]))
-        _distance, score, queue_time_est, _node_id, host_type, recovery_flight_time = scored_hosts[0]
+        (
+            _distance,
+            score,
+            queue_time_est,
+            _node_id,
+            host_type,
+            recovery_flight_time,
+            recovery_energy_j,
+        ) = scored_hosts[0]
         return {
             "score": float(score),
             "recovery_flight_time": float(recovery_flight_time),
+            "recovery_energy_j": float(recovery_energy_j),
             "queue_time_est": float(queue_time_est),
             "host_type": host_type,
         }
@@ -854,6 +971,93 @@ def _predicted_queue_time_est(node_state: Any) -> float:
     if int(node_state.available_slots) > 0:
         return 0.0
     return (int(node_state.queue_length) + 1) * float(node_state.swap_time)
+
+
+def _teacher_energy_ratio(
+    energy_j: float,
+    battery_max: float,
+    *,
+    debug_messages: list[str],
+    label: str,
+) -> float:
+    energy = float(energy_j)
+    battery = float(battery_max)
+    if not math.isfinite(battery) or battery <= 0.0:
+        debug_messages.append(
+            f"{label}: invalid battery_max={battery!r}; teacher energy ratio set to 0"
+        )
+        return 0.0
+    if not math.isfinite(energy):
+        debug_messages.append(
+            f"{label}: non-finite energy_j={energy!r}; teacher energy ratio set to 0"
+        )
+        return 0.0
+    if energy < 0.0:
+        debug_messages.append(
+            f"{label}: negative energy_j={energy!r}; teacher energy ratio set to 0"
+        )
+        return 0.0
+    ratio = energy / battery
+    if not math.isfinite(ratio):
+        debug_messages.append(
+            f"{label}: non-finite energy ratio={ratio!r}; teacher energy ratio set to 0"
+        )
+        return 0.0
+    return float(max(0.0, ratio))
+
+
+def _sum_teacher_energy_ratios(
+    *ratios: float,
+    debug_messages: list[str],
+    label: str,
+) -> float:
+    total = 0.0
+    for ratio in ratios:
+        value = float(ratio)
+        if not math.isfinite(value) or value < 0.0:
+            debug_messages.append(
+                f"{label}: invalid component ratio={value!r}; total ratio set to 0"
+            )
+            return 0.0
+        total += value
+    if not math.isfinite(total):
+        debug_messages.append(
+            f"{label}: non-finite total ratio={total!r}; total ratio set to 0"
+        )
+        return 0.0
+    return float(max(0.0, total))
+
+
+def _teacher_energy_saving_ratio(
+    has_mode_b: bool,
+    has_mode_c: bool,
+    mode_b_total_energy_ratio: float,
+    mode_c_total_energy_ratio: float,
+    *,
+    debug_messages: list[str],
+    label: str,
+) -> float:
+    if not has_mode_b or not has_mode_c:
+        return 0.0
+    b_total = float(mode_b_total_energy_ratio)
+    c_total = float(mode_c_total_energy_ratio)
+    if (
+        not math.isfinite(b_total)
+        or not math.isfinite(c_total)
+        or b_total < 0.0
+        or c_total < 0.0
+    ):
+        debug_messages.append(
+            f"{label}: invalid total ratios b={b_total!r}, c={c_total!r}; saving set to 0"
+        )
+        return 0.0
+    saving = b_total - c_total
+    if not math.isfinite(saving):
+        debug_messages.append(
+            f"{label}: non-finite saving ratio={saving!r}; saving set to 0"
+        )
+        return 0.0
+    return float(saving)
 
 
 def _new_counter(keys: tuple[str, ...]) -> dict[str, int]:
@@ -1016,6 +1220,12 @@ def _padding_order_feature() -> OrderFeatures:
         best_mode_c_truck_eta_remaining=0.0,
         best_mode_c_timeout_risk=0.0,
         is_valid=False,
+        delivery_energy_ratio=0.0,
+        best_mode_b_recovery_energy_ratio=0.0,
+        best_mode_c_recovery_energy_ratio=0.0,
+        best_mode_b_total_energy_ratio=0.0,
+        best_mode_c_total_energy_ratio=0.0,
+        mode_c_energy_saving_ratio=0.0,
         estimated_delivery_finish_slack_sec=0.0,
     )
 

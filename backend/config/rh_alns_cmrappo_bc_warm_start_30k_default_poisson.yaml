@@ -24,9 +24,11 @@ scene:
   region: shanghai_pudong
 
   # 固定离线训练/验证阶段的主输入来源，保证只看本配置即可定位场景数据。
+  # 本次复跑固定场景目录（default_scene）
   scene_bundle_dir: backend/test_data/default_scene
   scene_config_file: scene_config.json
   entities_file: entities.json
+  # benchmark 订单流固定使用该文件（由 scene.orders_file 提供给 benchmark replay）
   orders_file: orders_ppo_training_intensity.json
   osm_network_file: osm_network.geojson
   osm_network_format: geojson

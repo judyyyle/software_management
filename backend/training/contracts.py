@@ -557,6 +557,12 @@ class OrderFeatures:
     best_mode_c_truck_eta_remaining: float
     best_mode_c_timeout_risk: float
     is_valid: bool
+    delivery_energy_ratio: float = 0.0
+    best_mode_b_recovery_energy_ratio: float = 0.0
+    best_mode_c_recovery_energy_ratio: float = 0.0
+    best_mode_b_total_energy_ratio: float = 0.0
+    best_mode_c_total_energy_ratio: float = 0.0
+    mode_c_energy_saving_ratio: float = 0.0
     estimated_delivery_finish_slack_sec: float = 0.0
 
 
@@ -643,6 +649,22 @@ class ResolvedActionLookup:
 
 
 @dataclass(frozen=True)
+class CandidateTeacherEnergy:
+    """Teacher-only UAV energy estimates by candidate order slot.
+
+    These fields are deliberately kept out of CandidateFeatures so actor/critic
+    observation tensor dimensions remain unchanged.
+    """
+
+    delivery_energy_ratio: float = 0.0
+    best_mode_b_recovery_energy_ratio: float = 0.0
+    best_mode_c_recovery_energy_ratio: float = 0.0
+    best_mode_b_total_energy_ratio: float = 0.0
+    best_mode_c_total_energy_ratio: float = 0.0
+    mode_c_energy_saving_ratio: float = 0.0
+
+
+@dataclass(frozen=True)
 class CandidateOutput:
     candidate_features: CandidateFeatures
     root_branch_mask: tuple[bool, bool]
@@ -651,6 +673,9 @@ class CandidateOutput:
     mode_mask: tuple[tuple[bool, bool], ...]
     factorized_action_schema: FactorizedActionSchema
     resolved_action_lookup: ResolvedActionLookup
+    teacher_energy_by_order_idx: Mapping[int, CandidateTeacherEnergy] = field(
+        default_factory=dict
+    )
     diagnostics: Mapping[str, Any] = field(default_factory=dict)
 
 
@@ -861,6 +886,10 @@ class PolicyMeta:
     use_drone_source_type_flag: bool
     critic_mode: str
     inference_mode: str
+    uav_self_token_fields: tuple[str, ...] = ()
+    order_token_fields: tuple[str, ...] = ()
+    infra_token_fields: tuple[str, ...] = ()
+    history_token_fields: tuple[str, ...] = ()
     nhead: int | None = None
 
     def __post_init__(self) -> None:
@@ -937,6 +966,8 @@ class RewardMeta:
     rendezvous_arrive_bonus: float
     rendezvous_bonus: float
     mode_c_attempt_bonus: float
+    uav_energy_penalty_coef: float
+    uav_energy_penalty_cap_ratio: float
     max_overdue_sec: float
     hard_overdue_penalty_sec: float
     hard_failure_penalty_sec: float
@@ -1121,6 +1152,7 @@ __all__ = [
     "CandidateFeatures",
     "CandidateMeta",
     "CandidateOutput",
+    "CandidateTeacherEnergy",
     "CoarsePlanView",
     "CriticBatch",
     "CriticNormalizationMeta",

@@ -164,13 +164,34 @@ def load_policy_runtime_for_scene(
     因为在线前端场景需要与当前激活的 scene bundle 保持一致。
     """
 
+    started_at = time.perf_counter()
+    logger.info(
+        "[policy_runtime_load] 开始加载策略 runtime: scene_id=%s policy_path=%s config_path=%s device=%s",
+        scene_ctx.scene_id,
+        policy_path,
+        config_path,
+        device,
+    )
+    logger.info("[policy_runtime_load] 检查 torch 依赖...")
     _require_torch()
     cfg_path = Path(config_path)
+    logger.info("[policy_runtime_load] 读取 policy 配置...")
     policy_cfg = _load_policy_config(cfg_path)
+    logger.info(
+        "[policy_runtime_load] policy 配置读取完成: d_model=%d ff_dim=%d lstm_hidden=%d "
+        "lstm_layers=%d hist_len=%d",
+        policy_cfg.d_model,
+        policy_cfg.ff_dim,
+        policy_cfg.lstm_hidden,
+        policy_cfg.lstm_layers,
+        policy_cfg.hist_len,
+    )
+    logger.info("[policy_runtime_load] 初始化 observation tensorizer 和 critic builder...")
     tensorizer = ObservationTensorizer(scene_ctx=scene_ctx, config_path=cfg_path)
     critic_builder = CriticBatchBuilder(scene_ctx=scene_ctx, config_path=cfg_path)
     critic_schema = critic_builder.default_schema_meta
 
+    logger.info("[policy_runtime_load] 构建 bootstrap order source 和 env...")
     bootstrap_source = build_order_source(
         scene_ctx,
         mode=OrderSourceMode.POISSON,
@@ -182,14 +203,27 @@ def load_policy_runtime_for_scene(
         config_path=cfg_path,
         phase4_route_dir=phase4_route_dir,
     )
+    logger.info("[policy_runtime_load] reset bootstrap env...")
     bootstrap_result = bootstrap_env.reset()
     if bootstrap_result.decision_context is None:
         raise RuntimeError("bootstrap env 没有可用的 decision_context")
+    logger.info(
+        "[policy_runtime_load] bootstrap reset 完成: t_now=%.3f decision_drones=%d",
+        float(bootstrap_result.decision_context.t_now),
+        len(bootstrap_result.decision_context.drone_ids),
+    )
+    logger.info("[policy_runtime_load] 构建 bootstrap candidate output...")
     bootstrap_candidate = _build_candidate_output(
         env=bootstrap_env,
         decision_context=bootstrap_result.decision_context,
         last_seen_plan_version_by_drone={},
     )
+    logger.info(
+        "[policy_runtime_load] candidate output 完成: candidate_orders=%d order_mask_slots=%d",
+        len(bootstrap_candidate.candidate_features.order_features),
+        len(bootstrap_candidate.order_mask),
+    )
+    logger.info("[policy_runtime_load] 构建 bootstrap observation 和 critic tensor...")
     bootstrap_observation = tensorizer.build(
         decision_context=bootstrap_result.decision_context,
         candidate_out=bootstrap_candidate,
@@ -199,7 +233,19 @@ def load_policy_runtime_for_scene(
         decision_context=bootstrap_result.decision_context,
         critic_tensor_schema_meta=critic_schema,
     )
+    logger.info(
+        "[policy_runtime_load] bootstrap tensor 完成: uav_dim=%d order_dim=%d infra_dim=%d "
+        "history_dim=%d critic_order_dim=%d critic_uav_dim=%d critic_station_dim=%d",
+        int(bootstrap_observation.uav_self_token.shape[-1]),
+        int(bootstrap_observation.order_tokens.shape[-1]),
+        int(bootstrap_observation.infra_tokens.shape[-1]),
+        int(bootstrap_observation.history_tokens.shape[-1]),
+        int(bootstrap_critic.global_order_pool_tokens.shape[-1]),
+        int(bootstrap_critic.global_uav_tokens.shape[-1]),
+        int(bootstrap_critic.global_station_tokens.shape[-1]),
+    )
 
+    logger.info("[policy_runtime_load] 初始化 actor-critic 模型...")
     model = SharedPPOActorCritic(
         uav_feat_dim=int(bootstrap_observation.uav_self_token.shape[-1]),
         order_feat_dim=int(bootstrap_observation.order_tokens.shape[-1]),
@@ -216,16 +262,29 @@ def load_policy_runtime_for_scene(
         lstm_layers=policy_cfg.lstm_layers,
     )
 
+    logger.info("[policy_runtime_load] 解析推理设备并移动模型...")
     device_obj = _resolve_device(device)
     model.to(device_obj)
 
     resolved_policy_path = Path(policy_path).resolve()
+    logger.info("[policy_runtime_load] 读取 checkpoint: %s", resolved_policy_path)
     checkpoint = torch.load(resolved_policy_path, map_location=device_obj)
     state_dict = checkpoint.get("model_state_dict")
     if not isinstance(state_dict, dict):
         raise ValueError(f"policy checkpoint 缺少 model_state_dict: {resolved_policy_path}")
+    logger.info(
+        "[policy_runtime_load] checkpoint 读取完成: model_version=%s global_step=%s update=%s",
+        checkpoint.get("model_version"),
+        checkpoint.get("global_step"),
+        checkpoint.get("update"),
+    )
+    logger.info("[policy_runtime_load] 加载 model_state_dict...")
     model.load_state_dict(state_dict)
     model.eval()
+    logger.info(
+        "[policy_runtime_load] 策略 runtime 加载完成: elapsed=%.2fs",
+        time.perf_counter() - started_at,
+    )
 
     return LoadedPolicyRuntime(
         config_path=cfg_path,
@@ -514,13 +573,26 @@ class OnlinePolicyRuntimePlayer:
         activation: PolicyActivationConfig,
         scene_ctx: TrainingSceneContext,
     ) -> None:
+        started_at = time.perf_counter()
         self._activation = activation
         self._scene_ctx = scene_ctx
+        logger.info(
+            "[OnlinePolicyRuntimePlayer] 开始初始化: policy=%s scene_id=%s checkpoint=%s config=%s",
+            activation.policy_name,
+            scene_ctx.scene_id,
+            activation.policy_path,
+            activation.config_path,
+        )
         self._phase4_route_dir = Path(
             tempfile.mkdtemp(prefix="hivelogix_phase4_runtime_")
         ).resolve()
         try:
+            logger.info(
+                "[OnlinePolicyRuntimePlayer] 导出 Phase4 truck route: output_dir=%s",
+                self._phase4_route_dir,
+            )
             self._replan_phase4_locked()
+            logger.info("[OnlinePolicyRuntimePlayer] Phase4 truck route 导出完成")
             self._runtime = load_policy_runtime_for_scene(
                 scene_ctx=scene_ctx,
                 policy_path=activation.policy_path,
@@ -528,11 +600,17 @@ class OnlinePolicyRuntimePlayer:
                 device=activation.device,
                 phase4_route_dir=self._phase4_route_dir,
             )
+            logger.info("[OnlinePolicyRuntimePlayer] 已加载 policy runtime，初始化 telemetry bridge...")
             self._telemetry = TrainingTelemetryBridge(
                 policy_name=activation.policy_name,
                 checkpoint_path=str(self._runtime.policy_path),
             )
         except Exception:
+            logger.exception(
+                "[OnlinePolicyRuntimePlayer] 初始化失败，清理临时目录: output_dir=%s elapsed=%.2fs",
+                self._phase4_route_dir,
+                time.perf_counter() - started_at,
+            )
             shutil.rmtree(self._phase4_route_dir, ignore_errors=True)
             raise
 
@@ -552,7 +630,12 @@ class OnlinePolicyRuntimePlayer:
         self._last_seen_plan_version_by_drone: dict[str, int] = {}
         self._lstm_state_by_drone: dict[str, Any] = {}
         self._recurrent_segment_id_by_drone: dict[str, int] = {}
+        logger.info("[OnlinePolicyRuntimePlayer] reset 在线 runtime state...")
         self._reset_runtime_state_locked()
+        logger.info(
+            "[OnlinePolicyRuntimePlayer] 初始化完成: elapsed=%.2fs",
+            time.perf_counter() - started_at,
+        )
 
     @property
     def current_time(self) -> float:
@@ -1050,9 +1133,16 @@ class OnlinePolicyRuntimePlayer:
             return self._latest_decision_event_seq()
 
     def _reset_runtime_state_locked(self) -> None:
+        started_at = time.perf_counter()
+        logger.info(
+            "[OnlinePolicyRuntimePlayer] runtime state reset 开始: order_source_mode=%s seed=%s",
+            self._activation.order_source_mode.value,
+            self._activation.seed,
+        )
         overrides: dict[str, Any] = {}
         if self._activation.arrival_rate_per_min is not None:
             overrides["poisson_arrival_rate"] = float(self._activation.arrival_rate_per_min)
+        logger.info("[OnlinePolicyRuntimePlayer] 构建在线 order source...")
         order_source = build_order_source(
             self._scene_ctx,
             mode=self._activation.order_source_mode,
@@ -1060,13 +1150,22 @@ class OnlinePolicyRuntimePlayer:
             overrides=overrides,
             config_path=self._activation.config_path,
         )
+        logger.info("[OnlinePolicyRuntimePlayer] 创建在线 TrainingEnvAdapter...")
         self._env = TrainingEnvAdapter(
             scene_ctx=self._scene_ctx,
             order_source=order_source,
             config_path=self._activation.config_path,
             phase4_route_dir=self._phase4_route_dir,
         )
+        logger.info("[OnlinePolicyRuntimePlayer] reset 在线 TrainingEnvAdapter...")
         self._result = self._env.reset()
+        decision_context = getattr(self._result, "decision_context", None)
+        logger.info(
+            "[OnlinePolicyRuntimePlayer] 在线 env reset 完成: t_now=%.3f has_decision_context=%s done=%s",
+            float(getattr(getattr(self._result, "runtime_state", None), "t_now", 0.0)),
+            decision_context is not None,
+            bool(getattr(self._result, "done", False)),
+        )
         self._history_buffer = deque(maxlen=self._runtime.policy_cfg.hist_len)
         self._pending_transition = None
         self._decision_event_ledger = []
@@ -1074,12 +1173,22 @@ class OnlinePolicyRuntimePlayer:
         self._last_seen_plan_version_by_drone = {}
         self._lstm_state_by_drone = {}
         self._recurrent_segment_id_by_drone = {}
+        logger.info(
+            "[OnlinePolicyRuntimePlayer] runtime state reset 完成: elapsed=%.2fs",
+            time.perf_counter() - started_at,
+        )
 
     def _replan_phase4_locked(self) -> None:
+        started_at = time.perf_counter()
+        logger.info("[OnlinePolicyRuntimePlayer] Phase4 route export 调用开始")
         export_phase4_truck_route_for_scene(
             scene_ctx=self._scene_ctx,
             config_path=self._activation.config_path,
             output_dir=self._phase4_route_dir,
+        )
+        logger.info(
+            "[OnlinePolicyRuntimePlayer] Phase4 route export 调用完成: elapsed=%.2fs",
+            time.perf_counter() - started_at,
         )
 
     def _require_env_locked(self) -> TrainingEnvAdapter:
