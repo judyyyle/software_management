@@ -1,18 +1,18 @@
 # HiveLogix — RH-ALNS + CMRAPPO 离线训练/验证算法专属配置
 # =============================================================================
 # 适用范围：
-#   - scene-2 / scene_2_7x7（当前实际约 7.0km × 7.0km）
+#   - default_scene（约 4.0km × 4.0km）
 #   - 1 个 depot，10 个充换电站，1 辆卡车，12 架无人机
 #   - RH-ALNS 负责低频粗规划，CMRAPPO 负责高频局部决策
 #
 # 设计原则：
 #   1. 与共享物理参数解耦：物理/能耗/服务时长继续来自 drone_params.yaml
-#   2. 与当前真实资产对齐：默认值依据 scene-2 地图、10 站点、真实 benchmark 动态单强度设定
+#   2. 与当前真实资产对齐：默认值依据 4×4km 地图、10 站点、真实 benchmark 动态单强度设定
 #   3. 优先保证可复现：训练、benchmark、stochastic 的订单源与随机种子显式固定
 #   4. 优先保证语义稳定：动作空间、候选集预算、reward 口径在本文件中集中冻结
 #
 # 标定依据摘要（对应 docs/ppo算法方案/algorithm_scheme_parameter_adjustment_4km_10stations_poisson_modifying.md）：
-#   - 地图尺度：约 7028.8m × 6992.1m
+#   - 地图尺度：约 4011.5m × 4011.5m
 #   - 站点最近邻间距：均值约 949m
 #   - 订单到最近站点距离：均值约 500m
 #   - benchmark 动态订单强度：当前 orders.json 约 0.66~0.67 单/分钟
@@ -20,11 +20,11 @@
 # =============================================================================
 
 scene:
-  scene_id: scene_2_7x7
+  scene_id: default_test_4x4km
   region: shanghai_pudong
 
   # 固定离线训练/验证阶段的主输入来源，保证只看本配置即可定位场景数据。
-  scene_bundle_dir: backend/test_data/scene-2
+  scene_bundle_dir: backend/test_data/default_scene
   scene_config_file: scene_config.json
   entities_file: entities.json
   orders_file: orders_ppo_training_intensity.json
@@ -33,8 +33,8 @@ scene:
 
   # 运行时优先从 scene_config.json.bounds 派生地图尺寸；下面的数值用于校验和审计。
   derive_map_size_from_bbox: true
-  map_width_m_ref: 7028.8
-  map_height_m_ref: 6992.1
+  map_width_m_ref: 4011.5
+  map_height_m_ref: 4011.5
 
   # 资产规模基线，用于后续加载阶段做一致性断言。
   expected_depot_count: 1
@@ -42,7 +42,7 @@ scene:
   expected_truck_count: 1
   expected_drone_count: 12
 
-  # scene-2 当前实际约 7×7km / 10 站点；1.2km 支撑半径保留为局部候选视野，
+  # 4×4km / 10 站点下，1.2km 支撑半径可覆盖最近邻站点与主要订单簇，
   # 同时不会把大部分站点都放进同一个候选局部视野。
   default_support_radius_km: 1.2
 
@@ -392,7 +392,7 @@ training:
   log_interval_updates: 1
   save_interval_updates: 25
   # 诊断短跑阶段降低评估频率；若 selection key 优于历史最优，则覆盖保存 policy_best.pt。
-  eval_interval_updates: 10
+  eval_interval_updates: 0
   benchmark_eval_episodes: 1
   stochastic_eval_seeds: 1
   checkpoint_keep_last: 5
