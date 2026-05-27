@@ -393,7 +393,7 @@ training:
   log_interval_updates: 1
   save_interval_updates: 25
   # 诊断短跑阶段降低评估频率；若 selection key 优于历史最优，则覆盖保存 policy_best.pt。
-  eval_interval_updates: 10
+  eval_interval_updates: 0
   benchmark_eval_episodes: 3
   stochastic_eval_seeds: 5
   checkpoint_keep_last: 5
@@ -403,7 +403,7 @@ training:
   #   1. best checkpoint 以 stochastic_high / stochastic_medium 为主排序目标
   #   2. benchmark 仅作 guardrail：优先无 timeout 且 all_orders_cleared，不参与 patience
   #   3. 当 stochastic_high 长时间无提升，且 value_loss 未出现新低时提前停训
-  early_stop_enabled: true
+  early_stop_enabled: false
   early_stop_min_evals: 8
   early_stop_stochastic_high_patience: 15
   early_stop_value_loss_window: 5

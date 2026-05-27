@@ -329,7 +329,7 @@ training:
   mixed_precision: false
 
   # PPO 核心超参数。
-  total_timesteps: 20000
+  total_timesteps: 30000
   # Run16: 小幅回升学习率，补偿更大 Huber delta 下 critic 梯度绝对值下降。
   ppo_learning_rate: 0.0001
   rollout_steps: 512
@@ -372,8 +372,8 @@ training:
 
   # BC warm start 默认关闭。开启后用同刻 batch teacher 生成监督标签，
   # 并通过 apply_decision_batch() 沿 teacher 轨迹采样后续 decision batch。
-  bc_warm_start_enabled: true
-  bc_warm_start_updates: 30
+  bc_warm_start_enabled: false
+  bc_warm_start_updates: 0
   bc_warm_start_batches_per_update: 2
   # 正式 10k 验证先限制每条 teacher rollout 的采样长度，避免 BC 成本远大于 PPO 本体。
   bc_warm_start_max_decision_batches_per_rollout: 128
