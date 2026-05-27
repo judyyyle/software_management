@@ -903,13 +903,14 @@ def sim_policy_activate():
         )
         logger.info(
             "[sim_policy_activate] 基础场景解析完成: scene_id=%s depots=%d stations=%d "
-            "trucks=%d drones=%d orders=%d",
+            "trucks=%d drones=%d static_orders=%d dynamic_orders=%d",
             base_scene_ctx.scene_id,
             len(base_scene_ctx.depots),
             len(base_scene_ctx.stations),
             len(base_scene_ctx.trucks),
             len(base_scene_ctx.drones),
-            len(base_scene_ctx.orders),
+            len(base_scene_ctx.static_orders),
+            len(base_scene_ctx.dynamic_orders),
         )
 
         use_current_init_payload = bool(body.get("use_current_init_payload", True))
