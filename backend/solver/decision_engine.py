@@ -1821,6 +1821,7 @@ class DispatchDecisionEngine:
                 order_mgr=self.order_mgr,
                 plan=plan,
                 current_time=current_time,
+                build_uav_polyline=self._build_uav_polyline,
             )
             return
 
@@ -2049,6 +2050,7 @@ class DispatchDecisionEngine:
                 entity_mgr=self.entity_mgr,
                 order_mgr=self.order_mgr,
                 plan=plan,
+                build_uav_polyline=self._build_uav_polyline,
             )
             return
 

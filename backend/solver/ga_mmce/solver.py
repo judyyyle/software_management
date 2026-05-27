@@ -89,6 +89,12 @@ class GAMMCESolver:
         """
         self._reuse_static_plan_cache_override = None if enabled is None else bool(enabled)
 
+    def set_path_planner(self, planner: Any) -> None:
+        """Forward the shared UAV obstacle-avoidance planner to GA helper solvers."""
+        for helper in (self.greedy_helper, self.dynamic_greedy_helper):
+            if hasattr(helper, "set_path_planner"):
+                helper.set_path_planner(planner)
+
     def dispatch(
         self,
         pending_orders: dict[str, Any],
@@ -689,6 +695,8 @@ class GAMMCESolver:
 
         try:
             self.greedy_helper._road_distance_memo.clear()
+            self.greedy_helper._uav_path_distance_memo.clear()
+            self.greedy_helper._activate_path_planner(getattr(state, "scene_id", None))
             self.greedy_helper._load_road_graph(bbox, getattr(state, "scene_id", None))
         except Exception as exc:
             logger.warning("[GA-MMCE] OSM 路网预加载失败，Decoder 将 fallback 到直接距离: %s", exc)
@@ -830,6 +838,7 @@ class GAMMCESolver:
         if self.last_best_decode_result is None:
             self.last_best_decode_result = SimpleNamespace(plan=plan)
 
+        self._refresh_cached_plan_drone_routes(plan, state)
         self._actual_generations = 0
         self._annotate_plan(plan, context, started, dispatch_type)
         plan.summary["static_cache_reused"] = True
@@ -848,6 +857,47 @@ class GAMMCESolver:
         logger.info("[GA-MMCE] 复用静态计划缓存: %s", path)
         self._debug_run_end(plan, cached_best, context, started)
         return plan
+
+    def _refresh_cached_plan_drone_routes(self, plan: DispatchPlan, state: Any) -> None:
+        """Refresh cached drone route geometry with the current UAV obstacle planner."""
+        routes = getattr(plan, "drone_routes", None)
+        if not routes:
+            return
+
+        try:
+            self.greedy_helper._activate_path_planner(getattr(state, "scene_id", None))
+        except Exception as exc:
+            self._debug_write(f"static_plan_cache drone_route_refresh skipped reason=planner_activate_failed error={exc}")
+            return
+
+        planner = getattr(self.greedy_helper, "_path_planner", None)
+        if planner is None:
+            self._debug_write("static_plan_cache drone_route_refresh skipped reason=no_path_planner")
+            return
+
+        altitude = float(getattr(self.greedy_helper, "UAV_CRUISE_ALTITUDE_M", 80.0) or 80.0)
+        refreshed = 0
+        for route in routes.values():
+            path = list(getattr(route, "path", []) or [])
+            launch_loc = getattr(route, "launch_loc", None) or (path[0] if path else None)
+            delivery_loc = getattr(route, "delivery_loc", None) or (path[1] if len(path) > 1 else None)
+            recovery_loc = getattr(route, "recovery_loc", None) or (path[-1] if path else None)
+            if launch_loc is None or delivery_loc is None or recovery_loc is None:
+                continue
+
+            outbound = list(planner.plan(launch_loc, delivery_loc, altitude) or [])
+            inbound = list(planner.plan(delivery_loc, recovery_loc, altitude) or [])
+            if not outbound:
+                outbound = [launch_loc, delivery_loc]
+            if not inbound:
+                inbound = [delivery_loc, recovery_loc]
+            route.path = outbound + inbound[1:]
+            route.launch_loc = launch_loc
+            route.delivery_loc = delivery_loc
+            route.recovery_loc = recovery_loc
+            refreshed += 1
+
+        self._debug_write(f"static_plan_cache drone_route_refresh refreshed={refreshed}")
 
     def _save_static_plan_cache(
         self,
@@ -957,9 +1007,7 @@ class GAMMCESolver:
         return reasons
 
     def _allow_explicit_static_plan_cache_reuse(self, mismatch: list[str]) -> bool:
-        if self._reuse_static_plan_cache_override is not True:
-            return False
-        return set(mismatch) <= {"scene_id"}
+        return self._reuse_static_plan_cache_override is True
 
     def _host_signature(self, hosts: dict[str, Any], host_ids: list[str]) -> tuple[tuple[str, tuple[float, float, float]], ...]:
         rows = []

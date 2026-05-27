@@ -390,6 +390,7 @@ class SimulationEngine:
             "entities": entities,
             "orders": orders,
             "stats":    stats,
+            "paths": self._build_runtime_path_snapshot(),
         }
 
     def build_full_snapshot(self) -> dict:
@@ -425,5 +426,170 @@ class SimulationEngine:
                 "sim_start_wall_ms": self.sim_start_wall_ms,
                 "entities":          entities,
                 "stats":             stats,
+                "paths":             self._build_runtime_path_snapshot(),
             },
         }
+
+    def _build_runtime_path_snapshot(self) -> dict[str, list[dict]]:
+        if self._entity_mgr is None:
+            return {"trucks": [], "drones": []}
+
+        return {
+            "trucks": self._build_active_truck_paths(),
+            "drones": self._build_active_drone_paths(),
+        }
+
+    @staticmethod
+    def _frontend_path(points: list) -> list[list[float]]:
+        coords: list[list[float]] = []
+        for point in points:
+            if point is None:
+                continue
+            lon, lat = point.to_wgs84()
+            coords.append([round(lon, 6), round(lat, 6)])
+        return coords
+
+    def _build_active_truck_paths(self) -> list[dict]:
+        paths: list[dict] = []
+        for truck in self._entity_mgr.trucks.values():
+            route_data = list(getattr(truck, "_route_data", []) or [])
+            if not getattr(getattr(truck, "status", None), "is_mobile", False) or len(route_data) < 2:
+                continue
+
+            elapsed = max(0.0, self.current_time - float(getattr(truck, "_departure_time", 0.0) or 0.0))
+            dist_traveled = elapsed * float(getattr(truck, "speed", 0.0) or 0.0)
+            next_node = None
+            for node in route_data:
+                if float(getattr(node, "cumulative_dist", 0.0) or 0.0) > dist_traveled + 1e-6:
+                    next_node = node
+                    break
+            if next_node is None:
+                continue
+
+            current = truck.get_location(self.current_time)
+            target = next_node.position
+            paths.append(
+                {
+                    "entity_id": truck.truck_id,
+                    "status": "active",
+                    "motion_mode": "truck_current_leg",
+                    "distance_m": round(current.distance_2d(target), 2),
+                    "path": self._frontend_path([current, target]),
+                }
+            )
+        return paths
+
+    def _build_active_drone_paths(self) -> list[dict]:
+        paths: list[dict] = []
+        for drone in self._entity_mgr.drones.values():
+            if not getattr(getattr(drone, "status", None), "is_flying", False):
+                continue
+            route_plan = list(getattr(drone, "route_plan", []) or [])
+            idx = int(getattr(drone, "current_waypoint_index", 0) or 0)
+            if idx >= len(route_plan):
+                continue
+
+            start_idx, target_idx = self._active_drone_display_slice(drone, route_plan, idx)
+            waypoint = route_plan[target_idx]
+            action = getattr(waypoint, "action", None)
+            action_name = getattr(action, "value", action)
+            segment_points = [wp.loc for wp in route_plan[start_idx:target_idx + 1]]
+            paths.append(
+                {
+                    "entity_id": drone.drone_id,
+                    "status": "active",
+                    "motion_mode": "drone_current_leg",
+                    "target_node_id": getattr(waypoint, "target_entity_id", None),
+                    "target_node_type": str(action_name or ""),
+                    "order_id": getattr(drone, "carrying_order_id", None)
+                    or getattr(drone, "pending_release_order_id", None)
+                    or getattr(waypoint, "target_entity_id", None),
+                    "distance_m": round(self._polyline_distance_2d(segment_points), 2),
+                    "path": self._frontend_path(segment_points),
+                }
+            )
+        return paths
+
+    def _active_drone_display_slice(self, drone, route_plan: list, start_idx: int) -> tuple[int, int]:
+        ga_slice = self._active_ga_drone_display_slice(drone, route_plan, start_idx)
+        if ga_slice is not None:
+            return ga_slice
+
+        target_idx = self._active_drone_target_waypoint_index(drone, route_plan, start_idx)
+        action = getattr(route_plan[target_idx], "action", None)
+        action_name = str(getattr(action, "value", action) or "")
+
+        if action_name == "DELIVER":
+            segment_start = 0
+            for idx in range(target_idx - 1, -1, -1):
+                prev_action = getattr(route_plan[idx], "action", None)
+                prev_name = str(getattr(prev_action, "value", prev_action) or "")
+                if prev_name in {"DELIVER", "DOCK_DEPOT", "DOCK_TRUCK", "SWAP_BATTERY"}:
+                    segment_start = idx + 1
+                    break
+            return max(0, segment_start), target_idx
+
+        if action_name in {"DOCK_DEPOT", "DOCK_TRUCK", "SWAP_BATTERY"}:
+            segment_start = start_idx
+            for idx in range(min(start_idx, target_idx), -1, -1):
+                prev_action = getattr(route_plan[idx], "action", None)
+                prev_name = str(getattr(prev_action, "value", prev_action) or "")
+                if prev_name == "DELIVER":
+                    segment_start = idx
+                    break
+            return max(0, segment_start), target_idx
+
+        return max(0, start_idx), target_idx
+
+    def _active_ga_drone_display_slice(self, drone, route_plan: list, start_idx: int) -> tuple[int, int] | None:
+        segments = list(getattr(drone, "_ga_runtime_segments", []) or [])
+        if not segments:
+            return None
+
+        current_segment = None
+        for segment in segments:
+            seg_start = int(getattr(segment, "start_idx", 0) or 0)
+            seg_end = int(getattr(segment, "dock_idx", seg_start) or seg_start)
+            if seg_start <= start_idx <= seg_end:
+                current_segment = segment
+                break
+        if current_segment is None:
+            current_segment = segments[-1]
+
+        seg_start = int(getattr(current_segment, "start_idx", 0) or 0)
+        deliver_idx = int(getattr(current_segment, "deliver_idx", seg_start) or seg_start)
+        dock_idx = int(getattr(current_segment, "dock_idx", deliver_idx) or deliver_idx)
+        status = str(getattr(getattr(drone, "status", None), "value", getattr(drone, "status", "")) or "")
+        if status in {"FLYING_TO_STATION", "FLYING_TO_TRUCK", "RETURNING_TO_DEPOT"} or start_idx > deliver_idx:
+            return max(0, deliver_idx), min(len(route_plan) - 1, dock_idx)
+        return max(0, seg_start), min(len(route_plan) - 1, deliver_idx)
+
+    @staticmethod
+    def _polyline_distance_2d(points: list) -> float:
+        if len(points) < 2:
+            return 0.0
+        return sum(points[idx - 1].distance_2d(points[idx]) for idx in range(1, len(points)))
+
+    @staticmethod
+    def _active_drone_target_waypoint_index(drone, route_plan: list, start_idx: int) -> int:
+        status = getattr(getattr(drone, "status", None), "value", getattr(drone, "status", ""))
+        remaining = range(start_idx, len(route_plan))
+
+        def action_name_at(index: int) -> str:
+            action = getattr(route_plan[index], "action", None)
+            return str(getattr(action, "value", action) or "")
+
+        if status == "FLYING_TO_DELIVER" or getattr(drone, "carrying_order_id", None):
+            for idx in remaining:
+                if action_name_at(idx) == "DELIVER":
+                    return idx
+
+        if status in {"FLYING_TO_STATION", "FLYING_TO_TRUCK", "RETURNING_TO_DEPOT"}:
+            for idx in remaining:
+                if action_name_at(idx) in {"DOCK_DEPOT", "DOCK_TRUCK", "SWAP_BATTERY"}:
+                    return idx
+
+        for idx in remaining:
+            if action_name_at(idx) in {"DELIVER", "DOCK_DEPOT", "DOCK_TRUCK", "SWAP_BATTERY"}:
+                return idx
+        return start_idx
