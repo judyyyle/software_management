@@ -320,8 +320,12 @@ def print_summary(summary: Mapping[str, Any]) -> None:
         "sum_timeout_order_count",
         "sum_unserved_primary_order_count",
         "sum_fallback_count",
+        "sum_hard_failure_count",
         "sum_mode_c_selected_count",
         "sum_mode_c_success_count",
+        "sum_episode_uav_energy_reward_penalty",
+        "sum_episode_uav_energy_ratio_sum",
+        "sum_episode_uav_energy_penalty_events",
         "script_selected_C_given_legal_C",
         "episode_metrics_path",
     ]

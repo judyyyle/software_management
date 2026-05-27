@@ -307,6 +307,8 @@ reward:
   rendezvous_arrive_bonus: 8.0
   rendezvous_bonus: 20.0
   mode_c_attempt_bonus: 5.0
+  uav_energy_penalty_coef: 35.0
+  uav_energy_penalty_cap_ratio: 0.75
 
   # severe overdue 只作为指标阈值；不移除订单、不标记 TIMEOUT、不扣 reward。
   max_overdue_sec: 600

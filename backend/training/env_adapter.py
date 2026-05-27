@@ -420,6 +420,8 @@ class _YamlConfig:
     late_delivery_penalty_cap: float
     min_late_delivery_reward: float
     mode_c_attempt_bonus: float
+    uav_energy_penalty_coef: float
+    uav_energy_penalty_cap_ratio: float
     max_overdue_sec: float
     hard_overdue_penalty_sec: float
     hard_failure_penalty_sec: float
@@ -598,6 +600,9 @@ class TrainingEnvAdapter:
         self._episode_hard_overdue_order_ids: set[str] = set()
         self._episode_lateness_discount_total = 0.0
         self._episode_reservation_timeout_cost_sec = 0.0
+        self._episode_uav_energy_reward_penalty = 0.0
+        self._episode_uav_energy_ratio_sum = 0.0
+        self._episode_uav_energy_penalty_events = 0
         self._runtime_uav_completed_distance_m = 0.0
         self._runtime_uav_completed_energy_j = 0.0
         self._planner_bridge = (
@@ -746,6 +751,9 @@ class TrainingEnvAdapter:
         self._episode_hard_overdue_order_ids = set()
         self._episode_lateness_discount_total = 0.0
         self._episode_reservation_timeout_cost_sec = 0.0
+        self._episode_uav_energy_reward_penalty = 0.0
+        self._episode_uav_energy_ratio_sum = 0.0
+        self._episode_uav_energy_penalty_events = 0
         self._runtime_uav_completed_distance_m = 0.0
         self._runtime_uav_completed_energy_j = 0.0
 
@@ -1461,6 +1469,15 @@ class TrainingEnvAdapter:
             "t_reservation_timeout_cost_sec": float(
                 self._episode_reservation_timeout_cost_sec
             ),
+            "episode_uav_energy_reward_penalty": float(
+                self._episode_uav_energy_reward_penalty
+            ),
+            "episode_uav_energy_ratio_sum": float(
+                self._episode_uav_energy_ratio_sum
+            ),
+            "episode_uav_energy_penalty_events": int(
+                self._episode_uav_energy_penalty_events
+            ),
             "pending_primary_order_count": int(pending_primary_order_count),
             "assigned_primary_order_count": int(assigned_primary_order_count),
             "system_context_stats": self.build_system_context_stats(),
@@ -1775,6 +1792,42 @@ class TrainingEnvAdapter:
         ratio = max(0.0, min(1.0, float(progress_ratio)))
         self._runtime_uav_completed_distance_m += max(0.0, float(leg.distance_m)) * ratio
         self._runtime_uav_completed_energy_j += max(0.0, float(leg.energy_cost_j)) * ratio
+
+    def _settle_uav_leg_energy_penalty(
+        self,
+        *,
+        drone_id: str,
+        leg: FlightLeg,
+        progress_ratio: float = 1.0,
+    ) -> dict[str, float]:
+        ratio = max(0.0, min(1.0, float(progress_ratio)))
+        leg_energy_j = max(0.0, float(leg.energy_cost_j)) * ratio
+        drone = self._require_entity_manager().drones[drone_id]
+        battery_max = float(getattr(drone, "battery_max", 0.0))
+        if battery_max <= _TIME_EPS or not math.isfinite(battery_max):
+            return {}
+        energy_ratio = leg_energy_j / battery_max
+        if not math.isfinite(energy_ratio) or energy_ratio <= _TIME_EPS:
+            return {}
+
+        cap_ratio = max(0.0, float(self._cfg.uav_energy_penalty_cap_ratio))
+        coef = max(0.0, float(self._cfg.uav_energy_penalty_coef))
+        clamped_ratio = min(max(0.0, energy_ratio), cap_ratio)
+        penalty = -coef * clamped_ratio
+        if not math.isfinite(penalty):
+            return {}
+
+        self._agent_cost_accum[drone_id] = (
+            self._agent_cost_accum.get(drone_id, 0.0) + penalty
+        )
+        self._episode_uav_energy_reward_penalty += penalty
+        self._episode_uav_energy_ratio_sum += energy_ratio
+        self._episode_uav_energy_penalty_events += 1
+        return {
+            "uav_energy_penalty": float(penalty),
+            "uav_energy_ratio_sum": float(energy_ratio),
+            "uav_energy_penalty_events": 1.0,
+        }
 
     def _flight_leg_position_at(self, *, leg: FlightLeg, t_now: float) -> Position3D:
         geometry = self._flight_leg_geometry(leg)
@@ -3635,17 +3688,20 @@ class TrainingEnvAdapter:
         delivery_reward = 0.0
         lateness_discount = 0.0
         mode_c_selection_reward = 0.0
+        uav_energy_reward = 0.0
         hard_failure_reward = 0.0
         reservation_timeout_hard_failure_reward = 0.0
 
         # 1. 硬失败事件：半空停电会在到达事件之前截断当前飞行段。
         for drone_id, leg, failure_time in hard_failure_ready:
-            penalty = self._process_airborne_failure_event(
+            penalty, energy_breakdown = self._process_airborne_failure_event(
                 drone_id,
                 leg=leg,
                 failure_time=failure_time,
             )
             hard_failure_reward += penalty
+            uav_energy_reward += float(energy_breakdown.get("uav_energy_penalty", 0.0))
+            _merge_reward_breakdown(reward_breakdown, energy_breakdown)
             # 归因给失败的无人机
             self._agent_cost_accum[drone_id] = (
                 self._agent_cost_accum.get(drone_id, 0.0) + penalty
@@ -3653,12 +3709,14 @@ class TrainingEnvAdapter:
 
         # 2. UAV 订单送达 / mode A 背景完成（只记系统上下文统计，不进 PPO reward）
         for drone_id, leg in delivery_ready:
-            delivery_bonus, delivery_lateness_discount, service_bonus = (
+            delivery_bonus, delivery_lateness_discount, service_bonus, energy_breakdown = (
                 self._process_delivery_event(drone_id, leg)
             )
             delivery_reward += delivery_bonus
             lateness_discount += delivery_lateness_discount
             mode_c_selection_reward += service_bonus
+            uav_energy_reward += float(energy_breakdown.get("uav_energy_penalty", 0.0))
+            _merge_reward_breakdown(reward_breakdown, energy_breakdown)
             # 送达奖励归因给完成送达的无人机
             self._agent_cost_accum[drone_id] = (
                 self._agent_cost_accum.get(drone_id, 0.0)
@@ -3705,6 +3763,7 @@ class TrainingEnvAdapter:
             + lateness_discount
             + hard_failure_reward
             + mode_c_selection_reward
+            + uav_energy_reward
         )
         if delivery_reward:
             reward_breakdown["delivery_bonus"] = delivery_reward
@@ -3729,7 +3788,13 @@ class TrainingEnvAdapter:
         newly_idle_from_host: list[str] = []
         mode_b_depot_return_ready: list[str] = []
         for drone_id, leg in non_delivery_ready:
-            self._process_non_delivery_arrival(drone_id, leg)
+            energy_breakdown = self._process_non_delivery_arrival(drone_id, leg)
+            non_delivery_energy_reward = float(
+                energy_breakdown.get("uav_energy_penalty", 0.0)
+            )
+            uav_energy_reward += non_delivery_energy_reward
+            event_reward += non_delivery_energy_reward
+            _merge_reward_breakdown(reward_breakdown, energy_breakdown)
 
         self._process_truck_charge_host(t_next)
 
@@ -3877,7 +3942,11 @@ class TrainingEnvAdapter:
             }
         )
 
-    def _process_delivery_event(self, drone_id: str, leg: FlightLeg) -> tuple[float, float, float]:
+    def _process_delivery_event(
+        self,
+        drone_id: str,
+        leg: FlightLeg,
+    ) -> tuple[float, float, float, dict[str, float]]:
         """处理一次到达客户点事件；真实完成与奖励在 delivery service 结束时结算。"""
         entity_mgr = self._require_entity_manager()
         order_mgr = self._require_order_manager()
@@ -3886,6 +3955,10 @@ class TrainingEnvAdapter:
 
         drone.current_loc = _clone_position(leg.target_pos)
         self._record_uav_leg_energy(leg=leg)
+        energy_breakdown = self._settle_uav_leg_energy_penalty(
+            drone_id=drone_id,
+            leg=leg,
+        )
         drone.battery_current = max(0.0, drone.battery_current - leg.energy_cost_j)
         released_order_id = drone.release_order()
         if released_order_id != commit.order_id:
@@ -3907,7 +3980,7 @@ class TrainingEnvAdapter:
                     service_pos=_clone_position(leg.target_pos),
                 ),
             )
-            return delivery_bonus, lateness_discount, service_bonus
+            return delivery_bonus, lateness_discount, service_bonus, energy_breakdown
 
         self._delivery_service_legs[drone_id] = DeliveryServiceLeg(
             order_id=commit.order_id,
@@ -3916,7 +3989,7 @@ class TrainingEnvAdapter:
             service_pos=_clone_position(leg.target_pos),
         )
 
-        return 0.0, 0.0, 0.0
+        return 0.0, 0.0, 0.0, energy_breakdown
 
     def _process_delivery_service_event(
         self,
@@ -4074,12 +4147,20 @@ class TrainingEnvAdapter:
         self._episode_lateness_discount_total += discount
         return gross_reward, -discount
 
-    def _process_non_delivery_arrival(self, drone_id: str, leg: FlightLeg) -> None:
+    def _process_non_delivery_arrival(
+        self,
+        drone_id: str,
+        leg: FlightLeg,
+    ) -> dict[str, float]:
         """处理除送达以外的飞行到达事件。"""
         entity_mgr = self._require_entity_manager()
         drone = entity_mgr.drones[drone_id]
         drone.current_loc = _clone_position(leg.target_pos)
         self._record_uav_leg_energy(leg=leg)
+        energy_breakdown = self._settle_uav_leg_energy_penalty(
+            drone_id=drone_id,
+            leg=leg,
+        )
         drone.battery_current = max(0.0, drone.battery_current - leg.energy_cost_j)
         self._flight_legs.pop(drone_id, None)
 
@@ -4101,27 +4182,27 @@ class TrainingEnvAdapter:
                     cause=FALLBACK_CAUSE_ENERGY_OR_NODE_INVALID,
                 ):
                     self._mark_hard_failure(drone_id)
-                return
+                return energy_breakdown
             self._drone_state[drone_id] = TrainingDroneState.WAITING_FOR_TRUCK
             self._rendezvous_wait_started_at[drone_id] = float(leg.arrival_time)
-            return
+            return energy_breakdown
 
         if leg.kind == "mode_b_return_to_depot":
             self._mode_b_pending_depot_return.pop(drone_id, None)
             self._dispatch_commit.pop(drone_id, None)
             self._drone_state[drone_id] = TrainingDroneState.IDLE
-            return
+            return energy_breakdown
 
         host = self._resolve_host(leg.target_node_id, leg.target_node_type)
         if leg.kind == "fallback_recovery":
             # fallback 到达后直接进入统一 charging host 入口，不再转成 return_to_station/depot 二次飞行。
             self._fallback_leg.pop(drone_id, None)
             self._on_arrive_charging_host(drone_id, host, leg.arrival_time)
-            return
+            return energy_breakdown
 
         if leg.kind in {"return_to_station", "return_to_depot"}:
             self._on_arrive_charging_host(drone_id, host, leg.arrival_time)
-            return
+            return energy_breakdown
 
         raise RuntimeError(f"未知飞行段类型: {leg.kind}")
 
@@ -4153,18 +4234,24 @@ class TrainingEnvAdapter:
         *,
         leg: FlightLeg,
         failure_time: float,
-    ) -> float:
+    ) -> tuple[float, dict[str, float]]:
         """处理一次真实的空中电量耗尽事件。"""
         drone = self._require_entity_manager().drones[drone_id]
+        progress_ratio = self._flight_leg_progress_ratio(
+            leg=leg,
+            t_now=float(failure_time),
+        )
         self._record_uav_leg_energy(
             leg=leg,
-            progress_ratio=self._flight_leg_progress_ratio(
-                leg=leg,
-                t_now=float(failure_time),
-            ),
+            progress_ratio=progress_ratio,
+        )
+        energy_breakdown = self._settle_uav_leg_energy_penalty(
+            drone_id=drone_id,
+            leg=leg,
+            progress_ratio=progress_ratio,
         )
         drone.battery_current = 0.0
-        return self._mark_hard_failure(drone_id)
+        return self._mark_hard_failure(drone_id), energy_breakdown
 
     # ---------------------------------------------------------------------
     # Scheduling helpers
@@ -6614,6 +6701,12 @@ def _load_env_yaml(config_path: Path) -> _YamlConfig:
             reward.get("min_late_delivery_reward", 1.0)
         ),
         mode_c_attempt_bonus=float(reward.get("mode_c_attempt_bonus", 0.0)),
+        uav_energy_penalty_coef=float(
+            reward.get("uav_energy_penalty_coef", 0.0)
+        ),
+        uav_energy_penalty_cap_ratio=float(
+            reward.get("uav_energy_penalty_cap_ratio", 0.0)
+        ),
         max_overdue_sec=float(reward["max_overdue_sec"]),
         hard_overdue_penalty_sec=float(reward.get("hard_overdue_penalty_sec", 0.0)),
         hard_failure_penalty_sec=float(reward["hard_failure_penalty_sec"]),
@@ -6633,6 +6726,10 @@ def _load_env_yaml(config_path: Path) -> _YamlConfig:
         raise ValueError("reward.min_late_delivery_reward 不能为负数")
     if cfg.min_late_delivery_reward > cfg.R_delivery_bonus:
         raise ValueError("reward.min_late_delivery_reward 不能大于 R_delivery_bonus")
+    if cfg.uav_energy_penalty_coef < 0.0:
+        raise ValueError("reward.uav_energy_penalty_coef 不能为负数")
+    if cfg.uav_energy_penalty_cap_ratio < 0.0:
+        raise ValueError("reward.uav_energy_penalty_cap_ratio 不能为负数")
     return cfg
 
 

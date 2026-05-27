@@ -29,6 +29,7 @@ _DEADLINE_CRITICAL_WINDOW_SEC = 300.0
 _DEADLINE_WARNING_WEIGHT = 1.0
 _DEADLINE_CRITICAL_WEIGHT = 4.0
 _DEADLINE_LATE_WEIGHT = 10.0
+_TEACHER_ENERGY_COST_SEC_PER_BATTERY = 240.0
 
 
 DispatchCostFn = Callable[[Any, CandidateOutput, DispatchAction, int, int], float]
@@ -260,11 +261,13 @@ def _default_dispatch_cost(
     mode = str(action.mode)
     if mode == "B":
         recovery_cost = float(order_feature.best_mode_b_recovery_flight_time)
-        return float(
+        energy_cost = _teacher_energy_cost(candidate_out, order_idx, mode)
+        return _finite_or_inf(
             delivery_flight_time
             + service_time
             + recovery_cost
             + deadline_risk_penalty
+            + energy_cost
         )
     if mode == "C":
         recovery_cost = (
@@ -272,11 +275,13 @@ def _default_dispatch_cost(
             + _MODE_C_WAIT_COST_WEIGHT
             * float(order_feature.best_mode_c_wait_time)
         )
-        return float(
+        energy_cost = _teacher_energy_cost(candidate_out, order_idx, mode)
+        return _finite_or_inf(
             delivery_flight_time
             + service_time
             + recovery_cost
             + deadline_risk_penalty
+            + energy_cost
         )
     raise ValueError(f"未知 dispatch mode: {action.mode}")
 
@@ -328,6 +333,30 @@ def _deadline_risk_penalty(*, slack_sec: float) -> float:
         - critical_bonus_cap
         + _DEADLINE_LATE_WEIGHT * (-slack)
     )
+
+
+def _teacher_energy_cost(
+    candidate_out: CandidateOutput,
+    order_idx: int,
+    mode: str,
+) -> float:
+    energy = candidate_out.teacher_energy_by_order_idx.get(int(order_idx))
+    if energy is None:
+        return 0.0
+    if mode == "B":
+        ratio = float(energy.best_mode_b_total_energy_ratio)
+    elif mode == "C":
+        ratio = float(energy.best_mode_c_total_energy_ratio)
+    else:
+        raise ValueError(f"未知 dispatch mode: {mode}")
+    if not math.isfinite(ratio) or ratio < 0.0:
+        return 0.0
+    return float(_TEACHER_ENERGY_COST_SEC_PER_BATTERY * ratio)
+
+
+def _finite_or_inf(value: float) -> float:
+    result = float(value)
+    return result if math.isfinite(result) else math.inf
 
 
 def _default_wait_cost(
