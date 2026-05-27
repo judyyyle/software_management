@@ -207,10 +207,11 @@ def load_policy_runtime_for_scene(
     bootstrap_result = bootstrap_env.reset()
     if bootstrap_result.decision_context is None:
         raise RuntimeError("bootstrap env 没有可用的 decision_context")
+    bootstrap_decision = bootstrap_result.decision_context
     logger.info(
-        "[policy_runtime_load] bootstrap reset 完成: t_now=%.3f decision_drones=%d",
-        float(bootstrap_result.decision_context.t_now),
-        len(bootstrap_result.decision_context.drone_ids),
+        "[policy_runtime_load] bootstrap reset 完成: t_now=%.3f decision_drone=%s",
+        float(bootstrap_result.runtime_state.t_now),
+        bootstrap_decision.deciding_drone_id,
     )
     logger.info("[policy_runtime_load] 构建 bootstrap candidate output...")
     bootstrap_candidate = _build_candidate_output(

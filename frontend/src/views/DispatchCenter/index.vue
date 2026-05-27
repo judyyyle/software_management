@@ -466,6 +466,8 @@ const dispatchLoading = ref(false)
 const lastDispatchResult = ref<any>(null)
 const dispatchPlan = ref<DispatchPlan | null>(null)
 const totalEnergyCostWh = ref(0)
+// 本地 UI 游标：避免把同一条 PPO 决策事件重复写入 DynamicFlowPanel。
+const lastRenderedDecisionEventSeq = ref(0)
 type DispatchSolverName = 'greedy' | 'greedy_mmce' | 'greedy_mmce_bi' | 'ga_mmce' | 'market'
 const dispatchSolver = ref<DispatchSolverName>('greedy')
 const reuseGaStaticPlan = ref(false)
