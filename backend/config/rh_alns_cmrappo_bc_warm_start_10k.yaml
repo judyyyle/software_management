@@ -398,7 +398,7 @@ training:
   log_interval_updates: 1
   save_interval_updates: 25
   # 诊断短跑阶段降低评估频率；若 selection key 优于历史最优，则覆盖保存 policy_best.pt。
-  eval_interval_updates: 10
+  eval_interval_updates: 0
   benchmark_eval_episodes: 1
   stochastic_eval_seeds: 1
   checkpoint_keep_last: 5
