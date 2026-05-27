@@ -71,6 +71,121 @@ class GADroneRouteLookup(dict):
         return routes[idx]
 
 
+def _plan_drone_routes_by_drone(plan: Any) -> dict[str, list[DroneRoute]]:
+    raw_routes = getattr(plan, "drone_routes", None)
+    if not raw_routes:
+        return {}
+    if hasattr(raw_routes, "_routes_by_drone"):
+        return {
+            str(drone_id): list(routes)
+            for drone_id, routes in getattr(raw_routes, "_routes_by_drone", {}).items()
+        }
+
+    result: dict[str, list[DroneRoute]] = defaultdict(list)
+    values = raw_routes.values() if isinstance(raw_routes, dict) else raw_routes
+    for route in values or []:
+        drone_id = str(getattr(route, "drone_id", "") or "")
+        if drone_id:
+            result[drone_id].append(route)
+    return result
+
+
+def _route_for_alloc(
+    routes_by_drone: dict[str, list[DroneRoute]],
+    route_cursor: dict[str, int],
+    alloc: Any,
+) -> DroneRoute | None:
+    drone_id = str(getattr(alloc, "drone_id", "") or "")
+    routes = routes_by_drone.get(drone_id) or []
+    if not routes:
+        return None
+
+    start = route_cursor.get(drone_id, 0)
+    order_id = str(getattr(alloc, "order_id", "") or "")
+    for idx in range(start, len(routes)):
+        if str(getattr(routes[idx], "order_id", "") or "") == order_id:
+            route_cursor[drone_id] = idx + 1
+            return routes[idx]
+    if start < len(routes):
+        route_cursor[drone_id] = start + 1
+        return routes[start]
+    return routes[-1]
+
+
+def _route_path_for_segment(route: DroneRoute | None, segment: "GARuntimeSegment") -> tuple[list[Any], int]:
+    path = list(getattr(route, "path", []) or []) if route is not None else []
+    if len(path) < 2:
+        path = [segment.launch_loc, segment.delivery_loc, segment.recovery_loc]
+
+    path[0] = segment.launch_loc
+    path[-1] = segment.recovery_loc
+    delivery_idx = min(
+        range(len(path)),
+        key=lambda idx: path[idx].distance_2d(segment.delivery_loc)
+        if hasattr(path[idx], "distance_2d")
+        else float("inf"),
+    )
+    if delivery_idx in (0, len(path) - 1):
+        insert_idx = max(1, len(path) - 1)
+        path.insert(insert_idx, segment.delivery_loc)
+        delivery_idx = insert_idx
+    else:
+        path[delivery_idx] = segment.delivery_loc
+    return path, delivery_idx
+
+
+def _route_path_with_greedy_builder(
+    route: DroneRoute | None,
+    segment: "GARuntimeSegment",
+    build_uav_polyline: Any = None,
+) -> tuple[list[Any], int]:
+    if callable(build_uav_polyline):
+        altitude = float(
+            max(
+                getattr(segment.launch_loc, "z", 0.0),
+                getattr(segment.delivery_loc, "z", 0.0),
+                getattr(segment.recovery_loc, "z", 0.0),
+                80.0,
+            )
+        )
+        try:
+            path, delivery_idx = build_uav_polyline(
+                launch_loc=segment.launch_loc,
+                delivery_loc=segment.delivery_loc,
+                recovery_loc=segment.recovery_loc,
+                altitude=altitude,
+            )
+            if path:
+                return list(path), int(delivery_idx)
+        except Exception:
+            logger.exception(
+                "[GA-MMCE runtime] failed to build greedy-style UAV polyline for order %s",
+                segment.order_id,
+            )
+    return _route_path_for_segment(route, segment)
+
+
+def _waypoints_for_segment(path: list[Any], delivery_idx: int, segment: "GARuntimeSegment") -> list[RouteWaypoint]:
+    last_idx = len(path) - 1
+    dock_action = WaypointAction.DOCK_TRUCK if segment.truck_recovery else WaypointAction.DOCK_DEPOT
+    waypoints: list[RouteWaypoint] = []
+    for idx, loc in enumerate(path):
+        if idx == 0:
+            action = WaypointAction.PICKUP
+            target_id = segment.order_id
+        elif idx == delivery_idx:
+            action = WaypointAction.DELIVER
+            target_id = segment.order_id
+        elif idx == last_idx:
+            action = dock_action
+            target_id = segment.recovery_node_id
+        else:
+            action = WaypointAction.PICKUP
+            target_id = segment.order_id
+        waypoints.append(RouteWaypoint(loc, action, target_id))
+    return waypoints
+
+
 def normalize_ga_allocation_modes(plan: Any) -> None:
     """Expose GA station-launch B tasks through the simulator's B_WAIT contract."""
     for alloc in getattr(plan, "allocations", []) or []:
@@ -96,6 +211,7 @@ def apply_ga_mmce_runtime_plan(
     order_mgr: Any,
     plan: Any,
     current_time: float,
+    build_uav_polyline: Any = None,
 ) -> None:
     """Apply GA drone runtime state without changing shared solver semantics."""
     normalize_ga_allocation_modes(plan)
@@ -111,6 +227,8 @@ def apply_ga_mmce_runtime_plan(
 
     _clear_obsolete_ga_drone_routes(entity_mgr=entity_mgr, plan=plan)
 
+    routes_by_drone = _plan_drone_routes_by_drone(plan)
+    route_cursor: dict[str, int] = defaultdict(int)
     prepared = 0
     for drone_id, allocs in grouped.items():
         drone = entity_mgr.drones.get(drone_id)
@@ -138,18 +256,13 @@ def apply_ga_mmce_runtime_plan(
             )
             if segment is None:
                 continue
-            dock_action = (
-                WaypointAction.DOCK_TRUCK
-                if segment.truck_recovery
-                else WaypointAction.DOCK_DEPOT
-            )
-            waypoints.extend(
-                [
-                    RouteWaypoint(segment.launch_loc, WaypointAction.PICKUP, segment.order_id),
-                    RouteWaypoint(segment.delivery_loc, WaypointAction.DELIVER, segment.order_id),
-                    RouteWaypoint(segment.recovery_loc, dock_action, segment.recovery_node_id),
-                ]
-            )
+            route = _route_for_alloc(routes_by_drone, route_cursor, alloc)
+            path, delivery_idx = _route_path_with_greedy_builder(route, segment, build_uav_polyline)
+            segment.start_idx = len(waypoints)
+            segment.pickup_idx = segment.start_idx
+            segment.deliver_idx = segment.start_idx + delivery_idx
+            segment.dock_idx = segment.start_idx + len(path) - 1
+            waypoints.extend(_waypoints_for_segment(path, delivery_idx, segment))
             segments.append(segment)
 
         if not segments:
@@ -173,10 +286,13 @@ def build_ga_mmce_drone_routes(
     entity_mgr: Any,
     order_mgr: Any,
     plan: Any,
+    build_uav_polyline: Any = None,
 ) -> None:
     """Build frontend route lookup while keeping simulation_bp unchanged."""
     normalize_ga_allocation_modes(plan)
     routes_by_drone: dict[str, list[DroneRoute]] = defaultdict(list)
+    existing_routes_by_drone = _plan_drone_routes_by_drone(plan)
+    route_cursor: dict[str, int] = defaultdict(int)
 
     for alloc in getattr(plan, "allocations", []) or []:
         if (
@@ -200,11 +316,13 @@ def build_ga_mmce_drone_routes(
         )
         if segment is None:
             continue
+        existing_route = _route_for_alloc(existing_routes_by_drone, route_cursor, alloc)
+        path, _delivery_idx = _route_path_with_greedy_builder(existing_route, segment, build_uav_polyline)
         routes_by_drone[str(alloc.drone_id)].append(
             DroneRoute(
                 drone_id=str(alloc.drone_id),
                 order_id=str(alloc.order_id),
-                path=[segment.launch_loc, segment.delivery_loc, segment.recovery_loc],
+                path=path,
                 mode=str(alloc.mode),
                 launch_loc=segment.launch_loc,
                 delivery_loc=segment.delivery_loc,

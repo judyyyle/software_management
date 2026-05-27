@@ -243,20 +243,6 @@
                 <span>复用上次静态结果</span>
               </label>
               <button class="sc-btn sc-btn--dispatch"
-                :class="{ 'sc-btn--dispatch-active': dispatchSolver === 'ga_mmce' }"
-                :disabled="!initDone || dispatchLoading"
-                @click="dispatchSolver = 'ga_mmce'">
-                🧬 遗传算法
-              </button>
-              <label v-if="dispatchSolver === 'ga_mmce'" class="dispatch-cache-toggle">
-                <input
-                  v-model="reuseGaStaticPlan"
-                  type="checkbox"
-                  :disabled="dispatchLoading"
-                >
-                <span>复用上次静态结果</span>
-              </label>
-              <button class="sc-btn sc-btn--dispatch"
                 :class="{ 'sc-btn--dispatch-active': dispatchSolver === 'market' }"
                 :disabled="!initDone || dispatchLoading || systemStore.policyActive || systemStore.trainingRunning"
                 @click="dispatchSolver = 'market'">
@@ -844,8 +830,12 @@ async function doDispatch() {
         }
         console.groupEnd()
       }
-      
-      mapRef.value?.drawDispatchRoutes?.(plan)
+
+      if (dispatchSolver.value === 'ga_mmce') {
+        mapRef.value?.drawCurrentDroneRoutes?.(plan, Number(result.timestamp ?? 0))
+      } else {
+        mapRef.value?.drawDispatchRoutes?.(plan)
+      }
       
       // 清除之前的动态实体标记，为仿真做准备
       mapRef.value?.clearDynamicEntities?.()
@@ -943,10 +933,14 @@ function setupRealtimeUpdates() {
       }
     }
 
-    if (systemStore.policyActive) {
-      mapRef.value?.drawRuntimePaths?.(systemStore.runtimePaths)
-    } else {
-      mapRef.value?.drawRuntimePaths?.({ trucks: [], drones: [] })
+    const runtimePathsForMap = dispatchSolver.value === 'ga_mmce'
+      ? { trucks: [], drones: systemStore.runtimePaths.drones ?? [] }
+      : systemStore.runtimePaths
+    const hasRuntimePaths = dispatchSolver.value === 'ga_mmce'
+      ? (runtimePathsForMap.drones?.length ?? 0) > 0
+      : ((runtimePathsForMap.trucks?.length ?? 0) > 0 || (runtimePathsForMap.drones?.length ?? 0) > 0)
+    if (hasRuntimePaths || systemStore.running) {
+      mapRef.value?.drawRuntimePaths?.(runtimePathsForMap)
     }
 
     for (const event of systemStore.decisionEvents) {

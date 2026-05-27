@@ -1065,9 +1065,9 @@ class GADecoder:
         if not drone_id:
             return None
 
-        launch_loc = path[0] if path else None
-        delivery_loc = path[1] if len(path) > 1 else launch_loc
-        recovery_loc = path[-1] if path else launch_loc
+        launch_loc = self._read_field(fragment, "launch_loc", path[0] if path else None)
+        delivery_loc = self._read_field(fragment, "delivery_loc", path[1] if len(path) > 1 else launch_loc)
+        recovery_loc = self._read_field(fragment, "recovery_loc", path[-1] if path else launch_loc)
         return DroneRoute(
             drone_id=drone_id,
             order_id=order_id,

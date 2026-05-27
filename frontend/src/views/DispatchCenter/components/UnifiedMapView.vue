@@ -478,6 +478,53 @@ function drawDispatchRoutes(plan: { truck_routes?: Record<string, any>; drone_ro
   }
 }
 
+function drawCurrentDroneRoutes(plan: { drone_routes?: any[] }, currentTime = 0) {
+  if (!map) return
+  if (runtimePathGroup) {
+    runtimePathGroup.clearLayers()
+    runtimePathGroup.remove()
+    runtimePathGroup = null
+  }
+
+  runtimePathGroup = L.layerGroup().addTo(map)
+
+  const routes = Array.isArray(plan.drone_routes) ? plan.drone_routes : []
+  const currentRoutes = routes.filter((flight: any) => {
+    const launchTime = Number(flight?.launch_time ?? 0)
+    const mode = String(flight?.mode ?? '')
+    return mode === 'C' || mode === 'B' || launchTime <= currentTime + 1e-6
+  })
+
+  const printable = currentRoutes.length > 0 ? currentRoutes : routes.slice(0, 1)
+  for (const flight of printable) {
+    const rawPath = Array.isArray(flight?.path) ? flight.path : []
+    const coords: [number, number][] = rawPath
+      .filter((point: any) => Array.isArray(point) && point.length >= 2)
+      .map(([lng, lat]: [number, number]) => [Number(lat), Number(lng)] as [number, number])
+      .filter((point: [number, number]) => Number.isFinite(point[0]) && Number.isFinite(point[1]))
+    if (coords.length <= 1) continue
+    const line = L.polyline(coords, {
+      color: '#7c3aed',
+      weight: 3,
+      opacity: 0.9,
+      dashArray: '8,6',
+      pane: 'droneRoutePane',
+    }).addTo(runtimePathGroup as L.LayerGroup)
+
+    const label = [
+      `UAV ${flight.drone_id ?? ''}`,
+      flight.order_id ? `订单 ${flight.order_id}` : '',
+      flight.mode ? `模式 ${flight.mode}` : '',
+      coords.length > 2 ? `避障点 ${coords.length}` : '直达',
+    ].filter(Boolean).join(' · ')
+    line.bindTooltip(label, {
+      sticky: true,
+      direction: 'top',
+      className: 'runtime-path-tooltip',
+    })
+  }
+}
+
 function drawRuntimePaths(paths: { trucks?: any[]; drones?: any[] }) {
   if (!map) return
   if (runtimePathGroup) {
@@ -755,7 +802,7 @@ function getCurrentBounds() {
   }
 }
 
-defineExpose({ setFacilities, updateTruck, updateDrone, addOrder, clearDynamic, clearDispatchRoutes: clearRouteOverlays, drawDispatchRoutes, drawRuntimePaths, drawOrders, clearDynamicEntities, getCurrentBounds })
+defineExpose({ setFacilities, updateTruck, updateDrone, addOrder, clearDynamic, clearDispatchRoutes: clearRouteOverlays, drawDispatchRoutes, drawCurrentDroneRoutes, drawRuntimePaths, drawOrders, clearDynamicEntities, getCurrentBounds })
 </script>
 
 <style scoped>
