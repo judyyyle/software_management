@@ -248,6 +248,7 @@ export interface DispatchDroneRoute {
   mode: FulfillmentMode
   launch_node_id?: string
   launch_node_type?: string
+  launch_time?: number
   recovery_station_id?: string  // 新增：回收点 ID（充电站或仓库）
   path: [number, number][]
 }
