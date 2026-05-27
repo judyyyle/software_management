@@ -593,6 +593,7 @@ def _serialize_runtime_drone_route(
         "mode": alloc.mode,
         "launch_node_id": launch_node_id,
         "launch_node_type": launch_node_type,
+        "launch_time": float(getattr(alloc, "launch_time", 0.0) or 0.0),
         "recovery_station_id": alloc.recovery_station_id,
         "path": path,
     }
@@ -1118,6 +1119,9 @@ def sim_dispatch():
                         "feasible": a.feasible,
                         "reason": a.reason,
                         "recovery_station_id": a.recovery_station_id,
+                        "launch_station_id": getattr(a, "launch_station_id", ""),
+                        "launch_time": float(getattr(a, "launch_time", 0.0) or 0.0),
+                        "wait_duration": float(getattr(a, "wait_duration", 0.0) or 0.0),
                         "drone_id": a.drone_id,
                     }
                     for a in plan.allocations
