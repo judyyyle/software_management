@@ -25,6 +25,7 @@ from __future__ import annotations
 import logging
 import math
 import copy
+import time
 from typing import TYPE_CHECKING
 
 from flask import Blueprint, jsonify, request
@@ -870,19 +871,50 @@ def sim_policy_activate():
       - 仅通过活跃运行时切换，让现有 `/control` `/state` `/ws` 自动复用。
     """
     body = request.get_json(silent=True) or {}
+    started_at = time.perf_counter()
+    logger.info(
+        "[sim_policy_activate] 收到激活请求: policy_path=%s config_path=%s scene_id=%s "
+        "order_source_mode=%s use_current_init_payload=%s deterministic=%s",
+        body.get("policy_path"),
+        body.get("config_path"),
+        body.get("scene_id"),
+        body.get("order_source_mode"),
+        body.get("use_current_init_payload", True),
+        body.get("deterministic", True),
+    )
 
     try:
         if _training_runtime is not None and _training_runtime.is_running:
             return jsonify({"error": "PPO 训练正在运行，不能激活在线策略"}), 409
+        logger.info("[sim_policy_activate] 解析激活配置...")
         activation = build_policy_activation_config(body)
+        logger.info(
+            "[sim_policy_activate] 激活配置解析完成: policy=%s checkpoint=%s config=%s device=%s",
+            activation.policy_name,
+            activation.policy_path,
+            activation.config_path,
+            activation.device,
+        )
+        logger.info("[sim_policy_activate] 解析场景上下文...")
         base_scene_ctx = resolve_scene_context(
             config_path=activation.config_path,
             scene_id=activation.scene_id or None,
             scene_bundle_dir=activation.scene_bundle_dir,
         )
+        logger.info(
+            "[sim_policy_activate] 基础场景解析完成: scene_id=%s depots=%d stations=%d "
+            "trucks=%d drones=%d orders=%d",
+            base_scene_ctx.scene_id,
+            len(base_scene_ctx.depots),
+            len(base_scene_ctx.stations),
+            len(base_scene_ctx.trucks),
+            len(base_scene_ctx.drones),
+            len(base_scene_ctx.orders),
+        )
 
         use_current_init_payload = bool(body.get("use_current_init_payload", True))
         if use_current_init_payload and _last_init_payload is not None:
+            logger.info("[sim_policy_activate] 使用最近一次前端 init payload 重建在线场景...")
             init_scene_id = str(_last_init_payload.get("scene_id", "")).strip()
             requested_scene_id = activation.scene_id or base_scene_ctx.scene_id
             if init_scene_id and requested_scene_id and init_scene_id != requested_scene_id:
@@ -892,20 +924,37 @@ def sim_policy_activate():
                 )
             scene_ctx = _build_policy_scene_context_from_last_init(base_scene_ctx, _last_init_payload)
         else:
+            logger.info(
+                "[sim_policy_activate] 使用配置默认场景: use_current_init_payload=%s has_last_init_payload=%s",
+                use_current_init_payload,
+                _last_init_payload is not None,
+            )
             scene_ctx = base_scene_ctx
 
+        logger.info("[sim_policy_activate] 暂停 classic sim engine，开始创建 PPO runtime...")
         _sim_engine.pause()
         runtime = OnlinePolicyRuntimePlayer(
             activation=activation,
             scene_ctx=scene_ctx,
         )
+        logger.info("[sim_policy_activate] PPO runtime 创建完成，切换 snapshot builder...")
         _switch_to_policy_runtime(runtime)
 
         try:
+            logger.info("[sim_policy_activate] 构造并广播激活后首帧...")
             broadcast_tick(runtime.build_tick_payload())
+            logger.info("[sim_policy_activate] 首帧广播完成")
         except Exception:
             logger.exception("[sim_policy_activate] 激活后首帧广播失败")
 
+        elapsed_sec = time.perf_counter() - started_at
+        logger.info(
+            "[sim_policy_activate] 激活成功: scene_id=%s sim_time=%.3f speed_ratio=%.3f elapsed=%.2fs",
+            scene_ctx.scene_id,
+            runtime.current_time,
+            runtime.speed_ratio,
+            elapsed_sec,
+        )
         return jsonify(
             {
                 "status": "activated",
@@ -921,7 +970,10 @@ def sim_policy_activate():
             }
         )
     except Exception as exc:
-        logger.exception("[sim_policy_activate] 激活失败")
+        logger.exception(
+            "[sim_policy_activate] 激活失败: elapsed=%.2fs",
+            time.perf_counter() - started_at,
+        )
         return jsonify({"error": str(exc)}), 422
 
 

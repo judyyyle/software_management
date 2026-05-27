@@ -15,6 +15,7 @@ HiveLogix — Phase 7 ObservationTensorizer.
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
@@ -103,6 +104,12 @@ ORDER_TOKEN_FIELDS = (
     "best_mode_c_wait_time_norm",
     "best_mode_c_uav_flight_time_norm",
     "best_mode_c_energy_margin_ratio",
+    "delivery_energy_ratio",
+    "best_mode_b_recovery_energy_ratio",
+    "best_mode_c_recovery_energy_ratio",
+    "best_mode_b_total_energy_ratio",
+    "best_mode_c_total_energy_ratio",
+    "mode_c_energy_saving_ratio",
     "best_mode_c_node_type_code_norm",
     "best_mode_c_truck_eta_remaining_norm",
     "best_mode_c_timeout_risk_norm",
@@ -397,6 +404,24 @@ class ObservationTensorizer:
                     self._norm_time_nonneg(float(item.best_mode_c_wait_time)),
                     self._norm_time_nonneg(float(item.best_mode_c_uav_flight_time)),
                     self._clip01(max(0.0, float(item.best_mode_c_energy_margin_ratio))),
+                    self._energy_ratio_feature(float(item.delivery_energy_ratio)),
+                    self._energy_ratio_feature(
+                        float(item.best_mode_b_recovery_energy_ratio)
+                    ),
+                    self._energy_ratio_feature(
+                        float(item.best_mode_c_recovery_energy_ratio)
+                    ),
+                    self._energy_ratio_feature(
+                        float(item.best_mode_b_total_energy_ratio)
+                    ),
+                    self._energy_ratio_feature(
+                        float(item.best_mode_c_total_energy_ratio)
+                    ),
+                    self._clip_signed(
+                        self._finite_or_zero(float(item.mode_c_energy_saving_ratio)),
+                        -1.0,
+                        1.0,
+                    ),
                     self._code_norm(_HOST_TYPE_CODE, str(item.best_mode_c_node_type)),
                     self._norm_time_nonneg(float(item.best_mode_c_truck_eta_remaining)),
                     self._clip01(float(item.best_mode_c_timeout_risk)),
@@ -538,6 +563,9 @@ class ObservationTensorizer:
         norm_base = max(float(battery_max), _TIME_EPS)
         return self._clip01(float(value) / norm_base)
 
+    def _energy_ratio_feature(self, value: float) -> float:
+        return self._clip01(max(0.0, self._finite_or_zero(float(value))))
+
     def _norm_time_nonneg(self, value: float) -> float:
         return self._clip01(float(value) / max(self._cfg.upper_horizon_sec, _TIME_EPS))
 
@@ -551,6 +579,11 @@ class ObservationTensorizer:
     @staticmethod
     def _norm_plan_version_delta(value: int) -> float:
         return ObservationTensorizer._clip_signed(float(value) / 16.0, -1.0, 1.0)
+
+    @staticmethod
+    def _finite_or_zero(value: float) -> float:
+        result = float(value)
+        return result if math.isfinite(result) else 0.0
 
     @staticmethod
     def _code_norm(

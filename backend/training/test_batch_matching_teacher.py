@@ -12,6 +12,7 @@ from .batch_matching_teacher import build_batch_matching_teacher_labels
 from .contracts import (
     CandidateFeatures,
     CandidateOutput,
+    CandidateTeacherEnergy,
     FactorizedActionSchema,
     InfraFeatures,
     OrderFeatures,
@@ -234,6 +235,46 @@ class TestBatchMatchingTeacher(unittest.TestCase):
             msg="Cost must use delivery finish slack (-20), not arrival slack (+10)",
         )
 
+    def test_default_cost_adds_teacher_only_energy_ratio(self) -> None:
+        runtime_state = object()
+        coarse_plan = object()
+        contexts = (_context("DRN-1", runtime_state, coarse_plan),)
+        candidates = {
+            "DRN-1": _candidate_output(
+                [("ORDER-1", ("B", "C"))],
+                "DRN-1",
+                order_feature_overrides_by_order={
+                    "ORDER-1": {
+                        "deadline": 2000.0,
+                        "distance_to_order": 100.0,
+                        "best_mode_b_recovery_flight_time": 10.0,
+                        "best_mode_c_uav_flight_time": 10.0,
+                        "best_mode_c_wait_time": 0.0,
+                    },
+                },
+                teacher_energy_by_order_idx={
+                    0: CandidateTeacherEnergy(
+                        delivery_energy_ratio=0.10,
+                        best_mode_b_recovery_energy_ratio=0.40,
+                        best_mode_c_recovery_energy_ratio=0.05,
+                        best_mode_b_total_energy_ratio=0.50,
+                        best_mode_c_total_energy_ratio=0.15,
+                    )
+                },
+            )
+        }
+
+        result = build_batch_matching_teacher_labels(
+            decision_contexts=contexts,
+            candidate_outputs_by_drone=candidates,
+        )
+
+        self.assertEqual(
+            result.actions_by_drone["DRN-1"],
+            DispatchAction("ORDER-1", "C"),
+        )
+        self.assertAlmostEqual(result.assignments_by_drone["DRN-1"].cost, 86.0)
+
 
 def _context(drone_id: str, runtime_state: object, coarse_plan: object) -> SimpleNamespace:
     return SimpleNamespace(
@@ -262,6 +303,7 @@ def _candidate_output(
     drone_id: str,
     *,
     order_feature_overrides_by_order: dict[str, dict[str, float]] | None = None,
+    teacher_energy_by_order_idx: dict[int, CandidateTeacherEnergy] | None = None,
 ) -> CandidateOutput:
     order_features: list[OrderFeatures] = []
     order_mask: list[bool] = []
@@ -312,6 +354,7 @@ def _candidate_output(
             wait_action=WAIT_ACTION,
             dispatch_actions=dispatch_actions,
         ),
+        teacher_energy_by_order_idx=dict(teacher_energy_by_order_idx or {}),
     )
 
 

@@ -48,7 +48,13 @@ from .contracts import (
 )
 from .critic_batch_builder import CriticBatchBuilder
 from .model import SharedPPOActorCritic
-from .observation_tensorizer import ObservationTensorizer
+from .observation_tensorizer import (
+    HISTORY_TOKEN_FIELDS,
+    INFRA_TOKEN_FIELDS,
+    ORDER_TOKEN_FIELDS,
+    UAV_SELF_TOKEN_FIELDS,
+    ObservationTensorizer,
+)
 from .order_source_adapter import (
     OrderSourceConfig,
     OrderSourceMode,
@@ -1993,6 +1999,15 @@ def _summarize_episode_records(
         "sum_t_reservation_timeout_cost_sec": float(
             sum(float(item["t_reservation_timeout_cost_sec"]) for item in episodes)
         ),
+        "sum_episode_uav_energy_reward_penalty": float(
+            sum(float(item.get("episode_uav_energy_reward_penalty", 0.0)) for item in episodes)
+        ),
+        "sum_episode_uav_energy_ratio_sum": float(
+            sum(float(item.get("episode_uav_energy_ratio_sum", 0.0)) for item in episodes)
+        ),
+        "sum_episode_uav_energy_penalty_events": int(
+            sum(int(item.get("episode_uav_energy_penalty_events", 0)) for item in episodes)
+        ),
         "mode_b_dispatch_ratio": (
             float(mode_b_total / dispatch_total) if dispatch_total > 0.0 else 0.0
         ),
@@ -3669,6 +3684,10 @@ def _build_meta_payload(
             use_drone_source_type_flag=bool(policy["use_drone_source_type_flag"]),
             critic_mode=str(policy["critic_mode"]),
             inference_mode=str(policy["inference_mode"]),
+            uav_self_token_fields=tuple(UAV_SELF_TOKEN_FIELDS),
+            order_token_fields=tuple(ORDER_TOKEN_FIELDS),
+            infra_token_fields=tuple(INFRA_TOKEN_FIELDS),
+            history_token_fields=tuple(HISTORY_TOKEN_FIELDS),
         ),
         action_space=ActionSpaceMeta(
             type=str(action_space["type"]),
@@ -3735,6 +3754,12 @@ def _build_meta_payload(
             rendezvous_arrive_bonus=float(reward.get("rendezvous_arrive_bonus", 0.0)),
             rendezvous_bonus=float(reward.get("rendezvous_bonus", 0.0)),
             mode_c_attempt_bonus=float(reward.get("mode_c_attempt_bonus", 0.0)),
+            uav_energy_penalty_coef=float(
+                reward.get("uav_energy_penalty_coef", 0.0)
+            ),
+            uav_energy_penalty_cap_ratio=float(
+                reward.get("uav_energy_penalty_cap_ratio", 0.0)
+            ),
             max_overdue_sec=float(reward["max_overdue_sec"]),
             hard_overdue_penalty_sec=float(reward.get("hard_overdue_penalty_sec", 0.0)),
             hard_failure_penalty_sec=float(reward["hard_failure_penalty_sec"]),
@@ -3804,6 +3829,8 @@ def _build_meta_payload(
                 "reward.late_delivery_penalty_coef",
                 "reward.late_delivery_penalty_cap",
                 "reward.min_late_delivery_reward",
+                "reward.uav_energy_penalty_coef",
+                "reward.uav_energy_penalty_cap_ratio",
             ),
         ),
     )

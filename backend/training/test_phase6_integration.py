@@ -1962,6 +1962,7 @@ class TestPhase6Integration(unittest.TestCase):
             deliver_pos=SimpleNamespace(),
             t_deliver_finish=0.0,
             energy_after_delivery=100.0,
+            delivery_energy_ratio=0.2,
             trigger_type="test_idle",
             trigger_station_id=None,
             t_now=0.0,
@@ -1971,6 +1972,9 @@ class TestPhase6Integration(unittest.TestCase):
         self.assertEqual(summary.candidate_count, 2)
         self.assertAlmostEqual(summary.best_truck_eta_remaining, 500.0)
         self.assertAlmostEqual(summary.best_uav_flight_time, 100.0)
+        self.assertAlmostEqual(summary.best_recovery_energy_j, 10.0)
+        self.assertAlmostEqual(summary.best_recovery_energy_ratio, 0.1)
+        self.assertAlmostEqual(summary.best_total_energy_ratio, 0.3)
         self.assertAlmostEqual(summary.best_wait_time, 400.0)
 
     def test_public_candidate_output_entry_rebuilds_from_decision_context(self) -> None:
