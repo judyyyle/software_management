@@ -211,18 +211,6 @@
             <!-- 调度控制行 -->
             <div class="sc-action-row">
               <button class="sc-btn sc-btn--dispatch"
-                :class="{ 'sc-btn--dispatch-active': dispatchSolver === 'greedy' }"
-                :disabled="!initDone || dispatchLoading || systemStore.policyActive || systemStore.trainingRunning"
-                @click="dispatchSolver = 'greedy'">
-                🧠 贪心（baseline）
-              </button>
-              <button class="sc-btn sc-btn--dispatch"
-                :class="{ 'sc-btn--dispatch-active': dispatchSolver === 'greedy_mmce' }"
-                :disabled="!initDone || dispatchLoading || systemStore.policyActive || systemStore.trainingRunning"
-                @click="dispatchSolver = 'greedy_mmce'">
-                🧩 贪心（多模式）
-              </button>
-              <button class="sc-btn sc-btn--dispatch"
                 :class="{ 'sc-btn--dispatch-active': dispatchSolver === 'greedy_mmce_bi' }"
                 :disabled="!initDone || dispatchLoading || systemStore.policyActive || systemStore.trainingRunning"
                 @click="dispatchSolver = 'greedy_mmce_bi'">
@@ -242,12 +230,6 @@
                 >
                 <span>复用上次静态结果</span>
               </label>
-              <button class="sc-btn sc-btn--dispatch"
-                :class="{ 'sc-btn--dispatch-active': dispatchSolver === 'market' }"
-                :disabled="!initDone || dispatchLoading || systemStore.policyActive || systemStore.trainingRunning"
-                @click="dispatchSolver = 'market'">
-                🏷️ 市场拍卖算法
-              </button>
               <button class="sc-btn sc-btn--dispatch sc-btn--dispatch-run"
                 :disabled="!initDone || dispatchLoading || systemStore.policyActive || systemStore.trainingRunning"
                 @click="doDispatch">
@@ -289,56 +271,92 @@
       <div class="dispatch-main">
         <!-- 左侧面板 -->
         <aside class="dispatch-aside">
-          <!-- KPI 卡片组（迁自 Dashboard） -->
-          <div class="kpi-grid">
-            <div v-for="k in kpiList" :key="k.label" class="kpi-card">
-              <div class="kpi-card__icon">{{ k.icon }}</div>
-              <div class="kpi-card__value">{{ k.value }}</div>
-              <div class="kpi-card__label">{{ k.label }}</div>
-              <div class="kpi-card__trend" :class="k.up ? 'trend--up' : 'trend--down'">
-                {{ k.up ? '↑' : '↓' }} {{ k.change }}
+          <div class="dispatch-aside-scroll">
+            <!-- KPI 卡片组（迁自 Dashboard） -->
+            <div class="kpi-grid">
+              <div v-for="k in kpiList" :key="k.label" class="kpi-card">
+                <div class="kpi-card__icon">{{ k.icon }}</div>
+                <div class="kpi-card__value">{{ k.value }}</div>
+                <div class="kpi-card__label">{{ k.label }}</div>
+                <div class="kpi-card__trend" :class="k.up ? 'trend--up' : 'trend--down'">
+                  {{ k.up ? '↑' : '↓' }} {{ k.change }}
+                </div>
               </div>
             </div>
+
+            <!-- 动态订单队列（实况统计） -->
+            <SectionCard title="动态订单队列" icon="📋" class="dispatch-section dispatch-section--orders">
+              <div class="order-panel-scroll">
+                <template v-if="orderStore.stats">
+                  <div class="order-stats-grid">
+                    <div class="order-stat">
+                      <span class="order-stat__num">{{ orderStore.stats.orders_pending }}</span>
+                      <span class="order-stat__lbl">待分配</span>
+                    </div>
+                    <div class="order-stat">
+                      <span class="order-stat__num order-stat__num--active">{{ orderStore.stats.orders_assigned }}</span>
+                      <span class="order-stat__lbl">配送中</span>
+                    </div>
+                    <div class="order-stat">
+                      <span class="order-stat__num order-stat__num--success">{{ orderStore.stats.orders_completed }}</span>
+                      <span class="order-stat__lbl">已完成</span>
+                    </div>
+                    <div class="order-stat">
+                      <span class="order-stat__num order-stat__num--danger">{{ orderStore.stats.orders_timeout }}</span>
+                      <span class="order-stat__lbl">超时</span>
+                    </div>
+                  </div>
+                </template>
+                <div v-if="dynamicOrderQueue.length" class="dynamic-order-list">
+                  <div
+                    v-for="order in dynamicOrderQueue"
+                    :key="order.order_id"
+                    class="dynamic-order-row"
+                    :class="dynamicOrderStatusClass(order.status)"
+                  >
+                    <div class="dynamic-order-row__main">
+                      <span class="dynamic-order-row__id">{{ order.order_id }}</span>
+                      <span class="dynamic-order-row__badge">{{ dynamicOrderStatusText(order.status) }}</span>
+                    </div>
+                    <div class="dynamic-order-row__meta">
+                      <span>注入 {{ formatSimClock(order.spawn_sim_s) }}</span>
+                      <span>截止 {{ formatSimClock(order.deadline_sim_s) }}</span>
+                    </div>
+                    <div class="dynamic-order-row__meta">
+                      <span>{{ formatWeight(order.payload_weight) }}</span>
+                      <span>{{ order.priority_label || order.priority || '普通' }}</span>
+                    </div>
+                  </div>
+                </div>
+                <div v-else class="empty-list">
+                  <span>⏳ 等待仿真数据接入</span>
+                </div>
+              </div>
+            </SectionCard>
+
+            <SectionCard title="告警中心" icon="🔔" class="dispatch-section dispatch-section--alerts">
+              <div v-if="deadlineAlerts.length" class="alert-list">
+                <div
+                  v-for="alert in deadlineAlerts"
+                  :key="alert.order_id"
+                  class="alert-row"
+                  :class="alert.severity === 'overdue' ? 'alert-row--danger' : 'alert-row--warn'"
+                >
+                  <div class="alert-row__main">
+                    <span class="alert-row__id">{{ alert.order_id }}</span>
+                    <span class="alert-row__badge">{{ alert.sourceLabel }}</span>
+                  </div>
+                  <div class="alert-row__meta">
+                    <span>{{ alert.remainingLabel }}</span>
+                    <span>截止 {{ alert.deadlineLabel }}</span>
+                  </div>
+                </div>
+              </div>
+              <div v-else class="empty-list">
+                <div class="alert-badge alert-badge--ok">✅ 无活跃告警</div>
+              </div>
+            </SectionCard>
           </div>
-
-          <!-- 动态订单队列（实况统计） -->
-          <SectionCard title="动态订单队列" icon="📋">
-            <template v-if="orderStore.stats">
-              <div class="order-stats-grid">
-                <div class="order-stat">
-                  <span class="order-stat__num">{{ orderStore.stats.orders_pending }}</span>
-                  <span class="order-stat__lbl">待分配</span>
-                </div>
-                <div class="order-stat">
-                  <span class="order-stat__num order-stat__num--active">{{ orderStore.stats.orders_assigned }}</span>
-                  <span class="order-stat__lbl">配送中</span>
-                </div>
-                <div class="order-stat">
-                  <span class="order-stat__num order-stat__num--success">{{ orderStore.stats.orders_completed }}</span>
-                  <span class="order-stat__lbl">已完成</span>
-                </div>
-                <div class="order-stat">
-                  <span class="order-stat__num order-stat__num--danger">{{ orderStore.stats.orders_timeout }}</span>
-                  <span class="order-stat__lbl">超时</span>
-                </div>
-              </div>
-            </template>
-            <div v-else class="empty-list">
-              <span>⏳ 等待仿真数据接入</span>
-            </div>
-          </SectionCard>
-
-          <SectionCard title="告警中心" icon="🔔">
-            <div class="empty-list">
-              <div class="alert-badge alert-badge--ok">✅ 无活跃告警</div>
-            </div>
-          </SectionCard>
-
-          <SectionCard title="快速决策" icon="⚡">
-            <div class="empty-list">
-              <span>模式 E 触发时弹出算法推荐路径</span>
-            </div>
-          </SectionCard>
         </aside>
 
         <!-- 中央地图区 -->
@@ -454,16 +472,13 @@ const dispatchPlan = ref<DispatchPlan | null>(null)
 const totalEnergyCostWh = ref(0)
 // 本地 UI 游标：避免把同一条 PPO 决策事件重复写入 DynamicFlowPanel。
 const lastRenderedDecisionEventSeq = ref(0)
-type DispatchSolverName = 'greedy' | 'greedy_mmce' | 'greedy_mmce_bi' | 'ga_mmce' | 'market'
-const dispatchSolver = ref<DispatchSolverName>('greedy')
+type DispatchSolverName = 'greedy_mmce_bi' | 'ga_mmce'
+const dispatchSolver = ref<DispatchSolverName>('greedy_mmce_bi')
 const reuseGaStaticPlan = ref(false)
 
 function dispatchSolverLabel(solver: DispatchSolverName): string {
-  if (solver === 'greedy') return '贪心（baseline）'
-  if (solver === 'greedy_mmce') return '贪心（多模式）'
   if (solver === 'greedy_mmce_bi') return '贪心（增量）'
-  if (solver === 'ga_mmce') return '遗传算法'
-  return '市场拍卖'
+  return '遗传算法'
 }
 
 // 预设保存状态
@@ -477,6 +492,169 @@ function toSimSeconds(value: number | undefined, timeDomain?: 'wall_ms' | 'sim_s
   if (typeof value !== 'number' || !Number.isFinite(value)) return null
   return timeDomain === 'wall_ms' ? value / 1000 : value
 }
+
+const DEADLINE_ALERT_WINDOW_SEC = 10 * 60
+type DynamicOrderUiStatus = Order['status'] | 'WAITING' | string
+
+interface DynamicOrderQueueRow {
+  order_id: string
+  spawn_sim_s: number
+  deadline_sim_s: number
+  payload_weight: number
+  priority?: string
+  priority_label?: string
+  status: DynamicOrderUiStatus
+}
+
+interface DeadlineAlertRow {
+  order_id: string
+  sourceLabel: string
+  deadline_sim_s: number
+  deadlineLabel: string
+  remainingSec: number
+  remainingLabel: string
+  severity: 'warn' | 'overdue'
+}
+
+function formatSimClock(value: number | undefined | null) {
+  const seconds = Number(value)
+  if (!Number.isFinite(seconds)) return '--'
+  const sign = seconds < 0 ? '-' : ''
+  const abs = Math.abs(seconds)
+  const h = Math.floor(abs / 3600)
+  const m = Math.floor((abs % 3600) / 60)
+  const s = Math.floor(abs % 60)
+  if (h > 0) return `${sign}${h}时${String(m).padStart(2, '0')}分${String(s).padStart(2, '0')}秒`
+  return `${sign}${m}分${String(s).padStart(2, '0')}秒`
+}
+
+function formatWeight(value: number | undefined | null) {
+  const weight = Number(value)
+  return Number.isFinite(weight) ? `${weight.toFixed(2)} kg` : '-- kg'
+}
+
+function scheduledDynamicDeadline(order: any) {
+  const absoluteDeadline = Number(order?.deadline_sim_s)
+  if (Number.isFinite(absoluteDeadline)) return absoluteDeadline
+  const spawn = Number(order?.spawn_sim_s ?? 0)
+  const offset = Number(order?.deadline_offset_s ?? 900)
+  return spawn + offset
+}
+
+function dynamicOrderStatusText(status: DynamicOrderUiStatus) {
+  const labels: Record<string, string> = {
+    WAITING: '待注入',
+    PENDING: '待分配',
+    ASSIGNED: '已分配',
+    PICKED_UP: '已取货',
+    DELIVERING: '配送中',
+    IN_TRANSIT: '配送中',
+    COMPLETED: '已完成',
+    TIMEOUT: '已超时',
+    REJECTED: '已拒绝',
+  }
+  return labels[String(status)] || String(status)
+}
+
+function dynamicOrderStatusClass(status: DynamicOrderUiStatus) {
+  if (status === 'COMPLETED') return 'dynamic-order-row--done'
+  if (status === 'TIMEOUT' || status === 'REJECTED') return 'dynamic-order-row--danger'
+  if (status === 'WAITING') return 'dynamic-order-row--waiting'
+  return 'dynamic-order-row--active'
+}
+
+const dynamicOrderIds = computed(() =>
+  new Set(orderStore.scheduledDynamicOrders.map(order => String(order.order_id)))
+)
+
+const dynamicOrderQueue = computed<DynamicOrderQueueRow[]>(() => {
+  const runtimeOrdersById = new Map(
+    orderStore.generatedOrders.map(order => [String(order.order_id), order])
+  )
+  return orderStore.scheduledDynamicOrders
+    .map(order => {
+      const runtimeOrder = runtimeOrdersById.get(String(order.order_id))
+      return {
+        order_id: String(order.order_id),
+        spawn_sim_s: Number(order.spawn_sim_s ?? runtimeOrder?.create_time ?? 0),
+        deadline_sim_s: toSimSeconds(runtimeOrder?.deadline, runtimeOrder?.time_domain)
+          ?? scheduledDynamicDeadline(order),
+        payload_weight: Number(runtimeOrder?.payload_weight ?? order.payload_weight ?? 0),
+        priority: String(runtimeOrder?.priority ?? order.priority ?? ''),
+        priority_label: String(runtimeOrder?.priority_label ?? order.priority_label ?? ''),
+        status: runtimeOrder?.status ?? 'WAITING',
+      }
+    })
+    .sort((a, b) => a.spawn_sim_s - b.spawn_sim_s)
+})
+
+function runtimeOrderRemaining(order: Order) {
+  if (order.time_domain === 'wall_ms') {
+    return (Number(order.deadline) - Date.now()) / 1000
+  }
+  return Number(order.deadline) - Number(systemStore.simTime)
+}
+
+function runtimeOrderDeadlineLabel(order: Order) {
+  if (order.time_domain === 'wall_ms') {
+    const deadlineMs = Number(order.deadline)
+    if (!Number.isFinite(deadlineMs)) return '--'
+    return new Date(deadlineMs).toLocaleTimeString('zh-CN', {
+      hour: '2-digit',
+      minute: '2-digit',
+      second: '2-digit',
+    })
+  }
+  return formatSimClock(Number(order.deadline))
+}
+
+function remainingLabel(remainingSec: number) {
+  if (remainingSec < 0) return `已超时 ${formatSimClock(Math.abs(remainingSec))}`
+  return `剩余 ${formatSimClock(remainingSec)}`
+}
+
+const deadlineAlerts = computed<DeadlineAlertRow[]>(() => {
+  const rows: DeadlineAlertRow[] = []
+  const seen = new Set<string>()
+  const closedStatuses = new Set(['COMPLETED', 'REJECTED'])
+
+  for (const order of orderStore.generatedOrders) {
+    const status = String(order.status)
+    if (closedStatuses.has(status)) continue
+    const remainingSec = runtimeOrderRemaining(order)
+    if (!Number.isFinite(remainingSec)) continue
+    if (remainingSec > DEADLINE_ALERT_WINDOW_SEC && status !== 'TIMEOUT') continue
+    seen.add(String(order.order_id))
+    rows.push({
+      order_id: String(order.order_id),
+      sourceLabel: dynamicOrderIds.value.has(String(order.order_id)) ? '动态订单' : '静态订单',
+      deadline_sim_s: toSimSeconds(order.deadline, order.time_domain) ?? 0,
+      deadlineLabel: runtimeOrderDeadlineLabel(order),
+      remainingSec,
+      remainingLabel: remainingLabel(remainingSec),
+      severity: remainingSec < 0 || status === 'TIMEOUT' ? 'overdue' : 'warn',
+    })
+  }
+
+  for (const order of dynamicOrderQueue.value) {
+    if (seen.has(order.order_id) || order.status === 'COMPLETED' || order.status === 'REJECTED') continue
+    const remainingSec = order.deadline_sim_s - Number(systemStore.simTime)
+    if (remainingSec > DEADLINE_ALERT_WINDOW_SEC && order.status !== 'TIMEOUT') continue
+    rows.push({
+      order_id: order.order_id,
+      sourceLabel: '动态订单',
+      deadline_sim_s: order.deadline_sim_s,
+      deadlineLabel: formatSimClock(order.deadline_sim_s),
+      remainingSec,
+      remainingLabel: remainingLabel(remainingSec),
+      severity: remainingSec < 0 || order.status === 'TIMEOUT' ? 'overdue' : 'warn',
+    })
+  }
+
+  return rows
+    .sort((a, b) => a.remainingSec - b.remainingSec)
+    .slice(0, 8)
+})
 
 const kpiList = computed(() => {
   const runtimeEnergyWh = Number(orderStore.stats?.total_energy_cost_wh)
@@ -1451,8 +1629,33 @@ onBeforeUnmount(() => {
   flex-shrink: 0;
   display: flex;
   flex-direction: column;
+  min-height: 0;
+  overflow: hidden;
+}
+
+.dispatch-aside-scroll {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
   gap: var(--hl-space-md);
   overflow-y: auto;
+  padding-right: 4px;
+}
+
+.dispatch-section {
+  flex-shrink: 0;
+}
+
+.dispatch-section--orders :deep(.section-card__body) {
+  padding: 0;
+}
+
+.order-panel-scroll {
+  max-height: clamp(260px, 36vh, 420px);
+  overflow-y: auto;
+  padding: 12px 14px;
+  min-height: 0;
 }
 
 /* KPI 网格 */
@@ -1496,6 +1699,112 @@ onBeforeUnmount(() => {
 .order-stat__num--success { color: var(--hl-success); }
 .order-stat__num--danger  { color: var(--hl-danger); }
 .order-stat__lbl   { font-size: 11px; color: var(--hl-text-muted); }
+
+.dynamic-order-list,
+.alert-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin-top: 10px;
+  padding-right: 4px;
+}
+
+.dynamic-order-list {
+  max-height: none;
+  overflow: visible;
+}
+
+.alert-list {
+  max-height: clamp(140px, 22vh, 240px);
+  overflow-y: auto;
+}
+
+.dynamic-order-row,
+.alert-row {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  padding: 9px 10px;
+  border: 1px solid var(--hl-border);
+  border-radius: 8px;
+  background: var(--hl-content-bg);
+}
+
+.dynamic-order-row__main,
+.alert-row__main,
+.dynamic-order-row__meta,
+.alert-row__meta {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  min-width: 0;
+}
+
+.dynamic-order-row__id,
+.alert-row__id {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 11.5px;
+  font-weight: 700;
+  color: var(--hl-text);
+}
+
+.dynamic-order-row__badge,
+.alert-row__badge {
+  flex-shrink: 0;
+  padding: 2px 7px;
+  border-radius: 999px;
+  font-size: 10.5px;
+  font-weight: 700;
+  background: #e2e8f0;
+  color: #475569;
+}
+
+.dynamic-order-row__meta,
+.alert-row__meta {
+  font-size: 10.5px;
+  color: var(--hl-text-muted);
+}
+
+.dynamic-order-row--waiting .dynamic-order-row__badge {
+  background: #f1f5f9;
+  color: #64748b;
+}
+
+.dynamic-order-row--active .dynamic-order-row__badge {
+  background: #dbeafe;
+  color: #1d4ed8;
+}
+
+.dynamic-order-row--done .dynamic-order-row__badge {
+  background: #dcfce7;
+  color: #166534;
+}
+
+.dynamic-order-row--danger,
+.alert-row--danger {
+  border-color: #fecaca;
+  background: #fef2f2;
+}
+
+.dynamic-order-row--danger .dynamic-order-row__badge,
+.alert-row--danger .alert-row__badge {
+  background: #fee2e2;
+  color: #b91c1c;
+}
+
+.alert-row--warn {
+  border-color: #fed7aa;
+  background: #fff7ed;
+}
+
+.alert-row--warn .alert-row__badge {
+  background: #ffedd5;
+  color: #c2410c;
+}
 
 /* 地图区 */
 .dispatch-map {
