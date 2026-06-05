@@ -64,6 +64,10 @@ class TestPhase7SnapshotAndTensorizers(unittest.TestCase):
         self.assertEqual(batch.history_padding_mask.dtype, np.bool_)
         self.assertEqual(action_mask.root_branch_mask.shape, (2,))
         self.assertEqual(action_mask.mode_mask.shape[0], len(candidate_out.mode_mask))
+        self.assertIn("deadline_remaining_time_norm", ORDER_TOKEN_FIELDS)
+        self.assertIn("estimated_delivery_finish_slack_norm", ORDER_TOKEN_FIELDS)
+        self.assertIn("best_mode_b_recovery_flight_time_norm", ORDER_TOKEN_FIELDS)
+        self.assertIn("local_teacher_order_cost_norm", ORDER_TOKEN_FIELDS)
 
     def test_history_trigger_types_use_distinct_codes_for_runtime_resume_paths(self) -> None:
         candidate_out = self.env.build_candidate_output(

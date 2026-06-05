@@ -9,6 +9,7 @@ Phase 7 model runtime tests.
 
 from __future__ import annotations
 
+import json
 import random
 import tempfile
 import unittest
@@ -50,6 +51,7 @@ from .train_cmrappo import (
     _shape_post_action_reward_for_rendezvous,
     _should_stop_early,
     _build_stochastic_high_improvement_key,
+    _BCWarmStartStageConfig,
     _TrainingConfig,
     _resolve_device,
     _resolve_rollout_prefix_bootstrap_values,
@@ -178,6 +180,7 @@ class TestPhase7ModelRuntime(unittest.TestCase):
             sequence_minibatch_size=2,
             target_minibatch_timesteps=4,
             ppo_learning_rate=3e-4,
+            bc_learning_rate=3e-4,
             batch_size_alias=4,
             ppo_epochs=2,
             gamma=0.99,
@@ -210,6 +213,14 @@ class TestPhase7ModelRuntime(unittest.TestCase):
             early_stop_value_loss_window=3,
             early_stop_value_loss_min_delta=0.0,
             allowed_train_order_source_mode=("poisson",),
+            bc_warm_start_stages=(
+                _BCWarmStartStageConfig(
+                    name="test_bc",
+                    order_source_mode="benchmark",
+                    updates=1,
+                    learning_rate=3e-4,
+                ),
+            ),
         )
 
     def test_bc_warm_start_reads_batch_labels_without_env_step(self) -> None:
@@ -288,28 +299,32 @@ class TestPhase7ModelRuntime(unittest.TestCase):
                 return_value=fake_env,
             ):
                 with mock.patch(
-                    "backend.training.train_cmrappo.build_batch_matching_teacher_labels",
-                    side_effect=[teacher_result_1, teacher_result_2],
-                ) as teacher_mock:
-                    stats = _run_bc_warm_start(
-                        model=model,
-                        optimizer=optimizer,
-                        scene_ctx=SimpleNamespace(),
-                        order_source=SimpleNamespace(),
-                        config_path=Path("backend/config/rh_alns_cmrappo.yaml"),
-                        tensorizer=SimpleNamespace(
-                            build=mock.Mock(return_value=SimpleNamespace()),
-                            build_action_mask=mock.Mock(return_value=SimpleNamespace()),
-                        ),
-                        critic_builder=SimpleNamespace(
-                            build=mock.Mock(return_value=SimpleNamespace())
-                        ),
-                        critic_schema=SimpleNamespace(),
-                        train_cfg=train_cfg,
-                        device=device,
-                        metrics_path=metrics_path,
-                        event_hook=None,
-                    )
+                    "backend.training.train_cmrappo.build_order_source",
+                    return_value=SimpleNamespace(),
+                ):
+                    with mock.patch(
+                        "backend.training.train_cmrappo.build_batch_matching_teacher_labels",
+                        side_effect=[teacher_result_1, teacher_result_2],
+                    ) as teacher_mock:
+                        stats = _run_bc_warm_start(
+                            model=model,
+                            optimizer=optimizer,
+                            scene_ctx=SimpleNamespace(),
+                            order_source=SimpleNamespace(),
+                            config_path=Path("backend/config/rh_alns_cmrappo.yaml"),
+                            tensorizer=SimpleNamespace(
+                                build=mock.Mock(return_value=SimpleNamespace()),
+                                build_action_mask=mock.Mock(return_value=SimpleNamespace()),
+                            ),
+                            critic_builder=SimpleNamespace(
+                                build=mock.Mock(return_value=SimpleNamespace())
+                            ),
+                            critic_schema=SimpleNamespace(),
+                            train_cfg=train_cfg,
+                            device=device,
+                            metrics_path=metrics_path,
+                            event_hook=None,
+                        )
 
             self.assertEqual(stats["samples"], 2)
             self.assertEqual(stats["wait"], 2)
@@ -326,6 +341,121 @@ class TestPhase7ModelRuntime(unittest.TestCase):
             ],
         )
         self.assertEqual(teacher_mock.call_count, 2)
+
+    def test_bc_warm_start_can_continue_rollout_across_updates(self) -> None:
+        device = torch.device("cpu")
+
+        class DummyModel(torch.nn.Module):
+            def __init__(self) -> None:
+                super().__init__()
+                self.weight = torch.nn.Parameter(torch.as_tensor(1.0, dtype=torch.float32))
+
+            def forward(self, **_kwargs: object) -> tuple[SimpleNamespace, None]:
+                return SimpleNamespace(), None
+
+            def evaluate_actions(self, **_kwargs: object) -> tuple[torch.Tensor, torch.Tensor]:
+                return self.weight.reshape(1), torch.zeros(1, dtype=torch.float32)
+
+        model = DummyModel()
+        optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
+        train_cfg = replace(
+            self._build_training_config(),
+            bc_warm_start_enabled=True,
+            bc_warm_start_updates=2,
+            bc_warm_start_stages=(
+                _BCWarmStartStageConfig(
+                    name="test_bc",
+                    order_source_mode="benchmark",
+                    updates=2,
+                    learning_rate=3e-4,
+                ),
+            ),
+            bc_warm_start_batches_per_update=1,
+            bc_warm_start_decision_batches_per_update=1,
+            bc_warm_start_reset_each_update=False,
+        )
+        contexts = [
+            SimpleNamespace(deciding_drone_id="d1", coarse_plan=SimpleNamespace(plan_version=1)),
+            SimpleNamespace(deciding_drone_id="d2", coarse_plan=SimpleNamespace(plan_version=2)),
+        ]
+        candidate_outputs = [
+            SimpleNamespace(resolved_action_lookup=SimpleNamespace(dispatch_actions={})),
+            SimpleNamespace(resolved_action_lookup=SimpleNamespace(dispatch_actions={})),
+        ]
+        fake_env = mock.Mock()
+        fake_env.reset.return_value = SimpleNamespace(done=False)
+        fake_env.is_done.side_effect = [False, False, False, False]
+        fake_env.peek_current_decision_batch.side_effect = [(contexts[0],), (contexts[1],)]
+        fake_env.build_candidate_output.side_effect = candidate_outputs
+        fake_env.step.side_effect = AssertionError("BC warm start 不应执行 env.step")
+        fake_env.apply_decision_batch.side_effect = [
+            SimpleNamespace(done=False),
+            SimpleNamespace(done=True),
+        ]
+        teacher_results = [
+            SimpleNamespace(
+                labels_by_drone={"d1": ResolvedActionIndices(root_branch_idx=0)},
+                assignments_by_drone={"d1": SimpleNamespace(action=WAIT_ACTION)},
+                actions_by_drone={"d1": WAIT_ACTION},
+            ),
+            SimpleNamespace(
+                labels_by_drone={"d2": ResolvedActionIndices(root_branch_idx=0)},
+                assignments_by_drone={"d2": SimpleNamespace(action=WAIT_ACTION)},
+                actions_by_drone={"d2": WAIT_ACTION},
+            ),
+        ]
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            metrics_path = Path(tmpdir) / "train_metrics.jsonl"
+            with mock.patch(
+                "backend.training.train_cmrappo.TrainingEnvAdapter",
+                return_value=fake_env,
+            ):
+                with mock.patch(
+                    "backend.training.train_cmrappo.build_order_source",
+                    return_value=SimpleNamespace(),
+                ):
+                    with mock.patch(
+                        "backend.training.train_cmrappo.build_batch_matching_teacher_labels",
+                        side_effect=teacher_results,
+                    ):
+                        stats = _run_bc_warm_start(
+                            model=model,
+                            optimizer=optimizer,
+                            scene_ctx=SimpleNamespace(),
+                            order_source=SimpleNamespace(),
+                            config_path=Path("backend/config/rh_alns_cmrappo.yaml"),
+                            tensorizer=SimpleNamespace(
+                                build=mock.Mock(return_value=SimpleNamespace()),
+                                build_action_mask=mock.Mock(return_value=SimpleNamespace()),
+                            ),
+                            critic_builder=SimpleNamespace(
+                                build=mock.Mock(return_value=SimpleNamespace())
+                            ),
+                            critic_schema=SimpleNamespace(),
+                            train_cfg=train_cfg,
+                            device=device,
+                            metrics_path=metrics_path,
+                            event_hook=None,
+                        )
+
+            rows = [
+                json.loads(line)
+                for line in metrics_path.read_text(encoding="utf-8").splitlines()
+                if line.strip()
+            ]
+
+        self.assertEqual(fake_env.reset.call_count, 1)
+        fake_env.step.assert_not_called()
+        self.assertEqual(stats["samples"], 2)
+        self.assertEqual(stats["decision_batches"], 2)
+        self.assertEqual(stats["rollout_episodes"], 1)
+        self.assertEqual(stats["completed_rollouts"], 1)
+        self.assertFalse(stats["reset_each_update"])
+        self.assertEqual(rows[0]["bc_decision_batches"], 1)
+        self.assertEqual(rows[0]["bc_rollout_episodes"], 1)
+        self.assertEqual(rows[1]["bc_decision_batches"], 1)
+        self.assertEqual(rows[1]["bc_rollout_episodes"], 0)
 
     def test_bc_warm_start_checkpoint_round_trips_model_optimizer_and_stats(self) -> None:
         device = torch.device("cpu")
@@ -2379,6 +2509,7 @@ class TestPhase7ModelRuntime(unittest.TestCase):
                 {
                     "total_reward": 10.0,
                     "episode_length_decisions": 5,
+                    "episode_length_decision_batches": 2,
                     "episode_end_t_sec": 120.0,
                     "delivery_count": 2,
                     "on_time_rate": 1.0,
@@ -2420,6 +2551,7 @@ class TestPhase7ModelRuntime(unittest.TestCase):
                 {
                     "total_reward": 14.0,
                     "episode_length_decisions": 7,
+                    "episode_length_decision_batches": 3,
                     "episode_end_t_sec": 150.0,
                     "delivery_count": 3,
                     "on_time_rate": 0.5,
@@ -2505,6 +2637,8 @@ class TestPhase7ModelRuntime(unittest.TestCase):
         self.assertAlmostEqual(report["sum_t_ppo_attributed_fallback_sec"], 6.0)
         self.assertAlmostEqual(report["sum_t_system_attributed_fallback_sec"], 4.0)
         self.assertAlmostEqual(report["mean_total_reward"], 12.0)
+        self.assertAlmostEqual(report["mean_episode_length_decision_batches"], 2.5)
+        self.assertEqual(report["sum_episode_length_decision_batches"], 5)
         self.assertAlmostEqual(report["mode_b_dispatch_ratio"], 0.5)
         self.assertAlmostEqual(report["mode_c_dispatch_ratio"], 0.5)
         self.assertEqual(len(report["episodes"]), 2)

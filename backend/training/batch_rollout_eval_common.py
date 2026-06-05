@@ -307,6 +307,7 @@ def print_summary(summary: Mapping[str, Any]) -> None:
         "strategy",
         "episode_count",
         "mean_total_reward",
+        "mean_episode_length_decision_batches",
         "mean_delivery_count",
         "mean_on_time_rate",
         "mean_avg_order_delay_min",

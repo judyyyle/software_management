@@ -564,6 +564,16 @@ class OrderFeatures:
     best_mode_c_total_energy_ratio: float = 0.0
     mode_c_energy_saving_ratio: float = 0.0
     estimated_delivery_finish_slack_sec: float = 0.0
+    local_teacher_has_order_choice: bool = False
+    local_teacher_prefers_order: bool = False
+    local_teacher_order_cost: float = 0.0
+    local_teacher_best_mode: str = "NONE"
+    local_teacher_peer_prefer_count: int = 0
+    local_teacher_peer_best_other_cost: float = 0.0
+    local_teacher_cost_gap_to_order_best: float = 0.0
+    local_teacher_is_order_best: bool = False
+    local_teacher_mode_b_prefer_count: int = 0
+    local_teacher_mode_c_prefer_count: int = 0
 
 
 @dataclass(frozen=True)

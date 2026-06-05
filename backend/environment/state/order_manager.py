@@ -370,9 +370,17 @@ class OrderManager:
         weight = self._sample_payload_weight(cfg)
 
         # ── 唯一 ID（seed 可复现）──────────────────────────────────────────
-        self._order_seq += 1
-        short_hex = f"{random.getrandbits(32):08X}"
-        order_id  = f"ORD-{short_hex}-{self._order_seq}"
+        # benchmark 静态单可能复用历史泊松生成的 ORD-* ID；训练 reset 时先注入
+        # 静态 UAV 单，再生成新的泊松单，因此这里必须避免覆盖 pending 池中的同名订单。
+        existing_ids = self._existing_order_ids()
+        for _ in range(1000):
+            self._order_seq += 1
+            short_hex = f"{random.getrandbits(32):08X}"
+            order_id = f"ORD-{short_hex}-{self._order_seq}"
+            if order_id not in existing_ids:
+                break
+        else:
+            raise RuntimeError("[OrderManager._create_order] 无法生成唯一订单 ID")
 
         return Order(
             order_id=order_id,
@@ -423,3 +431,10 @@ class OrderManager:
             float(cfg.get("weight_min", 0.5)),
             float(cfg.get("weight_max", 5.0)),
         )
+
+    def _existing_order_ids(self) -> set[str]:
+        return {
+            *self.pending_orders.keys(),
+            *self.assigned_orders.keys(),
+            *(order.order_id for order in self.completed_orders),
+        }
