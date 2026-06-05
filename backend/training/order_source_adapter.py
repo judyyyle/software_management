@@ -113,7 +113,11 @@ class OrderSourceConfig:
     说明：
       - `background_static_orders` 始终保留 `static_orders`，供卡车骨架 /
         mode A 背景订单使用；
-      - `scheduled_dynamic_orders` 仅包含 benchmark 回放订单；
+      - `initial_static_uav_orders` 在 benchmark / poisson / hybrid episode
+        起点注入 UAV-capable static orders，使训练重开一轮时与卡车静态
+        背景订单处在同一初始场景里；
+      - `scheduled_dynamic_orders` 包含 benchmark/hybrid 回放动态单，以及
+        poisson/hybrid 下显式加入的 truck-only 动态扰动单；
       - `poisson_gen_config` 始终存在；benchmark 模式通过 `arrival_rate=0`
         显式关闭泊松流，而不是省略配置。
     """
@@ -126,6 +130,9 @@ class OrderSourceConfig:
     seed: int
     benchmark: BenchmarkMeta
     training_input_meta: TrainingInputMeta
+    initial_static_uav_orders: tuple[Mapping[str, Any], ...] = field(
+        default_factory=tuple
+    )
 
     @property
     def has_scheduled_dynamic_orders(self) -> bool:
@@ -141,6 +148,7 @@ class OrderSourceConfig:
         return {
             "mode": self.mode.value,
             "background_static_orders": len(self.background_static_orders),
+            "initial_static_uav_orders": len(self.initial_static_uav_orders),
             "scheduled_dynamic_orders": len(self.scheduled_dynamic_orders),
             "arrival_rate": self.arrival_rate,
             "seed": self.seed,
@@ -259,6 +267,10 @@ def build_order_source(
         seed=selected_seed,
         upper_horizon_sec=float(_require_mapping(cfg, "planner")["upper_horizon_sec"]),
     )
+    initial_static_uav_orders = _build_initial_static_uav_orders(
+        scene_ctx=scene_ctx,
+        mode=selected_mode,
+    )
 
     benchmark = _build_benchmark_meta(
         scene_ctx=scene_ctx,
@@ -285,6 +297,7 @@ def build_order_source(
         seed=selected_seed,
         benchmark=benchmark,
         training_input_meta=training_input_meta,
+        initial_static_uav_orders=initial_static_uav_orders,
     )
 
 
@@ -300,7 +313,13 @@ def configure_order_manager_for_source(
         dict(scene_ctx.bounds),
     )
     manager.set_scheduled_dynamic_orders(
-        [dict(entry) for entry in order_source.scheduled_dynamic_orders]
+        [
+            dict(entry)
+            for entry in (
+                tuple(order_source.initial_static_uav_orders)
+                + tuple(order_source.scheduled_dynamic_orders)
+            )
+        ]
     )
 
 
@@ -448,6 +467,31 @@ def _build_scheduled_dynamic_orders(
     return tuple(
         sorted(
             scheduled,
+            key=lambda item: (float(item.get("spawn_sim_s", 0.0)), str(item.get("order_id", ""))),
+        )
+    )
+
+
+def _build_initial_static_uav_orders(
+    *,
+    scene_ctx: TrainingSceneContext,
+    mode: OrderSourceMode,
+) -> tuple[Mapping[str, Any], ...]:
+    if mode not in {
+        OrderSourceMode.BENCHMARK,
+        OrderSourceMode.POISSON,
+        OrderSourceMode.HYBRID,
+    }:
+        return ()
+    heavy_payload_capacity = float(load_drone_params().heavy.payload_capacity)
+    entries = [
+        _normalize_initial_static_uav_entry(order)
+        for order in scene_ctx.static_orders
+        if float(order.payload_weight) <= heavy_payload_capacity
+    ]
+    return tuple(
+        sorted(
+            entries,
             key=lambda item: (float(item.get("spawn_sim_s", 0.0)), str(item.get("order_id", ""))),
         )
     )
@@ -668,6 +712,25 @@ def _normalize_scheduled_dynamic_entry(
         raw["deadline_offset_s"] = float(dynamic_order.deadline_offset_s or 0.0)
         raw.pop("deadline_sim_s", None)
     return raw
+
+
+def _normalize_initial_static_uav_entry(order: Order) -> Mapping[str, Any]:
+    delivery_lng, delivery_lat = order.delivery_loc.to_wgs84()
+    return {
+        "order_id": str(order.order_id),
+        "spawn_sim_s": 0.0,
+        "deadline_sim_s": float(order.deadline),
+        "payload_weight": float(order.payload_weight),
+        "delivery_lng": float(delivery_lng),
+        "delivery_lat": float(delivery_lat),
+        "delivery_z": float(order.delivery_loc.z),
+        "pickup_source_id": order.pickup_source_id,
+        "source_type": (
+            None
+            if order.source_type is None
+            else str(order.source_type.value)
+        ),
+    }
 
 
 def _resolve_weight_bands(

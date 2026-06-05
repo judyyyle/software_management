@@ -33,12 +33,14 @@ def main() -> int:
     horizon_sec = 3600.0
 
     summaries: dict[str, dict] = {}
+    sources = {}
     for mode in (
         OrderSourceMode.BENCHMARK,
         OrderSourceMode.POISSON,
         OrderSourceMode.HYBRID,
     ):
         order_source = build_order_source(scene_ctx, mode=mode)
+        sources[mode.value] = order_source
         summaries[mode.value] = build_order_source_preview_summary(
             scene_ctx,
             order_source,
@@ -50,14 +52,23 @@ def main() -> int:
     benchmark = summaries["benchmark"]
     poisson = summaries["poisson"]
     hybrid = summaries["hybrid"]
+    benchmark_dynamic_ids = {item.order.order_id for item in scene_ctx.dynamic_orders}
+    poisson_scheduled_ids = {
+        str(entry["order_id"]) for entry in sources["poisson"].scheduled_dynamic_orders
+    }
 
     assert benchmark["arrival_rate"] == 0.0, "benchmark 模式必须关闭泊松流"
     assert benchmark["scheduled_dynamic_orders"] == len(scene_ctx.dynamic_orders)
+    assert benchmark["initial_static_uav_orders"] > 0, "benchmark 必须注入静态 UAV 单"
 
-    assert poisson["scheduled_dynamic_orders"] == 0, "poisson 模式不得注入 dynamic_orders"
+    assert poisson["initial_static_uav_orders"] > 0, "poisson 训练必须注入静态 UAV 单"
+    assert not (
+        benchmark_dynamic_ids & poisson_scheduled_ids
+    ), "poisson 模式不得回放 benchmark dynamic_orders"
     assert poisson["arrival_rate"] > 0.0, "poisson 模式必须启用泊松流"
 
-    assert hybrid["scheduled_dynamic_orders"] == len(scene_ctx.dynamic_orders)
+    assert hybrid["scheduled_dynamic_orders"] >= len(scene_ctx.dynamic_orders)
+    assert hybrid["initial_static_uav_orders"] > 0, "hybrid 必须注入静态 UAV 单"
     assert hybrid["arrival_rate"] > 0.0, "hybrid 模式必须同时包含泊松流"
 
     same_seed_a = build_order_source_preview_summary(

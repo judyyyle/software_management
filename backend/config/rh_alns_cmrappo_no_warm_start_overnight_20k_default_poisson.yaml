@@ -15,8 +15,8 @@
 #   - 地图尺度：约 4011.5m × 4011.5m
 #   - 站点最近邻间距：均值约 949m
 #   - 订单到最近站点距离：均值约 500m
-#   - benchmark 动态订单强度：当前 orders.json 约 0.66~0.67 单/分钟
-#   - 当前 PPO 训练泊松强度：取 1.20 单/分钟，提高动态单到达频率
+#   - benchmark primary 动态订单强度：当前 orders_ppo_training_intensity.json 约 2.14 单/分钟
+#   - 当前 PPO 训练泊松强度：取 2.15 单/分钟，对齐 benchmark primary 动态流
 # =============================================================================
 
 scene:
@@ -24,9 +24,11 @@ scene:
   region: shanghai_pudong
 
   # 固定离线训练/验证阶段的主输入来源，保证只看本配置即可定位场景数据。
+  # 本次复跑固定场景目录（default_scene）
   scene_bundle_dir: backend/test_data/default_scene
   scene_config_file: scene_config.json
   entities_file: entities.json
+  # benchmark 订单流固定使用该文件（由 scene.orders_file 提供给 benchmark replay）
   orders_file: orders_ppo_training_intensity.json
   osm_network_file: osm_network.geojson
   osm_network_format: geojson
@@ -72,10 +74,12 @@ data:
   c_sensitive_eval_min_legal_mode_c_recovery_nodes: 1
 
   # 训练主输入：泊松流。
-  # 正式 baseline 对照输入：保持下方 poisson_weight_bands 的 0.70/0.30 载重比例不变，
-  # 将动态订单到达频率固定为 1.50/min，在 5400s episode 下期望约 135 单。
+  # 对齐 default_scene/orders_ppo_training_intensity.json 的 primary 动态单：
+  #   - 108 个 <=10kg 订单分布在 0~3000s，平均间隔约 28.0s
+  #   - 等效到达频率约 2.14/min
+  #   - max_orders=113 与 5 个 truck-only 预定义扰动配合，约束总动态单规模
   # 单位固定为 单/分钟，与 Phase 1 文档口径保持一致。
-  poisson_arrival_rate: 1.50
+  poisson_arrival_rate: 2.15
   poisson_weight_min_kg: 0.5
   poisson_weight_max_kg: 10.0
   # 分段载重采样：当前机队为 9 LightDrone(<=2kg) + 3 HeavyDrone(<=10kg)，
@@ -84,35 +88,35 @@ data:
   # 均匀采样。
   poisson_weight_bands:
     - name: light_uav
-      probability: 0.70
+      probability: 0.72
       weight_min_kg: 0.5
       weight_max_kg: 2.0
     - name: heavy_uav
-      probability: 0.30
+      probability: 0.28
       weight_min_kg: 2.0
       weight_max_kg: 10.0
   poisson_geo_mode: bbox_uniform
   poisson_burst_enabled: false
   poisson_burst_multiplier: 1.0
-  poisson_max_orders_per_episode: 160
+  poisson_max_orders_per_episode: 113
 
   # Mode C 两阶段改造第一步：在 PPO 训练的动态流中加入极少量 truck-only 订单。
   # 这些订单 payload 必须超过 heavy UAV 承载上限，因此不会进入 PPO 可授权订单集合；
   # deadline 刻意显著长于普通 UAV 动态订单，仅作为后续卡车动态重排的结构性扰动。
   truck_only_dynamic_enabled: true
   truck_only_dynamic_orders_per_episode: 5
-  truck_only_dynamic_spawn_start_s: 600
-  truck_only_dynamic_spawn_end_s: 2400
-  truck_only_dynamic_weight_min_kg: 10.5
-  truck_only_dynamic_weight_max_kg: 12.0
-  truck_only_dynamic_deadline_window_min_min: 80
-  truck_only_dynamic_deadline_window_max_min: 120
+  truck_only_dynamic_spawn_start_s: 375
+  truck_only_dynamic_spawn_end_s: 1340
+  truck_only_dynamic_weight_min_kg: 10.9
+  truck_only_dynamic_weight_max_kg: 11.8
+  truck_only_dynamic_deadline_window_min_min: 92
+  truck_only_dynamic_deadline_window_max_min: 119
 
   # stochastic 验证的标准强度档。
   stochastic_eval_arrival_rate_per_min:
     low: 0.67
     medium: 1.20
-    high: 1.50
+    high: 2.15
 
   # hybrid 模式仅用于后续随机扩展验证；训练主循环不应启用。
   hybrid_background_dynamic_orders: true
@@ -288,7 +292,7 @@ reward:
   wait_idle_penalty_coef: 0.03
   # 当 IDLE UAV 在当前确有合法派单动作时仍选择 WAIT，立即施加小额机会成本。
   # 只惩罚“跳过可执行派单”的 WAIT，避免未接单 pending 超时完全缺少 credit。
-  wait_opportunity_penalty_coef: 2.0
+  wait_opportunity_penalty_coef: 5.0
   lambda_miss: 0.15
   lambda_res_timeout: 0.0  # deprecated: reservation timeout no longer creates reward penalty
   lambda_overdue: 0.0  # deprecated: overdue no longer creates per-dt reward penalty
@@ -306,6 +310,8 @@ reward:
   rendezvous_arrive_bonus: 8.0
   rendezvous_bonus: 20.0
   mode_c_attempt_bonus: 5.0
+  uav_energy_penalty_coef: 10.0
+  uav_energy_penalty_cap_ratio: 0.35
 
   # severe overdue 只作为指标阈值；不移除订单、不标记 TIMEOUT、不扣 reward。
   max_overdue_sec: 600
@@ -320,25 +326,25 @@ reward:
 training:
   # 复现性：单环境、固定训练随机种子、强制 deterministic。
   training_seed: 20260424
-  device: cpu
+  device: mps
   num_envs: 1
   torch_deterministic: true
   cudnn_benchmark: false
   mixed_precision: false
 
   # PPO 核心超参数。
-  total_timesteps: 50000
+  total_timesteps: 20000
   # Run16: 小幅回升学习率，补偿更大 Huber delta 下 critic 梯度绝对值下降。
   ppo_learning_rate: 0.0001
-  rollout_steps: 2048
+  rollout_steps: 512
   recurrent_ppo: true
   sequence_len: 16
   burn_in_len: 0
   train_len: 16
-  sequence_minibatch_size: 64
-  target_minibatch_timesteps: 1024
+  sequence_minibatch_size: 32
+  target_minibatch_timesteps: 512
   # 兼容旧字段；在 recurrent PPO 下只允许作为 target_minibatch_timesteps 的过渡别名。
-  batch_size: 1024
+  batch_size: 512
   ppo_epochs: 2
   gamma: 0.99
   gae_lambda: 0.95
@@ -372,18 +378,22 @@ training:
   # 并通过 apply_decision_batch() 沿 teacher 轨迹采样后续 decision batch。
   bc_warm_start_enabled: false
   bc_warm_start_updates: 0
-  bc_warm_start_batches_per_update: 1
-  # 0 表示每条 teacher rollout 直到 episode done；正数表示每条 rollout 最多采样多少个 decision batch。
-  bc_warm_start_max_decision_batches_per_rollout: 0
-  # BC 专用监督损失权重；只影响 warm start，不影响 PPO rollout/update。
-  bc_wait_no_dispatch_loss_weight: 0.05
-  bc_wait_with_dispatch_loss_weight: 0.50
+  bc_warm_start_batches_per_update: 2
+  # 正式 10k 验证先限制每条 teacher rollout 的采样长度，避免 BC 成本远大于 PPO 本体。
+  bc_warm_start_max_decision_batches_per_rollout: 128
+  # warmup 完成后保存 bc_warm_start_policy.pt；后续重跑同一 output_dir 时优先复用，
+  # 或通过 bc_warm_start_checkpoint_path 显式指定已有 warmup 产物。
+  bc_warm_start_reuse_existing: false
+  bc_warm_start_checkpoint_path: ""
+  # BC 专用监督损失权重；降低 forced WAIT 稀释，适度放大 C 标签。
+  bc_wait_no_dispatch_loss_weight: 0.0
+  bc_wait_with_dispatch_loss_weight: 0.75
   bc_mode_b_dispatch_loss_weight: 1.00
-  bc_mode_c_dispatch_loss_weight: 1.00
+  bc_mode_c_dispatch_loss_weight: 1.50
 
-  # 正式 baseline 对照固定使用 high=1.50/min；与贪心预训练配置保持同一订单强度。
+  # 正式贪心预训练固定使用 high=2.15/min；对齐 default_scene benchmark 动态单强度。
   train_arrival_curriculum_enabled: true
-  train_arrival_base_rate_per_min: 1.50
+  train_arrival_base_rate_per_min: 2.15
   train_arrival_high_start_update: 0
   train_arrival_high_full_update: 0
   train_arrival_high_max_probability: 1.00
@@ -394,7 +404,7 @@ training:
   # 诊断短跑阶段降低评估频率；若 selection key 优于历史最优，则覆盖保存 policy_best.pt。
   eval_interval_updates: 0
   benchmark_eval_episodes: 1
-  stochastic_eval_seeds: 3
+  stochastic_eval_seeds: 1
   checkpoint_keep_last: 5
 
   # Run05：checkpoint / early-stop 稳态版。

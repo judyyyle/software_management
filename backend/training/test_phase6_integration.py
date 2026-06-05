@@ -204,6 +204,11 @@ class TestPhase6Integration(unittest.TestCase):
                 "truck_only_dynamic_deadline_window_max_min": 90,
             },
         )
+        static_uav_ids = {
+            str(entry["order_id"])
+            for entry in order_source.initial_static_uav_orders
+        }
+        self.assertTrue(static_uav_ids)
         truck_only_entries = [
             entry
             for entry in order_source.scheduled_dynamic_orders
@@ -238,6 +243,7 @@ class TestPhase6Integration(unittest.TestCase):
         env = TrainingEnvAdapter(scene_ctx=scene_ctx, order_source=order_source)
         env.reset()
         order_mgr = env._require_order_manager()
+        self.assertTrue(static_uav_ids.issubset(set(order_mgr.pending_orders)))
         truck_only_order_id = str(truck_only_entries[0]["order_id"])
         if truck_only_order_id in order_mgr.pending_orders:
             coarse_plan = env._refresh_coarse_plan_if_needed(
@@ -257,6 +263,39 @@ class TestPhase6Integration(unittest.TestCase):
             ]
             self.assertEqual(len(truck_only_events), 1)
             self.assertEqual(truck_only_events[0]["order_id"], truck_only_order_id)
+
+    def test_poisson_reset_injects_static_uav_without_poisson_id_overwrite(self) -> None:
+        config_path = Path(
+            "backend/config/"
+            "rh_alns_cmrappo_bc_warm_start_stage1_benchmark_only_overnight_20k_default_poisson.yaml"
+        )
+        scene_ctx = load_default_scene(config_path=config_path)
+        order_source = build_order_source(
+            scene_ctx,
+            mode=OrderSourceMode.POISSON,
+            config_path=config_path,
+        )
+        static_uav_by_id = {
+            str(entry["order_id"]): entry
+            for entry in order_source.initial_static_uav_orders
+        }
+        self.assertTrue(static_uav_by_id)
+
+        env = TrainingEnvAdapter(
+            scene_ctx=scene_ctx,
+            order_source=order_source,
+            config_path=config_path,
+        )
+        env.reset()
+        order_mgr = env._require_order_manager()
+
+        self.assertTrue(set(static_uav_by_id).issubset(set(order_mgr.pending_orders)))
+        self.assertGreater(len(order_mgr.pending_orders), len(static_uav_by_id))
+        for order_id, entry in static_uav_by_id.items():
+            self.assertAlmostEqual(
+                order_mgr.pending_orders[order_id].deadline,
+                float(entry["deadline_sim_s"]),
+            )
 
     def test_manual_truck_only_order_is_not_uav_authorized(self) -> None:
         env, drone_id = self._reset_controlled_env()

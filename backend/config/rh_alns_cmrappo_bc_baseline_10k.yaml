@@ -376,7 +376,7 @@ training:
   # 0 表示每条 teacher rollout 直到 episode done；正数表示每条 rollout 最多采样多少个 decision batch。
   bc_warm_start_max_decision_batches_per_rollout: 0
   # BC 专用监督损失权重；只影响 warm start，不影响 PPO rollout/update。
-  bc_wait_no_dispatch_loss_weight: 0.05
+  bc_wait_no_dispatch_loss_weight: 0.0
   bc_wait_with_dispatch_loss_weight: 0.50
   bc_mode_b_dispatch_loss_weight: 1.00
   bc_mode_c_dispatch_loss_weight: 1.00

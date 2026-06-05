@@ -11,7 +11,7 @@ actions, and does not advance simulation time.
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Callable, Mapping
 
 from config.loader import load_solver_energy_params
@@ -88,7 +88,11 @@ def build_batch_matching_teacher_labels(
             total_cost=0.0,
         )
 
-    _validate_contexts(decision_contexts, require_shared_snapshot=require_shared_snapshot)
+    if require_shared_snapshot:
+        _validate_contexts(
+            decision_contexts,
+            require_shared_snapshot=require_shared_snapshot,
+        )
     dispatch_cost = dispatch_cost_fn or _default_dispatch_cost
     wait_cost = wait_cost_fn or _default_wait_cost
 
@@ -186,6 +190,146 @@ def build_batch_matching_teacher_labels(
         },
         total_cost=float(total_cost),
     )
+
+
+def attach_local_teacher_competition_hints(
+    *,
+    decision_contexts: tuple[Any, ...],
+    candidate_outputs_by_drone: Mapping[str, CandidateOutput],
+    dispatch_cost_fn: DispatchCostFn | None = None,
+    require_shared_snapshot: bool = True,
+) -> dict[str, CandidateOutput]:
+    """Attach pre-matching local teacher hints to candidate order features.
+
+    The hints are derived from each UAV's local dispatch choices before the
+    order-mutual-exclusion assignment is solved.  No selected Hungarian column,
+    final BC label, or final batch action is used here.
+    """
+
+    if not decision_contexts:
+        return dict(candidate_outputs_by_drone)
+
+    if require_shared_snapshot:
+        _validate_contexts(
+            decision_contexts,
+            require_shared_snapshot=require_shared_snapshot,
+        )
+    dispatch_cost = dispatch_cost_fn or _default_dispatch_cost
+    drone_ids = [str(context.deciding_drone_id) for context in decision_contexts]
+    missing = [drone_id for drone_id in drone_ids if drone_id not in candidate_outputs_by_drone]
+    if missing:
+        raise ValueError(f"candidate_outputs_by_drone 缺少 UAV: {missing}")
+
+    choices_by_drone: dict[str, dict[str, _DispatchChoice]] = {}
+    preferred_choice_by_drone: dict[str, _DispatchChoice] = {}
+    for context in decision_contexts:
+        drone_id = str(context.deciding_drone_id)
+        candidate_out = candidate_outputs_by_drone[drone_id]
+        choices = _best_dispatch_choice_by_order(
+            context=context,
+            candidate_out=candidate_out,
+            dispatch_cost_fn=dispatch_cost,
+        )
+        choices_by_drone[drone_id] = choices
+        if choices:
+            preferred_choice_by_drone[drone_id] = min(
+                choices.values(),
+                key=lambda item: (float(item.cost), str(item.order_id), str(item.action.mode)),
+            )
+
+    prefer_count_by_order: dict[str, int] = {}
+    mode_b_prefer_count_by_order: dict[str, int] = {}
+    mode_c_prefer_count_by_order: dict[str, int] = {}
+    for choice in preferred_choice_by_drone.values():
+        order_id = str(choice.order_id)
+        prefer_count_by_order[order_id] = int(prefer_count_by_order.get(order_id, 0)) + 1
+        mode = str(choice.action.mode)
+        if mode == "B":
+            mode_b_prefer_count_by_order[order_id] = (
+                int(mode_b_prefer_count_by_order.get(order_id, 0)) + 1
+            )
+        elif mode == "C":
+            mode_c_prefer_count_by_order[order_id] = (
+                int(mode_c_prefer_count_by_order.get(order_id, 0)) + 1
+            )
+
+    order_costs: dict[str, list[tuple[str, _DispatchChoice]]] = {}
+    for drone_id, choices in choices_by_drone.items():
+        for order_id, choice in choices.items():
+            order_costs.setdefault(str(order_id), []).append((str(drone_id), choice))
+
+    annotated: dict[str, CandidateOutput] = dict(candidate_outputs_by_drone)
+    for drone_id in drone_ids:
+        candidate_out = candidate_outputs_by_drone[drone_id]
+        choices = choices_by_drone.get(drone_id, {})
+        preferred = preferred_choice_by_drone.get(drone_id)
+        updated_orders = []
+        for order_feature in candidate_out.candidate_features.order_features:
+            if not bool(order_feature.is_valid):
+                updated_orders.append(order_feature)
+                continue
+
+            order_id = str(order_feature.order_id)
+            choice = choices.get(order_id)
+            all_order_choices = order_costs.get(order_id, [])
+            best_cost = (
+                min(float(item.cost) for _peer_id, item in all_order_choices)
+                if all_order_choices
+                else None
+            )
+            other_costs = [
+                float(item.cost)
+                for peer_id, item in all_order_choices
+                if str(peer_id) != str(drone_id)
+            ]
+            best_other_cost = min(other_costs) if other_costs else 0.0
+            has_choice = choice is not None
+            order_cost = float(choice.cost) if choice is not None else 0.0
+            cost_gap = (
+                float(order_cost) - float(best_cost)
+                if choice is not None and best_cost is not None
+                else 0.0
+            )
+            is_order_best = (
+                choice is not None
+                and best_cost is not None
+                and float(choice.cost) <= float(best_cost) + _TIME_EPS
+            )
+            updated_orders.append(
+                replace(
+                    order_feature,
+                    local_teacher_has_order_choice=bool(has_choice),
+                    local_teacher_prefers_order=bool(
+                        preferred is not None and str(preferred.order_id) == order_id
+                    ),
+                    local_teacher_order_cost=float(order_cost),
+                    local_teacher_best_mode=(
+                        str(choice.action.mode) if choice is not None else "NONE"
+                    ),
+                    local_teacher_peer_prefer_count=int(
+                        prefer_count_by_order.get(order_id, 0)
+                    ),
+                    local_teacher_peer_best_other_cost=float(best_other_cost),
+                    local_teacher_cost_gap_to_order_best=float(cost_gap),
+                    local_teacher_is_order_best=bool(is_order_best),
+                    local_teacher_mode_b_prefer_count=int(
+                        mode_b_prefer_count_by_order.get(order_id, 0)
+                    ),
+                    local_teacher_mode_c_prefer_count=int(
+                        mode_c_prefer_count_by_order.get(order_id, 0)
+                    ),
+                )
+            )
+
+        annotated[drone_id] = replace(
+            candidate_out,
+            candidate_features=replace(
+                candidate_out.candidate_features,
+                order_features=tuple(updated_orders),
+            ),
+        )
+
+    return annotated
 
 
 def _validate_contexts(
@@ -436,6 +580,7 @@ def _solve_rectangular_assignment(cost_matrix: list[list[float]]) -> list[int]:
 
 
 __all__ = [
+    "attach_local_teacher_competition_hints",
     "BatchMatchingTeacherResult",
     "BatchTeacherAssignment",
     "DispatchCostFn",
