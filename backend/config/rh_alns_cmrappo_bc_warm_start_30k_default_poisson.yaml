@@ -293,6 +293,7 @@ reward:
   # 当 IDLE UAV 在当前确有合法派单动作时仍选择 WAIT，立即施加小额机会成本。
   # 只惩罚“跳过可执行派单”的 WAIT，避免未接单 pending 超时完全缺少 credit。
   wait_opportunity_penalty_coef: 5.0
+  wait_opportunity_penalty_coef: 5.0
   lambda_miss: 0.15
   lambda_res_timeout: 0.0  # deprecated: reservation timeout no longer creates reward penalty
   lambda_overdue: 0.0  # deprecated: overdue no longer creates per-dt reward penalty
@@ -326,6 +327,7 @@ reward:
 training:
   # 复现性：单环境、固定训练随机种子、强制 deterministic。
   training_seed: 20260424
+  device: mps
   device: mps
   num_envs: 1
   torch_deterministic: true
