@@ -292,7 +292,7 @@ reward:
   wait_idle_penalty_coef: 0.03
   # 当 IDLE UAV 在当前确有合法派单动作时仍选择 WAIT，立即施加小额机会成本。
   # 只惩罚“跳过可执行派单”的 WAIT，避免未接单 pending 超时完全缺少 credit。
-  wait_opportunity_penalty_coef: 2.0
+  wait_opportunity_penalty_coef: 5.0
   lambda_miss: 0.15
   lambda_res_timeout: 0.0  # deprecated: reservation timeout no longer creates reward penalty
   lambda_overdue: 0.0  # deprecated: overdue no longer creates per-dt reward penalty
@@ -310,6 +310,8 @@ reward:
   rendezvous_arrive_bonus: 8.0
   rendezvous_bonus: 20.0
   mode_c_attempt_bonus: 5.0
+  uav_energy_penalty_coef: 10.0
+  uav_energy_penalty_cap_ratio: 0.35
 
   # severe overdue 只作为指标阈值；不移除订单、不标记 TIMEOUT、不扣 reward。
   max_overdue_sec: 600
@@ -324,7 +326,7 @@ reward:
 training:
   # 复现性：单环境、固定训练随机种子、强制 deterministic。
   training_seed: 20260424
-  device: cpu
+  device: mps
   num_envs: 1
   torch_deterministic: true
   cudnn_benchmark: false
@@ -375,19 +377,23 @@ training:
   # BC warm start 默认关闭。开启后用同刻 batch teacher 生成监督标签，
   # 并通过 apply_decision_batch() 沿 teacher 轨迹采样后续 decision batch。
   bc_warm_start_enabled: true
-  bc_warm_start_updates: 30
-  bc_warm_start_batches_per_update: 2
-  # 正式 10k 验证先限制每条 teacher rollout 的采样长度，避免 BC 成本远大于 PPO 本体。
-  bc_warm_start_max_decision_batches_per_rollout: 128
+  bc_warm_start_updates: 100
+  # 每个 update 只采 32 个 decision batch，但跨 update 继续同一条 episode；
+  # 仅当 episode done 时 reset，避免反复只训练 episode 开头片段。
+  bc_warm_start_batches_per_update: 1
+  bc_warm_start_decision_batches_per_update: 32
+  bc_warm_start_reset_each_update: false
+  bc_warm_start_max_decision_batches_per_rollout: 0
   # warmup 完成后保存 bc_warm_start_policy.pt；后续重跑同一 output_dir 时优先复用，
   # 或通过 bc_warm_start_checkpoint_path 显式指定已有 warmup 产物。
   bc_warm_start_reuse_existing: true
+  bc_warm_start_checkpoint_interval_updates: 10
   bc_warm_start_checkpoint_path: ""
   # BC 专用监督损失权重；降低 forced WAIT 稀释，适度放大 C 标签。
-  bc_wait_no_dispatch_loss_weight: 0.05
-  bc_wait_with_dispatch_loss_weight: 0.50
+  bc_wait_no_dispatch_loss_weight: 0.0
+  bc_wait_with_dispatch_loss_weight: 0.75
   bc_mode_b_dispatch_loss_weight: 1.00
-  bc_mode_c_dispatch_loss_weight: 1.00
+  bc_mode_c_dispatch_loss_weight: 2.00
 
   # 正式贪心预训练固定使用 high=2.15/min；对齐 default_scene benchmark 动态单强度。
   train_arrival_curriculum_enabled: true

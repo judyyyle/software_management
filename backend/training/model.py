@@ -60,6 +60,7 @@ if torch is not None:  # pragma: no cover
             self.d_model = int(d_model)
             self.lstm_hidden = int(lstm_hidden)
             self.lstm_layers = int(lstm_layers)
+            self._lstm_device_override: torch.device | None = None
 
             self.uav_proj = nn.Linear(uav_feat_dim, d_model)
             self.order_proj = nn.Linear(order_feat_dim, d_model)
@@ -109,6 +110,13 @@ if torch is not None:  # pragma: no cover
                 nn.Linear(ff_dim, 1),
             )
 
+        def enable_lstm_cpu_fallback(self) -> None:
+            """Run LSTM modules on CPU while the rest of the model may use MPS."""
+
+            self.history_encoder.to("cpu")
+            self.recurrent_core.to("cpu")
+            self._lstm_device_override = torch.device("cpu")
+
         def forward(
             self,
             *,
@@ -142,6 +150,7 @@ if torch is not None:  # pragma: no cover
             lstm_state: tuple[Tensor, Tensor] | None = None,
         ) -> tuple[PolicyForwardOutput, tuple[Tensor, Tensor]]:
             device = self.uav_proj.weight.device
+            lstm_device = self._lstm_device_override or device
             uav_self = _ensure_sequence_dim(
                 _to_float_tensor(observation_batch.uav_self_token, device=device),
                 single_rank=1,
@@ -172,7 +181,7 @@ if torch is not None:  # pragma: no cover
                 single_rank=1,
                 name="observation_batch.history_padding_mask",
             )
-            lstm_state = _move_lstm_state(lstm_state, device=device)
+            lstm_state = _move_lstm_state(lstm_state, device=lstm_device)
 
             batch_size, seq_len = uav_self.shape[:2]
             uav_embed = self.uav_proj(uav_self)
@@ -186,13 +195,15 @@ if torch is not None:  # pragma: no cover
                 history_embed.size(3),
             )
             history_padding_mask_flat = history_padding_mask.reshape(-1, history_padding_mask.size(2))
+            history_embed = history_embed.to(lstm_device)
+            history_padding_mask_flat = history_padding_mask_flat.to(lstm_device)
             history_embed = history_embed.masked_fill(history_padding_mask_flat.unsqueeze(-1), 0.0)
             history_out, _ = self.history_encoder(history_embed)
             history_summary = _masked_mean(
                 history_out,
                 ~history_padding_mask_flat,
                 dim=1,
-            ).reshape(batch_size, seq_len, -1)
+            ).reshape(batch_size, seq_len, -1).to(device)
             order_valid_mask = ~order_padding_mask
             order_mean = _masked_mean(order_embed, order_valid_mask, dim=2)
             order_max = _masked_max(order_embed, order_valid_mask, dim=2)
@@ -211,8 +222,11 @@ if torch is not None:  # pragma: no cover
                     dim=-1,
                 )
             )
-            recurrent_out, next_lstm_state = self.recurrent_core(base_context, lstm_state)
-            recurrent_context = self.recurrent_proj(recurrent_out)
+            recurrent_out, next_lstm_state = self.recurrent_core(
+                base_context.to(lstm_device),
+                lstm_state,
+            )
+            recurrent_context = self.recurrent_proj(recurrent_out.to(device))
             context = base_context + recurrent_context
 
             root_branch_logits = self.root_head(context)
@@ -343,8 +357,16 @@ if torch is not None:  # pragma: no cover
             log_prob = log_prob + order_dist.log_prob(order_idx)
             result["order_idx"] = int(order_idx[0].item())
 
-            mode_logits = policy_out.mode_logits[torch.arange(batch), order_idx]
-            chosen_mode_mask = mode_mask[torch.arange(batch), order_idx]
+            mode_logits = _select_order_slot(
+                policy_out.mode_logits,
+                order_idx,
+                name="policy_out.mode_logits",
+            )
+            chosen_mode_mask = _select_order_slot(
+                mode_mask,
+                order_idx,
+                name="action_mask.mode_mask",
+            )
             mode_logits = _masked_logits(mode_logits, chosen_mode_mask)
             mode_dist = torch.distributions.Categorical(logits=mode_logits)
             mode_idx = torch.argmax(mode_logits, dim=-1) if deterministic else mode_dist.sample()
@@ -407,8 +429,16 @@ if torch is not None:  # pragma: no cover
             entropy = entropy + p_dispatch * order_entropy
 
             batch = root_idx.size(0)
-            mode_logits = policy_out.mode_logits[torch.arange(batch), order_idx]
-            chosen_mode_mask = mode_mask[torch.arange(batch), order_idx]
+            mode_logits = _select_order_slot(
+                policy_out.mode_logits,
+                order_idx,
+                name="policy_out.mode_logits",
+            )
+            chosen_mode_mask = _select_order_slot(
+                mode_mask,
+                order_idx,
+                name="action_mask.mode_mask",
+            )
             mode_logits, mode_has_valid = _safe_masked_logits(
                 mode_logits,
                 chosen_mode_mask,
@@ -434,6 +464,26 @@ if torch is not None:  # pragma: no cover
 
     def _to_bool_tensor(value: Any, *, device: torch.device) -> Tensor:
         return torch.as_tensor(value, dtype=torch.bool, device=device)
+
+
+    def _select_order_slot(value: Tensor, order_idx: Tensor, *, name: str) -> Tensor:
+        if value.dim() != 3:
+            raise ValueError(f"{name} 期望为 3D tensor，实际 shape={tuple(value.shape)}")
+        if order_idx.dim() != 1:
+            raise ValueError(
+                f"order_idx 期望为 1D tensor，实际 shape={tuple(order_idx.shape)}"
+            )
+        if value.size(0) != order_idx.size(0):
+            raise ValueError(
+                f"{name} batch 维度与 order_idx 不一致: "
+                f"{value.size(0)} != {order_idx.size(0)}"
+            )
+        index = order_idx.to(dtype=torch.long).reshape(-1, 1, 1).expand(
+            -1,
+            1,
+            value.size(-1),
+        )
+        return torch.gather(value, dim=1, index=index).squeeze(1)
 
 
     def _ensure_batch_dim(

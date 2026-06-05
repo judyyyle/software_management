@@ -22,6 +22,7 @@ from .order_source_adapter import OrderSourceMode, build_order_source
 from .scene_loader import DEFAULT_CONFIG_PATH, TrainingSceneContext, load_default_scene
 from .train_cmrappo import (
     _EpisodeAccumulator,
+    _actor_observation_schema_hash,
     _build_candidate_output,
     _detach_lstm_state,
     _finalize_episode_metrics,
@@ -119,6 +120,16 @@ def load_trained_policy(
     state_dict = checkpoint.get("model_state_dict")
     if not isinstance(state_dict, dict):
         raise ValueError(f"policy checkpoint 缺少 model_state_dict: {resolved_policy_path}")
+    checkpoint_actor_schema_hash = checkpoint.get("actor_observation_schema_hash")
+    expected_actor_schema_hash = _actor_observation_schema_hash()
+    if (
+        checkpoint_actor_schema_hash is not None
+        and str(checkpoint_actor_schema_hash) != expected_actor_schema_hash
+    ):
+        raise ValueError(
+            "policy checkpoint actor observation schema 不匹配: "
+            f"{checkpoint_actor_schema_hash} != {expected_actor_schema_hash}"
+        )
     model.load_state_dict(state_dict)
     model.eval()
 
@@ -137,6 +148,9 @@ def load_trained_policy(
             "global_step": checkpoint.get("global_step"),
             "update": checkpoint.get("update"),
             "critic_schema_hash": checkpoint.get("critic_schema_hash"),
+            "actor_observation_schema_hash": checkpoint.get(
+                "actor_observation_schema_hash"
+            ),
         },
     )
 

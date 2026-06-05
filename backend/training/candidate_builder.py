@@ -1227,6 +1227,16 @@ def _padding_order_feature() -> OrderFeatures:
         best_mode_c_total_energy_ratio=0.0,
         mode_c_energy_saving_ratio=0.0,
         estimated_delivery_finish_slack_sec=0.0,
+        local_teacher_has_order_choice=False,
+        local_teacher_prefers_order=False,
+        local_teacher_order_cost=0.0,
+        local_teacher_best_mode="NONE",
+        local_teacher_peer_prefer_count=0,
+        local_teacher_peer_best_other_cost=0.0,
+        local_teacher_cost_gap_to_order_best=0.0,
+        local_teacher_is_order_best=False,
+        local_teacher_mode_b_prefer_count=0,
+        local_teacher_mode_c_prefer_count=0,
     )
 
 
