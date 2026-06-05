@@ -87,7 +87,8 @@ UAV_SELF_TOKEN_FIELDS = (
 ORDER_TOKEN_FIELDS = (
     "is_valid",
     "weight_norm",
-    "deadline_slack_norm",
+    "deadline_remaining_time_norm",
+    "estimated_delivery_finish_slack_norm",
     "delivery_x_norm",
     "delivery_y_norm",
     "delivery_z_norm",
@@ -96,6 +97,7 @@ ORDER_TOKEN_FIELDS = (
     "priority_band_norm",
     "has_mode_b_action",
     "best_mode_b_return_score_norm",
+    "best_mode_b_recovery_flight_time_norm",
     "best_mode_b_host_type_code_norm",
     "best_mode_b_queue_time_est_norm",
     "has_mode_c_action",
@@ -113,6 +115,16 @@ ORDER_TOKEN_FIELDS = (
     "best_mode_c_node_type_code_norm",
     "best_mode_c_truck_eta_remaining_norm",
     "best_mode_c_timeout_risk_norm",
+    "local_teacher_has_order_choice",
+    "local_teacher_prefers_order",
+    "local_teacher_order_cost_norm",
+    "local_teacher_best_mode_code_norm",
+    "local_teacher_peer_prefer_count_norm",
+    "local_teacher_peer_best_other_cost_norm",
+    "local_teacher_cost_gap_to_order_best_norm",
+    "local_teacher_is_order_best",
+    "local_teacher_mode_b_prefer_count_norm",
+    "local_teacher_mode_c_prefer_count_norm",
 )
 
 INFRA_TOKEN_FIELDS = (
@@ -190,6 +202,7 @@ class _SceneNorm:
     diagonal_m: float
     max_speed: float
     max_payload_capacity: float
+    max_drone_count: int
 
 
 class ObservationTensorizer:
@@ -385,6 +398,7 @@ class ObservationTensorizer:
                     1.0,
                     self._clip01(float(item.weight) / max(self._cfg.payload_norm_kg, _TIME_EPS)),
                     self._norm_time_signed(float(item.remaining_time)),
+                    self._norm_time_signed(float(item.estimated_delivery_finish_slack_sec)),
                     self._norm_x(float(item.delivery_x)),
                     self._norm_y(float(item.delivery_y)),
                     self._norm_z(float(item.delivery_z)),
@@ -393,6 +407,7 @@ class ObservationTensorizer:
                     self._clip01(float(item.priority_band) / 2.0),
                     self._bool(bool(item.has_mode_b_action)),
                     self._norm_time_nonneg(float(item.best_mode_b_return_score)),
+                    self._norm_time_nonneg(float(item.best_mode_b_recovery_flight_time)),
                     self._code_norm(_HOST_TYPE_CODE, str(item.best_mode_b_host_type)),
                     self._norm_time_nonneg(float(item.best_mode_b_queue_time_est)),
                     self._bool(bool(item.has_mode_c_action)),
@@ -425,6 +440,19 @@ class ObservationTensorizer:
                     self._code_norm(_HOST_TYPE_CODE, str(item.best_mode_c_node_type)),
                     self._norm_time_nonneg(float(item.best_mode_c_truck_eta_remaining)),
                     self._clip01(float(item.best_mode_c_timeout_risk)),
+                    self._bool(bool(item.local_teacher_has_order_choice)),
+                    self._bool(bool(item.local_teacher_prefers_order)),
+                    self._norm_time_signed(float(item.local_teacher_order_cost)),
+                    self._code_norm(
+                        _DISPATCH_MODE_CODE,
+                        str(item.local_teacher_best_mode),
+                    ),
+                    self._norm_peer_count(int(item.local_teacher_peer_prefer_count)),
+                    self._norm_time_signed(float(item.local_teacher_peer_best_other_cost)),
+                    self._norm_time_signed(float(item.local_teacher_cost_gap_to_order_best)),
+                    self._bool(bool(item.local_teacher_is_order_best)),
+                    self._norm_peer_count(int(item.local_teacher_mode_b_prefer_count)),
+                    self._norm_peer_count(int(item.local_teacher_mode_c_prefer_count)),
                 ],
                 dtype=_FLOAT_DTYPE,
             )
@@ -576,6 +604,11 @@ class ObservationTensorizer:
             1.0,
         )
 
+    def _norm_peer_count(self, value: int) -> float:
+        return self._clip01(
+            float(value) / max(float(self._scene_norm.max_drone_count), 1.0)
+        )
+
     @staticmethod
     def _norm_plan_version_delta(value: int) -> float:
         return ObservationTensorizer._clip_signed(float(value) / 16.0, -1.0, 1.0)
@@ -657,6 +690,7 @@ def _build_scene_norm(scene_ctx: TrainingSceneContext) -> _SceneNorm:
         diagonal_m=max(diagonal_m, 1.0),
         max_speed=max(max_speed, 1.0),
         max_payload_capacity=max(max_payload_capacity, 1.0),
+        max_drone_count=max(len(scene_ctx.drones), 1),
     )
 
 

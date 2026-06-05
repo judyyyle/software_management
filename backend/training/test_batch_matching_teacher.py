@@ -8,7 +8,10 @@ import unittest
 from types import SimpleNamespace
 
 from .actions import DispatchAction, WAIT_ACTION
-from .batch_matching_teacher import build_batch_matching_teacher_labels
+from .batch_matching_teacher import (
+    attach_local_teacher_competition_hints,
+    build_batch_matching_teacher_labels,
+)
 from .contracts import (
     CandidateFeatures,
     CandidateOutput,
@@ -274,6 +277,57 @@ class TestBatchMatchingTeacher(unittest.TestCase):
             DispatchAction("ORDER-1", "C"),
         )
         self.assertAlmostEqual(result.assignments_by_drone["DRN-1"].cost, 86.0)
+
+    def test_local_teacher_competition_hints_are_pre_matching(self) -> None:
+        runtime_state = object()
+        coarse_plan = object()
+        contexts = (
+            _context("DRN-1", runtime_state, coarse_plan),
+            _context("DRN-2", runtime_state, coarse_plan),
+        )
+        candidates = {
+            "DRN-1": _candidate_output(
+                [("ORDER-1", ("B",)), ("ORDER-2", ("B",))],
+                "DRN-1",
+            ),
+            "DRN-2": _candidate_output([("ORDER-1", ("C",))], "DRN-2"),
+        }
+
+        hinted = attach_local_teacher_competition_hints(
+            decision_contexts=contexts,
+            candidate_outputs_by_drone=candidates,
+            dispatch_cost_fn=_cost(
+                {
+                    ("DRN-1", "ORDER-1", "B"): 0.0,
+                    ("DRN-1", "ORDER-2", "B"): 5.0,
+                    ("DRN-2", "ORDER-1", "C"): 1.0,
+                }
+            ),
+        )
+        final_result = build_batch_matching_teacher_labels(
+            decision_contexts=contexts,
+            candidate_outputs_by_drone=candidates,
+            dispatch_cost_fn=_cost(
+                {
+                    ("DRN-1", "ORDER-1", "B"): 0.0,
+                    ("DRN-1", "ORDER-2", "B"): 5.0,
+                    ("DRN-2", "ORDER-1", "C"): 1.0,
+                }
+            ),
+        )
+
+        drn1_order1 = hinted["DRN-1"].candidate_features.order_features[0]
+        drn1_order2 = hinted["DRN-1"].candidate_features.order_features[1]
+        drn2_order1 = hinted["DRN-2"].candidate_features.order_features[0]
+        self.assertEqual(final_result.actions_by_drone["DRN-1"], DispatchAction("ORDER-2", "B"))
+        self.assertTrue(drn1_order1.local_teacher_prefers_order)
+        self.assertFalse(drn1_order2.local_teacher_prefers_order)
+        self.assertEqual(drn1_order1.local_teacher_peer_prefer_count, 2)
+        self.assertEqual(drn1_order1.local_teacher_mode_b_prefer_count, 1)
+        self.assertEqual(drn1_order1.local_teacher_mode_c_prefer_count, 1)
+        self.assertTrue(drn1_order1.local_teacher_is_order_best)
+        self.assertFalse(drn2_order1.local_teacher_is_order_best)
+        self.assertAlmostEqual(drn2_order1.local_teacher_cost_gap_to_order_best, 1.0)
 
 
 def _context(drone_id: str, runtime_state: object, coarse_plan: object) -> SimpleNamespace:
