@@ -1117,7 +1117,7 @@ function setupRealtimeUpdates() {
     const hasRuntimePaths = dispatchSolver.value === 'ga_mmce'
       ? (runtimePathsForMap.drones?.length ?? 0) > 0
       : ((runtimePathsForMap.trucks?.length ?? 0) > 0 || (runtimePathsForMap.drones?.length ?? 0) > 0)
-    if (hasRuntimePaths || systemStore.running) {
+    if (hasRuntimePaths || systemStore.running || systemStore.policyActive) {
       mapRef.value?.drawRuntimePaths?.(runtimePathsForMap)
     }
 

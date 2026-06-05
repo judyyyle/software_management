@@ -27,7 +27,7 @@
   "station_target_count": 5,
   "station_target_count_ok": true,
   "sumo_edge_sequence_non_empty": true,
-  "sumo_export_dir": "/Users/myx/Documents/GitHub/HiveLogix/backend/test_data/default_scene/sumo/phase4_truck_route",
+  "sumo_export_dir": "/Users/myx/Documents/GitHub/HiveLogix_修改warmup/backend/test_data/default_scene/sumo/phase4_truck_route",
   "truck_order_count": 6,
   "truck_order_ids": [
     "ORD-STATIC-08",

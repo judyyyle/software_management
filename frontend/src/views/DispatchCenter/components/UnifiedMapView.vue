@@ -75,6 +75,7 @@ let truckMarkers:   Map<string, L.Marker> = new Map()
 let droneMarkers:   Map<string, L.Marker> = new Map()
 let truckGroup:     L.LayerGroup   | null = null
 let droneGroup:     L.LayerGroup   | null = null
+const activeDronePathCache = new Map<string, [number, number][]>()
 
 
 // ── 地图初始化 ────────────────────────────────────────────────────
@@ -535,12 +536,30 @@ function drawRuntimePaths(paths: { trucks?: any[]; drones?: any[] }) {
 
   runtimePathGroup = L.layerGroup().addTo(map)
 
-  const drawPath = (entry: any, color: string, dashed = false) => {
+  const activeDroneKeys = new Set(
+    (paths.drones ?? [])
+      .filter((entry: any) => (entry?.status ?? 'active') === 'active')
+      .map((entry: any) => runtimeDronePathKey(entry))
+      .filter(Boolean)
+  )
+  for (const key of activeDronePathCache.keys()) {
+    if (!activeDroneKeys.has(key)) activeDronePathCache.delete(key)
+  }
+
+  const drawPath = (entry: any, color: string, dashed = false, cacheFullDronePath = false) => {
     const rawPath = Array.isArray(entry?.path) ? entry.path : []
-    const coords: [number, number][] = rawPath
+    let coords: [number, number][] = rawPath
       .filter((point: any) => Array.isArray(point) && point.length >= 2)
       .map(([lng, lat]: [number, number]) => [Number(lat), Number(lng)] as [number, number])
       .filter((point: [number, number]) => Number.isFinite(point[0]) && Number.isFinite(point[1]))
+    if (cacheFullDronePath) {
+      const key = runtimeDronePathKey(entry)
+      const cached = key ? activeDronePathCache.get(key) : undefined
+      if (key && (!cached || pathLength(coords) > pathLength(cached))) {
+        activeDronePathCache.set(key, coords.map(([lat, lng]) => [lat, lng] as [number, number]))
+      }
+      coords = (key ? activeDronePathCache.get(key) : undefined) ?? coords
+    }
     if (coords.length <= 1) return
     const line = L.polyline(coords, {
       color,
@@ -566,9 +585,31 @@ function drawRuntimePaths(paths: { trucks?: any[]; drones?: any[] }) {
   }
   for (const dronePath of paths.drones ?? []) {
     if ((dronePath?.status ?? 'active') === 'active') {
-      drawPath(dronePath, '#7c3aed', true)
+      drawPath(dronePath, '#7c3aed', true, true)
     }
   }
+}
+
+function runtimeDronePathKey(entry: any): string {
+  const entityId = String(entry?.entity_id ?? '').trim()
+  if (!entityId) return ''
+  return [
+    entityId,
+    String(entry?.route_version ?? ''),
+    String(entry?.segment_id ?? ''),
+    String(entry?.start_time ?? ''),
+    String(entry?.end_time ?? ''),
+  ].join('|')
+}
+
+function pathLength(coords: [number, number][]): number {
+  let total = 0
+  for (let i = 1; i < coords.length; i += 1) {
+    const [lat1, lng1] = coords[i - 1]
+    const [lat2, lng2] = coords[i]
+    total += Math.hypot(lat2 - lat1, lng2 - lng1)
+  }
+  return total
 }
 
 function buildRuntimePathLabel(entry: any, isDronePath: boolean): string {
