@@ -65,149 +65,6 @@
               <button class="sc-btn sc-btn--reset" :disabled="systemStore.trainingRunning" @click="doReset">🔄 重置</button>
             </div>
 
-            <div class="sc-policy-card" :class="{ 'sc-policy-card--collapsed': !ppoPanelOpen }">
-              <button
-                class="sc-policy-head"
-                type="button"
-                :aria-expanded="ppoPanelOpen"
-                @click="ppoPanelOpen = !ppoPanelOpen"
-              >
-                <div class="sc-policy-head-main">
-                  <span class="sc-policy-chevron" :class="{ 'sc-policy-chevron--open': ppoPanelOpen }">▾</span>
-                  <span class="sc-policy-title">🤖 PPO 在线推理</span>
-                  <span class="sc-policy-badge" :class="systemStore.policyActive ? 'sc-policy-badge--on' : 'sc-policy-badge--off'">
-                    {{ systemStore.policyActive ? '已激活' : '未激活' }}
-                  </span>
-                </div>
-                <span v-if="!ppoPanelOpen" class="sc-policy-summary sc-policy-summary--collapsed">
-                  {{ systemStore.policyActive ? `当前策略：${systemStore.policyName || 'PPO Policy'}` : '点击展开配置 PPO 运行时' }}
-                </span>
-              </button>
-              <transition name="sc-policy-collapse">
-                <div v-show="ppoPanelOpen" class="sc-policy-body">
-                  <div class="sc-policy-grid">
-                    <label class="sc-policy-field">
-                      <span>策略权重路径</span>
-                      <input v-model="policyPath" type="text" placeholder="weights/.../policy_best.pt" />
-                    </label>
-                    <label class="sc-policy-field">
-                      <span>配置文件路径</span>
-                      <input v-model="policyConfigPath" type="text" placeholder="config/rh_alns_cmrappo.yaml" />
-                    </label>
-                    <label class="sc-policy-field">
-                      <span>场景 ID</span>
-                      <input v-model="policySceneId" type="text" readonly />
-                    </label>
-                    <label class="sc-policy-field">
-                      <span>订单来源</span>
-                      <select v-model="policyOrderSourceMode">
-                        <option value="benchmark">benchmark</option>
-                        <option value="poisson">poisson</option>
-                        <option value="hybrid">hybrid</option>
-                      </select>
-                    </label>
-                  </div>
-                  <div class="sc-policy-options">
-                    <label class="sc-policy-check">
-                      <input v-model="policyDeterministic" type="checkbox" />
-                      <span>确定性推理</span>
-                    </label>
-                    <label class="sc-policy-check">
-                      <input v-model="policyUseCurrentInitPayload" type="checkbox" />
-                      <span>复用当前初始化实体与订单</span>
-                    </label>
-                    <span class="sc-policy-runtime">runtime: {{ systemStore.policyRuntimeType }}</span>
-                    <span class="sc-policy-runtime">init_scene: {{ systemStore.initializedSceneId || '未初始化' }}</span>
-                  </div>
-                  <div class="sc-policy-hint" :class="ppoReadyForActivation ? 'sc-policy-hint--ok' : 'sc-policy-hint--warn'">
-                    {{ ppoCompatibilityMessage }}
-                  </div>
-                  <div class="sc-action-row">
-                    <button class="sc-btn sc-btn--policy"
-                      :disabled="!ppoReadyForActivation || policyLoading || systemStore.policyActive || systemStore.trainingRunning"
-                      @click="doActivatePolicy">
-                      {{ policyLoading ? '⏳ 激活中...' : '🤖 切换到 PPO 在线策略' }}
-                    </button>
-                    <button class="sc-btn sc-btn--policy-off"
-                      :disabled="policyLoading || !systemStore.policyActive"
-                      @click="doDeactivatePolicy">
-                      ↩ 切回 Classic 仿真
-                    </button>
-                    <span class="sc-policy-summary">
-                      {{ systemStore.policyActive ? `当前策略：${systemStore.policyName || 'PPO Policy'}` : '当前未使用策略运行时' }}
-                    </span>
-                  </div>
-                  <div v-if="systemStore.policyCheckpoint" class="sc-policy-checkpoint">
-                    checkpoint：{{ systemStore.policyCheckpoint }}
-                  </div>
-                </div>
-              </transition>
-            </div>
-
-            <div class="sc-policy-card" :class="{ 'sc-policy-card--collapsed': !trainingPanelOpen }">
-              <button
-                class="sc-policy-head"
-                type="button"
-                :aria-expanded="trainingPanelOpen"
-                @click="trainingPanelOpen = !trainingPanelOpen"
-              >
-                <div class="sc-policy-head-main">
-                  <span class="sc-policy-chevron" :class="{ 'sc-policy-chevron--open': trainingPanelOpen }">▾</span>
-                  <span class="sc-policy-title">🧪 PPO 训练启动</span>
-                  <span class="sc-policy-badge" :class="systemStore.trainingRunning ? 'sc-policy-badge--on' : 'sc-policy-badge--off'">
-                    {{ systemStore.trainingRunning ? '训练中' : (systemStore.trainingCompleted ? '已结束' : '未启动') }}
-                  </span>
-                </div>
-                <span v-if="!trainingPanelOpen" class="sc-policy-summary sc-policy-summary--collapsed">
-                  {{ systemStore.trainingActive ? `step ${systemStore.trainingGlobalStep}` : '点击展开启动默认场景 PPO 训练' }}
-                </span>
-              </button>
-              <transition name="sc-policy-collapse">
-                <div v-show="trainingPanelOpen" class="sc-policy-body">
-                  <div class="sc-policy-grid">
-                    <label class="sc-policy-field">
-                      <span>训练配置文件</span>
-                      <input v-model="trainingConfigPath" type="text" placeholder="config/rh_alns_cmrappo.yaml" />
-                    </label>
-                    <label class="sc-policy-field">
-                      <span>输出目录</span>
-                      <input v-model="trainingOutputDirInput" type="text" placeholder="留空自动创建 weights/.../frontend_train_*" />
-                    </label>
-                    <label class="sc-policy-field">
-                      <span>训练场景 ID</span>
-                      <input v-model="trainingSceneId" type="text" readonly />
-                    </label>
-                    <label class="sc-policy-field">
-                      <span>推流间隔秒</span>
-                      <input v-model.number="trainingRenderIntervalSec" type="number" min="0" step="0.05" />
-                    </label>
-                  </div>
-                  <div class="sc-policy-options">
-                    <span class="sc-policy-runtime">订单源：训练配置 poisson curriculum</span>
-                    <span class="sc-policy-runtime">step：{{ systemStore.trainingGlobalStep }}</span>
-                    <span class="sc-policy-runtime">update：{{ systemStore.trainingUpdateIdx }}</span>
-                    <span class="sc-policy-runtime">episode：{{ systemStore.trainingEpisodeId ?? '尚未开始' }}</span>
-                  </div>
-                  <div class="sc-policy-hint" :class="trainingReady ? 'sc-policy-hint--ok' : 'sc-policy-hint--warn'">
-                    {{ trainingCompatibilityMessage }}
-                  </div>
-                  <div class="sc-action-row">
-                    <button class="sc-btn sc-btn--policy"
-                      :disabled="!trainingReady || trainingLoading || systemStore.trainingRunning || systemStore.policyActive"
-                      @click="doStartPpoTraining">
-                      {{ trainingLoading ? '⏳ 启动中...' : '🧪 启动 PPO 训练并推送前端' }}
-                    </button>
-                    <span class="sc-policy-summary">
-                      {{ systemStore.trainingActive ? `训练输出：${systemStore.trainingOutputDir || '等待后端返回'}` : '当前未启动训练直播' }}
-                    </span>
-                  </div>
-                  <div v-if="systemStore.trainingError" class="sc-policy-checkpoint sc-policy-checkpoint--error">
-                    训练错误：{{ systemStore.trainingError }}
-                  </div>
-                </div>
-              </transition>
-            </div>
-
             <!-- 调度控制行 -->
             <div class="sc-action-row">
               <button class="sc-btn sc-btn--dispatch"
@@ -221,6 +78,13 @@
                 :disabled="!initDone || dispatchLoading"
                 @click="dispatchSolver = 'ga_mmce'">
                 🧬 遗传算法
+              </button>
+              <button class="sc-btn sc-btn--policy"
+                :class="{ 'sc-btn--policy-active': systemStore.policyActive }"
+                :disabled="!initDone || dispatchLoading || policyLoading || systemStore.trainingRunning || (!systemStore.policyActive && !ppoReadyForActivation) || (systemStore.policyActive && systemStore.running)"
+                @click="doPpoPolicyButton">
+                <span>{{ ppoPolicyButtonText }}</span>
+                <span v-if="policyLoading" class="sc-btn-spinner" aria-hidden="true"></span>
               </button>
               <label v-if="dispatchSolver === 'ga_mmce'" class="dispatch-cache-toggle">
                 <input
@@ -414,13 +278,6 @@ const policySceneId = ref(PPO_SCENE_ID)
 const policyDeterministic = ref(true)
 const policyUseCurrentInitPayload = ref(true)
 const policyOrderSourceMode = ref<PolicyOrderSourceMode>('benchmark')
-const ppoPanelOpen = ref(true)
-const trainingPanelOpen = ref(false)
-const trainingLoading = ref(false)
-const trainingConfigPath = ref('config/rh_alns_cmrappo.yaml')
-const trainingOutputDirInput = ref('')
-const trainingSceneId = ref(PPO_SCENE_ID)
-const trainingRenderIntervalSec = ref(0.25)
 const currentSceneId = computed(() => String(sceneStore.context?.scene_id ?? '').trim())
 const ppoCurrentSceneCompatible = computed(() => currentSceneId.value === PPO_SCENE_ID)
 const ppoInitSceneCompatible = computed(() => String(systemStore.initializedSceneId ?? '').trim() === PPO_SCENE_ID)
@@ -444,25 +301,10 @@ const ppoCompatibilityMessage = computed(() => {
   }
   return `当前页面与最近一次初始化均匹配 ${PPO_SCENE_ID}，可以激活 PPO。`
 })
-const trainingReady = computed(() =>
-  systemStore.initialized &&
-  ppoCurrentSceneCompatible.value &&
-  ppoInitSceneCompatible.value
-)
-const trainingCompatibilityMessage = computed(() => {
-  if (!sceneStore.context) {
-    return `请先加载默认预设场景 ${PPO_SCENE_ID}。`
-  }
-  if (!ppoCurrentSceneCompatible.value) {
-    return `当前页面场景为 ${currentSceneId.value}，第一版训练直播仅支持 ${PPO_SCENE_ID}。`
-  }
-  if (!systemStore.initialized) {
-    return `请先使用 ${PPO_SCENE_ID} 完成一次初始化，确保前端底图与训练场景一致。`
-  }
-  if (!ppoInitSceneCompatible.value) {
-    return `最近一次初始化场景为 ${systemStore.initializedSceneId || 'unknown'}，请切回 ${PPO_SCENE_ID} 后重新初始化。`
-  }
-  return `训练将使用后端默认场景 ${PPO_SCENE_ID} 和训练配置中的 poisson 订单源。`
+const ppoPolicyButtonText = computed(() => {
+  if (policyLoading.value) return '切换到 PPO 在线策略'
+  if (systemStore.policyActive) return systemStore.running ? 'PPO 在线运行中' : '▶ 启动 PPO 在线策略'
+  return '切换到 PPO 在线策略'
 })
 
 // 调度相关状态
@@ -875,56 +717,17 @@ async function doActivatePolicy() {
   }
 }
 
-async function doDeactivatePolicy() {
-  policyLoading.value = true
-  _log('info', '↩ 正在切回 Classic 仿真运行时...')
-  try {
-    await systemStore.deactivatePolicy()
-    lastRenderedDecisionEventSeq.value = 0
-    await systemStore.fetchPolicyState()
-    _log('success', '✅ 已切回 Classic 仿真运行时')
-  } catch (e: any) {
-    _log('error', `❌ 切回 Classic 失败：${e.message}`)
-  } finally {
-    policyLoading.value = false
-  }
-}
-
-async function doStartPpoTraining() {
-  if (!trainingReady.value) {
-    _log('warn', `⚠️ ${trainingCompatibilityMessage.value}`)
+async function doPpoPolicyButton() {
+  if (!systemStore.policyActive) {
+    await doActivatePolicy()
     return
   }
-  trainingLoading.value = true
-  lastRenderedDecisionEventSeq.value = 0
-  totalEnergyCostWh.value = 0
-  _log('info', `🧪 正在启动 PPO 训练直播：${trainingConfigPath.value}`)
+  if (systemStore.running) return
   try {
-    const payload: {
-      config_path: string
-      scene_id: string
-      output_dir?: string
-      render_interval_sec: number
-      render_every_n_steps: number
-      require_current_init_scene: boolean
-    } = {
-      config_path: trainingConfigPath.value.trim(),
-      scene_id: trainingSceneId.value.trim(),
-      render_interval_sec: Number(trainingRenderIntervalSec.value) || 0.25,
-      render_every_n_steps: 1,
-      require_current_init_scene: true,
-    }
-    const outputDir = trainingOutputDirInput.value.trim()
-    if (outputDir) {
-      payload.output_dir = outputDir
-    }
-    await systemStore.startPpoTraining(payload)
-    await systemStore.fetchTrainingState().catch(() => {})
-    _log('success', `✅ PPO 训练已启动，训练订单将通过前端地图实时展示`)
+    await systemStore.start()
+    _log('success', '▶ PPO 在线推理已启动')
   } catch (e: any) {
-    _log('error', `❌ PPO 训练启动失败：${e.message}`)
-  } finally {
-    trainingLoading.value = false
+    _log('error', `❌ PPO 启动失败：${e.message}`)
   }
 }
 
@@ -1387,217 +1190,35 @@ onBeforeUnmount(() => {
 }
 .dispatch-quick-stat--policy { color: #b45309; }
 
-.sc-policy-card {
-  display: flex;
-  flex-direction: column;
-  gap: 10px;
-  padding: 12px;
-  background: linear-gradient(135deg, #eff6ff, #f8fafc);
-  border: 1px solid #bfdbfe;
-  border-radius: var(--hl-card-radius);
-}
-
-.sc-policy-card--collapsed {
-  gap: 0;
-}
-
-.sc-policy-head {
-  display: flex;
-  align-items: flex-start;
-  justify-content: space-between;
-  gap: 12px;
-  width: 100%;
-  padding: 0;
-  background: none;
-  border: none;
-  text-align: left;
-  cursor: pointer;
-}
-
-.sc-policy-head-main {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  min-width: 0;
-}
-
-.sc-policy-chevron {
-  font-size: 14px;
-  color: #2563eb;
-  line-height: 1;
-  transform: rotate(-90deg);
-  transition: transform 0.2s ease;
-}
-
-.sc-policy-chevron--open {
-  transform: rotate(0deg);
-}
-
-.sc-policy-title {
-  font-size: 13px;
-  font-weight: 700;
-  color: #1e3a8a;
-}
-
-.sc-policy-badge {
-  display: inline-flex;
-  align-items: center;
-  height: 24px;
-  padding: 0 10px;
-  border-radius: 999px;
-  font-size: 11px;
-  font-weight: 700;
-}
-
-.sc-policy-badge--on {
-  background: #dcfce7;
-  color: #166534;
-}
-
-.sc-policy-badge--off {
-  background: #e2e8f0;
-  color: #475569;
-}
-
-.sc-policy-body {
-  display: flex;
-  flex-direction: column;
-  gap: 10px;
-}
-
-.sc-policy-grid {
-  display: grid;
-  grid-template-columns: repeat(2, minmax(220px, 1fr));
-  gap: 10px;
-}
-
-.sc-policy-field {
-  display: flex;
-  flex-direction: column;
-  gap: 5px;
-  min-width: 0;
-}
-
-.sc-policy-field span {
-  font-size: 12px;
-  font-weight: 600;
-  color: var(--hl-text-secondary);
-}
-
-.sc-policy-field input,
-.sc-policy-field select {
-  width: 100%;
-  height: 34px;
-  padding: 0 10px;
-  border: 1px solid #cbd5e1;
-  border-radius: 8px;
-  background: #fff;
-  color: var(--hl-text);
-  font-size: 12px;
-  outline: none;
-}
-
-.sc-policy-field input:focus,
-.sc-policy-field select:focus {
-  border-color: #3b82f6;
-  box-shadow: 0 0 0 3px rgba(59, 130, 246, 0.12);
-}
-
-.sc-policy-options {
-  display: flex;
-  align-items: center;
-  gap: 12px;
-  flex-wrap: wrap;
-}
-
-.sc-policy-check {
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-  font-size: 12px;
-  color: var(--hl-text-secondary);
-  cursor: pointer;
-}
-
-.sc-policy-check input {
-  accent-color: #2563eb;
-}
-
-.sc-policy-runtime {
-  font-size: 11.5px;
-  color: #475569;
-}
-
-.sc-policy-hint {
-  font-size: 12px;
-  line-height: 1.5;
-  padding: 8px 10px;
-  border-radius: 8px;
-}
-
-.sc-policy-hint--ok {
-  background: #ecfdf5;
-  color: #166534;
-}
-
-.sc-policy-hint--warn {
-  background: #fff7ed;
-  color: #9a3412;
-}
-
 .sc-btn--policy {
-  background: #2563eb;
+  background: #0f766e;
   color: #fff;
-  min-width: 180px;
+  min-width: 178px;
 }
 
 .sc-btn--policy:hover:not(:disabled) {
-  background: #1d4ed8;
+  background: #0d9488;
 }
 
-.sc-btn--policy-off {
-  background: #fff;
-  color: #334155;
-  border: 1px solid #cbd5e1;
+.sc-btn--policy-active {
+  background: #115e59;
+  box-shadow: inset 0 2px 5px rgba(0, 0, 0, 0.22);
+  transform: translateY(1px);
 }
 
-.sc-btn--policy-off:hover:not(:disabled) {
-  background: #f8fafc;
-}
-
-.sc-policy-summary {
+.sc-btn-spinner {
   display: inline-flex;
-  align-items: center;
-  min-height: 34px;
-  font-size: 12px;
-  color: #1e293b;
+  width: 12px;
+  height: 12px;
+  margin-left: 6px;
+  border: 2px solid rgba(255, 255, 255, 0.42);
+  border-top-color: #fff;
+  border-radius: 50%;
+  animation: sc-spin 0.8s linear infinite;
 }
 
-.sc-policy-summary--collapsed {
-  min-height: auto;
-  color: #475569;
-  white-space: nowrap;
-}
-
-.sc-policy-checkpoint {
-  font-size: 11.5px;
-  color: #475569;
-  word-break: break-all;
-}
-
-.sc-policy-checkpoint--error {
-  color: #b91c1c;
-}
-
-.sc-policy-collapse-enter-active,
-.sc-policy-collapse-leave-active {
-  transition: opacity 0.18s ease, transform 0.18s ease;
-}
-
-.sc-policy-collapse-enter-from,
-.sc-policy-collapse-leave-to {
-  opacity: 0;
-  transform: translateY(-4px);
+@keyframes sc-spin {
+  to { transform: rotate(360deg); }
 }
 
 /* 速率选择 */
@@ -1859,19 +1480,6 @@ onBeforeUnmount(() => {
 @media (max-width: 1080px) {
   .sc-entity-row {
     grid-template-columns: repeat(2, minmax(0, 1fr));
-  }
-
-  .sc-policy-head {
-    flex-direction: column;
-    align-items: stretch;
-  }
-
-  .sc-policy-summary--collapsed {
-    white-space: normal;
-  }
-
-  .sc-policy-grid {
-    grid-template-columns: 1fr;
   }
 }
 
