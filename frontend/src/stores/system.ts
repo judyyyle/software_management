@@ -283,35 +283,6 @@ export const useSystemStore = defineStore('system', () => {
     latestEventSeq.value = 0
   }
 
-  async function startPpoTraining(payload: {
-    config_path: string
-    scene_id: string
-    output_dir?: string
-    render_interval_sec: number
-    render_every_n_steps: number
-    require_current_init_scene: boolean
-  }) {
-    const orderStore = useOrderStore()
-    orderStore.generatedOrders = []
-    orderStore.stats = null
-    runtimePaths.value = { trucks: [], drones: [] }
-    dispatchChains.value = []
-    decisionEvents.value = []
-    latestEventSeq.value = 0
-    const result = await http.post<any>('/api/sim/training/start', payload)
-    const runtime = result?.runtime ?? {}
-    trainingActive.value = true
-    trainingRunning.value = Boolean(runtime.running)
-    trainingCompleted.value = Boolean(runtime.completed)
-    trainingError.value = String(runtime.error ?? '')
-    trainingOutputDir.value = String(runtime.output_dir ?? payload.output_dir ?? '')
-    trainingGlobalStep.value = Number(runtime.global_step ?? 0)
-    trainingUpdateIdx.value = Number(runtime.update_idx ?? 0)
-    const episodeRaw = runtime.episode_id
-    trainingEpisodeId.value = episodeRaw === null || episodeRaw === undefined ? null : Number(episodeRaw)
-    return result
-  }
-
   async function fetchTrainingState() {
     const result = await http.get<any>('/api/sim/training/state')
     if (result?.active) {
@@ -485,6 +456,6 @@ export const useSystemStore = defineStore('system', () => {
     initWs, probeBackend, onTick,
     start, pause, reset, setSpeed, initSim, dispatch,
     activatePolicy, deactivatePolicy, fetchPolicyState,
-    startPpoTraining, fetchTrainingState,
+    fetchTrainingState,
   }
 })

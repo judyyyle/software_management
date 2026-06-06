@@ -378,12 +378,12 @@ training:
   # 并通过 apply_decision_batch() 沿 teacher 轨迹采样后续 decision batch。
   bc_warm_start_enabled: true
   # 兼容旧字段；显式配置 bc_warm_start_stages 后，训练入口以 stage updates 总和为准。
-  bc_warm_start_updates: 52
+  bc_warm_start_updates: 80
   bc_learning_rate: 0.0001
   bc_warm_start_stages:
     - name: poisson_teacher_bc
       order_source_mode: poisson
-      updates: 52
+      updates: 80
       learning_rate: 0.0001
   bc_warm_start_batches_per_update: 2
   # 正式 10k 验证先限制每条 teacher rollout 的采样长度，避免 BC 成本远大于 PPO 本体。
