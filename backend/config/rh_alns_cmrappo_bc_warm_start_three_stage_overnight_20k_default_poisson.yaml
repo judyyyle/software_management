@@ -402,11 +402,11 @@ training:
   bc_warm_start_reuse_existing: false
   bc_warm_start_checkpoint_interval_updates: 10
   bc_warm_start_checkpoint_path: ""
-  # BC 专用监督损失权重；降低 forced WAIT 稀释，适度放大 C 标签。
+  # BC 专用监督损失权重；跳过 forced WAIT，保留 C 标签相对优势。
   bc_wait_no_dispatch_loss_weight: 0.0
-  bc_wait_with_dispatch_loss_weight: 2.00
+  bc_wait_with_dispatch_loss_weight: 0.75
   bc_mode_b_dispatch_loss_weight: 1.00
-  bc_mode_c_dispatch_loss_weight: 1.25
+  bc_mode_c_dispatch_loss_weight: 1.50
 
   # 正式贪心预训练固定使用 high=2.70/min，高于 medium=2.40/min 的训练中档。
   train_arrival_curriculum_enabled: true
