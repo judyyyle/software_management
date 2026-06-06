@@ -26,7 +26,13 @@ import json
 import math
 import random
 from dataclasses import dataclass, replace
-from enum import StrEnum
+try:
+    from enum import StrEnum
+except ImportError:
+    from enum import Enum
+
+    class StrEnum(str, Enum):
+        pass
 from pathlib import Path
 from typing import Any, Mapping, TypeAlias
 
