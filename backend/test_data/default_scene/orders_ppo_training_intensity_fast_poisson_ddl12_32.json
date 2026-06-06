@@ -563,20 +563,6 @@
       "priority_label": "普通"
     },
     {
-      "order_id": "TRUCKONLY-20260424-03",
-      "spawn_sim_s": 18.805367,
-      "deadline_offset_s": 10377.950748,
-      "delivery_lng": 121.2130271,
-      "delivery_lat": 31.0454797,
-      "delivery_z": 0.0,
-      "payload_weight": 11.485476,
-      "source_type": null,
-      "pickup_source_id": null,
-      "fulfillment_mode": "DRONE_TRUCK_DEPOT",
-      "priority": "LOW",
-      "priority_label": "低优先"
-    },
-    {
       "order_id": "ORD-FASTPOISSON-003",
       "spawn_sim_s": 19.0,
       "deadline_offset_s": 1359.599887,
@@ -659,20 +645,6 @@
       "fulfillment_mode": "DRONE_DIRECT",
       "priority": "NORMAL",
       "priority_label": "普通"
-    },
-    {
-      "order_id": "TRUCKONLY-20260424-04",
-      "spawn_sim_s": 252.873906,
-      "deadline_offset_s": 5538.986541,
-      "delivery_lng": 121.2274052,
-      "delivery_lat": 31.0496544,
-      "delivery_z": 0.0,
-      "payload_weight": 11.071543,
-      "source_type": null,
-      "pickup_source_id": null,
-      "fulfillment_mode": "DRONE_TRUCK_DEPOT",
-      "priority": "LOW",
-      "priority_label": "低优先"
     },
     {
       "order_id": "ORD-FASTPOISSON-009",
@@ -785,20 +757,6 @@
       "fulfillment_mode": "DRONE_DIRECT",
       "priority": "URGENT",
       "priority_label": "紧急"
-    },
-    {
-      "order_id": "TRUCKONLY-20260424-05",
-      "spawn_sim_s": 477.662434,
-      "deadline_offset_s": 5734.972949,
-      "delivery_lng": 121.2176316,
-      "delivery_lat": 31.0530595,
-      "delivery_z": 0.0,
-      "payload_weight": 11.719512,
-      "source_type": null,
-      "pickup_source_id": null,
-      "fulfillment_mode": "DRONE_TRUCK_DEPOT",
-      "priority": "LOW",
-      "priority_label": "低优先"
     },
     {
       "order_id": "ORD-FASTPOISSON-017",
@@ -2003,12 +1961,6 @@
     "tick_step_sec": 1.0,
     "trimmed_dynamic_orders_from": 130,
     "trimmed_dynamic_orders_to": 100,
-    "trim_policy": "kept earliest 100 dynamic_orders sorted by spawn_sim_s; removed tail",
-    "manual_added_dynamic_orders_file": "backend/test_data/default_scene/orders_ppo_training_intensity.json",
-    "manual_added_dynamic_order_ids": [
-      "TRUCKONLY-20260424-03",
-      "TRUCKONLY-20260424-04",
-      "TRUCKONLY-20260424-05"
-    ]
+    "trim_policy": "kept earliest 100 dynamic_orders sorted by spawn_sim_s; removed tail"
   }
 }

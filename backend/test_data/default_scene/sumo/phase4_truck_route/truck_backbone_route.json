@@ -1,8 +1,8 @@
 {
   "truck_backbone_route": [
-    "STA-TEST-03",
-    "STA-TEST-06",
     "STA-TEST-10",
+    "STA-TEST-06",
+    "STA-TEST-01",
     "STA-TEST-02",
     "STA-TEST-09",
     "DEP-TEST-01"
